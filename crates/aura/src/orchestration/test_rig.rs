@@ -31,7 +31,6 @@
 //! chain, so execute_task-level tests drive the production path unmodified.
 
 use std::collections::VecDeque;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -778,59 +777,6 @@ pub(crate) fn worker_definition(
             skills: None,
         },
     )
-}
-
-/// A park-mode orchestrator over an in-memory approval store, persisted under
-/// `memory_dir` — the construction pattern the orchestrator's own park tests
-/// use, minus the run id (that lives behind the orchestrator's private
-/// persistence handle, readable only from the orchestrator's own test
-/// module). The execute_task-level fixtures live in that test module for the
-/// same reason, so this stays reserved.
-#[allow(dead_code)] // reserved: rig-level orchestrator fixture
-pub(crate) async fn park_orchestrator_in(
-    memory_dir: &Path,
-) -> (
-    super::Orchestrator,
-    Arc<crate::session_store::InMemoryApprovalStore>,
-    crate::hitl::PendingApprovals,
-) {
-    use crate::hitl::PendingApprovals;
-    use crate::session_store::InMemoryEventBus;
-
-    let store = Arc::new(crate::session_store::InMemoryApprovalStore::new());
-    let registry = PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
-    let (worker_name, worker) = worker_definition(
-        "operations",
-        "Runs the scripted tool",
-        "You apply changes with the echo tool.",
-    );
-    let mut workers = std::collections::HashMap::new();
-    workers.insert(worker_name, worker);
-    let config = crate::config::AgentRuntimeConfig {
-        hitl: Some(crate::hitl::HitlRuntime {
-            patterns: Arc::from(["kubectl_*".into()]),
-            route: Arc::new(crate::hitl::DecisionRoute::Conversational {
-                registry: registry.clone(),
-                timeout: Duration::from_secs(3600),
-            }),
-            park_enabled: true,
-            park_ttl: aura_config::ParkTtl::default(),
-            headers_from_request: std::collections::HashMap::new(),
-        }),
-        memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
-        session_id: Some("park-sess".to_string()),
-        request_id: Some(format!("req_rig_{}", uuid::Uuid::new_v4().simple())),
-        orchestration: Some(super::OrchestrationConfig {
-            enabled: true,
-            workers,
-            ..Default::default()
-        }),
-        ..crate::config::AgentRuntimeConfig::default()
-    };
-    let orchestrator = super::Orchestrator::new(config)
-        .await
-        .expect("orchestrator builds");
-    (orchestrator, store, registry)
 }
 
 // ============================================================================

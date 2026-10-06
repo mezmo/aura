@@ -44,12 +44,6 @@ pub(crate) enum RehydrateError {
     /// endpoint renders as the 409 `parked` body; an all-decided resume
     /// never sees this.
     Parked { blocking: Vec<BlockingEntry> },
-    /// Condition row "config_changed": the fingerprint no longer matches the
-    /// rebuilt configuration. Checked by the resume endpoint against a
-    /// header-resolved config entry point (P45 adoption).
-    #[allow(dead_code)]
-    // reserved: the fingerprint row is enforced structurally ahead of the consult
-    ConfigChanged,
     /// Condition row carried as a store fault: the approval store failed
     /// mid-read.
     Store(String),
@@ -69,7 +63,6 @@ impl std::fmt::Display for RehydrateError {
                 "{} approval(s) still await a decision inside the window",
                 blocking.len()
             ),
-            Self::ConfigChanged => write!(f, "configuration changed since the run parked"),
             Self::Store(detail) => write!(f, "approval store read failed: {detail}"),
             Self::Document(detail) => write!(f, "checkpoint document read failed: {detail}"),
         }

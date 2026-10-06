@@ -7,6 +7,11 @@
 //! nonoverlapping loop that sleeps 60 seconds between passes. A missing
 //! checkpoint root is not an error — a config may simply have no parked
 //! evidence yet — but an unreadable root or document is warned and kept.
+//!
+//! The approval store is shared by every agent in the process, so each engine
+//! reclaims only the rows its own instance parked — the same `instance_id`
+//! ownership key the poll reconciler claims by. A shorter-TTL sweep therefore
+//! cannot treat another agent's still-valid run as an orphan.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -48,6 +53,7 @@ pub struct ParkSweep {
     memory_dir: String,
     park_ttl: ParkTtl,
     label: String,
+    instance_id: String,
 }
 
 impl std::fmt::Debug for ParkSweep {
@@ -65,6 +71,9 @@ impl ParkSweep {
     /// Build one sweep engine for a park-enabled config. `table` must be the
     /// same shared claim table requests fence on, so a live run refuses cleanup
     /// here exactly as it refuses a duplicate claim in the handler.
+    /// `instance_id` is the config's effective instance id — the same identity
+    /// the gate stamps on the rows it parks — so this engine reclaims only
+    /// rows its own agent parked out of the shared store.
     #[must_use]
     pub fn new(
         table: Arc<ResumeClaimTable>,
@@ -73,6 +82,7 @@ impl ParkSweep {
         memory_dir: String,
         park_ttl: ParkTtl,
         label: String,
+        instance_id: String,
     ) -> Self {
         Self {
             table,
@@ -81,6 +91,7 @@ impl ParkSweep {
             memory_dir,
             park_ttl,
             label,
+            instance_id,
         }
     }
 
@@ -128,31 +139,18 @@ impl ParkSweep {
             }
         }
 
-        // Union with orphaned retained rows: runs whose rows still exist but
-        // whose checkpoint was not found in any scanned root.
-        match self.orphaned_rows(&candidates).await {
-            Ok(orphans) => {
-                for (run_id, rows) in orphans {
-                    let session = rows
-                        .iter()
-                        .find_map(|approval| session_from_scope(&approval.request.scope));
-                    candidates
-                        .entry(run_id.clone())
-                        .or_insert_with(|| Candidate {
-                            run_id,
-                            session,
-                            retained_rows: rows,
-                        });
-                }
-            }
-            Err(err) => {
-                warn!(
-                    agent = %self.label,
-                    error = %err,
-                    "park retention sweep could not read retained rows"
-                );
-                return;
-            }
+        // Attach this instance's retained rows to the runs they name: a
+        // candidate discovered by checkpoint scan gains its registry
+        // evidence (the age anchor a corrupt or absent checkpoint reclaims
+        // from), and a run with no scanned checkpoint becomes an orphan
+        // candidate in its own right.
+        if let Err(err) = self.attach_retained_rows(&mut candidates).await {
+            warn!(
+                agent = %self.label,
+                error = %err,
+                "park retention sweep could not read retained rows"
+            );
+            return;
         }
 
         for candidate in candidates.into_values() {
@@ -179,28 +177,42 @@ impl ParkSweep {
         }
     }
 
-    /// Retained rows grouped by run id, limited to runs not already found in a
-    /// checkpoint root. Single scopes carry no run id and do not contribute.
-    async fn orphaned_rows(
+    /// Attach every one of this instance's retained rows to the run it
+    /// names. The store is shared by every agent in the process, so another
+    /// agent's row is not this sweep's to consider — its checkpoint lives in
+    /// that agent's memory dir, and reaping it would strand that agent's
+    /// run. Single scopes carry no run id and do not contribute.
+    async fn attach_retained_rows(
         &self,
-        candidates: &HashMap<String, Candidate>,
-    ) -> Result<HashMap<String, Vec<ParkedApproval>>, SessionStoreError> {
+        candidates: &mut HashMap<String, Candidate>,
+    ) -> Result<(), SessionStoreError> {
         let rows = self.store.retained_rows().await?;
-        let mut by_run: HashMap<String, Vec<ParkedApproval>> = HashMap::new();
         for retained in rows {
             let approval = match retained {
                 RetainedApproval::Pending(approval) => approval,
                 RetainedApproval::Addressed { approval, .. } => approval,
             };
+            if approval.request.instance_id != self.instance_id {
+                continue;
+            }
             let Some(run_id) = run_id_from_scope(&approval.request.scope) else {
                 continue;
             };
-            if candidates.contains_key(&run_id) {
-                continue;
+            match candidates.entry(run_id.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().retained_rows.push(approval);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let session = session_from_scope(&approval.request.scope);
+                    entry.insert(Candidate {
+                        run_id,
+                        session,
+                        retained_rows: vec![approval],
+                    });
+                }
             }
-            by_run.entry(run_id).or_default().push(approval);
         }
-        Ok(by_run)
+        Ok(())
     }
 
     async fn process_candidate(&self, candidate: Candidate, now: DateTime<Utc>) {
@@ -267,14 +279,40 @@ impl ParkSweep {
                     }
                 }
             }
-            CheckpointPresence::Inaccessible(ref diagnostic)
-            | CheckpointPresence::Corrupt(ref diagnostic) => {
+            CheckpointPresence::Inaccessible(ref diagnostic) => {
                 warn!(
                     agent = %self.label,
                     run_id = %candidate.run_id,
                     error = %diagnostic,
                     "park retention sweep kept unreadable checkpoint evidence"
                 );
+            }
+            CheckpointPresence::Corrupt(ref diagnostic) => {
+                // An undecodable checkpoint carries no readable retention
+                // deadline, so its rows' registration age stands in — the
+                // same anchor the confirmed-absent orphan path ages from.
+                // Without rows there is no anchor, and the corrupt document
+                // is kept and warned rather than guessed at. Reclaiming
+                // here is what keeps a corrupt checkpoint from answering
+                // the resume endpoint with an immortal `reify_failed`:
+                // once its rows age out, the evidence goes and the run
+                // reads absent.
+                match orphan_deadline(&candidate.retained_rows, self.park_ttl) {
+                    Some(deadline) if now > deadline => {
+                        self.delete(&cleanup, &candidate.run_id).await;
+                    }
+                    Some(_) => {
+                        // Corrupt within its grace period: keep.
+                    }
+                    None => {
+                        warn!(
+                            agent = %self.label,
+                            run_id = %candidate.run_id,
+                            error = %diagnostic,
+                            "park retention sweep kept a corrupt checkpoint with no retained rows to age from"
+                        );
+                    }
+                }
             }
         }
     }
@@ -480,7 +518,11 @@ mod tests {
 
     const SESSION: &str = "sess-sweep";
     const RUN_A: &str = "0199c0de-4545-7000-8000-000000000045";
+    const RUN_B: &str = "0199c0de-4545-7000-8000-000000000046";
     const DECISION: &str = "0199c0de-4545-7000-8000-000000000042";
+    const INSTANCE: &str = "cleanup-instance";
+    const INSTANCE_A: &str = "instance-alpha";
+    const INSTANCE_B: &str = "instance-beta";
 
     fn parse_run_id(raw: &str) -> RunId {
         RunId::from_str(raw).expect("fixture run id parses")
@@ -556,6 +598,15 @@ mod tests {
 
     async fn write_document(path: &Path, document: &ParkedRun) {
         let bytes = serde_json::to_vec_pretty(document).expect("document serializes");
+        write_checkpoint_bytes(path, bytes).await;
+    }
+
+    /// A checkpoint that reads but never decodes: valid bytes, wrong shape.
+    async fn write_garbage_checkpoint(path: &Path) {
+        write_checkpoint_bytes(path, b"{ not a parked run".to_vec()).await;
+    }
+
+    async fn write_checkpoint_bytes(path: &Path, bytes: Vec<u8>) {
         let path = path.to_path_buf();
         tokio::task::spawn_blocking(move || {
             if let Some(parent) = path.parent() {
@@ -578,6 +629,7 @@ mod tests {
     }
 
     fn run_approval(
+        instance_id: &str,
         run_id: &str,
         decision_id: DecisionId,
         registered_at: chrono::DateTime<chrono::Utc>,
@@ -585,7 +637,7 @@ mod tests {
         ParkedApproval {
             request: ApprovalRequest {
                 version: PROTOCOL_VERSION,
-                instance_id: "cleanup-instance".to_string(),
+                instance_id: instance_id.to_string(),
                 decision_id,
                 request_id: run_owner_id(run_id),
                 scope: AgentScope::Worker {
@@ -617,9 +669,23 @@ mod tests {
         run_id: &str,
         registered_at: chrono::DateTime<chrono::Utc>,
     ) -> DecisionId {
+        stage_run_approval_for(INSTANCE, registry, run_id, registered_at).await
+    }
+
+    async fn stage_run_approval_for(
+        instance_id: &str,
+        registry: &PendingApprovals,
+        run_id: &str,
+        registered_at: chrono::DateTime<chrono::Utc>,
+    ) -> DecisionId {
         let decision_id = DecisionId::generate();
         registry
-            .register_durable(run_approval(run_id, decision_id, registered_at))
+            .register_durable(run_approval(
+                instance_id,
+                run_id,
+                decision_id,
+                registered_at,
+            ))
             .await
             .expect("stage run approval");
         decision_id
@@ -644,13 +710,32 @@ mod tests {
         memory_dir: &str,
         park_ttl: u64,
     ) -> ParkSweep {
+        sweep_as(
+            INSTANCE,
+            "sweep-test",
+            registry,
+            store,
+            memory_dir,
+            park_ttl,
+        )
+    }
+
+    fn sweep_as(
+        instance_id: &str,
+        label: &str,
+        registry: PendingApprovals,
+        store: Arc<dyn crate::session_store::ApprovalStore>,
+        memory_dir: &str,
+        park_ttl: u64,
+    ) -> ParkSweep {
         ParkSweep::new(
             Arc::new(ResumeClaimTable::new()),
             registry,
             store,
             memory_dir.to_string(),
             aura_config::ParkTtl::try_new(park_ttl).expect("fixture park ttl validates"),
-            "sweep-test".to_string(),
+            label.to_string(),
+            instance_id.to_string(),
         )
     }
 
@@ -761,6 +846,7 @@ mod tests {
             memory_dir,
             aura_config::ParkTtl::try_new(3600).unwrap(),
             "sweep-test".to_string(),
+            INSTANCE.to_string(),
         );
         sweep.run_pass().await;
 
@@ -774,8 +860,12 @@ mod tests {
         );
     }
 
+    /// A checkpoint the filesystem refuses to read (staged here as a
+    /// directory squatting on the document path) is `Inaccessible`, not
+    /// corrupt: the bytes were never judged, so the evidence is kept and
+    /// warned regardless of age.
     #[tokio::test]
-    async fn pass_keeps_corrupt_checkpoint() {
+    async fn pass_keeps_unreadable_checkpoint_evidence() {
         let dir = tempfile::tempdir().expect("temp memory root");
         let memory_dir = dir.path().to_string_lossy().to_string();
         let (registry, store) = make_registry(dir.path());
@@ -790,11 +880,64 @@ mod tests {
 
         assert!(
             docs.parked().exists(),
-            "corrupt checkpoint evidence is kept"
+            "unreadable checkpoint evidence is kept"
         );
         assert!(
             registry.try_parked(&decision_id).await.unwrap().is_some(),
-            "registry evidence for corrupt checkpoint is kept"
+            "registry evidence for an unreadable checkpoint is kept"
+        );
+    }
+
+    /// A checkpoint that reads but does not decode is `Corrupt`: within its
+    /// rows' grace period it is kept, exactly like any other unexpired run.
+    #[tokio::test]
+    async fn pass_keeps_corrupt_checkpoint_within_grace() {
+        let dir = tempfile::tempdir().expect("temp memory root");
+        let memory_dir = dir.path().to_string_lossy().to_string();
+        let (registry, store) = make_registry(dir.path());
+        let decision_id = stage_run_approval(&registry, RUN_A, chrono::Utc::now()).await;
+
+        let docs = documents(&memory_dir, Some(SESSION), RUN_A);
+        write_garbage_checkpoint(docs.parked()).await;
+
+        let sweep = sweep(registry.clone(), store.clone(), &memory_dir, 3600);
+        sweep.run_pass().await;
+
+        assert!(
+            docs.parked().exists(),
+            "corrupt checkpoint within its rows' grace period is kept"
+        );
+        assert!(
+            registry.try_parked(&decision_id).await.unwrap().is_some(),
+            "registry evidence for an in-grace corrupt checkpoint is kept"
+        );
+    }
+
+    /// Once a corrupt checkpoint's rows age past the TTL there is no
+    /// retention deadline left to honor — the document cannot be read, let
+    /// alone resumed — so the sweep reclaims it instead of answering the
+    /// resume endpoint with an immortal `reify_failed`.
+    #[tokio::test]
+    async fn pass_reclaims_corrupt_checkpoint_past_row_age() {
+        let dir = tempfile::tempdir().expect("temp memory root");
+        let memory_dir = dir.path().to_string_lossy().to_string();
+        let (registry, store) = make_registry(dir.path());
+        let registered_at = chrono::Utc::now() - chrono::Duration::seconds(7201);
+        let decision_id = stage_run_approval(&registry, RUN_A, registered_at).await;
+
+        let docs = documents(&memory_dir, Some(SESSION), RUN_A);
+        write_garbage_checkpoint(docs.parked()).await;
+
+        let sweep = sweep(registry.clone(), store.clone(), &memory_dir, 3600);
+        sweep.run_pass().await;
+
+        assert!(
+            !docs.parked().exists(),
+            "corrupt checkpoint with aged-out rows is reclaimed"
+        );
+        assert!(
+            registry.try_parked(&decision_id).await.unwrap().is_none(),
+            "registry evidence for an aged-out corrupt checkpoint is swept"
         );
     }
 
@@ -841,6 +984,124 @@ mod tests {
         assert!(
             registry.try_parked(&decision_id).await.unwrap().is_none(),
             "aged orphan rows are swept even when the memory root is missing"
+        );
+    }
+
+    /// Regression (PR #760 review): two park-enabled agents share one
+    /// approval store, and each engine scans only its own `memory_dir` for
+    /// checkpoints. Agent alpha's sweep must not treat beta's rows as
+    /// orphans — beta's checkpoint lives in beta's memory dir and is still
+    /// unexpired — even though beta's rows have aged past alpha's shorter
+    /// TTL. Cancelling them would strand beta's run: its checkpoint survives
+    /// with its decisions gone.
+    #[tokio::test]
+    async fn pass_leaves_another_agents_parked_run_alone() {
+        let dir = tempfile::tempdir().expect("temp memory root");
+        let (registry, store) = make_registry(dir.path());
+
+        // Beta parked under its own memory dir with an unexpired checkpoint,
+        // but its rows registered long enough ago that alpha's TTL has lapsed.
+        let memory_beta = dir.path().join("memory-beta").to_string_lossy().to_string();
+        let registered_at = chrono::Utc::now() - chrono::Duration::seconds(7201);
+        let decision_id = stage_run_approval_for(INSTANCE_B, &registry, RUN_B, registered_at).await;
+        let docs = documents(&memory_beta, Some(SESSION), RUN_B);
+        write_document(
+            docs.parked(),
+            &checkpoint_document(RUN_B, retention_expires_at("2126-09-01T00:00:00Z")),
+        )
+        .await;
+
+        // Alpha sweeps a different memory dir on a shorter TTL.
+        let memory_alpha = dir
+            .path()
+            .join("memory-alpha")
+            .to_string_lossy()
+            .to_string();
+        let sweep_alpha = sweep_as(
+            INSTANCE_A,
+            "alpha",
+            registry.clone(),
+            store.clone(),
+            &memory_alpha,
+            3600,
+        );
+        sweep_alpha.run_pass().await;
+
+        assert!(
+            docs.parked().exists(),
+            "beta's checkpoint is untouched by alpha's sweep"
+        );
+        assert!(
+            registry.try_parked(&decision_id).await.unwrap().is_some(),
+            "beta's approvals survive alpha's shorter-TTL sweep"
+        );
+
+        // Beta's own sweep keeps its unexpired run intact as well.
+        let sweep_beta = sweep_as(
+            INSTANCE_B,
+            "beta",
+            registry.clone(),
+            store.clone(),
+            &memory_beta,
+            3600,
+        );
+        sweep_beta.run_pass().await;
+
+        assert!(
+            docs.parked().exists(),
+            "beta's checkpoint is kept by its own sweep"
+        );
+        assert!(
+            registry.try_parked(&decision_id).await.unwrap().is_some(),
+            "beta's approvals are kept by its own sweep"
+        );
+    }
+
+    /// The flip side of instance scoping: it must not strand an agent's own
+    /// dead evidence in a shared store. Beta's aged orphans (no checkpoint
+    /// anywhere) are invisible to alpha's sweep and still reaped by beta's.
+    #[tokio::test]
+    async fn pass_sweeps_own_aged_orphans_only() {
+        let dir = tempfile::tempdir().expect("temp memory root");
+        let (registry, store) = make_registry(dir.path());
+
+        let memory_beta = dir.path().join("memory-beta").to_string_lossy().to_string();
+        let registered_at = chrono::Utc::now() - chrono::Duration::seconds(7201);
+        let decision_id = stage_run_approval_for(INSTANCE_B, &registry, RUN_B, registered_at).await;
+
+        let memory_alpha = dir
+            .path()
+            .join("memory-alpha")
+            .to_string_lossy()
+            .to_string();
+        let sweep_alpha = sweep_as(
+            INSTANCE_A,
+            "alpha",
+            registry.clone(),
+            store.clone(),
+            &memory_alpha,
+            3600,
+        );
+        sweep_alpha.run_pass().await;
+
+        assert!(
+            registry.try_parked(&decision_id).await.unwrap().is_some(),
+            "alpha's sweep ignores beta's aged orphan rows"
+        );
+
+        let sweep_beta = sweep_as(
+            INSTANCE_B,
+            "beta",
+            registry.clone(),
+            store.clone(),
+            &memory_beta,
+            3600,
+        );
+        sweep_beta.run_pass().await;
+
+        assert!(
+            registry.try_parked(&decision_id).await.unwrap().is_none(),
+            "beta's own sweep reaps its aged orphan rows"
         );
     }
 }

@@ -2,8 +2,8 @@
 
 Map of the ruled resume rows (2026-09-12, card P45) to their whole-frame
 golden fixtures, with the exclusions the goldens do not cover. The frames
-live in two suites, split along the visibility wall the DESIGN.md seam table
-records:
+live in two suites, split along the visibility wall (pipeline frames in
+this directory, endpoint frames in `aura-web-server`):
 
 - **Pipeline frames** —
   `orchestration::park::resume::goldens` (this directory, `goldens.rs`):
@@ -257,7 +257,8 @@ internals.
 
 ## The A1 id-channel frames (2026-09-25)
 
-Nine frames pin Mike's A1 ruling (the DESIGN.md section of the same name).
+Nine frames pin Mike's A1 ruling (the id-channel ruling in the 271
+park-resume decrees).
 They arrived red (e40468c6, repaired e7cbae7b) and turned green with the
 fill (1ea05b70):
 

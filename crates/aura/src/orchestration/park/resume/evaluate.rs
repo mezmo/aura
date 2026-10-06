@@ -284,6 +284,10 @@ pub enum ResumeRefusal {
 /// Why locating a checkpoint failed.
 enum LocateFault {
     Absent,
+    /// The document is present but does not decode — corrupt bytes or a
+    /// foreign schema version. Undecodable evidence is never read as
+    /// absent, and never answered as an anonymous internal fault.
+    Invalid(Diagnostic),
     Fault(Diagnostic),
 }
 
@@ -296,13 +300,11 @@ enum IdentityFault {
 /// Why admitting the checkpoint failed.
 enum AdmitFault {
     Interrupted,
-    Fault(Diagnostic),
 }
 
 /// Why the fingerprint check failed.
 enum FingerprintFault {
     Drift,
-    Fault(Diagnostic),
 }
 
 /// Why the recorded-decisions consult failed.
@@ -319,6 +321,7 @@ impl From<LocateFault> for ResumeRefusal {
     fn from(fault: LocateFault) -> Self {
         match fault {
             LocateFault::Absent => Self::DocumentAbsent,
+            LocateFault::Invalid(diagnostic) => Self::InvalidEvidence(diagnostic),
             LocateFault::Fault(diagnostic) => Self::Fault(diagnostic),
         }
     }
@@ -353,7 +356,6 @@ impl From<AdmitFault> for ResumeRefusal {
     fn from(fault: AdmitFault) -> Self {
         match fault {
             AdmitFault::Interrupted => Self::Conflict(ResumeConflictRow::interrupted()),
-            AdmitFault::Fault(diagnostic) => Self::Fault(diagnostic),
         }
     }
 }
@@ -362,7 +364,6 @@ impl From<FingerprintFault> for ResumeRefusal {
     fn from(fault: FingerprintFault) -> Self {
         match fault {
             FingerprintFault::Drift => Self::Conflict(ResumeConflictRow::config_changed()),
-            FingerprintFault::Fault(diagnostic) => Self::Fault(diagnostic),
         }
     }
 }
@@ -409,6 +410,10 @@ pub struct ResumeEvaluation<'a> {
 /// reference it handed out) ends.
 #[derive(Debug)]
 pub struct ResumeGrant {
+    /// The lease holding the run occupied for the grant's whole life:
+    /// never read — Drop releasing it is the point, the run stays fenced
+    /// until the segment's grant goes away.
+    #[allow(dead_code)]
     reservation: RunReservationLease,
     /// The run's ONE resumed execution scope, established when this grant
     /// was assembled from its reservation. Every consumer — supervisor,
@@ -435,14 +440,6 @@ impl ResumeGrant {
     #[must_use]
     pub fn run_id(&self) -> &ResumeRunId {
         &self.run
-    }
-
-    /// The reservation fencing this grant's run: the supervisor's lease
-    /// reference, cloned from the grant's own so both share the one
-    /// occupation.
-    #[must_use]
-    pub(crate) fn reservation(&self) -> &RunReservationLease {
-        &self.reservation
     }
 
     /// The scope the resumed execution runs under: a clone of the grant's
@@ -506,24 +503,6 @@ impl ReservedEvaluation {
             docs,
             document,
         }
-    }
-
-    /// The checkpoint as re-read under the reservation.
-    #[must_use]
-    pub(crate) fn document(&self) -> &ParkedRun {
-        &self.document
-    }
-
-    /// The reservation fencing the run through the evaluation.
-    #[must_use]
-    pub(crate) fn reservation(&self) -> &RunReservationLease {
-        &self.reservation
-    }
-
-    /// The run's two checkpoint paths.
-    #[must_use]
-    pub(crate) fn documents(&self) -> &ResumeDocuments {
-        &self.docs
     }
 }
 
@@ -601,10 +580,16 @@ pub(crate) async fn convert_reserved(
 /// Locate and load whichever checkpoint name exists for the run: the parked
 /// name first, the resuming name only when the parked name is absent. A
 /// present-but-unreadable document faults instead of reading as absent, so a
-/// corrupt checkpoint can never answer the not-found row.
+/// corrupt checkpoint can never answer the not-found row; a present-but-
+/// undecodable one answers the invalid-evidence row instead, so the client
+/// sees the fixed `reify_failed` code rather than a raw internal fault, and
+/// the diagnostic logs server-side.
 async fn locate_checkpoint(docs: &ResumeDocuments) -> Result<LocatedCheckpoint, LocateFault> {
     match load_parked_run(docs.parked()).await {
         Ok(document) => return Ok(LocatedCheckpoint::Parked { document }),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            return Err(LocateFault::Invalid(Diagnostic::new(e.to_string())));
+        }
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
             return Err(LocateFault::Fault(Diagnostic::new(format!(
                 "the parked checkpoint {} could not be read: {e}",
@@ -616,6 +601,9 @@ async fn locate_checkpoint(docs: &ResumeDocuments) -> Result<LocatedCheckpoint, 
     match load_parked_run(docs.resuming()).await {
         Ok(document) => Ok(LocatedCheckpoint::Resuming { document }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(LocateFault::Absent),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            Err(LocateFault::Invalid(Diagnostic::new(e.to_string())))
+        }
         Err(e) => Err(LocateFault::Fault(Diagnostic::new(format!(
             "the resuming checkpoint {} could not be read: {e}",
             docs.resuming().display()
@@ -697,10 +685,9 @@ async fn consult_decisions(
         Err(RehydrateError::Store(detail)) | Err(RehydrateError::Document(detail)) => {
             Err(ConsultFault::Fault(Diagnostic::new(detail)))
         }
-        Err(err @ (RehydrateError::NotFound | RehydrateError::ConfigChanged)) => {
-            // Structurally unreachable: the document was located and
-            // fingerprint-checked before the consult. Refuse loudly rather
-            // than invent a row.
+        Err(err @ RehydrateError::NotFound) => {
+            // Structurally unreachable: the document was located before the
+            // consult. Refuse loudly rather than invent a row.
             Err(ConsultFault::Fault(Diagnostic::new(format!(
                 "the recorded-decisions consult reported an unreachable condition: {err}"
             ))))

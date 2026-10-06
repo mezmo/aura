@@ -628,9 +628,13 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
     // Park retention sweep: one engine per park-enabled config, sharing the
     // reservation table above and the session store's approval backend. The
     // startup pass runs before the listener binds; the cadence loop spawns
-    // after bind and joins at teardown.
+    // after bind and joins at teardown. Each engine carries its config's
+    // effective instance id and reclaims only the rows that instance parked
+    // (the same ownership key the poll reconciler claims by), so sweeps on
+    // one shared store cannot strand each other's runs.
     let approval_store = session_store.approvals();
     let mut park_sweeps = Vec::new();
+    let mut sweep_claims = Vec::new();
     for config in configs_arc.iter() {
         let Some(hitl) = &config.hitl else {
             continue;
@@ -643,6 +647,8 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             continue;
         };
         let label = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
+        let instance_id = compute_instance_id(&config.agent).to_string();
+        sweep_claims.push((label.to_string(), instance_id.clone()));
         park_sweeps.push(aura::orchestration::ParkSweep::new(
             Arc::clone(&resume_claims),
             app_state.pending_approvals.clone(),
@@ -650,6 +656,28 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             memory_dir.to_string(),
             hitl.park.park_ttl,
             label.to_string(),
+            instance_id,
+        ));
+    }
+    // Boot guard, the sweep-side twin of the reconciler guard above: two
+    // park-enabled configs resolving to the same effective instance id would
+    // each reap the other's approval rows as orphans out of one shared
+    // store. The instance scoping inside each sweep only separates engines
+    // whose ids differ, so identical ids are refused here, loudly, the same
+    // as the poll-delivery conflict.
+    if let Some(((first, second), id)) = reconciler_id_conflicts(&sweep_claims) {
+        error!(
+            "park sweep conflict: agents '{first}' and '{second}' resolve to the same \
+             effective instance id {id}"
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "park sweep conflict: agents '{first}' and '{second}' resolve to the same \
+                 effective instance id {id}; two retention sweeps in one process would \
+                 reclaim each other's approvals. give each park-enabled agent a distinct \
+                 instance_seed (or a distinct name)"
+            ),
         ));
     }
 

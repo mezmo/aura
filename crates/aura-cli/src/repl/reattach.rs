@@ -56,9 +56,9 @@ pub(crate) enum ReattachEnd {
 /// The reattach timing policy.
 ///
 /// Pure scheduling state: the driver feeds it outcomes and sleeps the
-/// delays it returns. A successful 200 resets the transient budget (the
-/// failures must be consecutive); a fresh park resets the retryable
-/// cadence (each gate waits afresh).
+/// delays it returns. When each counter resets is decided — and
+/// documented — where the driver does it: a 200 stream resets the
+/// transient budget, a fresh park rebuilds the whole schedule.
 pub(crate) struct ReattachSchedule {
     retryable_step: u32,
     transient_failures: u32,

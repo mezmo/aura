@@ -34,6 +34,7 @@ use super::super::document::{
 };
 use super::super::retention::RetentionExpiresAt;
 use super::super::{RESUMING_DOCUMENT_SUFFIX, run_owner_id};
+use super::evaluate::{ReservedEvaluation, convert_reserved};
 use super::*;
 
 /// Drive one granted segment through the live borrowed-grant seam: the
@@ -124,11 +125,6 @@ const SIBLING_DONE: &str = "deployed and settled";
 const FAILED_TEXT: &str = "the apply failed: the cluster rejected the manifest";
 /// The replacement task's final turn text.
 const REPLACEMENT_DONE: &str = "recovered and settled";
-/// The mixed wave's completing sibling's marker — the text riding its
-/// submit_result turn, the wave frames' order pin for that sibling.
-const WAVE_SIBLING_DONE: &str = "checks done and settled";
-/// The follow-up wave sibling's marker — the same shape, second wave.
-const FOLLOWUP_DONE: &str = "the follow-up verified the rollout";
 /// The restored-failure fixture's already-failed node — the task the
 /// checkpoint recorded as Failed before the park, its description the
 /// seeded failure history carries.
@@ -187,6 +183,9 @@ fn decision_b() -> DecisionId {
 /// every matching document carries, and the worker surface the segment
 /// frames' continuation rebuilds.
 struct World {
+    /// Held so the temp directory outlives the `memory_dir` paths the
+    /// world's checkpoints live under — never read.
+    #[allow(dead_code)]
     dir: tempfile::TempDir,
     memory_dir: String,
     /// The file approval store behind the registry, held for the store-side
@@ -829,36 +828,6 @@ fn sibling_parks_document(world: &World) -> ParkedRun {
     document
 }
 
-/// The mixed-wave checkpoint: the standard fixture plus a completing
-/// sibling (task 1) and a parking sibling (task 0) — plan order
-/// deliberately REVERSED against the task-id merge, so the wave frames
-/// pin the merge's sort, not the workers' build order.
-fn sibling_wave_document(world: &World) -> ParkedRun {
-    let mut document = sentinel_document(world);
-    document
-        .plan
-        .tasks
-        .push(pending_sibling_node(1, "Run the deploy checks", vec![]));
-    document
-        .plan
-        .tasks
-        .push(pending_sibling_node(0, "Watch the gated rollout", vec![]));
-    document
-}
-
-/// The follow-up-wave checkpoint: the mixed-wave fixture plus one more
-/// sibling (task 2) dependent on the completing sibling (task 1) — the
-/// second wave a later runnable task forms after the mixed first wave.
-fn sibling_followup_wave_document(world: &World) -> ParkedRun {
-    let mut document = sibling_wave_document(world);
-    document.plan.tasks.push(pending_sibling_node(
-        2,
-        "Verify the rollout landed",
-        vec![1],
-    ));
-    document
-}
-
 /// The goal-distinct checkpoint: query and `plan.goal` deliberately
 /// different strings, everything else the standard sentinel fixture —
 /// the fixture the goal-restoration frame drives.
@@ -1181,54 +1150,6 @@ fn decided_result_turn_for(call_id: &str, wire: &str) -> Value {
     })
 }
 
-/// A completing worker's natural submit_result turn: the marker text
-/// streams ahead of the tool call in the same turn (the live
-/// submit_result decision short-circuit ends the stream one item past
-/// the tool result, so a trailing text turn is never requested).
-fn submit_result_turn(marker: &str, call: &str, summary: &str, result: &str) -> Value {
-    json!({
-        "role": "assistant",
-        "id": null,
-        "content": [
-            { "text": marker },
-            {
-                "id": call,
-                "call_id": null,
-                "function": {
-                    "name": "submit_result",
-                    "arguments": {
-                        "confidence": "high",
-                        "result": result,
-                        "summary": summary,
-                    },
-                },
-                "signature": null,
-                "additional_params": null,
-            },
-        ],
-    })
-}
-
-/// The gated assistant turn a parking worker's snapshot carries: the
-/// freshly issued call at full wire fidelity — the rig id and the
-/// provider call id both keyed by the scripted call, exactly the drive
-/// loop's re-park pin's gated-turn shape.
-fn fresh_gated_turn() -> Value {
-    json!({
-        "role": "assistant",
-        "id": null,
-        "content": [
-            {
-                "id": FRESH_CALL_ID,
-                "call_id": NEW_CALL_ID,
-                "function": { "name": NEW_TOOL, "arguments": { "namespace": "stage" } },
-                "signature": null,
-                "additional_params": null,
-            },
-        ],
-    })
-}
-
 /// The complete 409 body the refusal must render, extracted from the
 /// conflict row the web server serializes.
 fn assert_conflict(refusal: ResumeRefusal, expected: Value) {
@@ -1242,32 +1163,6 @@ fn assert_conflict(refusal: ResumeRefusal, expected: Value) {
         }
         other => panic!("expected a conflict row, got {other:?}"),
     }
-}
-
-/// Rewrite the freshly-minted blocking entry of a mid-segment re-park to
-/// placeholders, auditing shape and occurrence count first: exactly one
-/// entry, one UUID decision id, one RFC 3339 stamp.
-fn normalize_fresh_parking(body: &mut Value) {
-    let Value::Array(entries) = &mut body["blocking"] else {
-        panic!("the re-park blocking set is an array: {body}")
-    };
-    assert_eq!(entries.len(), 1, "exactly one new blocking entry: {body:?}");
-    let fresh_entry = &mut entries[0];
-    let fresh_id = fresh_entry["decision_id"]
-        .as_str()
-        .expect("the fresh decision id is a string");
-    uuid::Uuid::parse_str(fresh_id).expect("the fresh decision id is a UUID");
-    assert!(
-        fresh_entry["tool"] == json!(NEW_TOOL),
-        "the new entry names the newly gated tool: {fresh_entry}"
-    );
-    let fresh_expiry = fresh_entry["expires_at"]
-        .as_str()
-        .expect("the fresh expiry is a string")
-        .to_owned();
-    chrono::DateTime::parse_from_rfc3339(&fresh_expiry).expect("the fresh expiry is RFC 3339");
-    fresh_entry["decision_id"] = json!("<fresh decision id>");
-    fresh_entry["expires_at"] = json!("<fresh expiry>");
 }
 
 /// The ids of every tool result the reconstructed context carries, in
@@ -1943,61 +1838,9 @@ async fn concurrent_evaluations_admit_one_grant_and_refuse_the_loser_with_runnin
     }
 }
 
-/// How long the end-of-segment drain probe waits before declaring the
-/// segment still blocked on its in-flight tail. Long enough for the
-/// scripted segment body to run to completion when it does NOT drain (the
-/// RED state), short enough that a regressed fill is observable as a
-/// still-blocked return rather than a hung suite.
-const DRAIN_PROBE: Duration = Duration::from_secs(2);
-
-/// The gated-tail stand-in for the decided call's tool: on invocation it
-/// spawns a TRACKED tail through the run's ONE execution scope — the same
-/// registration path every production fire-and-forget tail takes — that
-/// holds until the test releases it. The spawn happens DURING the segment
-/// (the substitution invokes this tool), so the tail is still in flight
-/// when the segment body finishes.
-struct GatedTailTool {
-    scope: Arc<crate::orchestration::RunExecutionScope>,
-    gate: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
-}
-
-impl rig::tool::Tool for GatedTailTool {
-    const NAME: &'static str = "gated_tail";
-
-    type Error = std::convert::Infallible;
-    type Args = FreeformArgs;
-    type Output = String;
-
-    fn name(&self) -> String {
-        TOOL.to_string()
-    }
-
-    async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
-        rig::completion::ToolDefinition {
-            name: self.name(),
-            description: "Test stand-in: spawns a gated tracked tail on the run's scope."
-                .to_string(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        }
-    }
-
-    async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let gate = self
-            .gate
-            .lock()
-            .expect("the gated tail's gate lock")
-            .take()
-            .expect("the gated tail spawns once");
-        self.scope.spawn_tracked(async move {
-            let _ = gate.await;
-        });
-        Ok(ECHO_TOOL_RESULT.to_string())
-    }
-}
-
 /// The supervisor-drain rendezvous stand-in frame 10 stages with: the
-/// same tracked-tail shape as [`GatedTailTool`], plus the two frame
-/// observables — the substitution's spawn moment and the tail's own
+/// same tracked-tail shape as the retired gated-tail tool, plus the two
+/// frame observables — the substitution's spawn moment and the tail's own
 /// completion moment.
 struct SupervisorGatedTailTool {
     scope: Arc<crate::orchestration::RunExecutionScope>,
@@ -4095,14 +3938,6 @@ async fn pivot_denied_pair_steers_without_executing_and_completes() {
     .await;
 }
 
-/// Each turn in its wire form, for marker scans over the segment turns.
-fn serialized_turns(turns: &[rig::completion::Message]) -> Vec<String> {
-    turns
-        .iter()
-        .map(|message| serde_json::to_string(message).expect("turn serializes"))
-        .collect()
-}
-
 /// A frame's own panic must not leak its undriven worker overrides into
 /// the next consumer's builds: the queues are take-once and
 /// process-global, and a frame that fails mid-test — a regression, or a
@@ -4143,41 +3978,6 @@ fn coordinator_direct_turn() -> ScriptedTurn {
         }),
     )])
     .with_text(COORD_FINAL_ANSWER)
-}
-
-/// The coordinator tail turn every completed-segment pin embeds: the
-/// scripted final answer as the natural last turn.
-fn coordinator_tail_turn() -> Value {
-    json!({
-        "role": "assistant",
-        "id": null,
-        "content": [{ "text": COORD_FINAL_ANSWER }],
-    })
-}
-
-/// Whether an assistant turn carrying non-empty text rides strictly
-/// after the last turn containing `marker` — the presence pin for the
-/// coordinator's natural final-answer turns (the R6 natural-finish
-/// ruling): the later wire-level unit pins the envelope; here only
-/// existence beyond the last worker turn is pinned. Panics when no turn
-/// carries the marker: the marker is the fixture's own scripted text,
-/// so its absence is a wire-shape break, not a negative answer.
-fn coordinator_answered_after(turns: &[rig::completion::Message], marker: &str) -> bool {
-    let serialized = serialized_turns(turns);
-    let Some(at) = serialized.iter().rposition(|s| s.contains(marker)) else {
-        panic!("the segment turns carry the turn marked `{marker}`: {serialized:?}");
-    };
-    turns.iter().skip(at + 1).any(|message| {
-        matches!(
-            message,
-            rig::completion::Message::Assistant { content, .. }
-                if content.iter().any(|item| matches!(
-                    item,
-                    rig::message::AssistantContent::Text(text)
-                        if !text.text.trim().is_empty()
-                ))
-        )
-    })
 }
 
 /// The rendered continuation prompt from a scripted coordinator request:
@@ -6402,8 +6202,8 @@ fn s5_probe_call(rig_id: &str, args: Value) -> ScriptedToolCall {
 /// chat path reads"). Mid-tool-execution interruption is OUT of contract
 /// by design: the resumed run's tool invocations are tracked on the run's
 /// execution scope precisely so a tail outlives the segment
-/// (resume/DESIGN.md:336-348, streaming_request_hook.rs:367 — cancellation
-/// happens between operations, not mid-tool execution), and the S4 error
+/// (streaming_request_hook.rs:367 — cancellation happens between
+/// operations, not mid-tool execution), and the S4 error
 /// arm's drain waits those tracked tasks out. A stalled TOOL is therefore
 /// not this frame's vehicle; a stalled PROVIDER RESPONSE is.
 ///

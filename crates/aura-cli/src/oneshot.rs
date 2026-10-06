@@ -154,6 +154,8 @@ pub fn run_oneshot(
 
         match stream_result {
             Ok(outcome) => {
+                // The termination is branched on by variant only; the
+                // `detail` strings it may carry are diagnostic text.
                 let termination = outcome.termination;
                 match outcome.received {
                     StreamResult::TextResponse(text) => {

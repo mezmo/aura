@@ -3443,6 +3443,54 @@ url = "http://127.0.0.1:9"
             bare_404(response).await;
         }
 
+        /// A checkpoint that reads but does not decode answers the typed
+        /// invalid-evidence row — the fixed `reify_failed` client code with
+        /// its fixed message — never a raw `internal_error` carrying the
+        /// decode diagnostic. The whole response frame is pinned: the
+        /// corrupt document is planted at the documented layout
+        /// (`{memory_dir}/{session}/parked/{run}.json`), matching the
+        /// evaluation row's locate step.
+        #[tokio::test]
+        async fn undecodable_checkpoint_answers_reify_failed_not_internal_error() {
+            let memory = tempfile::tempdir().expect("temp memory root");
+            let parked_dir = memory.path().join("sess-p45").join("parked");
+            std::fs::create_dir_all(&parked_dir).expect("the parked directory creates");
+            std::fs::write(
+                parked_dir.join("0199c0de-4545-7000-8000-000000000045.json"),
+                b"{ not a parked run",
+            )
+            .expect("plant the corrupt checkpoint");
+            let state = make_state(vec![config_with_memory_dir(
+                memory.path().to_str().expect("UTF-8 path"),
+            )]);
+
+            let response = resume_run(
+                State(state),
+                resume_claims(),
+                HeaderMap::new(),
+                Path((
+                    "sess-p45".to_string(),
+                    "0199c0de-4545-7000-8000-000000000045".to_string(),
+                )),
+                None,
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let frame: serde_json::Value =
+                serde_json::from_slice(&body_bytes(response).await).expect("frame parses");
+            assert_eq!(
+                frame,
+                serde_json::json!({
+                    "error": {
+                        "message": "the paused run could not be restored",
+                        "type": "reify_failed"
+                    }
+                }),
+                "the corrupt-evidence frame carries the fixed client code, not the diagnostic"
+            );
+        }
+
         /// The pre-grant refusal contract: a refusal row answers from the
         /// pure projection of the config and the presented headers, before
         /// the fallible `prepare_agent_config` projection runs. With

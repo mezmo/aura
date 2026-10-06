@@ -60,8 +60,6 @@ pub fn is_model_error(err: &anyhow::Error) -> bool {
 pub struct ChatClient {
     http: Client,
     config: AppConfig,
-    /// Maximum time to receive resume response headers; the SSE body is
-    /// intentionally unbounded past it.
     resume_post_timeout: std::time::Duration,
 }
 

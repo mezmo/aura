@@ -22,10 +22,6 @@
 //! spawn helpers register before spawning and hold a lease reference through
 //! actual completion, so a detached task cannot spawn unregistered or
 //! outlive its fence.
-#![allow(dead_code)] // the L fill injects scopes into `ToolCallContext` call
-// sites and the E4 fill (shared reservation table: admit, authorize,
-// empty-resume recovery) threads the lease through the ordered resume.
-// Marker removed when those land.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -95,17 +91,6 @@ pub(crate) struct ReservationTable {
     live: Arc<Mutex<HashSet<RunId>>>,
 }
 
-/// Why an admission-with-step failed: the run was already occupied, or the
-/// under-lock step failed and the occupation rolled back.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AdmissionFault<E> {
-    /// A live reservation already holds the run; nothing changed.
-    Live,
-    /// The under-lock step failed; the occupation was rolled back and no
-    /// lease exists.
-    Step(E),
-}
-
 impl ReservationTable {
     /// An empty table.
     #[must_use]
@@ -113,7 +98,10 @@ impl ReservationTable {
         Self::default()
     }
 
-    /// Whether a live reservation holds the run.
+    /// Whether a live reservation holds the run. Test probe: the claim
+    /// table's own test-gated `is_live` forwards here; production asks the
+    /// table by admitting, never by peeking.
+    #[cfg(test)]
     pub(crate) fn is_live(&self, run: RunId) -> bool {
         self.live.lock().expect("resume claim lock").contains(&run)
     }
@@ -121,8 +109,7 @@ impl ReservationTable {
     /// Occupy `run` under the table's short standard lock — the
     /// check-and-insert is the whole critical section, never held across an
     /// await — returning the lease whose final reference releases the run.
-    /// The ONLY plain-admission seam; every [`RunReservationLease`] is born
-    /// here or in [`Self::admit_with`].
+    /// Every [`RunReservationLease`] is born here.
     pub(crate) fn admit(&self, run: RunId) -> Result<RunReservationLease, ReservationFault> {
         let mut live = self.live.lock().expect("resume claim lock");
         if live.insert(run) {
@@ -130,39 +117,6 @@ impl ReservationTable {
         } else {
             Err(ReservationFault::Live)
         }
-    }
-
-    /// Occupy `run`, then run `step` while still holding the table's lock:
-    /// `step` succeeding makes the occupation and its transition (the
-    /// claim-and-rename) move together; `step` failing rolls the occupation
-    /// back, so neither happens. The lease is constructed only on the
-    /// all-succeeded path.
-    pub(crate) fn admit_with<E>(
-        &self,
-        run: RunId,
-        step: impl FnOnce() -> Result<(), E>,
-    ) -> Result<RunReservationLease, AdmissionFault<E>> {
-        let mut live = self.live.lock().expect("resume claim lock");
-        if !live.insert(run) {
-            return Err(AdmissionFault::Live);
-        }
-        match step() {
-            Ok(()) => Ok(RunReservationLease::armed(run, Arc::clone(&self.live))),
-            Err(step_fault) => {
-                live.remove(&run);
-                Err(AdmissionFault::Step(step_fault))
-            }
-        }
-    }
-
-    /// Run `step` while holding the table's short standard lock: the
-    /// mutual-exclusion seam for transitions that must appear atomic
-    /// against [`Self::admit_with`]'s insert-and-step (the interim
-    /// rename-back). Never held across an await — callers run their step
-    /// on the blocking pool.
-    pub(crate) fn under_standard_lock<R>(&self, step: impl FnOnce() -> R) -> R {
-        let _guard = self.live.lock().expect("resume claim lock");
-        step()
     }
 }
 

@@ -32,9 +32,6 @@ pub enum StreamResult {
 
 /// Why an SSE stream ended, distinguishing a completed response from
 /// every other exit.
-///
-/// The `detail` strings are diagnostic-only; consumers branch on the
-/// variant, never the text.
 #[derive(Debug, Clone)]
 pub enum StreamTermination {
     /// The stream ended with the `[DONE]` sentinel after a completed

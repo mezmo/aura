@@ -39,7 +39,7 @@ pub enum ResumeOutcome {
     /// for identity). Terminal.
     NotFound,
     /// A 503 `reify_unavailable`: known pre-execution I/O availability
-    /// failure. Transient — counts against the reattach budget.
+    /// failure. Transient.
     Unavailable,
     /// A 500 `reify_failed`: corrupt or internal. Terminal.
     ReifyFailed,

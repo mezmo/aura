@@ -117,13 +117,17 @@ impl AdmittedParkRoute {
     }
 
     /// The validated `[hitl.park].park_ttl`, proven to cover the route
-    /// timeout.
+    /// timeout. Test probe: the admission tests below read the payload
+    /// back; the runtime consumes the admission result as pass/fail.
+    #[cfg(test)]
     #[must_use]
     pub fn park_ttl(&self) -> ParkTtl {
         self.park_ttl
     }
 
-    /// The route timeout the retention age was proven to cover.
+    /// The route timeout the retention age was proven to cover. Test
+    /// probe, as above.
+    #[cfg(test)]
     #[must_use]
     pub fn route_timeout(&self) -> RouteTimeoutSecs {
         self.route_timeout

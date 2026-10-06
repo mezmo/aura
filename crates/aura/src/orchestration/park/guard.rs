@@ -58,31 +58,6 @@ impl ParkGuard {
         })
     }
 
-    /// Create the guard for a resumed segment: checkpoint-preserving mode.
-    /// A drop never sweeps retained rows — the resumed run's evidence stays
-    /// for the next resume or retention cleanup, whatever ended this
-    /// segment.
-    #[expect(
-        dead_code,
-        reason = "constructed by the L3 fill's resumed-segment guard wiring"
-    )]
-    pub(crate) fn new_resumed(
-        registry: PendingApprovals,
-        run_id: String,
-        request_id: String,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            registry,
-            run_id,
-            request_id,
-            run: crate::run_context::current_run(),
-            mode: ParkGuardMode::Resumed,
-            execution_scope: std::sync::OnceLock::new(),
-            published: AtomicBool::new(false),
-            armed: AtomicBool::new(false),
-        })
-    }
-
     /// Create the guard with its sweep disposition and its execution scope
     /// TOGETHER — the L3 fill's injection seam. A resumed guard is always
     /// checkpoint-preserving AND scoped: its deferred sweep and tracked

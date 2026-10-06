@@ -286,7 +286,10 @@ impl ResumeClaimTable {
         })?
     }
 
-    /// Whether a live claim holds the run.
+    /// Whether a live claim holds the run. Test probe: the factory's
+    /// orchestration tests assert occupancy through this; production asks
+    /// the table by reserving, never by peeking.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn is_live(&self, run: &ResumeRunId) -> bool {
         self.reservations.is_live(run.run_id())

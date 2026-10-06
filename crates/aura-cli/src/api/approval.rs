@@ -42,10 +42,9 @@ pub enum ApprovalResponse {
 ///
 /// Semantically equivalent to `aura::hitl::ApprovalDecisionWire` — kept
 /// here so the CLI doesn't pull in the `aura` crate for one struct. The
-/// server deserializes with `ApprovalDecisionWire`, which uses
-/// `#[serde(deny_unknown_fields)]`; this struct serializes and deserializes
-/// the same `approved` + optional `reason` shape, rejecting unknown fields
-/// (a `status` envelope or a `pending` field) on the parse leg.
+/// pinned `{approved, reason}` shape, on both the serialize and the
+/// parse leg, is enforced by this struct's `deny_unknown_fields` and
+/// pinned by the tests below.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApprovalDecisionBody {

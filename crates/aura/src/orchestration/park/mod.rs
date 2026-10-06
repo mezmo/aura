@@ -37,16 +37,9 @@ pub(crate) use guard::{ParkGuard, ParkGuardMode};
 // The provider-valid context builder for the reconstruction direction
 // (P45, R5): the prelude names `CallId`, `NodePreflightInput`,
 // `OutcomeWire`, `SegmentPreflight`, and `rebuild_context` through this
-// re-export. The rest of the flat list is the design record's
-// completeness surface (REBUILD-DESIGN.md's seam table), reached only by
-// module path and inference — the marker stays for those names.
+// re-export; everything else in the module is reached by module path.
 pub(crate) use rebuild::{
     CallId, NodePreflightInput, OutcomeWire, SegmentPreflight, rebuild_context,
-};
-#[allow(unused_imports)]
-pub(crate) use rebuild::{
-    PreflightError, RebuiltContext, ResolveError, ResolvedCall, ResolvedCallBundle,
-    ToolResultPrompt, ValidatedCall, ValidatedCalls, ValidatedNode,
 };
 pub(crate) use recorded_decisions::{CallKey, PeekOutcome, RecordedDecisions};
 

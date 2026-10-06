@@ -5,8 +5,7 @@
 //! pairing providers require; an orphaned tool result is a protocol
 //! violation everywhere the chain speaks. Tool results the snapshot
 //! already carries for ids OUTSIDE the bundle inherit the producer's
-//! pairing and are preserved verbatim — the trust boundary (see the
-//! design record).
+//! pairing and are preserved verbatim — the trust boundary.
 //!
 //! Construction runs in two phases, because the outcome wires exist
 //! only after the segment invokes the decided calls:
@@ -47,9 +46,7 @@
 //! This stage-2b unit fills the five behavior bodies (the frames in the
 //! test module below pin them); P45 stage 3 wired the substitution prelude
 //! to this module (the stage 7 reap then deleted the retired slot-swap
-//! helper from `continuation`, with its unit frame), and the design
-//! record — including the repair-round panel ledger and the stage-2b
-//! coverage manifest — is `REBUILD-DESIGN.md` beside this module.
+//! helper from `continuation`, with its unit frame).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -527,18 +524,19 @@ pub(crate) struct RebuiltContext {
 
 impl RebuiltContext {
     /// The rebuilt history: the snapshot's captured messages in order,
-    /// with the synthesized assistant turn appended. Frame-only: the
+    /// with the synthesized assistant turn appended. Test probe: the
+    /// pairing-invariant assertions below read the frame directly; the
     /// production path takes the context apart through `into_parts`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn history(&self) -> &[Message] {
         &self.history
     }
 
     /// The rebuilt prompt: the snapshot's prompt with every bundle
-    /// call's tool result in place. Frame-only: the production path
+    /// call's tool result in place. Test probe, as above: production
     /// takes the context apart through `into_parts`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn current_prompt(&self) -> &Message {
         &self.current_prompt
@@ -693,9 +691,9 @@ mod tests {
     //! probes; the preflight and resolution frames pin each refusal variant
     //! together with its diagnostic wording; the serialization frame
     //! grounds provider-bound acceptance at the wire form the repo's own
-    //! serializer calibration uses (the Bedrock-seam exclusion, its
-    //! reason, and its owner are recorded in REBUILD-DESIGN.md's coverage
-    //! section).
+    //! serializer calibration uses. The Bedrock request-encode is out of
+    //! this crate's reach (the web-server side owns that seam), so this
+    //! suite pins the wire form the encoder consumes.
 
     use std::collections::HashSet;
 
@@ -1526,10 +1524,10 @@ mod tests {
     /// FRAME 9 (provider acceptance): the rebuilt context survives the rig
     /// Message wire round-trip — every rebuilt message serializes to the
     /// JSON wire form and parses back identical, sentinel-free. The
-    /// Bedrock request-encode itself is NOT reachable from this crate —
-    /// the exclusion row in REBUILD-DESIGN.md records the seam, the
-    /// reason, and its owner; this round-trip is the same serializer the
-    /// resume goldens calibrate their wire literals against.
+    /// Bedrock request-encode itself is NOT reachable from this crate
+    /// (the web-server side owns that seam); this round-trip is the same
+    /// serializer the resume goldens calibrate their wire literals
+    /// against.
     #[test]
     fn rebuilt_context_survives_the_rig_message_serialization_round_trip() {
         let (history, prompt, pending) = pivot_fixture();

@@ -1283,6 +1283,10 @@ pub fn run_repl(
                             ref termination,
                         }) => match received {
                             StreamResult::TextResponse(text) => {
+                                // The termination is branched on by
+                                // variant only; any `detail` text it
+                                // carries is diagnostic.
+                                //
                                 // An ambiguous end (EOF without [DONE], a
                                 // malformed event body, or a transport error)
                                 // still carries whatever text was received:
