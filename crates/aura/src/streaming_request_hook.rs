@@ -20,13 +20,13 @@
 //! # Park mode
 //!
 //! A worker stream in park mode has a [`BlockedCell`] registered under its
-//! request id; `on_completion_call` checks it before every other check.
+//! attempt key; `on_completion_call` checks it before every other check.
 //!
 //! # Usage
 //!
 //! ```ignore
 //! let options = RunOptions::bounded(Some(Duration::from_secs(60)));
-//! let (hook, cancel, usage_state) = StreamingRequestHook::new(options, "req_123");
+//! let (hook, cancel, usage_state) = StreamingRequestHook::new(options, StreamKey::Run(request_id));
 //!
 //! // Pass hook to streaming request
 //! agent.stream_prompt(query).with_hook(hook).multi_turn(depth).await;
@@ -38,6 +38,7 @@
 //! let (prompt, completion, total) = usage_state.get_final_usage();
 //! ```
 
+use crate::domain::RequestId;
 use crate::hooks::{AgentHook, ClientTools, Deadline, Hooks, RunCancelReason};
 use aura_events::agent::{AgentEvent, AgentEventPayload};
 use rig::agent::{CancelSignal, StreamingPromptHook};
@@ -65,10 +66,9 @@ const MAX_PENDING_TOOL_IDS: usize = 256;
 /// Cancel reason the hook stamps when a parked call ends the worker stream.
 pub(crate) const PARK_CANCEL_REASON: &str = "parked";
 
-/// Blocked cells of the worker streams in park mode, keyed by the per-stream
-/// id the orchestrator passes as the hook's `request_id`. The hook is built
-/// inside the streaming layer and cannot take the cell as a parameter, so it
-/// travels through this request-keyed global.
+/// Blocked cells of the worker streams in park mode, keyed by attempt key. The
+/// hook is built inside the streaming layer and cannot take the cell as a
+/// parameter, so it travels through this global.
 static PARK_CELLS: OnceLock<std::sync::RwLock<HashMap<String, Arc<BlockedCell>>>> = OnceLock::new();
 
 fn park_cells() -> &'static std::sync::RwLock<HashMap<String, Arc<BlockedCell>>> {
@@ -97,22 +97,51 @@ impl Drop for ParkCellRegistration {
     }
 }
 
+/// The stream a hook serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamKey {
+    /// The run itself.
+    Run(RequestId),
+    /// One orchestration task attempt inside the run.
+    Attempt(String),
+}
+
+impl std::fmt::Display for StreamKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Run(request_id) => request_id.fmt(f),
+            Self::Attempt(key) => f.write_str(key),
+        }
+    }
+}
+
 /// The run whose tool-call queue and tool events this stream may use, which is
 /// the run only when the stream *is* the run.
 ///
 /// MCP reads the queue under the run id, its only identity, so a queue filled
 /// by some other stream of the same run would hand a tool call the id of a
-/// sibling's. An orchestration worker streams under a key of its own and so
-/// correlates nothing until #732. Its tool events stay off the run for the same
-/// reason, and orchestration reports the worker's calls itself.
-fn queue_owner(stream_id: &str) -> Option<Arc<crate::run_context::RunContext>> {
-    current_run().filter(|run| run.id().as_ref() == stream_id)
+/// sibling's. An orchestration task attempt correlates nothing until #732. Its
+/// tool events stay off the run for the same reason, and orchestration reports
+/// the worker's calls itself.
+fn queue_owner(stream: &StreamKey) -> Option<Arc<crate::run_context::RunContext>> {
+    match stream {
+        StreamKey::Run(request_id) => current_run().filter(|run| run.id() == request_id),
+        StreamKey::Attempt(_) => None,
+    }
 }
 
 /// Sends a tool event raised by this stream to the run [`queue_owner`] gives it.
-async fn emit_from_stream(stream_id: &str, event: AgentEvent) {
-    if let Some(run) = queue_owner(stream_id) {
+async fn emit_from_stream(stream: &StreamKey, event: AgentEvent) {
+    if let Some(run) = queue_owner(stream) {
         let _ = run.emit(event).await;
+    }
+}
+
+/// The blocked cell of a task attempt in park mode. Only attempts park.
+fn park_cell(stream: &StreamKey) -> Option<Arc<BlockedCell>> {
+    match stream {
+        StreamKey::Attempt(key) => park_cell_for(key),
+        StreamKey::Run(_) => None,
     }
 }
 
@@ -378,8 +407,7 @@ impl ResponseContent {
 pub struct StreamingRequestHook {
     /// Everything watching this run.
     hooks: Hooks,
-    /// Request ID for event correlation
-    request_id: String,
+    stream: StreamKey,
     /// Shared usage state (returned separately for handler access)
     usage_state: UsageState,
     /// Optional per-agent scratchpad budget. When set, the hook feeds the
@@ -389,12 +417,12 @@ pub struct StreamingRequestHook {
 }
 
 impl StreamingRequestHook {
-    /// Create a new streaming request hook for one request.
+    /// Create a new streaming request hook for one stream.
     pub fn new(
         options: crate::streaming::RunOptions,
-        request_id: impl Into<String>,
+        stream: StreamKey,
     ) -> (Self, CancellationToken, UsageState) {
-        Self::with_scratchpad_budget(options, request_id, None, HashSet::new())
+        Self::with_scratchpad_budget(options, stream, None, HashSet::new())
     }
 
     /// Like `new`, but additionally wires a scratchpad `ContextBudget` so the
@@ -403,7 +431,7 @@ impl StreamingRequestHook {
     /// `StreamItem::TurnUsage`).
     pub fn with_scratchpad_budget(
         options: crate::streaming::RunOptions,
-        request_id: impl Into<String>,
+        stream: StreamKey,
         scratchpad_budget: Option<ContextBudget>,
         client_tool_names: HashSet<String>,
     ) -> (Self, CancellationToken, UsageState) {
@@ -415,7 +443,7 @@ impl StreamingRequestHook {
             hooks: Hooks::new()
                 .with(Arc::new(Deadline::new(timeout, cancel.clone())))
                 .with(Arc::new(ClientTools::new(client_tool_names))),
-            request_id: request_id.into(),
+            stream,
             usage_state: usage_state.clone(),
             scratchpad_budget,
         };
@@ -496,11 +524,11 @@ where
         async move {
             // Checked before the hooks: a waiting parked call must get its
             // snapshot whatever else is true.
-            if let Some(cell) = park_cell_for(&self.request_id)
+            if let Some(cell) = park_cell(&self.stream)
                 && cell.snapshot_if_pending(history, prompt)
             {
                 tracing::info!(
-                    request_id = %self.request_id,
+                    stream = %self.stream,
                     "Parked approval pending — cancelling stream (reason: {})",
                     PARK_CANCEL_REASON
                 );
@@ -553,7 +581,7 @@ where
         cancel_sig: CancelSignal,
     ) -> impl Future<Output = ()> + Send {
         let tool_name = tool_name.to_string();
-        let request_id = self.request_id.clone();
+        let stream = self.stream.clone();
         let tool_call_id = id;
         let args_str = args.to_string();
         // Scratchpad exploration tools are suppressed from the event surface
@@ -565,7 +593,7 @@ where
         let publish_event = Self::should_publish_tool_event(&tool_name);
         async move {
             // Stash the call id so the park arm can record it on the cell entry.
-            if let Some(cell) = park_cell_for(&request_id) {
+            if let Some(cell) = park_cell(&stream) {
                 cell.set_current_call_id(tool_call_id.clone());
             }
 
@@ -579,11 +607,11 @@ where
                 // Rig 0.28+ passes correct tool_call_id; register for event correlation
                 if let Some(id) = &tool_call_id {
                     let id = ToolCallId::new(id);
-                    if let Some(run) = queue_owner(&request_id) {
+                    if let Some(run) = queue_owner(&stream) {
                         run.push_tool_call(id.clone());
                     }
                     emit_from_stream(
-                        &request_id,
+                        &stream,
                         AgentEvent::single_agent(AgentEventPayload::ToolRequested {
                             tool_call_id: id,
                             tool_name: ToolName::new(&tool_name),
@@ -593,17 +621,17 @@ where
                     .await;
                 } else {
                     tracing::warn!(
-                        "Tool '{}' called without tool_call_id for request '{}' - event correlation unavailable",
+                        "Tool '{}' called without tool_call_id for stream '{}' - event correlation unavailable",
                         tool_name,
-                        request_id
+                        stream
                     );
                 }
             }
 
             tracing::debug!(
-                "Tool '{}' requested for request '{}' (tool_call_id: {:?})",
+                "Tool '{}' requested for stream '{}' (tool_call_id: {:?})",
                 tool_name,
-                request_id,
+                stream,
                 tool_call_id
             );
 
@@ -620,7 +648,7 @@ where
         cancel_sig: CancelSignal,
     ) -> impl Future<Output = ()> + Send {
         let tool_name = tool_name.to_string();
-        let request_id = self.request_id.clone();
+        let stream = self.stream.clone();
         let tool_call_id = id.clone();
         let had_tool_call_id = id.is_some();
         let usage_state = self.usage_state.clone();
@@ -641,14 +669,14 @@ where
                 // This maintains push/pop symmetry and prevents popping IDs belonging
                 // to other tool calls when a tool arrives without an ID.
                 if had_tool_call_id
-                    && let Some(run) = queue_owner(&request_id)
+                    && let Some(run) = queue_owner(&stream)
                     && run.pop_tool_call().is_none()
                 {
                     tracing::warn!(
-                        "Queue desync: pop returned None for tool '{}' on request '{}' \
+                        "Queue desync: pop returned None for tool '{}' on stream '{}' \
                          (possible duplicate on_tool_result or Rig version issue)",
                         tool_name,
-                        request_id
+                        stream
                     );
                 }
 
@@ -680,7 +708,7 @@ where
         M::StreamingResponse: GetTokenUsage,
     {
         let usage_state = self.usage_state.clone();
-        let request_id = self.request_id.clone();
+        let stream = self.stream.clone();
         let scratchpad_budget = self.scratchpad_budget.clone();
 
         // Extract usage if the response type supports it
@@ -724,7 +752,7 @@ where
                         tool_ids
                     );
                     emit_from_stream(
-                        &request_id,
+                        &stream,
                         AgentEvent::single_agent(AgentEventPayload::ToolUsage {
                             tool_call_ids: tool_ids,
                             usage: TokenUsage {
@@ -738,7 +766,7 @@ where
                 }
 
                 tracing::info!(
-                    request_id = %request_id,
+                    stream = %stream,
                     prompt_tokens = usage.input_tokens,
                     completion_tokens = usage.output_tokens,
                     total_tokens = usage.total_tokens,
@@ -758,10 +786,18 @@ mod tests {
     /// queue filled by another stream of the same run hands a tool call a
     /// sibling's id. Only the stream that *is* the run may fill it.
     mod queue_ownership {
-        use super::super::{emit_from_stream, queue_owner};
+        use super::super::{
+            BlockedCell, ParkCellRegistration, StreamKey, emit_from_stream, park_cell, queue_owner,
+        };
+        use crate::domain::RequestId;
         use crate::run_context::{RunContext, with_run};
         use aura_events::agent::{AgentEvent, AgentEventPayload};
         use aura_events::{ToolCallId, ToolName};
+        use std::sync::Arc;
+
+        fn attempt() -> StreamKey {
+            StreamKey::Attempt("orchestrator:task:0:attempt:1".to_string())
+        }
 
         fn requested(id: &str) -> AgentEvent {
             AgentEvent::single_agent(AgentEventPayload::ToolRequested {
@@ -775,10 +811,11 @@ mod tests {
         /// scope, and its tool events must not reach the run as the run's own.
         #[tokio::test]
         async fn only_the_run_s_own_stream_sends_it_tool_events() {
-            let (run, mut events) = RunContext::channel("req_1");
+            let id = RequestId::generate();
+            let (run, mut events) = RunContext::channel(id.clone());
             with_run(run, async {
-                emit_from_stream("req_1:task:0:attempt:1", requested("worker")).await;
-                emit_from_stream("req_1", requested("own")).await;
+                emit_from_stream(&attempt(), requested("worker")).await;
+                emit_from_stream(&StreamKey::Run(id), requested("own")).await;
             })
             .await;
 
@@ -796,19 +833,17 @@ mod tests {
 
         #[tokio::test]
         async fn the_run_s_own_stream_owns_the_queue() {
-            let run = RunContext::detached("req_1");
-            let owned = with_run(run, async { queue_owner("req_1").is_some() }).await;
+            let id = RequestId::generate();
+            let run = RunContext::detached(id.clone());
+            let owned = with_run(run, async { queue_owner(&StreamKey::Run(id)).is_some() }).await;
             assert!(owned);
         }
 
         /// An orchestration worker streams under its task attempt.
         #[tokio::test]
         async fn a_worker_s_stream_owns_no_queue() {
-            let run = RunContext::detached("req_1");
-            let owned = with_run(run, async {
-                queue_owner("req_1:task:0:attempt:1").is_some()
-            })
-            .await;
+            let run = RunContext::detached(RequestId::generate());
+            let owned = with_run(run, async { queue_owner(&attempt()).is_some() }).await;
             assert!(
                 !owned,
                 "a stream that is not the run leaves its queue alone"
@@ -816,8 +851,26 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_stream_of_another_run_owns_no_queue() {
+            let run = RunContext::detached(RequestId::generate());
+            let other = StreamKey::Run(RequestId::generate());
+            let owned = with_run(run, async { queue_owner(&other).is_some() }).await;
+            assert!(!owned);
+        }
+
+        #[tokio::test]
         async fn no_run_owns_nothing() {
-            assert!(queue_owner("req_1").is_none());
+            assert!(queue_owner(&StreamKey::Run(RequestId::generate())).is_none());
+        }
+
+        /// Park cells belong to task attempts, so a run's own stream finds none
+        /// even under a key spelled like its request id.
+        #[test]
+        fn a_run_s_own_stream_has_no_park_cell() {
+            let id = RequestId::generate();
+            let _registration =
+                ParkCellRegistration::new(id.as_str(), Arc::new(BlockedCell::default()));
+            assert!(park_cell(&StreamKey::Run(id)).is_none());
         }
     }
 
@@ -839,7 +892,7 @@ mod tests {
 
         let (hook, _cancel, _usage) = StreamingRequestHook::new(
             crate::streaming::RunOptions::bounded(Some(Duration::from_secs(300))),
-            "req_registered",
+            StreamKey::Run(RequestId::generate()),
         );
         assert!(
             hook.should_cancel().is_none(),
@@ -852,12 +905,13 @@ mod tests {
 
     #[test]
     fn test_streaming_request_hook_creation() {
+        let stream = StreamKey::Run(RequestId::generate());
         let (hook, _tx, _usage_state) = StreamingRequestHook::new(
             crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
-            "test_req_1",
+            stream.clone(),
         );
         assert!(hook.should_cancel().is_none());
-        assert_eq!(hook.request_id, "test_req_1");
+        assert_eq!(hook.stream, stream);
     }
 
     // ---------------------------------------------------------------------
@@ -898,7 +952,7 @@ mod tests {
     fn test_external_cancellation() {
         let (hook, cancel, _usage_state) = StreamingRequestHook::new(
             crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
-            "test_req_2",
+            StreamKey::Run(RequestId::generate()),
         );
         assert!(hook.should_cancel().is_none());
 
@@ -911,7 +965,7 @@ mod tests {
         // Create hook with very short timeout
         let (hook, _tx, _usage_state) = StreamingRequestHook::new(
             crate::streaming::RunOptions::bounded(Some(Duration::from_millis(1))),
-            "test_req_3",
+            StreamKey::Run(RequestId::generate()),
         );
 
         // Wait for timeout
@@ -923,7 +977,7 @@ mod tests {
     fn test_usage_state_creation() {
         let (_hook, _tx, usage_state) = StreamingRequestHook::new(
             crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
-            "test_req_4",
+            StreamKey::Run(RequestId::generate()),
         );
 
         // Initially all zeros
@@ -1052,7 +1106,7 @@ mod tests {
     fn test_usage_state_shared_between_clones() {
         let (_hook, _tx, usage_state) = StreamingRequestHook::new(
             crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
-            "test_req_5",
+            StreamKey::Run(RequestId::generate()),
         );
         let usage_state_clone = usage_state.clone();
 
@@ -1115,11 +1169,11 @@ mod tests {
     fn test_with_scratchpad_budget_none_matches_new() {
         let (hook_a, _, _) = StreamingRequestHook::new(
             crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
-            "req_a",
+            StreamKey::Run(RequestId::generate()),
         );
         let (hook_b, _, _) = StreamingRequestHook::with_scratchpad_budget(
             crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
-            "req_b",
+            StreamKey::Run(RequestId::generate()),
             None,
             HashSet::new(),
         );
@@ -1135,7 +1189,7 @@ mod tests {
         let budget = ContextBudget::new(128_000, 0.20, 0, counter);
         let (hook, _, _) = StreamingRequestHook::with_scratchpad_budget(
             crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
-            "req_with_budget",
+            StreamKey::Run(RequestId::generate()),
             Some(budget.clone()),
             HashSet::new(),
         );

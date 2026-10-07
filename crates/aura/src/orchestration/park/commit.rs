@@ -9,7 +9,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::config::AgentRuntimeConfig;
-use crate::hitl::{DecisionId, PendingApprovals};
+use crate::hitl::{ApprovalOwner, DecisionId, PendingApprovals};
+use crate::orchestration::RunId;
 use crate::orchestration::persistence::is_safe_path_component;
 use crate::orchestration::types::{PendingCall, Plan, TaskState};
 
@@ -45,12 +46,6 @@ pub(crate) struct ParkCommitOutcome {
     /// RFC 3339 expiry timestamp.
     pub expires_at: String,
     pub refreshed: RefreshedAwaiting,
-}
-
-/// The run-scoped owner id every approval parked by `run_id` is registered
-/// under.
-pub(crate) fn run_owner_id(run_id: &str) -> String {
-    format!("run:{run_id}")
 }
 
 /// Narrow the plan's awaiting tasks to the calls still parked and undecided,
@@ -217,13 +212,12 @@ pub(crate) async fn publish(
 /// caller rather than the ambient one.
 pub(crate) fn cancel_run_approvals(
     registry: &PendingApprovals,
-    run_id: &str,
+    run_id: RunId,
     run: Option<std::sync::Arc<crate::run_context::RunContext>>,
 ) -> tokio::task::JoinHandle<()> {
     let registry = registry.clone();
-    let run_id = run_id.to_string();
     tokio::task::spawn(async move {
-        for parked in registry.cancel_request(&run_owner_id(&run_id)).await {
+        for parked in registry.cancel_request(&ApprovalOwner::Run(run_id)).await {
             let cancelled = crate::hitl::completed_cancelled_event(
                 parked.request.decision_id,
                 &parked.request.scope,
@@ -315,7 +309,7 @@ mod tests {
 
     fn parked_approval(
         decision_id: DecisionId,
-        owner: &str,
+        owner: &ApprovalOwner,
         expires_at: chrono::DateTime<chrono::Utc>,
     ) -> ParkedApproval {
         ParkedApproval {
@@ -323,7 +317,7 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 instance_id: "test-instance".to_string(),
                 decision_id,
-                request_id: owner.to_string(),
+                owner: owner.clone(),
                 scope: AgentScope::Single { session_id: None },
                 origin: ApprovalOrigin::ConfigGate {
                     matched_pattern: "kubectl_*".to_string(),
@@ -461,7 +455,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_drops_decided_and_takes_earliest_expiry() {
         let (registry, _store) = conv_registry();
-        let owner = "run:0191e8c0-eeee-7000-8000-000000000003";
+        let owner = ApprovalOwner::Run("0191e8c0-eeee-7000-8000-000000000003".parse().unwrap());
         let now = chrono::Utc::now();
         let decided = DecisionId::generate();
         let removed = DecisionId::generate();
@@ -471,7 +465,7 @@ mod tests {
         registry
             .register_durable(parked_approval(
                 decided,
-                owner,
+                &owner,
                 now + chrono::Duration::hours(2),
             ))
             .await
@@ -479,7 +473,7 @@ mod tests {
         registry
             .register_durable(parked_approval(
                 removed,
-                owner,
+                &owner,
                 now + chrono::Duration::hours(2),
             ))
             .await
@@ -487,7 +481,7 @@ mod tests {
         registry
             .register_durable(parked_approval(
                 earliest,
-                owner,
+                &owner,
                 now + chrono::Duration::minutes(30),
             ))
             .await
@@ -495,7 +489,7 @@ mod tests {
         registry
             .register_durable(parked_approval(
                 latest,
-                owner,
+                &owner,
                 now + chrono::Duration::hours(1),
             ))
             .await
@@ -556,10 +550,10 @@ mod tests {
     #[tokio::test]
     async fn sweep_publishes_cancelled_for_undecided_sibling_only() {
         let (registry, store) = conv_registry();
-        let run_id = "0191e8c0-ffff-7000-8000-000000000006";
-        let owner = run_owner_id(run_id);
-        let request_id = format!("req_sweep_{}", uuid::Uuid::new_v4().simple());
-        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+        let run_id: RunId = "0191e8c0-ffff-7000-8000-000000000006".parse().unwrap();
+        let owner = ApprovalOwner::Run(run_id);
+        let request_id = crate::domain::RequestId::generate();
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.clone());
 
         let now = chrono::Utc::now();
         let decided = DecisionId::generate();
@@ -624,10 +618,10 @@ mod tests {
     #[tokio::test]
     async fn sweep_publishes_one_event_per_cleared_ticket() {
         let (registry, store) = conv_registry();
-        let run_id = "0191e8c0-aaaa-7000-8000-000000000007";
-        let owner = run_owner_id(run_id);
-        let request_id = format!("req_sweep_{}", uuid::Uuid::new_v4().simple());
-        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+        let run_id: RunId = "0191e8c0-aaaa-7000-8000-000000000007".parse().unwrap();
+        let owner = ApprovalOwner::Run(run_id);
+        let request_id = crate::domain::RequestId::generate();
+        let (run, mut events) = crate::run_context::RunContext::channel(request_id.clone());
 
         let now = chrono::Utc::now();
         let first = DecisionId::generate();
@@ -682,8 +676,8 @@ mod tests {
     #[tokio::test]
     async fn late_resolve_after_sweep_is_not_found() {
         let (registry, _store) = conv_registry();
-        let run_id = "0191e8c0-bbbb-7000-8000-000000000008";
-        let owner = run_owner_id(run_id);
+        let run_id: RunId = "0191e8c0-bbbb-7000-8000-000000000008".parse().unwrap();
+        let owner = ApprovalOwner::Run(run_id);
         let now = chrono::Utc::now();
         let ticket = DecisionId::generate();
         registry

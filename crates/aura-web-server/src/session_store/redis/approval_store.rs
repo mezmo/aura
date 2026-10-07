@@ -22,7 +22,7 @@
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
-use aura::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
+use aura::hitl::{ApprovalDecision, ApprovalOwner, DecisionId, ParkedApproval, ResolveError};
 use aura::session_store::{ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
@@ -94,8 +94,8 @@ impl RedisApprovalStore {
         format!("{}:approval:decision:{decision_id}", self.key_prefix)
     }
 
-    fn req_key(&self, request_id: &str) -> String {
-        format!("{}:approval:req:{request_id}", self.key_prefix)
+    fn req_key(&self, owner: impl std::fmt::Display) -> String {
+        format!("{}:approval:req:{owner}", self.key_prefix)
     }
 
     /// `GETDEL` a record and prune its request index best-effort, returning
@@ -204,9 +204,9 @@ impl ApprovalStore for RedisApprovalStore {
 
     async fn cancel_request(
         &self,
-        request_id: &str,
+        owner: &ApprovalOwner,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
-        let req_key = self.req_key(request_id);
+        let req_key = self.req_key(owner);
         let mut conn = self.conn.clone();
         let ids: Vec<String> = conn.smembers(&req_key).await.map_err(request_err)?;
         if ids.is_empty() {

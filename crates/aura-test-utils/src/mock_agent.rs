@@ -173,9 +173,9 @@ impl StreamingAgent for MockAgent {
         _query: &str,
         _chat_history: Vec<Message>,
         options: aura::streaming::RunOptions,
-        request_id: &str,
+        request_id: &aura::RequestId,
     ) -> AgentRun {
-        let stream = self.start(request_id).await;
+        let stream = self.start(request_id.as_str()).await;
         // Carries a caller-supplied token so `cancel_token()` returns the one the
         // caller named. The scripts do not race it, so cancelling does not end a
         // mock stream.
@@ -186,7 +186,7 @@ impl StreamingAgent for MockAgent {
         )
     }
 
-    async fn cancel_and_close_mcp(&self, _request_id: &str, _reason: &str) -> usize {
+    async fn cancel_and_close_mcp(&self, _request_id: &aura::RequestId, _reason: &str) -> usize {
         0
     }
 }
@@ -200,7 +200,12 @@ mod tests {
     async fn a_pending_agent_never_yields() {
         let agent = MockAgent::pending();
         let mut stream = agent
-            .stream("q", vec![], aura::streaming::RunOptions::default(), "req_1")
+            .stream(
+                "q",
+                vec![],
+                aura::streaming::RunOptions::default(),
+                &aura::RequestId::generate(),
+            )
             .await
             .into_events();
         assert!(
@@ -216,7 +221,12 @@ mod tests {
     async fn a_yielding_agent_produces_its_items_then_ends() {
         let agent = MockAgent::yielding(vec![items::text("hello "), items::text("world")]);
         let mut stream = agent
-            .stream("q", vec![], aura::streaming::RunOptions::default(), "req_1")
+            .stream(
+                "q",
+                vec![],
+                aura::streaming::RunOptions::default(),
+                &aura::RequestId::generate(),
+            )
             .await
             .into_events();
 
@@ -235,16 +245,24 @@ mod tests {
     async fn the_start_hook_runs_before_the_stream() {
         let ran = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&ran);
-        let agent = MockAgent::pending().on_stream_start(move |request_id| {
+        let request_id = aura::RequestId::generate();
+        let expected = request_id.to_string();
+        let agent = MockAgent::pending().on_stream_start(move |seen| {
             let flag = Arc::clone(&flag);
+            let expected = expected.clone();
             async move {
-                assert_eq!(request_id, "req_1");
+                assert_eq!(seen, expected);
                 flag.store(true, Ordering::SeqCst);
             }
         });
 
         let _ = agent
-            .stream("q", vec![], aura::streaming::RunOptions::default(), "req_1")
+            .stream(
+                "q",
+                vec![],
+                aura::streaming::RunOptions::default(),
+                &request_id,
+            )
             .await
             .into_events();
 
@@ -253,6 +271,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn effects_run_in_script_order_and_see_the_request_id() {
+        let request_id = aura::RequestId::generate();
         let order = Arc::new(Mutex::new(Vec::new()));
         let effect_order = Arc::clone(&order);
         let agent = MockAgent::scripted(vec![
@@ -270,13 +289,16 @@ mod tests {
                 "q",
                 vec![],
                 aura::streaming::RunOptions::default(),
-                "req_42",
+                &request_id,
             )
             .await
             .into_events();
         let items: Vec<_> = stream.collect().await;
 
-        assert_eq!(order.lock().expect("order lock").as_slice(), ["req_42"]);
+        assert_eq!(
+            order.lock().expect("order lock").as_slice(),
+            [request_id.to_string()]
+        );
         assert_eq!(items.len(), 1, "effects do not yield stream items");
     }
 
@@ -285,13 +307,23 @@ mod tests {
         let agent = MockAgent::yielding([items::text("once")]);
 
         let first: Vec<_> = agent
-            .stream("q", vec![], aura::streaming::RunOptions::default(), "req_1")
+            .stream(
+                "q",
+                vec![],
+                aura::streaming::RunOptions::default(),
+                &aura::RequestId::generate(),
+            )
             .await
             .into_events()
             .collect()
             .await;
         let second: Vec<_> = agent
-            .stream("q", vec![], aura::streaming::RunOptions::default(), "req_1")
+            .stream(
+                "q",
+                vec![],
+                aura::streaming::RunOptions::default(),
+                &aura::RequestId::generate(),
+            )
             .await
             .into_events()
             .collect()
@@ -318,7 +350,12 @@ mod tests {
         ]);
 
         let mut stream = agent
-            .stream("q", vec![], aura::streaming::RunOptions::default(), "req_1")
+            .stream(
+                "q",
+                vec![],
+                aura::streaming::RunOptions::default(),
+                &aura::RequestId::generate(),
+            )
             .await
             .into_events();
         while stream.next().await.is_some() {

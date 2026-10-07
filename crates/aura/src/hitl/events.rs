@@ -127,7 +127,7 @@ impl<'a> From<&'a ApprovalRequest> for ApprovalRequestWire<'a> {
             version: request.version,
             instance_id: request.instance_id.as_str(),
             decision_id: request.decision_id,
-            request_id: request.request_id.as_str(),
+            request_id: &request.owner,
             scope: scope_to_wire(&request.scope),
             origin: origin_to_wire(&request.origin),
             items: request.items.as_slice(),

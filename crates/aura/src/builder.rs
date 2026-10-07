@@ -332,12 +332,10 @@ impl Agent {
                     .clone()
                     .map(crate::config::SessionId::new),
             };
-            let request_id = config_owned.request_id.clone().unwrap_or_default();
             let wrapper = Arc::new(crate::hitl::HitlApprovalWrapper::new(
                 hitl.patterns.clone(),
                 hitl.route.clone(),
                 scope.clone(),
-                request_id.clone(),
                 config_owned.agent.name.clone(),
                 config_owned.instance_id.clone(),
             ));
@@ -352,7 +350,6 @@ impl Agent {
             let approval_tool = crate::hitl::RequestApprovalTool::new(
                 hitl.route.clone(),
                 scope,
-                request_id,
                 config_owned.agent.name.clone(),
                 config_owned.instance_id.clone(),
             );
@@ -1218,7 +1215,8 @@ impl Agent {
 
     /// Process a query with the agent (no chat history).
     ///
-    /// Uses the streaming pipeline internally and collects the result.
+    /// Collects [`Self::stream_prompt`], which documents how its HITL
+    /// approvals are owned.
     #[tracing::instrument(name = "agent.prompt", skip(self), fields(model = %self.model))]
     pub async fn prompt(
         &self,
@@ -1243,7 +1241,8 @@ impl Agent {
 
     /// Process a chat query with conversation history.
     ///
-    /// Uses the streaming pipeline internally and collects the result.
+    /// Collects [`Self::stream_chat`], which documents how its HITL approvals
+    /// are owned.
     #[tracing::instrument(name = "agent.chat", skip(self, chat_history), fields(model = %self.model, history_len = chat_history.len()))]
     pub async fn chat(
         &self,
@@ -1324,6 +1323,9 @@ impl Agent {
     }
 
     /// Stream a query with the agent (no chat history) - returns true streaming response with multi-turn tool support
+    ///
+    /// Starts no run, so HITL approvals raised here have no owner and their
+    /// events reach no observer. [`StreamingAgent::stream`] starts one.
     pub async fn stream_prompt(
         &self,
         query: &str,
@@ -1333,6 +1335,9 @@ impl Agent {
     }
 
     /// Stream a chat query with conversation history - returns true streaming response with multi-turn tool support
+    ///
+    /// Starts no run, so HITL approvals raised here have no owner and their
+    /// events reach no observer. [`StreamingAgent::stream`] starts one.
     pub async fn stream_chat(
         &self,
         query: &str,
@@ -1349,6 +1354,9 @@ impl Agent {
     ///
     /// Unlike `stream_chat()` which uses `self.max_depth`, this allows callers
     /// to specify depth. Used by orchestration phases that need tighter bounds.
+    ///
+    /// Starts no run, so HITL approvals raised here have no owner and their
+    /// events reach no observer. [`StreamingAgent::stream`] starts one.
     #[tracing::instrument(name = "agent.stream_chat", skip(self, chat_history),
         fields(model = %self.model, history_len = chat_history.len(), max_depth))]
     pub async fn stream_chat_with_depth(
@@ -1446,7 +1454,7 @@ impl Agent {
     /// # Arguments
     /// * `query` - The user query
     /// * `options` - How the run is bounded and cancelled
-    /// * `request_id` - Unique request ID for MCP tool cancellation context
+    /// * `stream` - Which stream this is: the run itself or a task attempt in it
     ///
     /// # Cancellation
     /// The StreamingRequestHook checks for cancellation at key points during streaming:
@@ -1457,11 +1465,11 @@ impl Agent {
     /// - After each streaming completion (captures usage, emits aura.tool_usage)
     ///
     /// To cancel externally (e.g., on client disconnect), cancel the run's token.
-    pub async fn stream_prompt_with_timeout(
+    pub(crate) async fn stream_prompt_with_timeout(
         &self,
         query: &str,
         options: crate::streaming::RunOptions,
-        request_id: &str,
+        stream: crate::StreamKey,
     ) -> crate::streaming::AgentRun {
         self.seed_scratchpad_request_input(query, &[]);
         self.inner
@@ -1469,7 +1477,7 @@ impl Agent {
                 query,
                 self.max_depth,
                 options,
-                request_id,
+                stream,
                 self.scratchpad_budget.clone(),
                 self.client_tool_names.clone(),
             )
@@ -1487,17 +1495,17 @@ impl Agent {
     /// * `query` - The user query
     /// * `chat_history` - Previous conversation messages
     /// * `options` - How the run is bounded and cancelled
-    /// * `request_id` - Unique request ID for MCP tool cancellation context
+    /// * `stream` - Which stream this is: the run itself or a task attempt in it
     ///
     ///
     /// # Cancellation
     /// See `stream_prompt_with_timeout` for cancellation details.
-    pub async fn stream_chat_with_timeout(
+    pub(crate) async fn stream_chat_with_timeout(
         &self,
         query: &str,
         chat_history: Vec<rig::completion::Message>,
         options: crate::streaming::RunOptions,
-        request_id: &str,
+        stream: crate::StreamKey,
     ) -> crate::streaming::AgentRun {
         self.seed_scratchpad_request_input(query, &chat_history);
         self.inner
@@ -1506,7 +1514,7 @@ impl Agent {
                 chat_history,
                 self.max_depth,
                 options,
-                request_id,
+                stream,
                 self.scratchpad_budget.clone(),
                 self.client_tool_names.clone(),
             )
@@ -1546,28 +1554,6 @@ impl Agent {
         (self.inner.provider_name(), &self.model)
     }
 
-    /// Cancel all in-flight MCP tool requests for an HTTP request.
-    ///
-    /// This sends `notifications/cancelled` to all MCP servers that have
-    /// in-flight requests, allowing them to abort long-running operations.
-    /// Call this when a client disconnects or request times out.
-    ///
-    /// # Arguments
-    /// * `http_request_id` - The HTTP request ID whose MCP calls should be cancelled
-    /// * `reason` - Reason for cancellation (e.g., "client disconnected", "timeout")
-    ///
-    /// # Returns
-    /// Total number of cancellation notifications sent
-    pub async fn cancel_mcp_requests(&self, http_request_id: &str, reason: &str) -> usize {
-        if let Some(mcp_manager) = &self.mcp_manager {
-            mcp_manager
-                .cancel_all_for_request(http_request_id, reason)
-                .await
-        } else {
-            0
-        }
-    }
-
     /// Cancel all in-flight MCP requests and forcefully close connections.
     ///
     /// This sends `notifications/cancelled` to all MCP servers and then
@@ -1579,16 +1565,18 @@ impl Agent {
     /// will need to reinitialize them.
     ///
     /// # Arguments
-    /// * `http_request_id` - The HTTP request ID whose MCP calls should be cancelled
+    /// * `request_id` - The request whose MCP calls should be cancelled
     /// * `reason` - Reason for cancellation
     ///
     /// # Returns
     /// Total number of cancellation notifications sent
-    pub async fn cancel_and_close_mcp(&self, http_request_id: &str, reason: &str) -> usize {
+    pub async fn cancel_and_close_mcp(
+        &self,
+        request_id: &crate::domain::RequestId,
+        reason: &str,
+    ) -> usize {
         if let Some(mcp_manager) = &self.mcp_manager {
-            mcp_manager
-                .cancel_and_close_all(http_request_id, reason)
-                .await
+            mcp_manager.cancel_and_close_all(request_id, reason).await
         } else {
             0
         }
@@ -1700,14 +1688,14 @@ impl StreamingAgent for Agent {
         query: &str,
         chat_history: Vec<rig::completion::Message>,
         options: crate::streaming::RunOptions,
-        request_id: &str,
+        request_id: &crate::domain::RequestId,
     ) -> crate::streaming::AgentRun {
         // The run is built on the token it will stop on, so the work that awaits
         // cancellation finds it there from the start.
         let (timeout, cancel) = options.into_parts();
         let cancel = cancel.unwrap_or_default();
         let (run, run_events) =
-            crate::run_context::RunContext::channel_on(request_id, cancel.clone());
+            crate::run_context::RunContext::channel_on(request_id.clone(), cancel.clone());
         let options = crate::streaming::RunOptions::on_token(timeout, cancel);
 
         // The gate and the approval tool are built with the agent, before any
@@ -1729,13 +1717,26 @@ impl StreamingAgent for Agent {
         }
 
         let started = if chat_history.is_empty() {
-            self.stream_prompt_with_timeout(query, options, request_id)
-                .await
+            self.stream_prompt_with_timeout(
+                query,
+                options,
+                crate::StreamKey::Run(request_id.clone()),
+            )
+            .await
         } else {
-            self.stream_chat_with_timeout(query, chat_history, options, request_id)
-                .await
+            self.stream_chat_with_timeout(
+                query,
+                chat_history,
+                options,
+                crate::StreamKey::Run(request_id.clone()),
+            )
+            .await
         };
 
+        let started = match &self.hitl_gate {
+            Some(gate) => started.sweeping_approvals(gate.route(), request_id),
+            None => started,
+        };
         started
             .map_stream(move |stream| {
                 Box::pin(crate::run_context::scope_stream(
@@ -1750,7 +1751,11 @@ impl StreamingAgent for Agent {
             .observed_by(run_events)
     }
 
-    async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize {
+    async fn cancel_and_close_mcp(
+        &self,
+        request_id: &crate::domain::RequestId,
+        reason: &str,
+    ) -> usize {
         Agent::cancel_and_close_mcp(self, request_id, reason).await
     }
 
@@ -2263,7 +2268,6 @@ mod tests {
         /// because rig calls the tool on its server task and no scope reaches
         /// there.
         fn gated_config(
-            request_id: &str,
             pattern: &str,
             run: Arc<crate::run_context::RunContext>,
         ) -> AgentRuntimeConfig {
@@ -2274,7 +2278,6 @@ mod tests {
                     timeout: Duration::from_millis(50),
                 }),
                 AgentScope::Single { session_id: None },
-                request_id.to_owned(),
                 "test-agent".to_owned(),
                 "test-instance-id".to_owned(),
             );
@@ -2287,13 +2290,12 @@ mod tests {
 
         async fn compose_gated_agent(
             server: &RecordingMcpServer,
-            request_id: &str,
             pattern: &str,
             namespace: &str,
             tool: &str,
             run: Arc<crate::run_context::RunContext>,
         ) -> rig::agent::Agent<UnpromptedModel> {
-            let config = gated_config(request_id, pattern, run);
+            let config = gated_config(pattern, run);
             let manager = Some(Arc::new(manager_serving(server, namespace, tool).await));
             let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
             Agent::add_all_tools(state, &config, &manager, Vec::new())
@@ -2307,12 +2309,10 @@ mod tests {
         /// one `add_mcp_tool` stamped, carried through `pre_call`.
         #[tokio::test]
         async fn a_namespace_scoped_pattern_gates_a_tool_from_that_server() {
-            let request_id = "req_ns_gating_match";
+            let request_id = crate::domain::RequestId::generate();
             let server = RecordingMcpServer::start().await;
-            let (run, mut rx) = crate::run_context::RunContext::channel(request_id);
-            let agent =
-                compose_gated_agent(&server, request_id, "github:*", "github", "list_repos", run)
-                    .await;
+            let (run, mut rx) = crate::run_context::RunContext::channel(request_id.clone());
+            let agent = compose_gated_agent(&server, "github:*", "github", "list_repos", run).await;
 
             // The parked approval expires unanswered; the call's own outcome is
             // not what this test is about.
@@ -2341,12 +2341,10 @@ mod tests {
         /// namespace were ignored and the bare name alone matched.
         #[tokio::test]
         async fn a_namespace_scoped_pattern_ignores_a_tool_from_another_server() {
-            let request_id = "req_ns_gating_miss";
+            let request_id = crate::domain::RequestId::generate();
             let server = RecordingMcpServer::start().await;
-            let (run, mut rx) = crate::run_context::RunContext::channel(request_id);
-            let agent =
-                compose_gated_agent(&server, request_id, "github:*", "k8s", "list_repos", run)
-                    .await;
+            let (run, mut rx) = crate::run_context::RunContext::channel(request_id.clone());
+            let agent = compose_gated_agent(&server, "github:*", "k8s", "list_repos", run).await;
 
             agent
                 .tool_server_handle
@@ -2646,11 +2644,7 @@ mod tests {
         }
 
         let tmp = tempfile::TempDir::new().unwrap();
-        let storage = Arc::new(
-            ScratchpadStorage::with_base_dir(tmp.path(), "req-single-compose")
-                .await
-                .unwrap(),
-        );
+        let storage = Arc::new(ScratchpadStorage::in_dir(tmp.path()).await.unwrap());
         let counter = TiktokenCounter::default_counter();
         let sp_budget = scratchpad::ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
 

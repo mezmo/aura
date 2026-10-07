@@ -400,9 +400,7 @@ fn verify_server(
                 (info.status.clone(), tools)
             })
             .ok_or_else(|| format!("`{name}` missing from the connection status snapshot"));
-        manager
-            .cancel_and_close_all("mcp-add-verify", "verification complete")
-            .await;
+        manager.close_all().await;
         result
     })
 }

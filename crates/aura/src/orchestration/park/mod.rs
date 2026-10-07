@@ -7,9 +7,7 @@ mod document;
 mod guard;
 mod recorded_decisions;
 
-pub(crate) use commit::{
-    ParkCommitInputs, cancel_run_approvals, commit_from_run_state, run_owner_id,
-};
+pub(crate) use commit::{ParkCommitInputs, cancel_run_approvals, commit_from_run_state};
 // The rehydrate entry points: consumed by commit 3's tests; the P45 resume
 // endpoint consumes them in production.
 #[allow(unused_imports)]

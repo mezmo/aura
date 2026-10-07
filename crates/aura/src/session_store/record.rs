@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::SessionId;
 use crate::hitl::{
-    AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
-    ParkedApproval, Timestamp,
+    AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalOwner, ApprovalRequest,
+    DecisionId, ParkedApproval, Timestamp,
 };
 use crate::orchestration::{RunId, TaskIdentity};
 
@@ -120,7 +120,7 @@ impl From<&ParkedApproval> for ParkedApprovalRecord {
             version: request.version,
             instance_id: request.instance_id.clone(),
             decision_id: request.decision_id,
-            request_id: request.request_id.clone(),
+            request_id: request.owner.to_string(),
             scope: ScopeRecord::from(&request.scope),
             origin: OriginRecord::from(&request.origin),
             items: request.items.clone(),
@@ -139,7 +139,7 @@ impl TryFrom<ParkedApprovalRecord> for ParkedApproval {
                 version: record.version,
                 instance_id: record.instance_id,
                 decision_id: record.decision_id,
-                request_id: record.request_id,
+                owner: parse_owner(&record.request_id)?,
                 scope: record.scope.try_into()?,
                 origin: record.origin.into(),
                 items: record.items,
@@ -233,6 +233,12 @@ impl From<OriginRecord> for ApprovalOrigin {
     }
 }
 
+fn parse_owner(raw: &str) -> Result<ApprovalOwner, InvalidRecord> {
+    ApprovalOwner::parse(raw).ok_or_else(|| InvalidRecord {
+        reason: format!("request_id '{raw}' names no request or run"),
+    })
+}
+
 fn parse_run_id(raw: &str) -> Result<RunId, InvalidRecord> {
     raw.parse().map_err(|e| InvalidRecord {
         reason: format!("run_id '{raw}': {e}"),
@@ -242,6 +248,7 @@ fn parse_run_id(raw: &str) -> Result<RunId, InvalidRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::RequestId;
     use crate::hitl::PROTOCOL_VERSION;
 
     fn parked(scope: AgentScope, origin: ApprovalOrigin) -> ParkedApproval {
@@ -251,7 +258,7 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 instance_id: "test-instance".to_string(),
                 decision_id: DecisionId::generate(),
-                request_id: "req-1".to_string(),
+                owner: ApprovalOwner::Request(RequestId::generate()),
                 scope,
                 origin,
                 items: vec![ApprovalItem {
@@ -316,6 +323,62 @@ mod tests {
                 agent_name: "test-agent".to_string(),
             },
         ));
+    }
+
+    fn gated(owner: ApprovalOwner) -> ParkedApproval {
+        let mut approval = parked(
+            AgentScope::Single { session_id: None },
+            ApprovalOrigin::ConfigGate {
+                matched_pattern: "*".to_string(),
+                agent_name: "test-agent".to_string(),
+            },
+        );
+        approval.request.owner = owner;
+        approval
+    }
+
+    /// Each owner kind stores as the bare string the webhook payload carries,
+    /// so any instance restores what another parked.
+    #[test]
+    fn owners_store_as_their_bare_string_and_restore() {
+        let run_id: RunId = "0191e8c0-1111-7000-8000-000000000000".parse().unwrap();
+        let request_id = RequestId::generate();
+        for (owner, stored) in [
+            (
+                ApprovalOwner::Request(request_id.clone()),
+                request_id.to_string(),
+            ),
+            (
+                ApprovalOwner::Request(RequestId::for_a2a_task("task-7")),
+                "a2a_task-7".to_string(),
+            ),
+            (
+                ApprovalOwner::Request(RequestId::for_a2a_task("")),
+                "a2a_".to_string(),
+            ),
+            (
+                ApprovalOwner::Run(run_id),
+                "run:0191e8c0-1111-7000-8000-000000000000".to_string(),
+            ),
+            (ApprovalOwner::Unowned, String::new()),
+        ] {
+            let approval = gated(owner);
+            assert_eq!(ParkedApprovalRecord::from(&approval).request_id, stored);
+            assert_round_trip(approval);
+        }
+    }
+
+    #[test]
+    fn a_record_naming_an_unminted_owner_is_rejected() {
+        let mut record =
+            ParkedApprovalRecord::from(&gated(ApprovalOwner::Request(RequestId::generate())));
+        for request_id in ["req-1", "run:not-a-uuid", "run:"] {
+            record.request_id = request_id.to_string();
+            assert!(
+                ParkedApproval::try_from(record.clone()).is_err(),
+                "{request_id:?} restored"
+            );
+        }
     }
 
     #[test]

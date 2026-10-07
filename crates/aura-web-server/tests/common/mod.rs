@@ -12,20 +12,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aura::hitl::{
-    AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
-    PROTOCOL_VERSION, ParkedApproval, ResolveError,
+    AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalOwner, ApprovalRequest,
+    DecisionId, PROTOCOL_VERSION, ParkedApproval, ResolveError,
 };
 use aura::session_store::{ApprovalStore, ParkedApprovalRecord};
 
-/// A representative parked approval, expiring in `ttl`.
-pub fn make_parked(request_id: &str, ttl: Duration) -> ParkedApproval {
+/// The same label always names the same owner; it stores as `a2a_<label>`.
+pub fn owner(label: &str) -> ApprovalOwner {
+    ApprovalOwner::Request(aura::RequestId::for_a2a_task(label))
+}
+
+/// A representative parked approval owned by `owner(label)`, expiring in `ttl`.
+pub fn make_parked(label: &str, ttl: Duration) -> ParkedApproval {
     let now = chrono::Utc::now();
     ParkedApproval {
         request: ApprovalRequest {
             version: PROTOCOL_VERSION,
             instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
-            request_id: request_id.to_string(),
+            owner: owner(label),
             scope: AgentScope::Single { session_id: None },
             origin: ApprovalOrigin::ConfigGate {
                 matched_pattern: "kubectl_*".to_string(),
@@ -153,7 +158,7 @@ pub async fn cancel_request_removes_only_matching(instance: &Arc<dyn ApprovalSto
     instance.register(cancel).await.unwrap();
     instance.register(keep).await.unwrap();
 
-    let cleared = instance.cancel_request("req-cancel").await.unwrap();
+    let cleared = instance.cancel_request(&owner("req-cancel")).await.unwrap();
 
     assert_eq!(cleared.len(), 1, "exactly the matching ticket is cleared");
     assert_eq!(

@@ -42,7 +42,7 @@ use tokio::sync::mpsc;
 /// Context for cancellation and cleanup callbacks.
 pub struct StreamingCallbacks {
     /// The request's id.
-    pub request_id: String,
+    pub request_id: aura::RequestId,
     /// Agent reference for MCP cleanup (cancel_and_close_mcp)
     pub agent: Arc<dyn StreamingAgent>,
     /// The run's own events.
@@ -2405,7 +2405,7 @@ mod tests {
             let (run_events_tx, run_events) = mpsc::channel(8);
             (
                 StreamingCallbacks {
-                    request_id: "req_inactivity_test".to_string(),
+                    request_id: aura::RequestId::generate(),
                     agent: Arc::new(MockAgent::pending()),
                     agent_events: Some(run_events),
                     usage_state: aura::UsageState::new(),
@@ -2873,7 +2873,7 @@ mod tests {
             (
                 Senders { run_events_tx },
                 StreamingCallbacks {
-                    request_id: "req_tool_events".to_string(),
+                    request_id: aura::RequestId::generate(),
                     agent: Arc::new(MockAgent::pending()),
                     agent_events: Some(run_events),
                     usage_state: UsageState::new(),
@@ -2928,7 +2928,7 @@ mod tests {
                     "q",
                     vec![],
                     aura::streaming::RunOptions::default(),
-                    "req_tool_events",
+                    &aura::RequestId::generate(),
                 )
                 .await
                 .into_events();

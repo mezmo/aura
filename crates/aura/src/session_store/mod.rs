@@ -25,7 +25,7 @@ use bytes::Bytes;
 use futures::Stream;
 
 use crate::config::SessionId;
-use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
+use crate::hitl::{ApprovalDecision, ApprovalOwner, DecisionId, ParkedApproval, ResolveError};
 
 #[cfg(test)]
 pub(crate) use fault_store::FaultInjectingStore;
@@ -96,7 +96,7 @@ pub trait ApprovalStore: Send + Sync {
     /// the cancellation applies to.
     async fn cancel_request(
         &self,
-        request_id: &str,
+        owner: &ApprovalOwner,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError>;
 }
 

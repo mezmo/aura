@@ -53,7 +53,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::task::{JoinError, spawn_blocking};
 
-use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
+use crate::hitl::{ApprovalDecision, ApprovalOwner, DecisionId, ParkedApproval, ResolveError};
 
 use super::{ApprovalStore, DecisionRecord, ParkedApprovalRecord, SessionStoreError};
 
@@ -259,7 +259,7 @@ impl Inner {
 
     fn cancel_request_sync(
         &self,
-        request_id: &str,
+        owner: &ApprovalOwner,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
         let _guard = self.lock();
         let entries = match fs::read_dir(self.approvals_dir()) {
@@ -294,7 +294,7 @@ impl Inner {
                     continue;
                 }
             };
-            if parked.request.request_id != request_id {
+            if parked.request.owner != *owner {
                 continue;
             }
             // resolve writes the decision before its best-effort approval
@@ -385,11 +385,11 @@ impl ApprovalStore for FileApprovalStore {
 
     async fn cancel_request(
         &self,
-        request_id: &str,
+        owner: &ApprovalOwner,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
         let inner = Arc::clone(&self.inner);
-        let request_id = request_id.to_owned();
-        spawn_blocking(move || inner.cancel_request_sync(&request_id))
+        let owner = owner.clone();
+        spawn_blocking(move || inner.cancel_request_sync(&owner))
             .await
             .map_err(join_err)?
     }

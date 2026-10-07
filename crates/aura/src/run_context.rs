@@ -23,12 +23,14 @@ use tokio::sync::mpsc;
 
 use aura_events::ToolCallId;
 
+use crate::domain::RequestId;
+
 /// Events a run may buffer before its observer reads them.
 pub const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 /// One run — what its own work needs to correlate, and where its events go.
 pub struct RunContext {
-    id: Arc<str>,
+    id: RequestId,
     tool_calls: Mutex<VecDeque<ToolCallId>>,
     events: mpsc::Sender<AgentEvent>,
     cancel: CancellationToken,
@@ -39,7 +41,7 @@ const MAX_PENDING_TOOL_CALLS: usize = 256;
 
 impl RunContext {
     /// A run and the receiver its observer reads, on a token of its own.
-    pub fn channel(id: impl Into<Arc<str>>) -> (Arc<Self>, mpsc::Receiver<AgentEvent>) {
+    pub fn channel(id: RequestId) -> (Arc<Self>, mpsc::Receiver<AgentEvent>) {
         Self::channel_on(id, CancellationToken::new())
     }
 
@@ -47,12 +49,12 @@ impl RunContext {
     /// to stop on — a child of its own caller's, so one run ending leaves the
     /// others alone.
     pub fn channel_on(
-        id: impl Into<Arc<str>>,
+        id: RequestId,
         cancel: CancellationToken,
     ) -> (Arc<Self>, mpsc::Receiver<AgentEvent>) {
         let (events, receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let run = Arc::new(Self {
-            id: id.into(),
+            id,
             tool_calls: Mutex::new(VecDeque::new()),
             events,
             cancel,
@@ -64,7 +66,7 @@ impl RunContext {
     /// reading what it emits. Production names a run it can reach an observer
     /// through, or names none.
     #[cfg(test)]
-    pub fn detached(id: impl Into<Arc<str>>) -> Arc<Self> {
+    pub fn detached(id: RequestId) -> Arc<Self> {
         Self::channel(id).0
     }
 
@@ -84,7 +86,7 @@ impl RunContext {
         delivered
     }
 
-    pub fn id(&self) -> &Arc<str> {
+    pub fn id(&self) -> &RequestId {
         &self.id
     }
 
@@ -190,8 +192,8 @@ pub fn current_run() -> Option<Arc<RunContext>> {
     RUN.try_with(Arc::clone).ok()
 }
 
-pub fn current_run_id() -> Option<Arc<str>> {
-    RUN.try_with(|run| Arc::clone(run.id())).ok()
+pub fn current_run_id() -> Option<RequestId> {
+    RUN.try_with(|run| run.id().clone()).ok()
 }
 
 /// Runs `f` with `run` in scope. Task-locals do not cross `tokio::spawn`, so
@@ -226,7 +228,7 @@ impl<S: Stream + Unpin> Stream for ScopedStream<S> {
 /// Runs `f` with a fresh run in scope and returns what it emitted, for a test
 /// that asserts on a run's events without standing up an observer.
 #[cfg(test)]
-pub(crate) async fn observing<F: Future>(id: &str, f: F) -> (F::Output, Vec<AgentEvent>) {
+pub(crate) async fn observing<F: Future>(id: RequestId, f: F) -> (F::Output, Vec<AgentEvent>) {
     let (run, mut events) = RunContext::channel(id);
     let out = with_run(run, f).await;
 
@@ -242,17 +244,18 @@ mod tests {
     use super::*;
     use futures::StreamExt;
 
-    fn run(id: &str) -> Arc<RunContext> {
-        RunContext::detached(id)
+    fn run() -> Arc<RunContext> {
+        RunContext::detached(RequestId::generate())
     }
 
     #[tokio::test]
     async fn a_scope_established_inside_a_spawn_holds() {
-        let (run, _rx) = RunContext::channel("spawned");
+        let id = RequestId::generate();
+        let (run, _rx) = RunContext::channel(id.clone());
         let seen = tokio::spawn(with_run(run, async { current_run_id() }))
             .await
             .unwrap();
-        assert_eq!(seen.as_deref(), Some("spawned"));
+        assert_eq!(seen, Some(id));
     }
 
     /// A run built on the caller's token stops when the caller does. The work
@@ -262,7 +265,7 @@ mod tests {
     #[tokio::test]
     async fn a_run_stops_on_the_token_it_was_built_on() {
         let caller = CancellationToken::new();
-        let (run, _events) = RunContext::channel_on("run_on_token", caller.clone());
+        let (run, _events) = RunContext::channel_on(RequestId::generate(), caller.clone());
         assert!(!run.cancel_token().is_cancelled());
 
         caller.cancel();
@@ -273,8 +276,8 @@ mod tests {
     /// cancels something else.
     #[tokio::test]
     async fn a_run_given_no_token_has_its_own() {
-        let (a, _ea) = RunContext::channel("run_a");
-        let (b, _eb) = RunContext::channel("run_b");
+        let (a, _ea) = RunContext::channel(RequestId::generate());
+        let (b, _eb) = RunContext::channel(RequestId::generate());
 
         a.cancel_token().cancel();
         assert!(a.cancel_token().is_cancelled());
@@ -292,34 +295,37 @@ mod tests {
 
     #[tokio::test]
     async fn a_scope_supplies_the_run() {
-        let seen = with_run(run("run_1"), async { current_run_id() }).await;
-        assert_eq!(seen.as_deref(), Some("run_1"));
+        let run = run();
+        let id = run.id().clone();
+        let seen = with_run(run, async { current_run_id() }).await;
+        assert_eq!(seen, Some(id));
     }
 
     #[tokio::test]
     async fn concurrent_runs_do_not_see_each_other() {
-        let a = tokio::spawn(with_run(run("run_a"), async {
+        let (run_a, run_b) = (run(), run());
+        let (id_a, id_b) = (run_a.id().clone(), run_b.id().clone());
+        let a = tokio::spawn(with_run(run_a, async {
             tokio::task::yield_now().await;
             current_run_id()
         }));
-        let b = tokio::spawn(with_run(run("run_b"), async {
+        let b = tokio::spawn(with_run(run_b, async {
             tokio::task::yield_now().await;
             current_run_id()
         }));
 
-        assert_eq!(a.await.unwrap().as_deref(), Some("run_a"));
-        assert_eq!(b.await.unwrap().as_deref(), Some("run_b"));
+        assert_eq!(a.await.unwrap(), Some(id_a));
+        assert_eq!(b.await.unwrap(), Some(id_b));
     }
 
     #[tokio::test]
     async fn a_scoped_stream_carries_the_run_into_each_poll() {
+        let run = run();
+        let id = run.id().clone();
         let inner = futures::stream::iter(0..3).map(|_| current_run_id());
-        let seen: Vec<_> = scope_stream(run("run_s"), inner).collect().await;
+        let seen: Vec<_> = scope_stream(run, inner).collect().await;
 
-        assert_eq!(
-            seen.iter().map(|id| id.as_deref()).collect::<Vec<_>>(),
-            vec![Some("run_s"); 3]
-        );
+        assert_eq!(seen, vec![Some(id); 3]);
     }
 
     /// Orchestration drives workers with `FuturesUnordered` inside the run's
@@ -329,7 +335,9 @@ mod tests {
     async fn workers_driven_as_futures_keep_the_run() {
         use futures::stream::FuturesUnordered;
 
-        let seen = with_run(run("run_w"), async {
+        let run = run();
+        let id = run.id().clone();
+        let seen = with_run(run, async {
             let mut workers: FuturesUnordered<_> = (0..3)
                 .map(|_| async {
                     tokio::task::yield_now().await;
@@ -345,17 +353,14 @@ mod tests {
         })
         .await;
 
-        assert_eq!(
-            seen.iter().map(|id| id.as_deref()).collect::<Vec<_>>(),
-            vec![Some("run_w"); 3]
-        );
+        assert_eq!(seen, vec![Some(id); 3]);
     }
 
     /// A spawned task does not inherit its parent's scope, which is why every
     /// orchestration worker establishes its own.
     #[tokio::test]
     async fn a_spawned_task_does_not_inherit_the_scope() {
-        let seen = with_run(run("run_p"), async {
+        let seen = with_run(run(), async {
             tokio::spawn(async { current_run_id() }).await.unwrap()
         })
         .await;
@@ -365,7 +370,7 @@ mod tests {
 
     #[test]
     fn a_run_with_no_calls_in_flight_has_nothing_to_report() {
-        let run = run("run_empty");
+        let run = run();
         assert_eq!(run.peek_tool_call(), None);
         assert_eq!(run.pop_tool_call(), None);
     }
@@ -374,7 +379,7 @@ mod tests {
     /// matches the order the calls were announced.
     #[test]
     fn tool_calls_come_back_in_the_order_they_were_pushed() {
-        let run = run("run_fifo");
+        let run = run();
         run.push_tool_call("call_1");
         run.push_tool_call("call_2");
 
@@ -391,8 +396,8 @@ mod tests {
 
     #[test]
     fn one_runs_calls_are_invisible_to_another() {
-        let a = run("run_a");
-        let b = run("run_b");
+        let a = run();
+        let b = run();
         a.push_tool_call("call_a");
 
         assert_eq!(b.peek_tool_call(), None);
@@ -403,7 +408,7 @@ mod tests {
     /// one, so a call recorded inside the scope has to be the same run's.
     #[tokio::test]
     async fn a_call_recorded_in_scope_is_visible_to_the_run() {
-        let run = run("run_hook");
+        let run = run();
 
         with_run(Arc::clone(&run), async {
             current_run()
@@ -422,7 +427,7 @@ mod tests {
     /// The order holds across a longer run, not only a pair.
     #[test]
     fn a_long_sequence_keeps_its_order() {
-        let run = run("run_many");
+        let run = run();
         for i in 0..64 {
             run.push_tool_call(format!("call_{i}"));
         }

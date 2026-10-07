@@ -38,12 +38,13 @@ mod signing;
 mod tool;
 
 pub use decision::{
-    AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, AwaitingDecision, CancelReason,
-    DecisionId, Timestamp,
+    AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, ApprovalOwner, AwaitingDecision,
+    CancelReason, DecisionId, Timestamp,
 };
 pub(crate) use events::completed_cancelled_event;
 pub use gate::HitlApprovalWrapper;
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
+pub(crate) use registry::SweepApprovalsOnDrop;
 pub use registry::{ParkedApproval, PendingApprovals, ResolveError};
 pub use route::{
     ApprovalError, DecisionRoute, HitlRuntime, PlaintextWebhookUrlError, WebhookClient,
@@ -54,3 +55,14 @@ pub use signing::{
     Tolerance, VerificationError, VerifiedBody, WebhookHmac, authorize_ingress,
 };
 pub use tool::{RequestApprovalArgs, RequestApprovalTool};
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::ApprovalOwner;
+    use crate::domain::RequestId;
+
+    /// The same label always names the same owner.
+    pub(crate) fn owner(label: &str) -> ApprovalOwner {
+        ApprovalOwner::Request(RequestId::for_a2a_task(label))
+    }
+}

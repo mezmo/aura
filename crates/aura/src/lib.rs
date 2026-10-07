@@ -9,6 +9,7 @@ pub mod approver_headers;
 pub mod bedrock_embedding;
 pub mod builder;
 pub mod config;
+pub mod domain;
 pub mod env_flags;
 pub mod error;
 pub mod fallback_tool_parser;
@@ -96,16 +97,17 @@ pub type AuraToolCall = provider_agent::ToolCall;
 pub type AuraToolResult = provider_agent::ToolResult;
 
 pub use aura_events::{TokenUsage, ToolCallId, ToolName};
+pub use domain::RequestId;
 pub use mcp::{InFlightRequests, McpManager, ProgressEnabledHandler};
 pub use rag_tools::{AutoIngest, VectorIngestTool};
-pub use request_cancellation::{RequestCancelToken, RequestId};
+pub use request_cancellation::RequestCancelToken;
 pub use rmcp::model::{NumberOrString, ProgressToken};
 pub use skill_tool::{LoadSkillTool, ReadSkillFileTool, SkillToolset, render_skill_catalog};
 pub use stream_events::{
     AgentContext, AuraStreamEvent, CorrelationContext, CorrelationContextExt, WorkerPhase,
     format_named_sse,
 };
-pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};
+pub use streaming_request_hook::{ResponseContent, StreamKey, StreamingRequestHook, UsageState};
 pub use tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent, ToolOutcome};
 pub use tool_error_detection::{DetectedToolError, ToolResultStatus, detect_tool_error};
 pub use tool_wrapper::{

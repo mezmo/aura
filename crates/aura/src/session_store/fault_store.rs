@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 
 use super::{ApprovalStore, InMemoryApprovalStore, SessionStoreError};
-use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
+use crate::hitl::{ApprovalDecision, ApprovalOwner, DecisionId, ParkedApproval, ResolveError};
 
 /// Delegates to an in-memory store; each `fail_*` flag makes that operation
 /// answer `SessionStoreError::Request` (the `*_once` flag fires one time).
@@ -73,8 +73,8 @@ impl ApprovalStore for FaultInjectingStore {
 
     async fn cancel_request(
         &self,
-        request_id: &str,
+        owner: &ApprovalOwner,
     ) -> Result<Vec<ParkedApproval>, SessionStoreError> {
-        self.inner.cancel_request(request_id).await
+        self.inner.cancel_request(owner).await
     }
 }

@@ -257,6 +257,14 @@ async fn webhook_round_trip<T>(
 }
 
 impl DecisionRoute {
+    /// The registry approvals park in, which only the conversational route has.
+    pub(crate) fn registry(&self) -> Option<&PendingApprovals> {
+        match self {
+            Self::Conversational { registry, .. } => Some(registry),
+            Self::Webhook { .. } => None,
+        }
+    }
+
     /// Obtain a decision for a config-gated call, carrying any captured
     /// approver header overrides on the approved arm.
     ///
@@ -758,13 +766,14 @@ mod tests {
     use serde_json::json;
 
     use super::super::decision::{
-        AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, DecisionId,
+        AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, ApprovalOwner, DecisionId,
     };
     use super::super::protocol::{
         ApprovalDecisionWire, ApprovalItem, ApprovalRequest, ApprovalRequestWire, PROTOCOL_VERSION,
     };
     use super::super::registry::PendingApprovals;
     use super::DecisionRoute;
+    use crate::hitl::test_support::owner;
     use std::time::Duration;
 
     fn conv_route(timeout: Duration) -> (PendingApprovals, DecisionRoute) {
@@ -776,12 +785,12 @@ mod tests {
         (registry, route)
     }
 
-    fn single_request(request_id: &str, origin: ApprovalOrigin) -> ApprovalRequest {
+    fn single_request(owner: ApprovalOwner, origin: ApprovalOrigin) -> ApprovalRequest {
         ApprovalRequest {
             version: PROTOCOL_VERSION,
             instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
-            request_id: request_id.into(),
+            owner,
             scope: AgentScope::Single { session_id: None },
             origin,
             items: vec![],
@@ -794,7 +803,7 @@ mod tests {
             version: PROTOCOL_VERSION,
             instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
-            request_id: "req-123".to_string(),
+            owner: owner("req-123"),
             scope: AgentScope::Single { session_id: None },
             origin: ApprovalOrigin::ConfigGate {
                 matched_pattern: "shell*".to_string(),
@@ -812,7 +821,7 @@ mod tests {
             serde_json::to_value(ApprovalRequestWire::from(&request)).expect("serializable");
 
         assert_eq!(value["version"], PROTOCOL_VERSION);
-        assert_eq!(value["request_id"], "req-123");
+        assert_eq!(value["request_id"], request.owner.to_string());
         assert!(value["decision_id"].is_string());
         assert!(value["instance_id"].is_string());
         // scope/origin are flat, `kind`-tagged DTOs: no Rust variant names leak.
@@ -863,7 +872,7 @@ mod tests {
             version: PROTOCOL_VERSION,
             instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
-            request_id: "req-9".to_string(),
+            owner: owner("req-9"),
             scope: AgentScope::Worker {
                 run_id,
                 task: crate::orchestration::TaskIdentity::new(2, Some("k8s-agent".to_string())),
@@ -880,7 +889,7 @@ mod tests {
             serde_json::to_value(ApprovalRequestWire::from(&request)).expect("serializable");
 
         assert_eq!(value["scope"]["kind"], "worker");
-        assert_eq!(value["request_id"], "req-9");
+        assert_eq!(value["request_id"], request.owner.to_string());
         assert_eq!(value["scope"]["task_id"], 2);
         assert_eq!(value["scope"]["worker"], "k8s-agent");
         assert_eq!(value["scope"]["session_id"], "sess-abc");
@@ -900,7 +909,7 @@ mod tests {
             version: PROTOCOL_VERSION,
             instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
-            request_id: "req-cg-intent".to_string(),
+            owner: owner("req-cg-intent"),
             scope: AgentScope::Single { session_id: None },
             origin: ApprovalOrigin::ConfigGate {
                 matched_pattern: "kubectl_*".to_string(),
@@ -929,7 +938,7 @@ mod tests {
             version: PROTOCOL_VERSION,
             instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
-            request_id: "req-ar-none".to_string(),
+            owner: owner("req-ar-none"),
             scope: AgentScope::Single { session_id: None },
             origin: ApprovalOrigin::AgentRequested {
                 reason: "touches prod".to_string(),
@@ -958,7 +967,7 @@ mod tests {
             version: PROTOCOL_VERSION,
             instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
-            request_id: "req-ar-intent".to_string(),
+            owner: owner("req-ar-intent"),
             scope: AgentScope::Single { session_id: None },
             origin: ApprovalOrigin::AgentRequested {
                 reason: "touches prod".to_string(),
@@ -1013,7 +1022,7 @@ mod tests {
     async fn conversational_decide_approved() {
         let (registry, route) = conv_route(Duration::from_secs(60));
         let request = single_request(
-            "conv-req-1",
+            owner("conv-req-1"),
             ApprovalOrigin::AgentRequested {
                 reason: "test".into(),
                 agent_name: "test-agent".to_string(),
@@ -1050,7 +1059,7 @@ mod tests {
     async fn conversational_decide_denied() {
         let (registry, route) = conv_route(Duration::from_secs(60));
         let request = single_request(
-            "conv-req-2",
+            owner("conv-req-2"),
             ApprovalOrigin::ConfigGate {
                 matched_pattern: "rm_*".into(),
                 agent_name: "test-agent".to_string(),
@@ -1096,7 +1105,7 @@ mod tests {
 
         let (registry, route) = conv_route(Duration::from_secs(5));
         let request = single_request(
-            "conv-req-3",
+            owner("conv-req-3"),
             ApprovalOrigin::AgentRequested {
                 reason: "test".into(),
                 agent_name: "test-agent".to_string(),
@@ -1161,7 +1170,7 @@ mod tests {
             timeout: Duration::from_secs(2),
         };
         let request = single_request(
-            "conv-req-backstop",
+            owner("conv-req-backstop"),
             ApprovalOrigin::AgentRequested {
                 reason: "test".into(),
                 agent_name: "test-agent".to_string(),
@@ -1195,7 +1204,7 @@ mod tests {
     async fn conversational_decide_cancelled_on_disconnect() {
         let (_, route) = conv_route(Duration::from_secs(60));
         let request = single_request(
-            "conv-req-4",
+            owner("conv-req-4"),
             ApprovalOrigin::AgentRequested {
                 reason: "test".into(),
                 agent_name: "test-agent".to_string(),
@@ -1221,12 +1230,12 @@ mod tests {
 
     #[tokio::test]
     async fn conversational_resolve_at_requested_event_succeeds() {
-        let request_id = format!("req_test_{}", uuid::Uuid::new_v4().simple());
-        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.as_str());
+        let request_id = crate::domain::RequestId::generate();
+        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.clone());
 
         let (registry, route) = conv_route(Duration::from_secs(60));
         let request = single_request(
-            &request_id,
+            ApprovalOwner::Request(request_id.clone()),
             ApprovalOrigin::ConfigGate {
                 matched_pattern: "dangerous_*".into(),
                 agent_name: "test-agent".to_string(),
@@ -1302,7 +1311,7 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 instance_id: "test-instance".to_string(),
                 decision_id,
-                request_id: "req-signed".into(),
+                owner: crate::hitl::ApprovalOwner::Request(crate::domain::RequestId::generate()),
                 scope: AgentScope::Single { session_id: None },
                 origin: ApprovalOrigin::ConfigGate {
                     matched_pattern: "dangerous_*".into(),
@@ -2219,8 +2228,8 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_route_emits_requested_and_completed_on_channel_error() {
-        let request_id = format!("req_test_{}", uuid::Uuid::new_v4().simple());
-        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.as_str());
+        let request_id = crate::domain::RequestId::generate();
+        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.clone());
         let route = super::DecisionRoute::Webhook {
             client: super::WebhookClient::new(
                 super::build_webhook_client(),
@@ -2232,7 +2241,7 @@ mod tests {
             version: PROTOCOL_VERSION,
             instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
-            request_id: request_id.clone(),
+            owner: ApprovalOwner::Request(request_id.clone()),
             scope: AgentScope::Single { session_id: None },
             origin: ApprovalOrigin::ConfigGate {
                 matched_pattern: "dangerous_*".into(),
@@ -2582,7 +2591,7 @@ mod tests {
             version: PROTOCOL_VERSION,
             instance_id: "test-instance".to_string(),
             decision_id: DecisionId::generate(),
-            request_id: "hdr-test".into(),
+            owner: owner("hdr-test"),
             scope: AgentScope::Single { session_id: None },
             origin: ApprovalOrigin::ConfigGate {
                 matched_pattern: "dangerous_*".into(),

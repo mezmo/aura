@@ -13,7 +13,10 @@ use rig::tool::{Tool, ToolError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::decision::{AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, DecisionId};
+use super::decision::{
+    AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, DecisionId,
+    live_approval_context,
+};
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 use super::route::{ApprovalError, DecisionRoute};
 
@@ -26,7 +29,6 @@ use super::route::{ApprovalError, DecisionRoute};
 pub struct RequestApprovalTool {
     route: Arc<DecisionRoute>,
     scope: AgentScope,
-    request_id: String,
     run: Arc<crate::run_context::BoundRun>,
     agent_name: String,
     /// Instance ID of the AURA process that built this tool.
@@ -38,14 +40,12 @@ impl RequestApprovalTool {
     pub fn new(
         route: Arc<DecisionRoute>,
         scope: AgentScope,
-        request_id: String,
         agent_name: String,
         instance_id: String,
     ) -> Self {
         Self {
             route,
             scope,
-            request_id,
             // A worker's tool is built inside its run; a single agent's is built
             // before one exists and is bound by `stream`.
             run: Arc::new(crate::run_context::BoundRun::captured()),
@@ -160,11 +160,13 @@ impl Tool for RequestApprovalTool {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         // Blank reasoning collapses to absent, consistent with the config_gate path.
         let tool_call_intent = normalize_tool_call_intent(args.tool_call_intent.as_deref());
+        let run = self.run();
+        let (owner, cancel) = live_approval_context(run.as_deref());
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
             instance_id: self.instance_id.clone(),
             decision_id: DecisionId::generate(),
-            request_id: self.request_id.clone(),
+            owner,
             scope: self.scope.clone(),
             origin: ApprovalOrigin::AgentRequested {
                 reason: args.risk_rationale.clone(),
@@ -177,13 +179,6 @@ impl Tool for RequestApprovalTool {
                 tool_call_intent,
             }],
         };
-        let run = self.run();
-        let cancel = run
-            .as_ref()
-            .map(|run| {
-                crate::request_cancellation::RequestCancelToken::from(run.cancel_token().clone())
-            })
-            .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
         // `DecisionRoute` emits the lifecycle itself; the scope is how those
         // events find the run, since rig calls this off it.
         let decided = match run {
@@ -333,17 +328,16 @@ mod tests {
         route: &Arc<DecisionRoute>,
         args: RequestApprovalArgs,
     ) -> ApprovalItem {
-        let request_id = format!("req_w2_{}", uuid::Uuid::new_v4().simple());
+        let request_id = crate::domain::RequestId::generate();
         let tool = RequestApprovalTool::new(
             route.clone(),
             AgentScope::Single { session_id: None },
-            request_id.clone(),
             "test-agent".to_string(),
             "test-instance-id".to_string(),
         );
 
         // The scope goes inside the spawn, because task-locals do not cross one.
-        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.as_str());
+        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.clone());
         let call_handle: tokio::task::JoinHandle<Result<String, ToolError>> =
             tokio::spawn(crate::run_context::with_run(run, async move {
                 tool.call(args).await
@@ -499,12 +493,11 @@ mod tests {
                 timeout: std::time::Duration::from_secs(60),
             });
 
-            let request_id = format!("req_tool_span_{}", uuid::Uuid::new_v4().simple());
-            let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+            let request_id = crate::domain::RequestId::generate();
+            let (run, mut events) = crate::run_context::RunContext::channel(request_id.clone());
             let tool = RequestApprovalTool::new(
                 route,
                 AgentScope::Single { session_id: None },
-                request_id.clone(),
                 "test-agent".to_string(),
                 "test-instance-id".to_string(),
             );

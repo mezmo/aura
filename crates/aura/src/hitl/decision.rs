@@ -14,6 +14,7 @@ use tokio::time::Instant;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::domain::RequestId;
 use crate::request_cancellation::RequestCancelToken;
 
 use crate::config::SessionId;
@@ -53,6 +54,57 @@ impl DecisionId {
 impl fmt::Display for DecisionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
+    }
+}
+
+const RUN_OWNER_PREFIX: &str = "run:";
+
+/// The key a parked approval is registered under and swept by.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ApprovalOwner {
+    Request(RequestId),
+    Unowned,
+    Run(RunId),
+}
+
+impl ApprovalOwner {
+    /// Inverse of `Display`, which is also the stored and webhook form.
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s.strip_prefix(RUN_OWNER_PREFIX) {
+            Some(run_id) => run_id.parse().ok().map(Self::Run),
+            None if s.is_empty() => Some(Self::Unowned),
+            None => RequestId::parse(s).map(Self::Request),
+        }
+    }
+}
+
+/// The owner of an approval raised live in `run`, and the token its wait stops
+/// on.
+pub(crate) fn live_approval_context(
+    run: Option<&crate::run_context::RunContext>,
+) -> (ApprovalOwner, RequestCancelToken) {
+    match run {
+        Some(run) => (
+            ApprovalOwner::Request(run.id().clone()),
+            RequestCancelToken::from(run.cancel_token().clone()),
+        ),
+        None => (ApprovalOwner::Unowned, RequestCancelToken::unbound()),
+    }
+}
+
+impl fmt::Display for ApprovalOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Request(request_id) => request_id.fmt(f),
+            Self::Unowned => Ok(()),
+            Self::Run(run_id) => write!(f, "{RUN_OWNER_PREFIX}{run_id}"),
+        }
+    }
+}
+
+impl Serialize for ApprovalOwner {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
     }
 }
 

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aura::{Message, RigBuilder, RunToolFactory, StreamItem, ToolDyn, no_run_tools};
+use aura::{Message, RequestId, RigBuilder, RunToolFactory, StreamItem, ToolDyn, no_run_tools};
 use futures_util::StreamExt;
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{Instrument, debug, error, info, warn};
@@ -264,14 +264,14 @@ impl SlackIngress {
     /// hold the bot turn that earned it. A conversation read here is
     /// checked here.
     async fn answer(&self, inbound: Inbound, prefetched: Option<Vec<SlackMessage>>) {
-        let request_id = format!("slack_{}_{}", inbound.channel, inbound.ts);
+        let request_id = RequestId::for_slack_message(&inbound.channel, &inbound.ts);
         let earlier = match prefetched {
             Some(earlier) => earlier,
             None => {
                 let earlier = match self.earlier_messages(&inbound).await {
                     Ok(earlier) => earlier,
                     Err(e) => {
-                        error!(request_id, error = %e, "could not read slack history");
+                        error!(%request_id, error = %e, "could not read slack history");
                         return;
                     }
                 };
@@ -288,7 +288,7 @@ impl SlackIngress {
             .add_reaction(&inbound.channel, &inbound.ts, ACK_REACTION)
             .await
         {
-            warn!(request_id, error = %e, "could not react to slack message");
+            warn!(%request_id, error = %e, "could not react to slack message");
         }
 
         let reply = match self.run_agent(&inbound, &earlier, &request_id).await {
@@ -298,13 +298,13 @@ impl SlackIngress {
             // tell the user something broke when nothing did.
             Err(RunError::Cancelled) => {
                 warn!(
-                    request_id,
+                    %request_id,
                     "slack-triggered agent run cancelled by shutdown"
                 );
                 return;
             }
             Err(e) => {
-                error!(request_id, error = %e, "slack-triggered agent run failed");
+                error!(%request_id, error = %e, "slack-triggered agent run failed");
                 FAILED_REPLY.to_owned()
             }
         };
@@ -313,7 +313,7 @@ impl SlackIngress {
             .post_message(&inbound.channel, inbound.reply_thread(), &reply)
             .await
         {
-            error!(request_id, error = %e, "could not post slack reply");
+            error!(%request_id, error = %e, "could not post slack reply");
         }
     }
 
@@ -344,7 +344,7 @@ impl SlackIngress {
         &self,
         inbound: &Inbound,
         earlier: &[SlackMessage],
-        request_id: &str,
+        request_id: &RequestId,
     ) -> Result<String, RunError> {
         let history = thread_history(earlier, &self.identity, &inbound.ts);
         let session_id = match inbound.reply_thread() {
@@ -353,19 +353,13 @@ impl SlackIngress {
         };
         let (config, tools) = run_setup(&self.config, &self.api, inbound);
         debug!(
-            request_id,
+            %request_id,
             search = inbound.action_token.is_some(),
             "slack run tools"
         );
         let agent = RigBuilder::new(config, self.state.pending_approvals.clone())
             .with_hitl_hmac(self.state.hitl_webhook_hmac.clone())
-            .build_streaming_agent_with_tools(
-                None,
-                Some(session_id),
-                None,
-                Some(request_id.to_owned()),
-                tools,
-            )
+            .build_streaming_agent_with_tools(None, Some(session_id), None, tools)
             .await
             .map_err(|e| RunError::Build(e.to_string()))?;
 
