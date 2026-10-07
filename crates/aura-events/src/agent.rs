@@ -110,6 +110,17 @@ pub enum AgentEventPayload {
         message: Option<String>,
     },
 
+    /// One member's answer in an `ask_agent` batch.
+    RemoteAgentAnswer {
+        /// Configured name of the answering remote.
+        remote: String,
+        success: bool,
+        /// The answer's section text (answer body plus its trailer).
+        text: String,
+        /// Wall-clock time from the batch's start to this answer.
+        elapsed_ms: u64,
+    },
+
     WorkerPhase {
         phase: WorkerPhase,
         /// Plan-relative: unique within its iteration, not across a run.

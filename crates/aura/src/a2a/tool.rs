@@ -657,6 +657,32 @@ impl RemoteAgentTool {
         }
     }
 
+    /// Publish one batch member's section as it lands, so a client can show
+    /// one agent's report while the rest of the batch is still running.
+    async fn announce_agent_answer(
+        &self,
+        remote: &RemoteAgent,
+        result: &Result<String, ToolError>,
+        elapsed: Duration,
+    ) {
+        let Some(run) = self.event_run() else {
+            return;
+        };
+        let (success, text) = match result {
+            Ok(text) => (true, text.clone()),
+            Err(e) => (false, e.to_string()),
+        };
+        run.emit(AgentEvent::single_agent(
+            AgentEventPayload::RemoteAgentAnswer {
+                remote: remote.name.clone(),
+                success,
+                text,
+                elapsed_ms: elapsed.as_millis() as u64,
+            },
+        ))
+        .await;
+    }
+
     fn cancel_token(&self) -> RequestCancelToken {
         self.run
             .get()
@@ -790,6 +816,7 @@ impl RigTool for RemoteAgentTool {
             // N. A batch where every agent failed is a failed call; one with
             // any answer carries each failure as its own section.
             let cancel = self.cancel_token();
+            let started = std::time::Instant::now();
             let mut in_flight: futures::stream::FuturesUnordered<_> = resolved
                 .iter()
                 .enumerate()
@@ -806,8 +833,15 @@ impl RigTool for RemoteAgentTool {
                 .collect();
             let mut sections: Vec<Option<Result<String, ToolError>>> =
                 (0..resolved.len()).map(|_| None).collect();
-            // Sections assemble in request order, whatever order they land in.
+            // Sections assemble in request order, but each answer publishes
+            // as it lands so a client can show one agent's report while the
+            // rest of the batch is still running.
+            let multi = resolved.len() > 1;
             while let Some((idx, result)) = futures::StreamExt::next(&mut in_flight).await {
+                if multi {
+                    self.announce_agent_answer(resolved[idx].0, &result, started.elapsed())
+                        .await;
+                }
                 sections[idx] = Some(result);
             }
             let sections: Vec<Result<String, ToolError>> = sections
@@ -829,7 +863,6 @@ impl RigTool for RemoteAgentTool {
                     "all {count} remote agent calls failed: {details}"
                 )));
             }
-            let multi = resolved.len() > 1;
             // A batch reads as one report per agent under a heading naming
             // it; a single agent's answer needs no heading.
             Ok(sections
@@ -1116,6 +1149,63 @@ mod tests {
         assert!(out.contains("## stage"), "{out}");
         assert!(out.contains("remote agent \"stage\":"), "{out}");
         assert!(out.contains("HTTP 503"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn batch_answers_publish_as_they_land_in_completion_order() {
+        let fast = completing_server(1).await;
+        let slow = completing_server(4).await;
+        let (run, mut events) = RunContext::channel("req-batch");
+        let tool = RemoteAgentTool::new(
+            vec![remote("dev", &slow, None), remote("stage", &fast, None)],
+            Arc::new(BoundRun::holding(run)),
+        );
+
+        let out = tool
+            .call(json!({ "calls": [
+                { "agent": "dev", "prompt": "sweep" },
+                { "agent": "stage", "prompt": "pods" }
+            ]}))
+            .await
+            .unwrap();
+        assert!(out.contains("## dev") && out.contains("## stage"), "{out}");
+
+        // The fast remote's event lands first even though it was requested second.
+        let first = events.recv().await.expect("stage answer event");
+        let AgentEventPayload::RemoteAgentAnswer {
+            remote,
+            success,
+            text,
+            ..
+        } = &first.payload
+        else {
+            panic!("expected an AgentAnswer, got {first:?}");
+        };
+        assert_eq!(remote, "stage");
+        assert!(success);
+        assert!(text.contains("42 is the answer"), "{text}");
+        let second = events.recv().await.expect("dev answer event");
+        let AgentEventPayload::RemoteAgentAnswer { remote, .. } = &second.payload else {
+            panic!("expected an AgentAnswer, got {second:?}");
+        };
+        assert_eq!(remote, "dev");
+    }
+
+    #[tokio::test]
+    async fn a_single_call_publishes_no_answer_event() {
+        let server = completing_server(1).await;
+        let (run, mut events) = RunContext::channel("req-single");
+        let tool = RemoteAgentTool::new(
+            vec![remote("dev", &server, None)],
+            Arc::new(BoundRun::holding(run)),
+        );
+        tool.call(json!({ "agent": "dev", "prompt": "x" }))
+            .await
+            .unwrap();
+        assert!(
+            events.try_recv().is_err(),
+            "a lone call answers immediately; no mid-batch event"
+        );
     }
 
     #[tokio::test]
