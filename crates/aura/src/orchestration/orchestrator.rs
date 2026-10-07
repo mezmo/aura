@@ -2598,9 +2598,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 tools_matching_filter(&all_tools, worker_config.mcp_filter.as_deref(), base_filter);
 
             // `ask_agent` is opt-in per worker, exactly when `create_worker`
-            // will build one for it.
+            // will build one for it. It leads the list because the planner
+            // views cut at `max_tools_per_worker`, and it is the planner's
+            // only sign that this worker can delegate to a remote.
             if self.worker_remote_agents(worker_config).is_some() {
-                matching_tools.push(crate::a2a::ASK_AGENT_TOOL_NAME.to_string());
+                matching_tools.insert(0, crate::a2a::ASK_AGENT_TOOL_NAME.to_string());
             }
 
             // Add vector store tools based on explicit vector_stores assignment
@@ -7823,6 +7825,66 @@ mod tests {
                 .build_workers_section_with_tools()
                 .contains("Tools: run_marker")
         );
+    }
+
+    /// A worker whose MCP tools exceed `max_tools_per_worker` still shows the
+    /// planner its `ask_agent`, in both planning views.
+    #[tokio::test]
+    async fn ask_agent_survives_the_planner_tool_cap() {
+        let mut manager = McpManager::with_sanitization(false);
+        manager.stdio_tools.insert(
+            "ops".to_owned(),
+            ["list_pods", "get_logs"]
+                .into_iter()
+                .map(|name| {
+                    crate::mcp::AuraTool::new(
+                        rmcp::model::Tool::new(
+                            name.to_owned(),
+                            "an ops tool".to_owned(),
+                            Arc::new(serde_json::Map::new()),
+                        ),
+                        "ops",
+                    )
+                })
+                .collect(),
+        );
+
+        let mut orchestrator = Orchestrator::new(AgentRuntimeConfig::default())
+            .await
+            .unwrap();
+        orchestrator.mcp_manager = Some(Arc::new(manager));
+        orchestrator.agent_config.a2a = Some(
+            toml::from_str(
+                r#"
+                [remote.k8s_ops]
+                url = "http://k8s:8080"
+                description = "Kubernetes operations"
+                "#,
+            )
+            .unwrap(),
+        );
+        orchestrator.config.max_tools_per_worker = 2;
+        let worker: aura_config::WorkerConfig = serde_json::from_value(serde_json::json!({
+            "description": "operates clusters",
+            "preamble": "You operate clusters.",
+            "remotes": ["k8s_ops"]
+        }))
+        .unwrap();
+        orchestrator
+            .config
+            .workers
+            .insert("operator".to_owned(), worker);
+
+        assert_eq!(
+            orchestrator.resolve_worker_tools()["operator"][0],
+            crate::a2a::ASK_AGENT_TOOL_NAME
+        );
+        let compact = orchestrator.build_workers_section_with_tools();
+        assert!(compact.contains("Tools: ask_agent, "), "{compact}");
+        assert!(compact.contains("(+1 more)"), "{compact}");
+        let full = orchestrator.build_workers_section_with_full_tools();
+        assert!(full.contains("  - ask_agent: "), "{full}");
+        assert!(full.contains("k8s_ops"), "{full}");
     }
 
     #[tokio::test]
