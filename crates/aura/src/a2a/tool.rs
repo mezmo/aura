@@ -31,10 +31,6 @@ const MAX_TRANSIENT_POLL_FAILURES: u32 = 2;
 /// Most agents one `ask_agent` call may fan out to in parallel.
 const MAX_BATCH_CALLS: usize = 8;
 
-/// Result prefix the tool-error detector recognizes; shared with MCP tool
-/// errors so a failed remote task lights up the same span status.
-const TOOL_ERROR_PREFIX: &str = "Tool returned an error: ";
-
 /// One configured remote plus the polling budget for calls to it.
 pub struct RemoteAgent {
     pub name: String,
@@ -186,9 +182,9 @@ impl RemoteAgent {
             ))
         };
 
-        let result = tokio::select! {
+        let outcome = tokio::select! {
             finished = tokio::time::timeout(self.timeout, run) => match finished {
-                Ok(outcome) => outcome.map(|o| o.render()),
+                Ok(outcome) => outcome,
                 Err(_elapsed) => Err(call_error(format!(
                     "remote agent {:?} did not finish within {}s",
                     self.name,
@@ -198,7 +194,9 @@ impl RemoteAgent {
             _ = cancel.cancelled() => Err(call_error("Request cancelled")),
         };
 
-        if result.is_err() {
+        // Whether this side gave up decides the remote task's fate; a task
+        // the remote itself failed is already over and needs no cancel.
+        if outcome.is_err() {
             if open.task_id().is_none() && !send_consumed.load(Ordering::SeqCst) {
                 tracing::debug!(
                     remote = %self.name,
@@ -213,14 +211,15 @@ impl RemoteAgent {
             }
         } else {
             // Settling suppresses the guard's Drop-cancel. That is only safe
-            // on success: a direct message opened no task, and a settled or
-            // input-waiting task stays on the remote on purpose. On an error
+            // once the remote has answered: a direct message opened no task,
+            // and a settled or input-waiting task stays on the remote on
+            // purpose. On an error
             // path the slot is empty or was already taken for the inline
             // abandon — unless the send is still in flight, in which case
             // the guard must cancel the task the send goes on to record.
             open.settle();
         }
-        result
+        outcome.and_then(AskAgentOutcome::render)
     }
 
     fn remote_error(&self, error: A2aClientError) -> ToolError {
@@ -441,12 +440,13 @@ impl AskAgentOutcome {
         }
     }
 
-    /// The tool result string: the answer text with a one-line trailer
-    /// carrying the state, task id, and context_id for a usable outcome;
-    /// the tool-error convention for a task that failed, was rejected, or
-    /// was cancelled on the remote. The answer leads because a JSON envelope
-    /// invites the model to relay the envelope rather than the answer.
-    fn render(self) -> String {
+    /// The tool result: the answer text with a one-line trailer carrying the
+    /// state, task id, and context_id for a usable outcome; an error for a
+    /// task that failed, was rejected, or was cancelled on the remote, so a
+    /// batch counts it as a failed member. The answer leads because a JSON
+    /// envelope invites the model to relay the envelope rather than the
+    /// answer.
+    fn render(self) -> Result<String, ToolError> {
         match self.state.as_str() {
             "failed" | "rejected" | "canceled" => {
                 let detail = if self.response.is_empty() {
@@ -454,12 +454,12 @@ impl AskAgentOutcome {
                 } else {
                     self.response
                 };
-                format!(
-                    "{TOOL_ERROR_PREFIX}remote agent {:?} task {} ended in state {}:\n{detail}",
+                Err(call_error(format!(
+                    "remote agent {:?} task {} ended in state {}:\n{detail}",
                     self.agent,
                     self.task_id.as_deref().unwrap_or("?"),
                     self.state,
-                )
+                )))
             }
             _ => {
                 let body = if self.response.is_empty() {
@@ -474,7 +474,7 @@ impl AskAgentOutcome {
                 if let Some(context_id) = &self.context_id {
                     trailer.push_str(&format!(" · context_id {context_id}"));
                 }
-                format!("{body}\n\n---\n{trailer}")
+                Ok(format!("{body}\n\n---\n{trailer}"))
             }
         }
     }
@@ -1284,27 +1284,98 @@ mod tests {
         assert_eq!(server.methods(), ["SendMessage"]);
     }
 
-    #[tokio::test]
-    async fn failed_task_uses_the_tool_error_convention() {
-        let server = LoopbackA2aServer::start(|method, _| match method {
-            "SendMessage" => Ok(json!({ "task": working_task("t9", "c") })),
+    /// A server whose task `id` ends in `state` on the first GetTask, with
+    /// `detail` as its status message.
+    async fn ending_server(
+        id: &'static str,
+        state: &'static str,
+        detail: &'static str,
+    ) -> LoopbackA2aServer {
+        LoopbackA2aServer::start(move |method, _| match method {
+            "SendMessage" => Ok(json!({ "task": working_task(id, "c") })),
             "GetTask" => Ok(json!({
-                "id": "t9", "contextId": "c",
-                "status": { "state": "TASK_STATE_FAILED", "message": {
-                    "messageId": "m", "role": "ROLE_AGENT", "parts": [ { "text": "LLM quota exceeded" } ]
+                "id": id, "contextId": "c",
+                "status": { "state": state, "message": {
+                    "messageId": "m", "role": "ROLE_AGENT", "parts": [ { "text": detail } ]
                 }}
             })),
             other => panic!("unexpected method {other}"),
         })
-        .await;
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_failed_task_is_a_tool_error_and_is_not_cancelled() {
+        let server = ending_server("t9", "TASK_STATE_FAILED", "LLM quota exceeded").await;
         let tool = RemoteAgentTool::new(vec![remote("dev", &server, None)], Arc::default());
-        let out = tool
+        let err = tool
             .call(json!({ "agent": "dev", "prompt": "hi" }))
             .await
-            .unwrap();
+            .unwrap_err();
         assert_eq!(
-            out,
-            "Tool returned an error: remote agent \"dev\" task t9 ended in state failed:\nLLM quota exceeded"
+            err.to_string(),
+            "ToolCallError: remote agent \"dev\" task t9 ended in state failed:\nLLM quota exceeded"
+        );
+        // The remote ended the task itself; there is nothing left to cancel.
+        assert_eq!(server.methods(), ["SendMessage", "GetTask"]);
+    }
+
+    #[tokio::test]
+    async fn a_task_that_failed_in_a_batch_is_a_failed_member() {
+        let up = completing_server(1).await;
+        let failing = ending_server("t9", "TASK_STATE_REJECTED", "not my job").await;
+        let (run, mut events) = RunContext::channel("req-batch-failed");
+        let tool = RemoteAgentTool::new(
+            vec![remote("dev", &up, None), remote("stage", &failing, None)],
+            Arc::new(BoundRun::holding(run)),
+        );
+
+        let out = tool
+            .call(json!({ "calls": [
+                { "agent": "dev", "prompt": "sweep" },
+                { "agent": "stage", "prompt": "sweep" }
+            ]}))
+            .await
+            .unwrap();
+        assert!(out.contains("## stage"), "{out}");
+        assert!(
+            out.contains("ToolCallError: remote agent \"stage\" task t9 ended in state rejected"),
+            "{out}"
+        );
+
+        let mut answers = std::collections::HashMap::new();
+        for _ in 0..2 {
+            let event = events.recv().await.expect("an answer event per member");
+            let AgentEventPayload::RemoteAgentAnswer {
+                remote, success, ..
+            } = event.payload
+            else {
+                panic!("expected a RemoteAgentAnswer, got {event:?}");
+            };
+            answers.insert(remote, success);
+        }
+        assert_eq!(answers.get("dev"), Some(&true));
+        assert_eq!(answers.get("stage"), Some(&false));
+    }
+
+    #[tokio::test]
+    async fn a_batch_whose_tasks_all_failed_is_a_tool_error() {
+        let a = ending_server("t1", "TASK_STATE_FAILED", "quota").await;
+        let b = ending_server("t2", "TASK_STATE_CANCELED", "operator stopped it").await;
+        let tool = RemoteAgentTool::new(
+            vec![remote("dev", &a, None), remote("stage", &b, None)],
+            Arc::default(),
+        );
+        let err = tool
+            .call(json!({ "calls": [
+                { "agent": "dev", "prompt": "x" },
+                { "agent": "stage", "prompt": "x" }
+            ]}))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("all 2 remote agent calls failed"),
+            "{err}"
         );
     }
 
