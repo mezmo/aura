@@ -14,12 +14,16 @@
 //!
 //! ```ignore
 //! use aura::streaming::{RunOptions, StreamingAgent};
-//! use aura::{StreamError, StreamItem};
+//! use aura::{RunId, StreamError, StreamItem};
 //! use futures::StreamExt;
 //!
-//! async fn handle_request(agent: impl StreamingAgent, query: &str) {
+//! // `agent` was built for `run_id` (`AgentRuntimeConfig::run_id`), the one
+//! // id it streams under.
+//! async fn handle_request(agent: impl StreamingAgent, run_id: RunId, query: &str) {
 //!     // The default leaves the run unbounded and lets it mint its own token.
-//!     let run = agent.stream(query, vec![], RunOptions::default(), "req_123").await;
+//!     let run = agent
+//!         .stream(query, vec![], RunOptions::default(), &run_id.to_string())
+//!         .await;
 //!     let mut items = run.into_events();
 //!
 //!     // Process stream items (convert to SSE, etc.)
@@ -37,6 +41,7 @@ use crate::provider_agent::{StreamError, StreamItem, StreamedAssistantContent};
 use crate::run_context::RunContext;
 use crate::streaming_request_hook::UsageState;
 use async_trait::async_trait;
+use aura_events::RunId;
 use futures::stream::BoxStream;
 use rig::completion::Message;
 use std::time::Duration;
@@ -83,6 +88,44 @@ impl RunOptions {
     }
 }
 
+/// Why a run would not stream.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StreamRefused {
+    /// The caller named a different run.
+    #[error("run `{run}` cannot stream under `{requested}`; pass the agent's `run_id()`")]
+    OtherId { run: RunId, requested: String },
+    /// The run has streamed already.
+    #[error("run `{run}` has streamed already; begin a new run to stream again")]
+    AlreadyStreamed { run: RunId },
+}
+
+/// The claim on a run's one stream.
+#[derive(Debug, Default)]
+pub struct StreamClaim {
+    taken: std::sync::atomic::AtomicBool,
+}
+
+impl StreamClaim {
+    /// Claims the stream of run `run` for a caller naming `request_id`.
+    ///
+    /// The id is checked before the claim is taken, so a call naming the wrong
+    /// run leaves the stream to the caller that names it. The id must be the
+    /// run's own string form, the key every request-keyed registry holds, not
+    /// merely the same UUID spelled differently.
+    pub fn claim(&self, run: RunId, request_id: &str) -> Result<(), StreamRefused> {
+        if run.to_string() != request_id {
+            return Err(StreamRefused::OtherId {
+                run,
+                requested: request_id.to_owned(),
+            });
+        }
+        if self.taken.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Err(StreamRefused::AlreadyStreamed { run });
+        }
+        Ok(())
+    }
+}
+
 /// A started run: the events it produces, the token that cancels it, and the
 /// usage it accumulates.
 pub struct AgentRun {
@@ -109,6 +152,16 @@ impl AgentRun {
             cancel,
             usage,
         }
+    }
+
+    /// A run that does nothing, whose stream yields `refused` and ends.
+    pub fn refused(refused: StreamRefused) -> Self {
+        let error: StreamError = Box::new(refused);
+        Self::new(
+            Box::pin(futures::stream::once(async move { Err(error) })),
+            CancellationToken::new(),
+            UsageState::new(),
+        )
     }
 
     /// Hands the run's events to its observer. A run whose producers emit
@@ -277,14 +330,18 @@ pub trait StreamingAgent: Send + Sync {
     /// needs to know the concrete agent type.
     fn get_provider_info(&self) -> (&str, &str);
 
+    /// The run this agent streams.
+    fn run_id(&self) -> RunId;
+
     /// Start a run.
     ///
     /// `options` bounds the run and may hand it a token the caller already
     /// holds. The returned handle owns the events, the token that cancels them,
     /// and the usage they accumulate.
     ///
-    /// The run streams under the id its agent was built for, which a caller
-    /// passes back as `request_id`; a different value is logged, not adopted.
+    /// `request_id` names the run: [`run_id`](Self::run_id), as a string. A
+    /// run streams once, and only under that id; any other call returns a run
+    /// whose stream yields one [`StreamRefused`] and does nothing.
     async fn stream(
         &self,
         query: &str,
@@ -338,6 +395,83 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use std::sync::Arc;
+
+    fn run(name: &str) -> RunId {
+        crate::run_context::named_run_id(name)
+    }
+
+    #[test]
+    fn the_first_claim_naming_the_run_streams() {
+        let claim = StreamClaim::default();
+        assert_eq!(claim.claim(run("a"), &run("a").to_string()), Ok(()));
+    }
+
+    #[test]
+    fn a_second_claim_is_refused() {
+        let claim = StreamClaim::default();
+        let id = run("a").to_string();
+        claim.claim(run("a"), &id).unwrap();
+
+        assert_eq!(
+            claim.claim(run("a"), &id),
+            Err(StreamRefused::AlreadyStreamed { run: run("a") })
+        );
+    }
+
+    /// A call naming the wrong run is refused without taking the stream, so
+    /// the caller that names the run still gets it.
+    #[test]
+    fn a_claim_naming_another_run_leaves_the_stream_untaken() {
+        let claim = StreamClaim::default();
+
+        assert_eq!(
+            claim.claim(run("a"), "req_123"),
+            Err(StreamRefused::OtherId {
+                run: run("a"),
+                requested: "req_123".to_owned(),
+            })
+        );
+        assert_eq!(claim.claim(run("a"), &run("a").to_string()), Ok(()));
+    }
+
+    /// The same UUID spelled another way is not the key the run's registries
+    /// hold, so it is refused too.
+    #[test]
+    fn the_run_id_must_be_spelled_as_the_run_spells_it() {
+        let claim = StreamClaim::default();
+        let shouted = run("a").to_string().to_uppercase();
+
+        assert!(matches!(
+            claim.claim(run("a"), &shouted),
+            Err(StreamRefused::OtherId { .. })
+        ));
+    }
+
+    /// A caller refused for naming the wrong run is told where the right one is.
+    #[test]
+    fn a_refusal_for_another_run_points_at_run_id() {
+        let refused = StreamRefused::OtherId {
+            run: run("a"),
+            requested: "req_123".to_owned(),
+        };
+        assert!(refused.to_string().contains("run_id()"), "got: {refused}");
+    }
+
+    /// A refused run reports why and ends, and dropping it cancels nothing but
+    /// its own token.
+    #[tokio::test]
+    async fn a_refused_run_yields_its_refusal_and_ends() {
+        let refused = AgentRun::refused(StreamRefused::AlreadyStreamed { run: run("a") });
+        let items: Vec<_> = refused.into_events().collect().await;
+
+        let [Err(error)] = items.as_slice() else {
+            panic!("expected one error, got {items:?}");
+        };
+        assert_eq!(
+            error.downcast_ref::<StreamRefused>(),
+            Some(&StreamRefused::AlreadyStreamed { run: run("a") })
+        );
+    }
 
     fn empty_run() -> (AgentRun, CancellationToken) {
         let cancel = CancellationToken::new();
