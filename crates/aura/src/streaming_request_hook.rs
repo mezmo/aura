@@ -26,7 +26,8 @@
 //!
 //! ```ignore
 //! let options = RunOptions::bounded(Some(Duration::from_secs(60)));
-//! let (hook, cancel, usage_state) = StreamingRequestHook::new(options, "req_123");
+//! // Keyed by the run's id, so this stream owns the run's tool-call queue.
+//! let (hook, cancel, usage_state) = StreamingRequestHook::new(options, run_id.to_string());
 //!
 //! // Pass hook to streaming request
 //! agent.stream_prompt(query).with_hook(hook).multi_turn(depth).await;

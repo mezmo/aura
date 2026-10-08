@@ -186,6 +186,8 @@ pub struct Agent {
     lease: Arc<RunLease>,
     /// The run's events, for its observer.
     events: Mutex<Option<mpsc::Receiver<AgentEvent>>>,
+    /// The run's one stream through [`StreamingAgent::stream`].
+    stream_claim: crate::streaming::StreamClaim,
 }
 
 /// A run reads its prepared agent's fields and calls its methods directly, so
@@ -1058,6 +1060,7 @@ impl PreparedAgent {
             prepared: Arc::clone(self),
             lease,
             events: Mutex::new(events),
+            stream_claim: crate::streaming::StreamClaim::default(),
         })
     }
 
@@ -1563,11 +1566,6 @@ impl Agent {
         self.lease.run()
     }
 
-    /// This run's id.
-    pub fn run_id(&self) -> RunId {
-        self.lease.run().id()
-    }
-
     /// This run's scratchpad budget, when scratchpad is wired up.
     pub fn scratchpad_budget(&self) -> Option<&ContextBudget> {
         self.lease.run().scratchpad_budget()
@@ -1985,6 +1983,10 @@ impl StreamingAgent for Agent {
         self.prepared.get_provider_info()
     }
 
+    fn run_id(&self) -> RunId {
+        self.lease.run().id()
+    }
+
     async fn stream(
         &self,
         query: &str,
@@ -1993,14 +1995,12 @@ impl StreamingAgent for Agent {
         request_id: &str,
     ) -> crate::streaming::AgentRun {
         // The run began at `begin_run`, so its context is what this streams
-        // under; the id is the run's.
+        // under. Only this trait method claims the run's stream: the
+        // orchestrator re-streams a coordinator through the inherent methods on
+        // a transient retry.
         let run = Arc::clone(self.lease.run());
-        if run.id().to_string() != request_id {
-            tracing::debug!(
-                run_id = %run.id(),
-                request_id,
-                "streaming under the run's id rather than the one passed",
-            );
+        if let Err(refused) = self.stream_claim.claim(run.id(), request_id) {
+            return crate::streaming::AgentRun::refused(refused);
         }
         let run_id = run.id().to_string();
 
@@ -3036,6 +3036,169 @@ mod tests {
     mod prepared_runs {
         use super::*;
         use crate::orchestration::{ScriptedCompletionModel, ScriptedTurn};
+        use crate::streaming::StreamRefused;
+
+        /// A prepared agent over `turns`, and the log of requests its model
+        /// served.
+        fn prepared_scripted(
+            turns: Vec<ScriptedTurn>,
+        ) -> (
+            Arc<PreparedAgent>,
+            Arc<std::sync::Mutex<Vec<rig::completion::CompletionRequest>>>,
+        ) {
+            let model = ScriptedCompletionModel::new(turns);
+            let requests = model.requests();
+            let prepared = prepared_over(
+                ProviderAgent::Scripted(rig::agent::AgentBuilder::new(model).build()),
+                ForwardedHeaders::default(),
+                None,
+            );
+            (prepared, requests)
+        }
+
+        /// Streams `agent` through the trait, as a server path does, and
+        /// collects what it yields.
+        async fn streamed_as(
+            agent: &Agent,
+            request_id: &str,
+        ) -> Vec<Result<StreamItem, StreamError>> {
+            StreamingAgent::stream(
+                agent,
+                "q",
+                Vec::new(),
+                crate::streaming::RunOptions::default(),
+                request_id,
+            )
+            .await
+            .into_events()
+            .collect()
+            .await
+        }
+
+        fn refusal(items: &[Result<StreamItem, StreamError>]) -> Option<&StreamRefused> {
+            match items {
+                [Err(error)] => error.downcast_ref::<StreamRefused>(),
+                _ => None,
+            }
+        }
+
+        #[tokio::test]
+        async fn a_stream_naming_another_run_is_refused_and_runs_nothing() {
+            let (prepared, requests) = prepared_scripted(vec![ScriptedTurn::text("done")]);
+            let run_id = crate::run_context::named_run_id("req_a");
+            let agent = prepared.begin_run(run_id, None, None).unwrap();
+
+            let items = streamed_as(&agent, "req_123").await;
+            assert!(
+                matches!(
+                    refusal(&items),
+                    Some(StreamRefused::OtherId { run, requested })
+                        if *run == run_id && requested == "req_123"
+                ),
+                "got: {items:?}",
+            );
+            assert!(
+                requests.lock().unwrap().is_empty(),
+                "a refused stream never reaches the model",
+            );
+
+            let items = streamed_as(&agent, &run_id.to_string()).await;
+            assert!(
+                refusal(&items).is_none(),
+                "the run still streams under its own id: {items:?}",
+            );
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_second_stream_is_refused_and_leaves_the_first_running() {
+            let (prepared, requests) = prepared_scripted(vec![
+                ScriptedTurn::text("first"),
+                ScriptedTurn::text("second"),
+            ]);
+            let run_id = crate::run_context::named_run_id("req_a");
+            let agent = prepared.begin_run(run_id, None, None).unwrap();
+            let id = run_id.to_string();
+
+            let first = StreamingAgent::stream(
+                &agent,
+                "q",
+                Vec::new(),
+                crate::streaming::RunOptions::default(),
+                &id,
+            )
+            .await;
+            let second = streamed_as(&agent, &id).await;
+
+            assert!(
+                matches!(refusal(&second), Some(StreamRefused::AlreadyStreamed { run }) if *run == run_id),
+                "got: {second:?}",
+            );
+            assert!(
+                !agent.run().cancel_token().is_cancelled(),
+                "the refusal leaves the run's token alone",
+            );
+
+            let first: Vec<_> = first.into_events().collect().await;
+            assert!(
+                !first.is_empty() && first.iter().all(Result::is_ok),
+                "the first stream runs to the end: {first:?}",
+            );
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                1,
+                "only the first stream reaches the model",
+            );
+        }
+
+        /// The orchestrator re-streams one coordinator `Agent` through
+        /// `stream_chat_with_depth` on a transient retry. The claim guards only
+        /// the trait method, so that path still streams twice.
+        #[tokio::test]
+        async fn the_coordinator_retry_path_still_streams_twice() {
+            let (prepared, requests) =
+                prepared_scripted(vec![ScriptedTurn::text("one"), ScriptedTurn::text("two")]);
+            let agent = prepared
+                .begin_run(crate::run_context::named_run_id("req_a"), None, None)
+                .unwrap();
+
+            for attempt in 0..2 {
+                let items: Vec<_> = agent
+                    .stream_chat_with_depth("q", Vec::new(), agent.max_depth)
+                    .await
+                    .collect()
+                    .await;
+                assert!(
+                    !items.is_empty() && items.iter().all(Result::is_ok),
+                    "attempt {attempt}: {items:?}",
+                );
+            }
+            assert_eq!(requests.lock().unwrap().len(), 2);
+        }
+
+        /// A caller holding only the trait object, as every builder returns,
+        /// reads the run's id from it and streams under that.
+        #[tokio::test]
+        async fn a_caller_holding_only_the_trait_streams_under_its_run_id() {
+            let (prepared, requests) = prepared_scripted(vec![ScriptedTurn::text("done")]);
+            let agent: Arc<dyn StreamingAgent> =
+                Arc::new(prepared.begin_run(RunId::mint(), None, None).unwrap());
+
+            let items: Vec<_> = agent
+                .stream(
+                    "q",
+                    Vec::new(),
+                    crate::streaming::RunOptions::default(),
+                    &agent.run_id().to_string(),
+                )
+                .await
+                .into_events()
+                .collect()
+                .await;
+
+            assert!(refusal(&items).is_none(), "got: {items:?}");
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
 
         /// A prepared agent over a scripted model, seeded with a scratchpad
         /// budget and a turn nudge that fires on the second turn, so a run
