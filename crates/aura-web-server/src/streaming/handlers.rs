@@ -2912,7 +2912,7 @@ mod tests {
         where
             F: FnOnce(&Senders) -> Vec<Step>,
         {
-            let (senders, callbacks) = channels();
+            let (senders, mut callbacks) = channels();
             let steps = build(&senders);
             let config = StreamConfig::new(emit_custom_events, false, ToolResultMode::Aura, 0);
             let ctx = TurnContext::new(
@@ -2923,13 +2923,13 @@ mod tests {
                 session_id,
             );
 
-            let stream = MockAgent::scripted(steps)
-                .stream(
-                    "q",
-                    vec![],
-                    aura::streaming::RunOptions::default(),
-                    "req_tool_events",
-                )
+            // The handler passes the run's id to both the stream and the
+            // callbacks, so the test does too.
+            let agent = MockAgent::scripted(steps);
+            let run_id = agent.run_id().to_string();
+            callbacks.request_id = run_id.clone();
+            let stream = agent
+                .stream("q", vec![], aura::streaming::RunOptions::default(), &run_id)
                 .await
                 .into_events();
 

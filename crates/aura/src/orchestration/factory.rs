@@ -26,6 +26,9 @@ use super::orchestrator::{
 pub struct OrchestratorFactory {
     agent_config: AgentRuntimeConfig,
     run_tools: crate::builder::RunToolFactory,
+    /// The one run this factory streams.
+    run_id: RunId,
+    stream_claim: crate::streaming::StreamClaim,
 }
 
 /// A run's cancellation, and the signal that its task ended.
@@ -64,10 +67,15 @@ fn final_response(
 }
 
 impl OrchestratorFactory {
-    pub fn new(agent_config: AgentRuntimeConfig) -> Self {
+    /// A factory for the run `agent_config.run_id`, or for a fresh run when
+    /// the config names none. The orchestration it spawns sees the same id.
+    pub fn new(mut agent_config: AgentRuntimeConfig) -> Self {
+        let run_id = *agent_config.run_id.get_or_insert_with(RunId::mint);
         Self {
             agent_config,
             run_tools: crate::builder::no_run_tools(),
+            run_id,
+            stream_claim: crate::streaming::StreamClaim::default(),
         }
     }
 
@@ -201,6 +209,10 @@ impl StreamingAgent for OrchestratorFactory {
         self.agent_config.llm.model_info()
     }
 
+    fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
     /// The coordinator's window: it holds the persistent conversation, so it
     /// is the context a client measures the session against.
     fn context_window(&self) -> Option<u64> {
@@ -218,15 +230,9 @@ impl StreamingAgent for OrchestratorFactory {
         options: crate::streaming::RunOptions,
         request_id: &str,
     ) -> crate::streaming::AgentRun {
-        // The run this factory was built for, or a fresh one when it was
-        // built for none.
-        let run_id = self.agent_config.run_id.unwrap_or_else(RunId::mint);
-        if run_id.to_string() != request_id {
-            tracing::debug!(
-                %run_id,
-                request_id,
-                "streaming under the run's id rather than the one passed",
-            );
+        let run_id = self.run_id;
+        if let Err(refused) = self.stream_claim.claim(run_id, request_id) {
+            return crate::streaming::AgentRun::refused(refused);
         }
         let (timeout, cancel) = options.into_parts();
         let cancel_token = cancel.unwrap_or_default();
@@ -282,6 +288,54 @@ impl StreamingAgent for OrchestratorFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+
+    /// A factory's run id is fixed when it is built, and the orchestration it
+    /// spawns carries the same one.
+    #[test]
+    fn a_factory_streams_the_run_it_was_built_for() {
+        let named = crate::run_context::named_run_id("req_a");
+        let config = AgentRuntimeConfig {
+            run_id: Some(named),
+            ..AgentRuntimeConfig::default()
+        };
+        let factory = OrchestratorFactory::new(config);
+        assert_eq!(factory.run_id(), named);
+        assert_eq!(factory.agent_config.run_id, Some(named));
+
+        let unnamed = OrchestratorFactory::new(AgentRuntimeConfig::default());
+        let other = OrchestratorFactory::new(AgentRuntimeConfig::default());
+        assert_eq!(unnamed.agent_config.run_id, Some(unnamed.run_id()));
+        assert_ne!(
+            unnamed.run_id(),
+            other.run_id(),
+            "each factory mints its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_factory_refuses_a_stream_naming_another_run() {
+        let factory = OrchestratorFactory::new(AgentRuntimeConfig::default());
+        let items: Vec<_> = factory
+            .stream(
+                "q",
+                Vec::new(),
+                crate::streaming::RunOptions::default(),
+                "req_123",
+            )
+            .await
+            .into_events()
+            .collect()
+            .await;
+
+        let [Err(error)] = items.as_slice() else {
+            panic!("expected one refusal, got {items:?}");
+        };
+        assert!(matches!(
+            error.downcast_ref::<crate::streaming::StreamRefused>(),
+            Some(crate::streaming::StreamRefused::OtherId { run, .. }) if *run == factory.run_id()
+        ));
+    }
 
     /// A reader that finds usage on the response takes the cache split from
     /// there too, so the response carries the run's split with its totals.

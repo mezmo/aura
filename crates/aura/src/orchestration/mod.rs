@@ -27,17 +27,22 @@
 //! # Example Usage
 //!
 //! ```ignore
-//! use aura::{RigBuilder, StreamingAgent};
+//! use aura::hitl::PendingApprovals;
+//! use aura::{RigBuilder, RunId, StreamingAgent};
 //! use aura_config::load_config_from_str;
 //!
 //! // `RigBuilder` returns an `Orchestrator` (wrapped as `StreamingAgent`) when
 //! // `orchestration.enabled = true`, or a standard `Agent` otherwise.
 //! let config = load_config_from_str(toml_str)?;
-//! let agent: std::sync::Arc<dyn StreamingAgent> = RigBuilder::new(config)
-//!     .build_streaming_agent_with_headers(None, None, None)
+//! let run_id = RunId::mint();
+//! let agent: std::sync::Arc<dyn StreamingAgent> = RigBuilder::new(config, PendingApprovals::new())
+//!     .build_streaming_agent_with_headers(None, None, None, Some(run_id))
 //!     .await?;
 //!
-//! let run = agent.stream(query, history, RunOptions::default(), "req_123").await;
+//! // The run streams under the id it was built for.
+//! let run = agent
+//!     .stream(query, history, RunOptions::default(), &run_id.to_string())
+//!     .await;
 //! let stream = run.into_events();
 //! ```
 
