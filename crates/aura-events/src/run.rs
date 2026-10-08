@@ -66,7 +66,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentEvent;
-use crate::{string_newtype, RunId, SessionId, TokenUsage};
+use crate::{nonempty_string_newtype, RunId, SessionId, TokenUsage};
 
 /// An instant as Unix time in milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -100,7 +100,7 @@ impl std::fmt::Display for Timestamp {
 
 /// An event's position in its session's stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "u64", into = "u64")]
 pub struct SequenceNumber(u64);
 
 impl SequenceNumber {
@@ -129,12 +129,42 @@ impl std::fmt::Display for SequenceNumber {
     }
 }
 
-string_newtype! {
+/// A sequence number of zero, which no event carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZeroSequenceNumber;
+
+impl std::fmt::Display for ZeroSequenceNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a session's sequence numbers start at 1")
+    }
+}
+
+impl std::error::Error for ZeroSequenceNumber {}
+
+impl TryFrom<u64> for SequenceNumber {
+    type Error = ZeroSequenceNumber;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        if value == 0 {
+            Err(ZeroSequenceNumber)
+        } else {
+            Ok(Self(value))
+        }
+    }
+}
+
+impl From<SequenceNumber> for u64 {
+    fn from(seq: SequenceNumber) -> Self {
+        seq.0
+    }
+}
+
+nonempty_string_newtype! {
     /// Identifier for one observer of a session, unique among its observers.
     ObserverId
 }
 
-string_newtype! {
+nonempty_string_newtype! {
     /// Locates a parked run's checkpoint, as the park machinery names it.
     CheckpointRef
 }
@@ -422,7 +452,7 @@ mod tests {
 
     fn observer(kind: ObserverKind, presence: bool) -> Observer {
         Observer {
-            id: ObserverId::new("obs_1"),
+            id: ObserverId::new("obs_1").unwrap(),
             kind,
             presence,
         }
@@ -551,7 +581,7 @@ mod tests {
                 policy: LivenessPolicy::Park,
             },
             LifecycleEvent::Parked {
-                checkpoint: CheckpointRef::new("memory/sess_1/parked/run_1.json"),
+                checkpoint: CheckpointRef::new("memory/sess_1/parked/run_1.json").unwrap(),
             },
             LifecycleEvent::Finished { usage: usage() },
             LifecycleEvent::Cancelled {
@@ -733,11 +763,11 @@ mod tests {
             json!("sess_1")
         );
         assert_eq!(
-            serde_json::to_value(ObserverId::new("obs_1")).unwrap(),
+            serde_json::to_value(ObserverId::new("obs_1").unwrap()).unwrap(),
             json!("obs_1")
         );
         assert_eq!(
-            serde_json::to_value(CheckpointRef::new("parked/run_1.json")).unwrap(),
+            serde_json::to_value(CheckpointRef::new("parked/run_1.json").unwrap()).unwrap(),
             json!("parked/run_1.json")
         );
     }
@@ -751,6 +781,69 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<RunId>(json!(RUN)).unwrap(),
             run_id()
+        );
+    }
+
+    /// The nil UUID is the UUID that names nothing, so it is refused on every
+    /// path a run id can be built by.
+    #[test]
+    fn the_nil_uuid_is_not_a_run_id() {
+        const NIL: &str = "00000000-0000-0000-0000-000000000000";
+
+        assert_eq!(NIL.parse::<RunId>(), Err(crate::InvalidRunId::Nil));
+        assert_eq!(
+            RunId::try_from(uuid::Uuid::nil()),
+            Err(crate::InvalidRunId::Nil)
+        );
+        let err = serde_json::from_value::<RunId>(json!(NIL)).unwrap_err();
+        assert!(err.to_string().contains("nil UUID"), "got: {err}");
+    }
+
+    /// An observer or checkpoint named by the empty string names nothing, so
+    /// neither the constructor nor deserialization will build one.
+    #[test]
+    fn an_empty_observer_or_checkpoint_id_is_refused() {
+        let err = ObserverId::new("").unwrap_err();
+        assert_eq!(err.to_string(), "ObserverId cannot be empty");
+        assert!(CheckpointRef::new(String::new()).is_err());
+        assert!(ObserverId::try_from("").is_err());
+
+        assert!(serde_json::from_value::<ObserverId>(json!("")).is_err());
+        assert!(serde_json::from_value::<CheckpointRef>(json!("")).is_err());
+        assert_eq!(
+            serde_json::from_value::<ObserverId>(json!("obs_1")).unwrap(),
+            "obs_1"
+        );
+    }
+
+    /// The refusal reaches the envelope: an attach naming an empty observer
+    /// does not parse into an event.
+    #[test]
+    fn an_event_naming_an_empty_observer_does_not_parse() {
+        let parsed = serde_json::from_value::<SessionEvent>(json!({
+            "session_id": "sess_1",
+            "seq": 1,
+            "at": 0,
+            "payload": {
+                "kind": "lifecycle",
+                "event": {
+                    "type": "observer_attached",
+                    "observer": { "id": "", "kind": "collecting", "presence": false }
+                }
+            }
+        }));
+        assert!(parsed.is_err());
+    }
+
+    /// A session's sequence starts at 1, so a zero is refused rather than
+    /// read as an event before the first.
+    #[test]
+    fn a_zero_sequence_number_is_refused() {
+        assert_eq!(SequenceNumber::try_from(0), Err(ZeroSequenceNumber));
+        assert!(serde_json::from_value::<SequenceNumber>(json!(0)).is_err());
+        assert_eq!(
+            serde_json::from_value::<SequenceNumber>(json!(1)).unwrap(),
+            SequenceNumber::FIRST
         );
     }
 
@@ -808,7 +901,7 @@ mod tests {
     fn only_a_terminal_lifecycle_event_ends_a_run() {
         let ending = [
             LifecycleEvent::Parked {
-                checkpoint: CheckpointRef::new("c"),
+                checkpoint: CheckpointRef::new("c").unwrap(),
             },
             LifecycleEvent::Finished { usage: usage() },
             LifecycleEvent::Cancelled {
@@ -883,7 +976,7 @@ mod tests {
         let from_owner = lifecycle(
             8,
             LifecycleEvent::Parked {
-                checkpoint: CheckpointRef::new("memory/sess_1/parked/run_1.json"),
+                checkpoint: CheckpointRef::new("memory/sess_1/parked/run_1.json").unwrap(),
             },
         );
 
