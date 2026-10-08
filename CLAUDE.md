@@ -90,6 +90,11 @@ aura/
 - Intercepts large MCP tool outputs and saves them to disk instead of filling the context window; works in both single-agent and orchestration mode. Full usage/config docs: https://docs.mezmo.com/aura/scratchpad
 - Code pointers: token-counter dispatch lives in `token_counter_for_provider` (`scratchpad/context_budget.rs`); per-agent budgets live on `Agent.scratchpad_budget`, created at `create_worker()` time; read tools resolve files under a per-agent **read root** distinct from the write-confined scratchpad dir (`ScratchpadStorage::with_read_root`)
 
+### A2A Client (Hub and Spoke)
+- The web server is the A2A *receiver* (`AURA_ENABLE_A2A=true`); the core crate's `a2a` module is the *sender*: `[a2a.remote.<name>]` entries become one `ask_agent` rig tool, built in `PreparedAgent::prepare` on the agent's run slot and registered in `add_all_tools` beside the MCP tools. A single agent gets every remote. `mcp_filter` governs MCP tools only and never `ask_agent`
+- Wire: v1.0 JSON-RPC at `{url}/a2a/v1/rpc` (`SendMessage` → poll `GetTask` → answer from the `final` artifact; `CancelTask` on request cancellation or `timeout_secs`). Uses only the `a2a-lf` types crate plus the workspace reqwest; the upstream client crate is avoided because it drags in tonic/prost via a2a-pb
+- `headers` (static, `{{ env.* }}`) and `headers_from_request` resolve when the agent is prepared, in `rig_builder` (`resolve_a2a_headers_in`), mirroring MCP; forwarded names join `ForwardedHeaders`, so `begin_run` refuses a request carrying different values; `model` is sent as `x-aura-model`
+
 ### Orchestration (Multi-Agent)
 - Coordinator/worker architecture with DAG-based parallel task execution
 - Per-worker LLM overrides: workers inherit `[agent.llm]` by default; `[orchestration.worker.<name>.llm]` overrides it (different model, same provider config). Resolved inline at worker construction (`worker.llm.as_ref().unwrap_or(&agent.llm)`)

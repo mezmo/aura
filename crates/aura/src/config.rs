@@ -77,6 +77,8 @@ pub struct AgentRuntimeConfig {
     pub agent: AgentSettings,
     pub vector_stores: Vec<VectorStoreConfig>,
     pub mcp: Option<McpConfig>,
+    /// Remote agents reachable over A2A.
+    pub a2a: Option<aura_config::A2aConfig>,
     pub tools: Option<ToolsConfig>,
     /// Top-level persistence directory shared by scratchpad and orchestration
     /// artifacts. Scratchpad: `{memory_dir}/scratchpad/` (single-agent) or
@@ -149,6 +151,9 @@ pub struct AgentRuntimeConfig {
     /// [`AgentScope`]: crate::hitl::AgentScope
     pub hitl_request_approval_tool: Option<crate::hitl::RequestApprovalTool>,
 
+    /// The `ask_agent` tool over this agent's `[a2a.remote]` entries.
+    pub remote_agent_tool: Option<crate::a2a::RemoteAgentTool>,
+
     /// Recorder for this request's skill-tool invocations.
     pub skill_recorder: Option<Arc<crate::skill_tool::SkillInvocationRecorder>>,
 }
@@ -161,6 +166,7 @@ impl Clone for AgentRuntimeConfig {
             agent: self.agent.clone(),
             vector_stores: self.vector_stores.clone(),
             mcp: self.mcp.clone(),
+            a2a: self.a2a.clone(),
             tools: self.tools.clone(),
             memory_dir: self.memory_dir.clone(),
             orchestration: self.orchestration.clone(),
@@ -179,6 +185,7 @@ impl Clone for AgentRuntimeConfig {
             forwarded_headers: self.forwarded_headers.clone(),
             instance_id: self.instance_id.clone(),
             hitl_request_approval_tool: self.hitl_request_approval_tool.clone(),
+            remote_agent_tool: self.remote_agent_tool.clone(),
             skill_recorder: self.skill_recorder.clone(),
         }
     }
@@ -192,6 +199,7 @@ impl std::fmt::Debug for AgentRuntimeConfig {
             .field("agent", &self.agent)
             .field("vector_stores", &self.vector_stores)
             .field("mcp", &self.mcp)
+            .field("a2a", &self.a2a)
             .field("tools", &self.tools)
             .field("orchestration", &self.orchestration)
             .field(
@@ -229,6 +237,10 @@ impl std::fmt::Debug for AgentRuntimeConfig {
                     .hitl_request_approval_tool
                     .as_ref()
                     .map(|_| "<request_approval>"),
+            )
+            .field(
+                "remote_agent_tool",
+                &self.remote_agent_tool.as_ref().map(|_| "<ask_agent>"),
             )
             .field(
                 "skill_recorder",
