@@ -138,8 +138,102 @@ macro_rules! string_newtype {
     };
 }
 
+/// Generates a string newtype that cannot hold the empty string: a fallible
+/// constructor, `TryFrom` the string types, and deserialization that refuses
+/// `""`.
+macro_rules! nonempty_string_newtype {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(try_from = "String", into = "String")]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Result<Self, $crate::EmptyId> {
+                let value = value.into();
+                if value.is_empty() {
+                    Err($crate::EmptyId {
+                        id: stringify!($name),
+                    })
+                } else {
+                    Ok(Self(value))
+                }
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            pub fn into_string(self) -> String {
+                self.0
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = $crate::EmptyId;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl TryFrom<&str> for $name {
+            type Error = $crate::EmptyId;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(id: $name) -> Self {
+                id.0
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl PartialEq<str> for $name {
+            fn eq(&self, other: &str) -> bool {
+                self.0 == other
+            }
+        }
+
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.0 == *other
+            }
+        }
+    };
+}
+
 // Path-based so submodules can invoke it regardless of declaration order.
-pub(crate) use string_newtype;
+pub(crate) use nonempty_string_newtype;
+
+/// An identifier given as the empty string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyId {
+    /// The identifier's type name.
+    pub id: &'static str,
+}
+
+impl std::fmt::Display for EmptyId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} cannot be empty", self.id)
+    }
+}
+
+impl std::error::Error for EmptyId {}
 
 string_newtype! {
     /// Identifier for a session: an agent's identity over time, and the key
@@ -154,7 +248,7 @@ string_newtype! {
 /// [`AgentContext::agent_id`], which is [`CONVERSATION_AGENT_ID`] or a worker
 /// name and attributes an event *within* a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "uuid::Uuid", into = "uuid::Uuid")]
 pub struct RunId(uuid::Uuid);
 
 impl RunId {
@@ -168,9 +262,42 @@ impl RunId {
     }
 }
 
-impl From<uuid::Uuid> for RunId {
-    fn from(uuid: uuid::Uuid) -> Self {
-        Self(uuid)
+/// Why a value is not a run id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvalidRunId {
+    /// Not a UUID.
+    Malformed(uuid::Error),
+    /// The nil UUID.
+    Nil,
+}
+
+impl std::fmt::Display for InvalidRunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(err) => err.fmt(f),
+            Self::Nil => f.write_str("the nil UUID names no run"),
+        }
+    }
+}
+
+impl std::error::Error for InvalidRunId {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Malformed(err) => Some(err),
+            Self::Nil => None,
+        }
+    }
+}
+
+impl TryFrom<uuid::Uuid> for RunId {
+    type Error = InvalidRunId;
+
+    fn try_from(uuid: uuid::Uuid) -> Result<Self, Self::Error> {
+        if uuid.is_nil() {
+            Err(InvalidRunId::Nil)
+        } else {
+            Ok(Self(uuid))
+        }
     }
 }
 
@@ -181,10 +308,12 @@ impl From<RunId> for uuid::Uuid {
 }
 
 impl std::str::FromStr for RunId {
-    type Err = uuid::Error;
+    type Err = InvalidRunId;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        uuid::Uuid::from_str(s).map(Self)
+        uuid::Uuid::from_str(s)
+            .map_err(InvalidRunId::Malformed)?
+            .try_into()
     }
 }
 
