@@ -445,21 +445,7 @@ pub async fn chat_completions(
         );
     }
 
-    // Extract or generate chat_session_id
-    // Priority: metadata > X-Chat-Session-Id header > x-openwebui-chat-id header > generate new
-    let chat_session_id = req
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("chat_session_id"))
-        .cloned()
-        .or_else(|| {
-            headers
-                .get("X-Chat-Session-Id")
-                .or_else(|| headers.get("x-openwebui-chat-id"))
-                .and_then(|h| h.to_str().ok())
-                .map(String::from)
-        })
-        .unwrap_or_else(generate_chat_session_id);
+    let chat_session_id = chat_session_id(req.metadata.as_ref(), &headers);
 
     // Convert HeaderMap to HashMap for framework-agnostic passing
     let req_headers_map: HashMap<String, String> = headers
@@ -1348,6 +1334,29 @@ pub async fn resolve_approval(
     }
 }
 
+/// The chat session a request belongs to: the id the client gave in its
+/// metadata, then `X-Chat-Session-Id`, then `x-openwebui-chat-id`, else a
+/// fresh one.
+///
+/// A blank value counts as none given. Taken as given, every client that sends
+/// one would share a single session, and with it each other's recorded skill
+/// invocations; orchestration persistence would refuse it outright.
+fn chat_session_id(metadata: Option<&HashMap<String, String>>, headers: &HeaderMap) -> String {
+    let given = |value: &str| (!value.trim().is_empty()).then(|| value.to_owned());
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(given)
+    };
+    metadata
+        .and_then(|m| m.get("chat_session_id"))
+        .and_then(|value| given(value))
+        .or_else(|| header("X-Chat-Session-Id"))
+        .or_else(|| header("x-openwebui-chat-id"))
+        .unwrap_or_else(generate_chat_session_id)
+}
+
 /// Generate a chat session ID (simple GUID)
 fn generate_chat_session_id() -> String {
     format!("cs_{}", Uuid::new_v4().simple())
@@ -1469,6 +1478,58 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
+
+    mod chat_session_id {
+        use super::super::chat_session_id;
+        use axum::http::{HeaderMap, HeaderValue};
+        use std::collections::HashMap;
+
+        fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+            let mut map = HeaderMap::new();
+            for (name, value) in pairs {
+                map.insert(*name, HeaderValue::from_static(value));
+            }
+            map
+        }
+
+        fn metadata(value: &str) -> HashMap<String, String> {
+            HashMap::from([("chat_session_id".to_owned(), value.to_owned())])
+        }
+
+        #[test]
+        fn metadata_wins_over_the_headers() {
+            let id = chat_session_id(
+                Some(&metadata("from-metadata")),
+                &headers(&[("X-Chat-Session-Id", "from-header")]),
+            );
+            assert_eq!(id, "from-metadata");
+        }
+
+        #[test]
+        fn the_openwebui_header_is_the_last_given_source() {
+            let id = chat_session_id(None, &headers(&[("x-openwebui-chat-id", "owui-1")]));
+            assert_eq!(id, "owui-1");
+        }
+
+        #[test]
+        fn a_blank_value_falls_through_to_the_next_source() {
+            let id = chat_session_id(
+                Some(&metadata("  ")),
+                &headers(&[("X-Chat-Session-Id", ""), ("x-openwebui-chat-id", "owui-1")]),
+            );
+            assert_eq!(id, "owui-1");
+        }
+
+        #[test]
+        fn only_blank_values_get_a_fresh_id_each_time() {
+            let blank = headers(&[("X-Chat-Session-Id", "")]);
+            let first = chat_session_id(Some(&metadata("")), &blank);
+            let second = chat_session_id(Some(&metadata("")), &blank);
+
+            assert!(first.starts_with("cs_"), "got: {first}");
+            assert_ne!(first, second);
+        }
+    }
 
     /// `--streaming-timeout-secs 0` is documented as disabling the bound, so a
     /// run configured that way has to outlive the first deadline check rather
