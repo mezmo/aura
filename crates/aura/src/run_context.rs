@@ -167,9 +167,13 @@ impl RunContext {
         self.id
     }
 
-    /// Whether `id` names this run. A string that is not a run id names none.
+    /// Whether `id` is this run's id as the run spells it — the form its
+    /// `Display` gives, which is the key every request-keyed registry holds.
+    /// The same UUID spelled another way names no run, and neither does a
+    /// string that is not one.
     pub fn has_id(&self, id: &str) -> bool {
-        id.parse::<RunId>().is_ok_and(|parsed| parsed == self.id)
+        let mut spelled = uuid::Uuid::encode_buffer();
+        *self.id.as_uuid().hyphenated().encode_lower(&mut spelled) == *id
     }
 
     /// The token that cancels this run.
@@ -459,6 +463,22 @@ mod tests {
     async fn there_is_no_run_outside_a_run() {
         assert!(current_run().is_none());
         assert_eq!(current_run_id(), None);
+    }
+
+    /// Registries key a run by the string its id displays as, so that is the
+    /// one spelling a run answers to: not the same UUID in another case or
+    /// form, and not a string that is no run id at all.
+    #[test]
+    fn a_run_answers_only_to_its_id_as_it_spells_it() {
+        let run = run("run_spelled");
+        let spelled = run.id().to_string();
+
+        assert!(run.has_id(&spelled));
+        assert!(!run.has_id(&spelled.to_uppercase()));
+        assert!(!run.has_id(&run.id().as_uuid().simple().to_string()));
+        assert!(!run.has_id(&format!("urn:uuid:{spelled}")));
+        assert!(!run.has_id("req_1"));
+        assert!(!run.has_id(&named_run_id("run_other").to_string()));
     }
 
     #[tokio::test]
