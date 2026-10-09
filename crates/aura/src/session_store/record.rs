@@ -179,7 +179,7 @@ impl TryFrom<ScopeRecord> for AgentScope {
     fn try_from(record: ScopeRecord) -> Result<Self, Self::Error> {
         Ok(match record {
             ScopeRecord::Single { session_id } => AgentScope::Single {
-                session_id: session_id.map(SessionId::new),
+                session_id: session_id.and_then(SessionId::non_empty),
             },
             ScopeRecord::Worker {
                 run_id,
@@ -189,7 +189,7 @@ impl TryFrom<ScopeRecord> for AgentScope {
             } => AgentScope::Worker {
                 run_id: parse_run_id(&run_id)?,
                 task: TaskIdentity::new(task_id, worker),
-                session_id: session_id.map(SessionId::new),
+                session_id: session_id.and_then(SessionId::non_empty),
             },
             ScopeRecord::Coordinator { run_id } => AgentScope::Coordinator {
                 run_id: parse_run_id(&run_id)?,
@@ -281,7 +281,7 @@ mod tests {
     fn single_scope_round_trips() {
         assert_round_trip(parked(
             AgentScope::Single {
-                session_id: Some(SessionId::new("sess-9")),
+                session_id: Some(SessionId::new("sess-9").unwrap()),
             },
             ApprovalOrigin::ConfigGate {
                 matched_pattern: "kubectl_*".to_string(),
@@ -330,6 +330,30 @@ mod tests {
         let json = serde_json::to_value(&record).unwrap();
         assert_eq!(json["scope"]["kind"], "single");
         assert_eq!(json["origin"]["kind"], "agent_requested");
+    }
+
+    /// A stored scope carrying an empty session id restores as a scope with
+    /// no session rather than failing to decode.
+    #[test]
+    fn a_blank_session_id_in_a_stored_scope_restores_as_none() {
+        let single = ScopeRecord::Single {
+            session_id: Some(String::new()),
+        };
+        assert_eq!(
+            AgentScope::try_from(single).unwrap(),
+            AgentScope::Single { session_id: None }
+        );
+
+        let worker = ScopeRecord::Worker {
+            run_id: "0191e8c0-1111-7000-8000-000000000000".to_string(),
+            task_id: 1,
+            worker: None,
+            session_id: Some(String::new()),
+        };
+        let AgentScope::Worker { session_id, .. } = AgentScope::try_from(worker).unwrap() else {
+            panic!("a worker scope restores as one");
+        };
+        assert_eq!(session_id, None);
     }
 
     #[test]

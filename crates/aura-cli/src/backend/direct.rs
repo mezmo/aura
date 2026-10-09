@@ -340,8 +340,10 @@ impl DirectBackend {
         let selected = get_selected_model();
         let mut req = Self::build_chat_request(messages, tools, selected);
 
+        let session =
+            aura::SessionId::new(session_id).map_err(|e| anyhow::anyhow!("session id: {e}"))?;
         let setup =
-            handlers::prepare_request(&self.app_state, &mut req, session_id, &self.extra_headers)
+            handlers::prepare_request(&self.app_state, &mut req, &session, &self.extra_headers)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -406,8 +408,10 @@ impl DirectBackend {
             tools: None,
         };
 
+        let session =
+            aura::SessionId::new(session_id).map_err(|e| anyhow::anyhow!("session id: {e}"))?;
         let setup =
-            handlers::prepare_request(&self.app_state, &mut req, session_id, &self.extra_headers)
+            handlers::prepare_request(&self.app_state, &mut req, &session, &self.extra_headers)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 

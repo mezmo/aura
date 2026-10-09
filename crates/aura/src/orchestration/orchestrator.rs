@@ -962,7 +962,7 @@ impl Orchestrator {
             let scope = crate::hitl::AgentScope::Worker {
                 run_id,
                 task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
-                session_id: session_id_owned.map(crate::config::SessionId::new),
+                session_id: session_id_owned.and_then(crate::config::SessionId::non_empty),
             };
             let mut gate = crate::hitl::HitlApprovalWrapper::new(
                 hitl.patterns.clone(),
@@ -1207,7 +1207,7 @@ impl Orchestrator {
             .map(|run_id| crate::hitl::AgentScope::Worker {
                 run_id,
                 task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
-                session_id: session_id.map(crate::config::SessionId::new),
+                session_id: session_id.and_then(crate::config::SessionId::non_empty),
             })
     }
 

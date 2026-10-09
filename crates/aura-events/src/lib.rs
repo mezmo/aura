@@ -161,6 +161,12 @@ macro_rules! nonempty_string_newtype {
                 }
             }
 
+            /// The identifier `value` names, or `None` for the empty string:
+            /// for a boundary where a blank and an absent value mean the same.
+            pub fn non_empty(value: impl Into<String>) -> Option<Self> {
+                Self::new(value).ok()
+            }
+
             pub fn as_str(&self) -> &str {
                 &self.0
             }
@@ -236,7 +242,7 @@ impl std::fmt::Display for EmptyId {
 
 impl std::error::Error for EmptyId {}
 
-string_newtype! {
+nonempty_string_newtype! {
     /// Identifier for a session: an agent's identity over time, and the key
     /// its [`SessionEvent`](run::SessionEvent) stream is ordered under.
     SessionId
