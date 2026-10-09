@@ -1,5 +1,216 @@
 ## Changelog
 
+## [0.2.19](https://github.com/mezmo/aura/compare/v0.2.18...v0.2.19) (2026-10-09)
+
+
+### Bug Fixes
+
+* **aura**: let the coordinator inspect the run's tools [0762386](https://github.com/mezmo/aura/commit/0762386497b2ca5e2e0d3982c1aef7672e3ef4f4) - Tony Rogers
+
+* **ci**: keep channel branches from releasing off a stale baseline [fea725e](https://github.com/mezmo/aura/commit/fea725e2b129c7fb822e73e2ebd68bf77c909a8e) - Jacob Hull
+
+* **ci**: refresh the docker jwt per dvp report and harden hogql reads [da6f957](https://github.com/mezmo/aura/commit/da6f9578ee707675e4c2a000d24186ba9f8ee78f) - Justin Gross
+
+* **cli**: flush telemetry on sigterm in standalone mode [3883d36](https://github.com/mezmo/aura/commit/3883d36cb12413249960521a7d2d779979531e6b) - Dan Hable [#305](https://github.com/mezmo/aura/issues/305)
+
+* **cli**: keep the http-only build clean under -D warnings [3d619f1](https://github.com/mezmo/aura/commit/3d619f158d25574a5b851a28180461dad3cadf60) - Justin Gross
+
+* **config**: end a literal run at a character class [cd986ea](https://github.com/mezmo/aura/commit/cd986eadd616c7efce10ea230932322b476a8ad3) - Justin Gross
+
+* **config**: enforce the mcp_filter literal cap and name it in the error [50eadd4](https://github.com/mezmo/aura/commit/50eadd422a61c22c777a33f369a8271559893957) - Justin Gross
+
+* **config**: match tool-name glob patterns with globset [837cf05](https://github.com/mezmo/aura/commit/837cf05db3644682cec50f3f7d12bfc721aa28f4) - Dan Hable [#705](https://github.com/mezmo/aura/issues/705)
+
+* **config**: measure a class as one character and report the full run [acb6251](https://github.com/mezmo/aura/commit/acb6251800efa5702147d2f7a5cdec7040686348) - Justin Gross
+
+* **events**: carry the worker id into the tool-completion frame [c323c5c](https://github.com/mezmo/aura/commit/c323c5ca923e5aee7bb057a8b66084a1dd7d191e) - Justin Gross
+
+* **mcp**: bound connect/initialize/discovery with a timeout [0088768](https://github.com/mezmo/aura/commit/00887684c48d5977d31741470e60908a447c4b27) - Dan Hable [#305](https://github.com/mezmo/aura/issues/305)
+
+* **mcp**: warn if multiple servers use same tool name [bf5ced8](https://github.com/mezmo/aura/commit/bf5ced82b29a20c93a0c2e3eb82b0e1fc4ddf956) - Dan Hable [#713](https://github.com/mezmo/aura/issues/713)
+
+* **orchestration**: attribute tool completions to the worker [84d2d98](https://github.com/mezmo/aura/commit/84d2d98c4f28ac8f7bc9316c25020326fc0a432b) - Justin Gross
+
+* **orchestration**: cap artifact listings in recovery hints [697ccd1](https://github.com/mezmo/aura/commit/697ccd13a021956404854a3bd83c2d995b546096) - Mike Shearer [INFRA-7869](https://mezmo.atlassian.net/browse/INFRA-7869)
+
+* **orchestration**: don't restate attached artifacts in tasks [276509b](https://github.com/mezmo/aura/commit/276509bc387c646a86301516de77b1a95f79ee1d) - Mike Shearer [INFRA-7869](https://mezmo.atlassian.net/browse/INFRA-7869)
+
+* **orchestration**: end a worker's run when its approval parks [3dfd2bb](https://github.com/mezmo/aura/commit/3dfd2bbd675c27fe54adb01ae7d8245a48e5374a) - Jacob Hull
+
+* **orchestration**: fail safe on dropped cancel watcher [c74a5f0](https://github.com/mezmo/aura/commit/c74a5f0f5fccb442583358df7c281e25c6b744d1) - Dan Hable [#305](https://github.com/mezmo/aura/issues/305)
+
+* **orchestration**: harden coordinator artifact handoff [52b3945](https://github.com/mezmo/aura/commit/52b394582a1c03ae627ca91845596b4498794cf6) - Mike Shearer [INFRA-7869](https://mezmo.atlassian.net/browse/INFRA-7869)
+
+* **orchestration**: honor [agent].turn_depth for the coordinator [22551a1](https://github.com/mezmo/aura/commit/22551a140c5c1c27fc3cdef8828bfd2566f79f95) - Mike Shearer [#772](https://github.com/mezmo/aura/issues/772)
+
+* **orchestration**: reject an unflattenable plan instead of panicking [cb8b5a4](https://github.com/mezmo/aura/commit/cb8b5a4c2db86a57c955f20bc3d698bd7fee111e) - Mike Shearer
+
+* show run tools to the planner and carry the run prompt to workers [6ad30f3](https://github.com/mezmo/aura/commit/6ad30f30964df1a58ec46ec62c60312187625553) - Tony Rogers
+
+* **skills**: scope skill invocation records to the serving agent [1188185](https://github.com/mezmo/aura/commit/11881853ac757fc709222a6ae90242162d65898c) - Justin Gross
+
+* **web-server**: abort stragglers before otel shutdown [1222763](https://github.com/mezmo/aura/commit/1222763d4c1b25071170a4fc2b061c7062c5173b) - Dan Hable [#305](https://github.com/mezmo/aura/issues/305)
+
+* **web-server**: answer thread replies, bound slack calls and waiting [6d07d5a](https://github.com/mezmo/aura/commit/6d07d5af70833b2781d91b552a1e9e27824eef30) - Tony Rogers
+
+* **web-server**: answer top-level slack dms inline with dm history [c62a36b](https://github.com/mezmo/aura/commit/c62a36bf6d826a8e8dc5fcb62a27635055292a97) - Tony Rogers
+
+* **web-server**: keep the bot's own replies in slack thread history [ecb3889](https://github.com/mezmo/aura/commit/ecb3889b575707ce72d25b8852b323ffdca6342f) - Tony Rogers
+
+* **web-server**: let a zero streaming timeout disable the bound [a4dec71](https://github.com/mezmo/aura/commit/a4dec7128565a5ad75c8e9379eccca8b86d95915) - Jacob Hull [#715](https://github.com/mezmo/aura/issues/715)
+
+* **web-server**: let the probe's participation verdict stand [69901d5](https://github.com/mezmo/aura/commit/69901d5c832602cf07025dd05c29217e0b08f2b6) - Tony Rogers
+
+* **web-server**: log messages the slack accept rules ignore at debug [544afb4](https://github.com/mezmo/aura/commit/544afb47420e8706688572870bdcfc59f03c0c4a) - Tony Rogers
+
+* **web-server**: post trimmed text and name both posting scopes [183ced5](https://github.com/mezmo/aura/commit/183ced5426351aab952176d01b5f0b6537fd9433) - Tony Rogers [#756](https://github.com/mezmo/aura/issues/756)
+
+* **web-server**: probe thread participation before queueing a reply [c5aec95](https://github.com/mezmo/aura/commit/c5aec9518e7e6e98d3ab1aa80a8477e662687dca) - Tony Rogers
+
+* **web-server**: reconnect the slack socket when it goes silent [1f2f600](https://github.com/mezmo/aura/commit/1f2f6001df04bb9dd750a45f75c436ea48c6e35a) - Tony Rogers [#767](https://github.com/mezmo/aura/issues/767)
+
+* **web-server**: reuse the probe's thread read when answering [d825eef](https://github.com/mezmo/aura/commit/d825eefd9b80ab4a9b16a0cbecf875112acaf870) - Tony Rogers
+
+* **web-server**: tell slack runs where the message came from [49acf5e](https://github.com/mezmo/aura/commit/49acf5e05041fe603fdf3ddc0718a77255fa7fee) - Tony Rogers
+
+* **web-server**: tell the agent what a failed slack post delivered [64cba5e](https://github.com/mezmo/aura/commit/64cba5ea76e4f0d019fcd3a840a7fce9459d1c5e) - Tony Rogers [#756](https://github.com/mezmo/aura/issues/756)
+
+* **web-server**: test turn eligibility without building the turn [60b505b](https://github.com/mezmo/aura/commit/60b505bfd2123c752b9a5af8b420baf84c717647) - Tony Rogers
+
+* **web-server**: treat a blank chat session id as missing [fa3861d](https://github.com/mezmo/aura/commit/fa3861d047bf1a57adbb8ae5f4b3151e38977011) - Justin Gross
+
+* **web-server**: trim a prefetched thread before queueing the reply [1e2362c](https://github.com/mezmo/aura/commit/1e2362c1a63507d38639c93ab2e25056e37dcddc) - Tony Rogers
+
+* **web-server**: trim a prefetched thread by turns, not raw messages [f0b2104](https://github.com/mezmo/aura/commit/f0b2104a58f0e50af39399c1e6a3a9622c784684) - Tony Rogers
+
+
+
+### Chores
+
+* **globpattern**: stop emiiting Regex debug info [86e15fe](https://github.com/mezmo/aura/commit/86e15fe51b1f8fd39b74df24f7b1dc2c5dbb4975) - Dan Hable
+
+
+
+### Code Refactoring
+
+* **agents**: cancel a run through its own token [2956e86](https://github.com/mezmo/aura/commit/2956e86580519ebbbccde4b4b69af50c05905d5d) - Jacob Hull [#626](https://github.com/mezmo/aura/issues/626)
+
+* **agent**: separate a prepared agent from its runs [513f1ec](https://github.com/mezmo/aura/commit/513f1ec15dce1aca19a6072c9181717e3a03612d) - Justin Gross
+
+* **events**: approvals reach the run's observer [25086ed](https://github.com/mezmo/aura/commit/25086edd8efcb58686b416bbe4810b5255f8b3a1) - Jacob Hull [#626](https://github.com/mezmo/aura/issues/626)
+
+* **events**: define orchestration SSE frames once [f227357](https://github.com/mezmo/aura/commit/f227357e0fa80fe5d43bb3678382b6765286f262) - Jacob Hull [#623](https://github.com/mezmo/aura/issues/623)
+
+* **events**: define the conversation agent id once [6bc6065](https://github.com/mezmo/aura/commit/6bc606579dc1f623bab20c59c99d1d3c402d5e8c) - Justin Gross
+
+* **events**: send a run's events to its observer [70b8e5a](https://github.com/mezmo/aura/commit/70b8e5ae2620731c5af8986491d17e8dedc43f0d) - Jacob Hull [#626](https://github.com/mezmo/aura/issues/626)
+
+
+
+### Documentation
+
+* **aura**: describe RunToolFactory as the value it is [4b6aa00](https://github.com/mezmo/aura/commit/4b6aa0071a629e0efc9e38219184461b7d3122b2) - Tony Rogers
+
+* **aura**: drop the stale line above get_all_tool_schemas [e976f84](https://github.com/mezmo/aura/commit/e976f8405912dd7b535cc19fe25b9c903a4bf6c6) - Tony Rogers
+
+* describe the slack ingress and the server's ingress paths [02f89ea](https://github.com/mezmo/aura/commit/02f89ea9eac88d547d37879255ebe23a38ea6560) - Tony Rogers
+
+* describe the slack post tool and its opt-in [466e11d](https://github.com/mezmo/aura/commit/466e11dcf89b57eb7d9f31af0e2a5da19accb85d) - Tony Rogers [#756](https://github.com/mezmo/aura/issues/756)
+
+* fix the slack ingress call count and name the messages tab setting [c0a5db5](https://github.com/mezmo/aura/commit/c0a5db53169616037d9f9a59e85ca8b4098fb511) - Tony Rogers
+
+* name the manifest fields slack enforces for the search token [e067d59](https://github.com/mezmo/aura/commit/e067d599949b7697413a87804d7a8c2ab60c3e9f) - Tony Rogers
+
+* note the slack socket idle deadline [40b75ed](https://github.com/mezmo/aura/commit/40b75ed43f44fea3c705b930dbce8d8cecae6c4c) - Tony Rogers [#767](https://github.com/mezmo/aura/issues/767)
+
+* say that thread follow-ups are opted into by the slack app's events [3e8b624](https://github.com/mezmo/aura/commit/3e8b62444b4fa92e14e1679dfd4fa47b962ceb0c) - Tony Rogers
+
+* trim the slack post tool paragraph to the overview [c5735da](https://github.com/mezmo/aura/commit/c5735dabd53ec5b17ea53e9886cabb19527ccf6e) - Tony Rogers [#756](https://github.com/mezmo/aura/issues/756)
+
+* **web-server**: state only the unit on POSTS_PER_RUN [162dad3](https://github.com/mezmo/aura/commit/162dad3bb240c7ec204d872dd3e3876e52e8ce1a) - Tony Rogers [#756](https://github.com/mezmo/aura/issues/756)
+
+
+
+### Features
+
+* **agents**: carry run identity in task-local scope [5b7e15b](https://github.com/mezmo/aura/commit/5b7e15bd1d01cb27bfa4125a4c660095284a45af) - Jacob Hull [#625](https://github.com/mezmo/aura/issues/625)
+
+* **agents**: give StreamingAgent one entry point returning a run handle [5f37ae8](https://github.com/mezmo/aura/commit/5f37ae8f5683d44115a29010105636258780a2e1) - Jacob Hull [#625](https://github.com/mezmo/aura/issues/625)
+
+* **agents**: give the run its own tool-call queue [51c9eed](https://github.com/mezmo/aura/commit/51c9eed45cc2e1a5d0dfc71d6c2b4874af1f5dfd) - Jacob Hull [#626](https://github.com/mezmo/aura/issues/626)
+
+* **agents**: make hooks an extension point [c530ee4](https://github.com/mezmo/aura/commit/c530ee4e1708c975122d74a89e74041d41791657) - Jacob Hull [#625](https://github.com/mezmo/aura/issues/625)
+
+* **aura**: accept per-run tools on the streaming agent builder [9aba534](https://github.com/mezmo/aura/commit/9aba53422c01cbe0ee50fbcc2d1771d9a0405751) - Tony Rogers
+
+* **events**: add agent event schema and broker adapter [6ea85b4](https://github.com/mezmo/aura/commit/6ea85b4406d511128f50d74b453cf56a165a3ccc) - Jacob Hull [#618](https://github.com/mezmo/aura/issues/618)
+
+* **events**: approvals emit the agent event schema [4424967](https://github.com/mezmo/aura/commit/4424967318f7e27debee865027a55baed84859f1) - Jacob Hull [#624](https://github.com/mezmo/aura/issues/624)
+
+* **events**: carry response content on the run's event stream [212b69e](https://github.com/mezmo/aura/commit/212b69e9aa187f93d1fe8624b355499f2f98c1c2) - Jacob Hull [#626](https://github.com/mezmo/aura/issues/626)
+
+* **events**: name the agent on orchestrated content [e552288](https://github.com/mezmo/aura/commit/e55228880b384b8bc7a52ef3821e45981a4ebf7d) - Jacob Hull [#626](https://github.com/mezmo/aura/issues/626)
+
+* **events**: orchestration emits the agent event schema [30c5f84](https://github.com/mezmo/aura/commit/30c5f840e39f34fe980549f77f2f85fc032a65c1) - Jacob Hull [#623](https://github.com/mezmo/aura/issues/623)
+
+* **events**: single-agent producers emit the agent event schema [f3bdbd6](https://github.com/mezmo/aura/commit/f3bdbd61aff4023353b1ec7f3f4a7cfe83c93ee5) - Jacob Hull [#620](https://github.com/mezmo/aura/issues/620)
+
+* **examples**: add Checkly incident response example config [30bb181](https://github.com/mezmo/aura/commit/30bb181ab0c8e2ca8df3356e2f839d9d7a0d3d21) - Mike Shearer
+
+* give orchestration workers the run's own tools and a search budget [dd2c08f](https://github.com/mezmo/aura/commit/dd2c08ff2a994e38ae4e38131e4cf01248c1a651) - Tony Rogers
+
+* list the tools the server grants an agent in /aura/info [2e98899](https://github.com/mezmo/aura/commit/2e988991d7241db30a01173bf36455369d7ce526) - Tony Rogers [#756](https://github.com/mezmo/aura/issues/756)
+
+* **mcp**: add namespace tracking for mcp tools [9033711](https://github.com/mezmo/aura/commit/903371114dc95ac0442ed6e4b7147c99e9dc7aaf) - Dan Hable [#712](https://github.com/mezmo/aura/issues/712)
+
+* **mcp**: identify aura to mcp servers with a configurable user agent [f7c9900](https://github.com/mezmo/aura/commit/f7c99004fe604fd02f29ffb87d39301a1ab171da) - Tony Rogers [#670](https://github.com/mezmo/aura/issues/670)
+
+* **orchestration**: add default 5m telemetry lookback policy [a8d25f7](https://github.com/mezmo/aura/commit/a8d25f70aff66f808c3d26382e67146ba4099ecc) - Mike Shearer [#697](https://github.com/mezmo/aura/issues/697)
+
+* **orchestration**: add write_artifact tool for the coordinator [cfa7903](https://github.com/mezmo/aura/commit/cfa790353fd71d4d8e9c416063129b62707e132a) - Mike Shearer [INFRA-7869](https://mezmo.atlassian.net/browse/INFRA-7869)
+
+* **orchestration**: attach validated artifacts to plan tasks [54f3704](https://github.com/mezmo/aura/commit/54f37041ee3ae5234ec8ac8599b077ff8f9c43da) - Mike Shearer [INFRA-7869](https://mezmo.atlassian.net/browse/INFRA-7869)
+
+* **orchestration**: list available artifacts on a read miss [78234cc](https://github.com/mezmo/aura/commit/78234cc2182ec282e35bdfe808ab202a2413dce3) - Mike Shearer [INFRA-7869](https://mezmo.atlassian.net/browse/INFRA-7869)
+
+* **skills**: persist and rehydrate skill invocations across turns [e54d2bc](https://github.com/mezmo/aura/commit/e54d2bc6e6b1a1f4851e5a53747bc33f612ff67e) - Justin Gross
+
+* **web-server**: add a slack post tool gated by an agent opt-in [2cbbb71](https://github.com/mezmo/aura/commit/2cbbb7132388f173433f38e1d2117ddb6417b457) - Tony Rogers [#756](https://github.com/mezmo/aura/issues/756)
+
+* **web-server**: add slack socket mode connection loop [b510c09](https://github.com/mezmo/aura/commit/b510c093b32e6863318f085ef93a85dc0dd018ac) - Tony Rogers
+
+* **web-server**: add slack web api client and event types [ce3f7fb](https://github.com/mezmo/aura/commit/ce3f7fbc2b8ed22eae41115995fc4b5cecb916a7) - Tony Rogers
+
+* **web-server**: answer slack mentions and dms with an agent [a5fa172](https://github.com/mezmo/aura/commit/a5fa1728da1118992b7308ba317ac91e13ccf769) - Tony Rogers
+
+* **web-server**: attach the slack post tool on http and a2a runs [907fa1d](https://github.com/mezmo/aura/commit/907fa1d4385c02bf74314519642c938133773572) - Tony Rogers [#756](https://github.com/mezmo/aura/issues/756)
+
+* **web-server**: carry slack action tokens and call the search api [7279251](https://github.com/mezmo/aura/commit/7279251ba2bb70fed9fdb2ebfde74fea6c6eb971) - Tony Rogers
+
+* **web-server**: give slack runs a search tool that acts as the asker [5017aee](https://github.com/mezmo/aura/commit/5017aee0aad181f6f64288ed2ad3207efb6e42bb) - Tony Rogers
+
+* **web-server**: log why the slack ingress answers or ignores a message [5e981e7](https://github.com/mezmo/aura/commit/5e981e7e3535bf99b3b03de95b82cc1b74ff6a11) - Tony Rogers
+
+
+
+### Miscellaneous
+
+* Merge branch 'main' into nightly [70d2ca7](https://github.com/mezmo/aura/commit/70d2ca70f10dae0c2324f65637f1cc2b4e356f7f) - Jacob Hull
+
+* Merge pull request #692 from mezmo/main [926a409](https://github.com/mezmo/aura/commit/926a40945bf879c27e413474659e30780d88c5b8) - GitHub [#692](https://github.com/mezmo/aura/issues/692)
+
+* Merge pull request #777 from mezmo/nightly [fb19c42](https://github.com/mezmo/aura/commit/fb19c42b45a3e6c12bde20b069bdf01dcf44d2f1) - GitHub [#777](https://github.com/mezmo/aura/issues/777)
+
+
+
+### Tests
+
+* **ci**: cover the dvp jwt refresh and hogql retry, clean up on failure [3a49ac4](https://github.com/mezmo/aura/commit/3a49ac4803a1399c69dda6c7a0de1e69f6c085da) - Justin Gross
+
+* **events**: state the worker-id parse case as current behavior [4956199](https://github.com/mezmo/aura/commit/49561991525ede4e18f7c877030627f81f32e6c8) - Justin Gross
+
+* **sre**: add coverage for default window and override query args [1f29185](https://github.com/mezmo/aura/commit/1f291857e93f53e29f1638d203c9df9ad16632ec) - Mike Shearer [#697](https://github.com/mezmo/aura/issues/697)
+
 ## [0.2.18](https://github.com/mezmo/aura/compare/v0.2.17...v0.2.18) (2026-10-05)
 
 
