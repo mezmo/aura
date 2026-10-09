@@ -229,6 +229,11 @@ pub enum AgentEventPayload {
     Synthesizing {
         iteration: usize,
     },
+
+    /// Any other value on the wire, read by a version of this crate that does
+    /// not know it. It cannot be written back.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 #[cfg(test)]
@@ -413,5 +418,18 @@ mod tests {
         };
         assert_eq!(content, "the answer");
         assert_eq!(usage.total_tokens.get(), 15);
+    }
+
+    /// A reader older than its producer reads a type it does not know as
+    /// `Unknown` rather than failing the event, and cannot write it back.
+    #[test]
+    fn an_unknown_type_reads_as_unknown_and_cannot_be_serialized() {
+        let event: AgentEvent = serde_json::from_value(json!({
+            "agent": serde_json::to_value(AgentContext::single_agent()).unwrap(),
+            "payload": { "type": "telemetry", "cpu": 0.5 }
+        }))
+        .unwrap();
+        assert!(matches!(event.payload, AgentEventPayload::Unknown));
+        assert!(serde_json::to_value(&event).is_err());
     }
 }

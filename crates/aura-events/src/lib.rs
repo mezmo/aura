@@ -10,13 +10,17 @@
 //!
 //! - [`AuraStreamEvent`] — Base aura events (tool lifecycle, usage, reasoning, progress)
 //! - [`OrchestrationStreamEvent`] — Multi-agent orchestration events
+//! - [`agent::AgentEvent`] — What a running agent emits, before any wire projection
+//! - [`run::SessionEvent`] — One session's ordered stream: its agents' events and its runs' lifecycle
 //!
-//! Both enums derive `Serialize + Deserialize` so they can be used for
+//! All derive `Serialize + Deserialize` so they can be used for
 //! producing SSE (server) and parsing SSE (client) with the same types.
 
 pub mod agent;
+pub mod duration_ms;
 pub mod event_names;
 pub mod orchestration;
+pub mod run;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -135,6 +139,191 @@ macro_rules! string_newtype {
     };
 }
 
+/// Generates a string newtype that cannot hold the empty string: a fallible
+/// constructor, `TryFrom` the string types, and deserialization that refuses
+/// `""`.
+macro_rules! nonempty_string_newtype {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(try_from = "String", into = "String")]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Result<Self, $crate::EmptyId> {
+                let value = value.into();
+                if value.is_empty() {
+                    Err($crate::EmptyId {
+                        id: stringify!($name),
+                    })
+                } else {
+                    Ok(Self(value))
+                }
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            pub fn into_string(self) -> String {
+                self.0
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = $crate::EmptyId;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl TryFrom<&str> for $name {
+            type Error = $crate::EmptyId;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(id: $name) -> Self {
+                id.0
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl PartialEq<str> for $name {
+            fn eq(&self, other: &str) -> bool {
+                self.0 == other
+            }
+        }
+
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.0 == *other
+            }
+        }
+    };
+}
+
+// Path-based so submodules can invoke it regardless of declaration order.
+pub(crate) use nonempty_string_newtype;
+
+/// An identifier given as the empty string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyId {
+    /// The identifier's type name.
+    pub id: &'static str,
+}
+
+impl std::fmt::Display for EmptyId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} cannot be empty", self.id)
+    }
+}
+
+impl std::error::Error for EmptyId {}
+
+string_newtype! {
+    /// Identifier for a session: an agent's identity over time, and the key
+    /// its [`SessionEvent`](run::SessionEvent) stream is ordered under.
+    SessionId
+}
+
+/// Identifier for one run: a unit of work within a session, from a prompt to
+/// a terminal state.
+///
+/// This is the epic's "unique agent id for that run". It is not
+/// [`AgentContext::agent_id`], which is [`CONVERSATION_AGENT_ID`] or a worker
+/// name and attributes an event *within* a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "uuid::Uuid", into = "uuid::Uuid")]
+pub struct RunId(uuid::Uuid);
+
+impl RunId {
+    /// A fresh id. Version 7, so ids order by when they were minted.
+    pub fn mint() -> Self {
+        Self(uuid::Uuid::now_v7())
+    }
+
+    pub fn as_uuid(&self) -> &uuid::Uuid {
+        &self.0
+    }
+}
+
+/// Why a value is not a run id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvalidRunId {
+    /// Not a UUID.
+    Malformed(uuid::Error),
+    /// The nil UUID.
+    Nil,
+}
+
+impl std::fmt::Display for InvalidRunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(err) => err.fmt(f),
+            Self::Nil => f.write_str("the nil UUID names no run"),
+        }
+    }
+}
+
+impl std::error::Error for InvalidRunId {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Malformed(err) => Some(err),
+            Self::Nil => None,
+        }
+    }
+}
+
+impl TryFrom<uuid::Uuid> for RunId {
+    type Error = InvalidRunId;
+
+    fn try_from(uuid: uuid::Uuid) -> Result<Self, Self::Error> {
+        if uuid.is_nil() {
+            Err(InvalidRunId::Nil)
+        } else {
+            Ok(Self(uuid))
+        }
+    }
+}
+
+impl From<RunId> for uuid::Uuid {
+    fn from(id: RunId) -> Self {
+        id.0
+    }
+}
+
+impl std::str::FromStr for RunId {
+    type Err = InvalidRunId;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        uuid::Uuid::from_str(s)
+            .map_err(InvalidRunId::Malformed)?
+            .try_into()
+    }
+}
+
+impl std::fmt::Display for RunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 string_newtype! {
     /// The id a model assigns to one tool call.
     ToolCallId
@@ -234,6 +423,98 @@ impl std::fmt::Display for Progress {
             Some(total) => write!(f, "{}/{total}", self.current),
             None => write!(f, "{}", self.current),
         }
+    }
+}
+
+/// An instant as Unix time in milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Timestamp(u64);
+
+impl Timestamp {
+    pub fn from_unix_millis(millis: u64) -> Self {
+        Self(millis)
+    }
+
+    pub fn unix_millis(self) -> u64 {
+        self.0
+    }
+
+    /// The current instant. A clock set before the Unix epoch reads as the
+    /// epoch itself.
+    pub fn now() -> Self {
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        Self(u64::try_from(since_epoch.as_millis()).unwrap_or(u64::MAX))
+    }
+}
+
+impl std::fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// A position in a sequence that starts at 1 and counts every item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct SequenceNumber(u64);
+
+impl SequenceNumber {
+    /// The first position.
+    pub const FIRST: Self = Self(1);
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+
+    /// The position after this one.
+    pub fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+
+    /// Whether this is the position immediately after `previous`. `false`
+    /// means the stream did not advance by exactly one: a position was
+    /// missed, this one was delivered again, or it arrived out of order.
+    pub fn follows(self, previous: Self) -> bool {
+        self.0 == previous.0.saturating_add(1)
+    }
+}
+
+impl std::fmt::Display for SequenceNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// A sequence number of zero, which no sequence uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZeroSequenceNumber;
+
+impl std::fmt::Display for ZeroSequenceNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("sequence numbers start at 1")
+    }
+}
+
+impl std::error::Error for ZeroSequenceNumber {}
+
+impl TryFrom<u64> for SequenceNumber {
+    type Error = ZeroSequenceNumber;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        if value == 0 {
+            Err(ZeroSequenceNumber)
+        } else {
+            Ok(Self(value))
+        }
+    }
+}
+
+impl From<SequenceNumber> for u64 {
+    fn from(seq: SequenceNumber) -> Self {
+        seq.0
     }
 }
 
@@ -1402,6 +1683,58 @@ mod tests {
             }
             other => panic!("expected ApprovalCompleted, got {:?}", other),
         }
+    }
+
+    /// A session's sequence starts at 1, so a zero is refused rather than
+    /// read as an event before the first.
+    #[test]
+    fn a_zero_sequence_number_is_refused() {
+        assert_eq!(SequenceNumber::try_from(0), Err(ZeroSequenceNumber));
+        assert!(serde_json::from_value::<SequenceNumber>(serde_json::json!(0)).is_err());
+        assert_eq!(
+            serde_json::from_value::<SequenceNumber>(serde_json::json!(1)).unwrap(),
+            SequenceNumber::FIRST
+        );
+    }
+
+    /// Dense numbering is what lets a consumer tell a missed event from a
+    /// quiet stream: the next number is always exactly one more.
+    #[test]
+    fn sequence_numbers_are_dense() {
+        let first = SequenceNumber::FIRST;
+        assert_eq!(first.get(), 1);
+
+        let second = first.next();
+        assert!(second.follows(first));
+        assert!(!second.next().follows(first), "a skipped number is a gap");
+        assert!(!first.follows(second), "order matters");
+        assert!(!first.follows(first), "a repeat is not a successor");
+    }
+
+    #[test]
+    fn a_sequence_number_serializes_as_a_bare_integer() {
+        let json = serde_json::to_value(SequenceNumber::FIRST.next()).unwrap();
+        assert_eq!(json, serde_json::json!(2));
+        assert_eq!(
+            serde_json::from_value::<SequenceNumber>(json).unwrap(),
+            SequenceNumber(2)
+        );
+    }
+
+    #[test]
+    fn a_timestamp_is_unix_milliseconds() {
+        let at = Timestamp::from_unix_millis(1_700_000_000_000);
+        assert_eq!(
+            serde_json::to_value(at).unwrap(),
+            serde_json::json!(1_700_000_000_000_u64)
+        );
+        assert_eq!(at.unix_millis(), 1_700_000_000_000);
+
+        let now = Timestamp::now();
+        assert!(
+            now > at,
+            "now ({now}) should be after November 2023 ({at}) on any sane clock"
+        );
     }
 }
 

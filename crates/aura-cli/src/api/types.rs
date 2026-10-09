@@ -222,7 +222,7 @@ pub struct ShellCallDetail {
     pub command_name: String,
     pub full_command: String,
     pub result: String,
-    #[serde(with = "duration_millis")]
+    #[serde(with = "aura_events::duration_ms")]
     pub duration: Duration,
 }
 
@@ -233,7 +233,7 @@ pub enum DisplayEvent {
     ToolCall {
         tool_name: String,
         arguments: BTreeMap<String, serde_json::Value>,
-        #[serde(with = "duration_millis")]
+        #[serde(with = "aura_events::duration_ms")]
         duration: Duration,
         result: Option<String>,
     },
@@ -270,7 +270,7 @@ pub enum DisplayEvent {
         diff_text: String,
         lines_added: usize,
         lines_removed: usize,
-        #[serde(with = "duration_millis")]
+        #[serde(with = "aura_events::duration_ms")]
         duration: Duration,
     },
     // Bullet colors are derived at render time via `task_color_for(key)`
@@ -347,20 +347,6 @@ pub fn snake_to_pascal_case(s: &str) -> String {
             }
         })
         .collect()
-}
-
-pub mod duration_millis {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::time::Duration;
-
-    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
-        d.as_millis().serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
-        let millis = u64::deserialize(d)?;
-        Ok(Duration::from_millis(millis))
-    }
 }
 
 #[cfg(test)]
@@ -674,21 +660,20 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // duration_millis serde module
+    // ShellCallDetail
     // -----------------------------------------------------------------------
 
     #[test]
-    fn duration_millis_roundtrip() {
-        // Test via ShellCallDetail which uses #[serde(with = "duration_millis")]
+    fn shell_call_duration_is_milliseconds() {
         let detail = ShellCallDetail {
             command_name: "ls".to_string(),
             full_command: "ls -la".to_string(),
             result: "output".to_string(),
             duration: Duration::from_millis(1234),
         };
-        let json = serde_json::to_string(&detail).unwrap();
-        assert!(json.contains("1234"));
-        let parsed: ShellCallDetail = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["duration"], 1234);
+        let parsed: ShellCallDetail = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.duration, Duration::from_millis(1234));
     }
 }
