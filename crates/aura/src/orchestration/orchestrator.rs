@@ -450,6 +450,9 @@ pub struct Orchestrator {
     /// The underlying agent configuration (for creating workers)
     agent_config: AgentRuntimeConfig,
 
+    /// The run the orchestration serves.
+    run_id: crate::config::RunId,
+
     /// Tool call observer for coordinator visibility into worker tool execution.
     /// Wired to emit AgentEventPayload for real-time SSE streaming via spawn_tool_event_forwarder.
     pub(super) tool_call_observer: ToolCallObserver,
@@ -595,10 +598,16 @@ enum LoopStep {
 }
 
 impl Orchestrator {
-    /// Create a new orchestrator from configuration.
+    /// Create a new orchestrator from configuration, for the run
+    /// `agent_config.run_id` names, or for a fresh run when it names none.
     pub async fn new(
-        agent_config: AgentRuntimeConfig,
+        mut agent_config: AgentRuntimeConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // Minted once, here, so every agent of the orchestration begins its
+        // run within the same one.
+        let run_id = *agent_config
+            .run_id
+            .get_or_insert_with(crate::config::RunId::mint);
         let orchestration_config = agent_config.orchestration.clone().unwrap_or_default();
 
         // Initialize MCP manager (shared across coordinator and all workers via Arc)
@@ -635,6 +644,9 @@ impl Orchestrator {
 
         let orchestrator_id = uuid::Uuid::new_v4().to_string();
 
+        // Persistence names the run by an id of its own, which the park
+        // owner, the checkpoint and `RunParked` carry; the run's `RunContext`
+        // is named by its `RunId`. The two are distinct.
         let run_id_str = persistence.lock().await.run_id().to_string();
         // One guard per park-mode run; `ParkGuard` documents arming and drop.
         let park_guard = agent_config
@@ -662,6 +674,7 @@ impl Orchestrator {
 
         Ok(Self {
             orchestrator_id,
+            run_id,
             config: orchestration_config,
             agent_config,
             tool_call_observer,
@@ -1156,12 +1169,10 @@ impl Orchestrator {
 
     /// The run the orchestration serves, for its workers and coordinator to
     /// begin theirs within. That is the run in scope; a test driving the
-    /// orchestrator outside one gets a run nobody observes, under the
-    /// request id the config carries.
+    /// orchestrator outside one gets a run nobody observes, under the id the
+    /// orchestrator was created with.
     fn orchestration_run(&self) -> Arc<RunContext> {
-        crate::run_context::current_run().unwrap_or_else(|| {
-            RunContext::channel(self.agent_config.request_id.clone().unwrap_or_default()).0
-        })
+        crate::run_context::current_run().unwrap_or_else(|| RunContext::channel(self.run_id).0)
     }
 
     /// Park-mode wiring for one worker attempt: `Some` only when this run
@@ -7499,6 +7510,33 @@ mod tests {
         assert_eq!(other["content"], "kept");
     }
 
+    /// Every agent of an orchestration begins its run within the
+    /// orchestration's, so outside a scope they all get the same unobserved
+    /// run, under the id the orchestrator was created with.
+    #[tokio::test]
+    async fn an_unscoped_orchestration_names_one_run() {
+        let orchestrator = Orchestrator::new(crate::config::AgentRuntimeConfig::default())
+            .await
+            .unwrap();
+        let first = orchestrator.orchestration_run();
+        let second = orchestrator.orchestration_run();
+        assert_eq!(first.id(), second.id());
+        assert_eq!(
+            orchestrator.agent_config.run_id,
+            Some(first.id()),
+            "the config carries the id the orchestrator minted"
+        );
+
+        let named = crate::run_context::named_run_id("req_named");
+        let orchestrator = Orchestrator::new(crate::config::AgentRuntimeConfig {
+            run_id: Some(named),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(orchestrator.orchestration_run().id(), named);
+    }
+
     /// Attached artifacts are listed in the worker's context after any
     /// dependency results, and alone when the task has no dependencies.
     #[tokio::test]
@@ -7703,8 +7741,8 @@ mod tests {
         };
         use crate::session_store::{InMemoryApprovalStore, InMemoryEventBus};
 
-        let request_id = format!("req_cancel_{}", uuid::Uuid::new_v4().simple());
-        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+        let run_id = aura_events::RunId::mint();
+        let (run, mut events) = crate::run_context::RunContext::channel(run_id);
 
         let store: Arc<dyn crate::session_store::ApprovalStore> =
             Arc::new(InMemoryApprovalStore::new());
@@ -7719,7 +7757,7 @@ mod tests {
                 }),
                 park_enabled: true,
             }),
-            request_id: Some(request_id.clone()),
+            run_id: Some(run_id),
             ..AgentRuntimeConfig::default()
         };
         let orchestrator = Orchestrator::new(config).await.unwrap();
@@ -7835,7 +7873,7 @@ mod tests {
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some("park-sess".to_string()),
-            request_id: Some(format!("req_park_{}", uuid::Uuid::new_v4().simple())),
+            run_id: Some(aura_events::RunId::mint()),
             ..AgentRuntimeConfig::default()
         };
         let orchestrator = Orchestrator::new(config).await.unwrap();
@@ -8083,12 +8121,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (orchestrator, store, registry, run_id) = park_orchestrator(dir.path()).await;
         let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
-        let request_id = orchestrator
+        let this_run = orchestrator
             .agent_config
-            .request_id
-            .clone()
-            .unwrap_or_default();
-        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+            .run_id
+            .expect("a park orchestrator is built for a run");
+        let (run, mut events) = crate::run_context::RunContext::channel(this_run);
         // Arming inside the scope is what gives the guard the run its drop
         // sweep reports to.
         crate::run_context::with_run(Arc::clone(&run), arm_guard(&orchestrator, &plan)).await;
@@ -8178,12 +8215,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (orchestrator, store, registry, run_id) = park_orchestrator(dir.path()).await;
         let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
-        let request_id = orchestrator
+        let this_run = orchestrator
             .agent_config
-            .request_id
-            .clone()
-            .unwrap_or_default();
-        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+            .run_id
+            .expect("a park orchestrator is built for a run");
+        let (run, mut events) = crate::run_context::RunContext::channel(this_run);
 
         // The human decides the first call before the commit is attempted.
         let decided = pending[0].decision_id;
@@ -8270,12 +8306,11 @@ mod tests {
         let (orchestrator, registry, run_id) =
             park_orchestrator_over(store.clone(), dir.path()).await;
         let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
-        let request_id = orchestrator
+        let this_run = orchestrator
             .agent_config
-            .request_id
-            .clone()
-            .unwrap_or_default();
-        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+            .run_id
+            .expect("a park orchestrator is built for a run");
+        let (run, mut events) = crate::run_context::RunContext::channel(this_run);
         crate::run_context::with_run(Arc::clone(&run), arm_guard(&orchestrator, &plan)).await;
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
@@ -8398,7 +8433,8 @@ mod tests {
                 skills: None,
             },
         )]);
-        let request_id = format!("req_orphan_{}", uuid::Uuid::new_v4().simple());
+        let run_id = aura_events::RunId::mint();
+        let request_id = run_id.to_string();
         let config = AgentRuntimeConfig {
             hitl: Some(crate::hitl::HitlRuntime {
                 patterns: Arc::from(["echo_tool".into()]),
@@ -8410,7 +8446,7 @@ mod tests {
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some("orphan-sess".to_string()),
-            request_id: Some(request_id.clone()),
+            run_id: Some(run_id),
             orchestration: Some(OrchestrationConfig {
                 enabled: true,
                 workers,
@@ -8522,7 +8558,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (orchestrator, store, _registry, request_id) =
             override_park_orchestrator(dir.path(), 1).await;
-        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+        let (run, mut events) =
+            crate::run_context::RunContext::channel(request_id.parse().expect("a run id"));
 
         // Depth 1 gives the loop three turns (the rig's +1 safety net), so
         // the gated call must land on the third: the first two turns burn
@@ -8581,7 +8618,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (orchestrator, store, _registry, request_id) =
             override_park_orchestrator(dir.path(), 4).await;
-        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+        let (run, mut events) =
+            crate::run_context::RunContext::channel(request_id.parse().expect("a run id"));
 
         let (_model, gated_invocations) =
             gated_worker_override(vec![ScriptedTurn::tool_calls_then_stream_failure(vec![
@@ -8701,7 +8739,7 @@ mod tests {
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some(session_id.to_string()),
-            request_id: Some(format!("req_resume_{}", uuid::Uuid::new_v4().simple())),
+            run_id: Some(aura_events::RunId::mint()),
             orchestration: Some(OrchestrationConfig {
                 enabled: true,
                 workers,

@@ -235,6 +235,16 @@ fn queue_answer(ingress: &Arc<SlackIngress>, inbound: Inbound, earlier: Option<V
         );
         return;
     };
+    // The answer runs inside this span, so its log lines, the agent's
+    // included, carry the run's id and the message it answers.
+    let run_id = aura::RunId::mint();
+    let span = tracing::info_span!(
+        parent: None,
+        "agent.stream",
+        run.id = %run_id,
+        slack.channel = %inbound.channel,
+        slack.ts = %inbound.ts,
+    );
     let ingress = Arc::clone(ingress);
     let tracker = Arc::clone(&ingress.state.active_requests);
     let active = ActiveRequestGuard::new(Arc::clone(&tracker));
@@ -247,12 +257,10 @@ fn queue_answer(ingress: &Arc<SlackIngress>, inbound: Inbound, earlier: Option<V
         };
         drop(waiting);
         if slot.is_ok() {
-            ingress.answer(inbound, earlier).await;
+            ingress.answer(inbound, earlier, run_id).await;
         }
     };
-    tracker.track_task(tokio::spawn(
-        task.instrument(tracing::info_span!(parent: None, "agent.stream")),
-    ));
+    tracker.track_task(tokio::spawn(task.instrument(span)));
 }
 
 impl SlackIngress {
@@ -263,8 +271,15 @@ impl SlackIngress {
     /// participation verdict stands, since the trimmed read may no longer
     /// hold the bot turn that earned it. A conversation read here is
     /// checked here.
-    async fn answer(&self, inbound: Inbound, prefetched: Option<Vec<SlackMessage>>) {
-        let request_id = format!("slack_{}_{}", inbound.channel, inbound.ts);
+    async fn answer(
+        &self,
+        inbound: Inbound,
+        prefetched: Option<Vec<SlackMessage>>,
+        run_id: aura::RunId,
+    ) {
+        // In string form, the run's id is the request id everything
+        // request-keyed reads.
+        let request_id = run_id.to_string();
         let earlier = match prefetched {
             Some(earlier) => earlier,
             None => {
@@ -291,7 +306,7 @@ impl SlackIngress {
             warn!(request_id, error = %e, "could not react to slack message");
         }
 
-        let reply = match self.run_agent(&inbound, &earlier, &request_id).await {
+        let reply = match self.run_agent(&inbound, &earlier, run_id).await {
             Ok(text) if text.trim().is_empty() => EMPTY_REPLY.to_owned(),
             Ok(text) => text,
             // The server is going down; a reply would race the shutdown and
@@ -344,8 +359,10 @@ impl SlackIngress {
         &self,
         inbound: &Inbound,
         earlier: &[SlackMessage],
-        request_id: &str,
+        run_id: aura::RunId,
     ) -> Result<String, RunError> {
+        let request_id = run_id.to_string();
+        let request_id = request_id.as_str();
         let history = thread_history(earlier, &self.identity, &inbound.ts);
         let session_id = match inbound.reply_thread() {
             Some(thread) => format!("slack:{}:{thread}", inbound.channel),
@@ -359,13 +376,7 @@ impl SlackIngress {
         );
         let agent = RigBuilder::new(config, self.state.pending_approvals.clone())
             .with_hitl_hmac(self.state.hitl_webhook_hmac.clone())
-            .build_streaming_agent_with_tools(
-                None,
-                Some(session_id),
-                None,
-                Some(request_id.to_owned()),
-                tools,
-            )
+            .build_streaming_agent_with_tools(None, Some(session_id), None, Some(run_id), tools)
             .await
             .map_err(|e| RunError::Build(e.to_string()))?;
 

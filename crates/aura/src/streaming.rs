@@ -283,7 +283,8 @@ pub trait StreamingAgent: Send + Sync {
     /// holds. The returned handle owns the events, the token that cancels them,
     /// and the usage they accumulate.
     ///
-    /// `request_id` correlates MCP progress and tool events for this run.
+    /// The run streams under the id its agent was built for, which a caller
+    /// passes back as `request_id`; a different value is logged, not adopted.
     async fn stream(
         &self,
         query: &str,
@@ -481,7 +482,8 @@ mod tests {
             agent: aura_events::AgentContext,
             items: Vec<Result<StreamItem, StreamError>>,
         ) -> (Vec<aura_events::AgentContext>, usize, Vec<Payload>) {
-            let (run, mut events) = RunContext::channel("run_tee");
+            let (run, mut events) =
+                RunContext::channel(crate::run_context::named_run_id("run_tee"));
             let passed = tee_content(run, agent, futures::stream::iter(items))
                 .collect::<Vec<_>>()
                 .await
@@ -564,7 +566,8 @@ mod tests {
         /// the items must still pass.
         #[tokio::test]
         async fn an_unobserved_run_still_streams_its_items() {
-            let (run, events) = RunContext::channel("run_unobserved");
+            let (run, events) =
+                RunContext::channel(crate::run_context::named_run_id("run_unobserved"));
             drop(events);
 
             let passed = tee_content(
