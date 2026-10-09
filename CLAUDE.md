@@ -134,7 +134,7 @@ aura/
 
 ### Shared Event Types (`aura-events`)
 - Lightweight crate defining `AuraStreamEvent` and `OrchestrationStreamEvent` enums
-- `run::SessionEvent` is a session's own envelope: its `SessionId`, the `RunId` when the event belongs to a run, a `SequenceNumber` dense per session, a `Timestamp`, and either an `agent::AgentEvent` or a `LifecycleEvent` (started, observer attached/detached, claims exhausted, liveness decided, parked, finished, cancelled, failed). `RunId` is a UUID (v7 when minted); there is one per run. No producer emits it yet
+- `run::SessionEvent` is a session's own envelope: its `SessionId`, the `RunId` when the event belongs to a run, a `SequenceNumber` dense per session, a `Timestamp`, and either an `agent::AgentEvent` or a `LifecycleEvent` (started, observer attached/detached, claims exhausted, liveness decided, parked, finished, cancelled, failed). `RunId` is a UUID (v7 when minted); there is one per run. `aura::journal::SessionJournal` is what stamps one (see Key Modules); nothing in production drives a run's channel into a journal yet
 - Both `Serialize + Deserialize` — used by the web server (producer) and CLI (consumer)
 - No agent, MCP, or provider dependencies — only `serde`, `serde_json`, and `uuid`
 - `ProgressToken` type uses a local wire-compatible definition by default; enables `rmcp-types` feature for direct rmcp interop (used by the `aura` crate)
@@ -164,6 +164,7 @@ export AWS_REGION="your-region"       # For Knowledge Base
 - `stream_events.rs` - Custom aura SSE events
 - `request_cancellation.rs` - The signal that stops a run, as awaiting work sees it
 - `run_context.rs` - `RunContext`, the run a task is working on: its event channel, the FIFO queue for tool_call_id correlation (see critical assumption below), and the scratchpad budget, turn-nudge counters and skill-invocation recorder an agent keeps for it; `BoundRun` is the slot through which prepare-time tools and wrappers (turn nudge, scratchpad, skills, HITL) reach it, and `RunLease` is what `begin_run` counts to serve one run at a time
+- `journal.rs` - `SessionJournal`, one session's append-only stream of `SessionEvent`s across its runs: `append` is the one serialized path that mints a `SequenceNumber` (agent events via `drain`, which is the sole reader of a run's channel, and lifecycle events alike), and `subscribe(Cursor)` replays from the store then follows live as one stream; a subscriber the broadcast moves past goes back to the store, so `JournalItem::Gap` means only that the store no longer holds the events either (cursor older than it keeps, session evicted, subscriber slower than its retention). Storage is `session_store::JournalStore`, a `SessionStore` capability beside approvals, skills and the bus; only `InMemoryJournalStore` exists, bounded per session and by session count
 - `orchestration/` - Multi-agent coordinator, workers, DAG execution, orchestration SSE events
 
 ### Critical Assumption: Rig Sequential Tool Execution

@@ -5,8 +5,9 @@
 //! the event bus ([`event_bus`]) are all Redis-backed, so A2A send/poll/list,
 //! conversational approvals, skill rehydration, and — through `crate::a2a`'s
 //! bus bridge — A2A streaming/subscribe/cancel all work across instances.
-//! Each submodule documents its own key schema under the configured
-//! `key_prefix`. See `docs/design/session-storage.md`.
+//! Session journals stay in memory on this backend too. Each submodule
+//! documents its own key schema under the configured `key_prefix`. See
+//! `docs/design/session-storage.md`.
 
 mod approval_store;
 mod event_bus;
@@ -17,7 +18,10 @@ use std::sync::Arc;
 
 use a2a_server::TaskStore;
 use async_trait::async_trait;
-use aura::session_store::{ApprovalStore, EventBus, SessionStoreError, SkillInvocationStore};
+use aura::session_store::{
+    ApprovalStore, EventBus, InMemoryJournalStore, JournalStore, SessionStoreError,
+    SkillInvocationStore,
+};
 use aura_config::{RedisSessionStoreConfig, SessionStoreBackend};
 use redis::Client;
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
@@ -33,6 +37,7 @@ pub struct RedisSessionStore {
     tasks: Arc<RedisTaskStore>,
     approvals: Arc<RedisApprovalStore>,
     skills: Arc<RedisSkillInvocationStore>,
+    journals: Arc<InMemoryJournalStore>,
     bus: Arc<RedisEventBus>,
 }
 
@@ -72,6 +77,7 @@ impl RedisSessionStore {
                 &config.key_prefix,
                 config.skills_ttl_secs,
             )),
+            journals: Arc::new(InMemoryJournalStore::new()),
             bus: Arc::new(RedisEventBus::new(
                 client,
                 conn.clone(),
@@ -99,6 +105,10 @@ impl SessionStore for RedisSessionStore {
 
     fn skills(&self) -> Arc<dyn SkillInvocationStore> {
         self.skills.clone()
+    }
+
+    fn journals(&self) -> Arc<dyn JournalStore> {
+        self.journals.clone()
     }
 
     fn bus(&self) -> Arc<dyn EventBus> {

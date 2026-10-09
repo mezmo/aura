@@ -1,18 +1,20 @@
 //! In-memory (single-process) implementations of the session-store
 //! capabilities: the default backend, with all state scoped to the process.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use aura_events::run::{SequenceNumber, SessionEvent};
 use bytes::Bytes;
 use tokio::sync::broadcast;
 
+use crate::config::SessionId;
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError, Timestamp};
 
 use super::{
-    ApprovalStore, EventBus, MAX_SKILL_RECORDS_PER_LOG, SessionStoreError, SkillInvocationRecord,
-    SkillInvocationStore, SkillLogKey, Subscription,
+    ApprovalStore, EventBus, JournalEntry, JournalStore, MAX_SKILL_RECORDS_PER_LOG,
+    SessionStoreError, SkillInvocationRecord, SkillInvocationStore, SkillLogKey, Subscription,
 };
 
 /// Buffered payloads per topic before slow subscribers start lagging.
@@ -24,6 +26,14 @@ const DECISION_RETENTION_MARGIN_SECS: i64 = 60;
 /// Skill logs kept in the skill-invocation store before the least-recently
 /// touched one is evicted.
 const MAX_SKILL_LOGS: usize = 1024;
+
+/// Events kept per session by [`InMemoryJournalStore::new`] before the oldest
+/// is dropped.
+pub const DEFAULT_MAX_JOURNAL_ENTRIES_PER_SESSION: usize = 4096;
+
+/// Sessions kept by [`InMemoryJournalStore::new`] before the least-recently
+/// touched one is evicted.
+pub const DEFAULT_MAX_JOURNAL_SESSIONS: usize = 256;
 
 /// A recorded decision and its retention deadline.
 struct DecidedEntry {
@@ -223,6 +233,155 @@ impl SkillInvocationStore for InMemorySkillInvocationStore {
         let mut records = entry.records.clone();
         records.sort_by_key(|r| (r.anchor, r.seq));
         Ok(records)
+    }
+}
+
+/// The session journals as a bounded ring per session.
+///
+/// Like skill records, journal entries have no natural removal event, so this
+/// store bounds growth itself: a per-session entry cap that drops the oldest
+/// entries first, and a least-recently-touched session eviction cap.
+pub struct InMemoryJournalStore {
+    // `std::sync::Mutex`: every operation is a synchronous ring op; nothing
+    // awaits while holding the lock.
+    inner: Mutex<Journals>,
+    max_entries_per_session: usize,
+    max_sessions: usize,
+}
+
+#[derive(Default)]
+struct Journals {
+    sessions: HashMap<SessionId, JournalRing>,
+    /// Non-decreasing touch counter backing least-recently-touched eviction.
+    clock: u64,
+}
+
+#[derive(Default)]
+struct JournalRing {
+    /// Contiguous, in sequence order.
+    entries: VecDeque<Arc<SessionEvent>>,
+    last_touched: u64,
+}
+
+impl Default for InMemoryJournalStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InMemoryJournalStore {
+    /// A store with the default bounds.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_bounds(
+            DEFAULT_MAX_JOURNAL_ENTRIES_PER_SESSION,
+            DEFAULT_MAX_JOURNAL_SESSIONS,
+        )
+    }
+
+    /// A store keeping at most `max_entries_per_session` events of a session
+    /// and at most `max_sessions` sessions. A bound of zero keeps one: a store
+    /// that holds nothing would make every append a silent drop.
+    #[must_use]
+    pub fn with_bounds(max_entries_per_session: usize, max_sessions: usize) -> Self {
+        Self {
+            inner: Mutex::new(Journals::default()),
+            max_entries_per_session: max_entries_per_session.max(1),
+            max_sessions: max_sessions.max(1),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Journals> {
+        self.inner.lock().expect("journal store lock poisoned")
+    }
+}
+
+impl Journals {
+    /// The session's ring, created if absent, marked as touched now.
+    fn touch(&mut self, session: &SessionId) -> &mut JournalRing {
+        // Saturating rather than wrapping, for the reason the skill store's
+        // counter is.
+        self.clock = self.clock.saturating_add(1);
+        let clock = self.clock;
+        let ring = self.sessions.entry(session.clone()).or_default();
+        ring.last_touched = clock;
+        ring
+    }
+
+    fn evict_past(&mut self, max_sessions: usize) {
+        if self.sessions.len() > max_sessions
+            && let Some(evict) = self
+                .sessions
+                .iter()
+                .min_by_key(|(_, ring)| ring.last_touched)
+                .map(|(key, _)| key.clone())
+        {
+            self.sessions.remove(&evict);
+        }
+    }
+}
+
+#[async_trait]
+impl JournalStore for InMemoryJournalStore {
+    /// Refuses an event whose `seq` does not follow the session's newest, since
+    /// two writers interleaving is the one thing the trait rules out and a ring
+    /// that accepted it would read back out of order.
+    async fn append(&self, event: Arc<SessionEvent>) -> Result<(), SessionStoreError> {
+        let mut inner = self.lock();
+        let ring = inner.touch(&event.session_id);
+
+        if let Some(newest) = ring.entries.back()
+            && event.seq <= newest.seq
+        {
+            return Err(SessionStoreError::Request {
+                reason: format!(
+                    "journal for session '{}' already holds seq {}; refusing seq {} out of order",
+                    event.session_id, newest.seq, event.seq
+                ),
+            });
+        }
+        if ring.entries.len() >= self.max_entries_per_session {
+            ring.entries.pop_front();
+        }
+        ring.entries.push_back(event);
+
+        inner.evict_past(self.max_sessions);
+        Ok(())
+    }
+
+    async fn read(
+        &self,
+        session: &SessionId,
+        from: SequenceNumber,
+        to: SequenceNumber,
+    ) -> Result<Vec<JournalEntry>, SessionStoreError> {
+        let mut inner = self.lock();
+        inner.clock = inner.clock.saturating_add(1);
+        let clock = inner.clock;
+        let Some(ring) = inner.sessions.get_mut(session) else {
+            return Ok(Vec::new());
+        };
+        ring.last_touched = clock;
+
+        let start = ring.entries.partition_point(|event| event.seq < from);
+        Ok(ring
+            .entries
+            .range(start..)
+            .take_while(|event| event.seq <= to)
+            .map(|event| JournalEntry::Event(Arc::clone(event)))
+            .collect())
+    }
+
+    async fn latest(
+        &self,
+        session: &SessionId,
+    ) -> Result<Option<SequenceNumber>, SessionStoreError> {
+        Ok(self
+            .lock()
+            .sessions
+            .get(session)
+            .and_then(|ring| ring.entries.back())
+            .map(|event| event.seq))
     }
 }
 
@@ -718,6 +877,156 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    fn journal_event(session: &str, seq: u64) -> Arc<SessionEvent> {
+        Arc::new(SessionEvent {
+            session_id: SessionId::new(session),
+            run_id: None,
+            seq: SequenceNumber::try_from(seq).unwrap(),
+            at: aura_events::run::Timestamp::from_unix_millis(seq),
+            payload: aura_events::run::SessionEventPayload::Lifecycle(
+                aura_events::run::LifecycleEvent::ClaimsExhausted,
+            ),
+        })
+    }
+
+    async fn fill(
+        store: &InMemoryJournalStore,
+        session: &str,
+        seqs: std::ops::RangeInclusive<u64>,
+    ) {
+        for seq in seqs {
+            store.append(journal_event(session, seq)).await.unwrap();
+        }
+    }
+
+    async fn read_seqs(
+        store: &InMemoryJournalStore,
+        session: &str,
+        from: u64,
+        to: u64,
+    ) -> Vec<u64> {
+        store
+            .read(
+                &SessionId::new(session),
+                SequenceNumber::try_from(from).unwrap(),
+                SequenceNumber::try_from(to).unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.seq().get())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn journal_store_reads_a_range_inclusive_in_order() {
+        let store = InMemoryJournalStore::new();
+        fill(&store, "sess-1", 1..=6).await;
+
+        assert_eq!(read_seqs(&store, "sess-1", 2, 4).await, vec![2, 3, 4]);
+        assert_eq!(
+            read_seqs(&store, "sess-1", 1, 6).await,
+            vec![1, 2, 3, 4, 5, 6]
+        );
+        assert_eq!(
+            read_seqs(&store, "sess-1", 5, 40).await,
+            vec![5, 6],
+            "a range past the end returns what exists"
+        );
+        assert!(read_seqs(&store, "sess-1", 7, 9).await.is_empty());
+        assert!(
+            read_seqs(&store, "sess-unknown", 1, 9).await.is_empty(),
+            "a session the store never saw reads as empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_store_latest_is_the_newest_or_none() {
+        let store = InMemoryJournalStore::new();
+        let session = SessionId::new("sess-1");
+        assert_eq!(store.latest(&session).await.unwrap(), None);
+
+        fill(&store, "sess-1", 1..=3).await;
+        assert_eq!(
+            store.latest(&session).await.unwrap(),
+            Some(SequenceNumber::try_from(3).unwrap())
+        );
+    }
+
+    /// Dropping the oldest first is what keeps what remains a suffix, which is
+    /// what lets a reader name what is missing from the numbers alone.
+    #[tokio::test]
+    async fn journal_store_drops_a_sessions_oldest_entries_past_its_cap() {
+        let store = InMemoryJournalStore::with_bounds(3, 8);
+        fill(&store, "sess-1", 1..=5).await;
+
+        assert_eq!(read_seqs(&store, "sess-1", 1, 5).await, vec![3, 4, 5]);
+        assert_eq!(
+            store.latest(&SessionId::new("sess-1")).await.unwrap(),
+            Some(SequenceNumber::try_from(5).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_store_evicts_the_least_recently_touched_session() {
+        let store = InMemoryJournalStore::with_bounds(8, 2);
+        fill(&store, "sess-a", 1..=1).await;
+        fill(&store, "sess-b", 1..=1).await;
+        // Reading touches: `sess-a` is now the more recent of the two.
+        assert_eq!(read_seqs(&store, "sess-a", 1, 1).await, vec![1]);
+
+        fill(&store, "sess-c", 1..=1).await;
+
+        assert_eq!(read_seqs(&store, "sess-a", 1, 1).await, vec![1]);
+        assert!(read_seqs(&store, "sess-b", 1, 1).await.is_empty());
+        assert_eq!(read_seqs(&store, "sess-c", 1, 1).await, vec![1]);
+        assert_eq!(store.lock().sessions.len(), 2);
+    }
+
+    /// The trait promises a strictly increasing sequence from one writer. The
+    /// store holds the writer to it rather than storing what it could not read
+    /// back in order.
+    #[tokio::test]
+    async fn journal_store_refuses_a_sequence_number_out_of_order() {
+        let store = InMemoryJournalStore::new();
+        fill(&store, "sess-1", 1..=3).await;
+
+        let repeat = store.append(journal_event("sess-1", 3)).await.unwrap_err();
+        assert!(repeat.to_string().contains("out of order"), "{repeat}");
+        let earlier = store.append(journal_event("sess-1", 2)).await.unwrap_err();
+        assert!(earlier.to_string().contains("out of order"), "{earlier}");
+        assert_eq!(read_seqs(&store, "sess-1", 1, 9).await, vec![1, 2, 3]);
+
+        // A later number need not be the very next one: a store only ever
+        // sees one writer, and what that writer skipped is not the store's
+        // to question.
+        store.append(journal_event("sess-1", 7)).await.unwrap();
+        assert_eq!(read_seqs(&store, "sess-1", 1, 9).await, vec![1, 2, 3, 7]);
+    }
+
+    #[tokio::test]
+    async fn journal_store_sessions_are_independent() {
+        let store = InMemoryJournalStore::new();
+        fill(&store, "sess-a", 1..=2).await;
+        fill(&store, "sess-b", 1..=1).await;
+
+        assert_eq!(read_seqs(&store, "sess-a", 1, 9).await, vec![1, 2]);
+        assert_eq!(read_seqs(&store, "sess-b", 1, 9).await, vec![1]);
+    }
+
+    /// A store that held nothing would turn every append into a silent drop,
+    /// so the smallest bound is one.
+    #[tokio::test]
+    async fn journal_store_bounds_of_zero_keep_one() {
+        let store = InMemoryJournalStore::with_bounds(0, 0);
+        fill(&store, "sess-a", 1..=2).await;
+        assert_eq!(read_seqs(&store, "sess-a", 1, 9).await, vec![2]);
+
+        fill(&store, "sess-b", 1..=1).await;
+        assert!(read_seqs(&store, "sess-a", 1, 9).await.is_empty());
+        assert_eq!(read_seqs(&store, "sess-b", 1, 9).await, vec![1]);
     }
 
     #[tokio::test]
