@@ -218,8 +218,8 @@ impl StreamingAgent for OrchestratorFactory {
         options: crate::streaming::RunOptions,
         request_id: &str,
     ) -> crate::streaming::AgentRun {
-        // The run is the one this factory was built for, as an `Agent`'s is
-        // the one it began; a factory built for none starts a fresh run.
+        // The run this factory was built for, or a fresh one when it was
+        // built for none.
         let run_id = self.agent_config.run_id.unwrap_or_else(RunId::mint);
         if run_id.to_string() != request_id {
             tracing::debug!(
