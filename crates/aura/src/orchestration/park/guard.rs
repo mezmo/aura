@@ -83,7 +83,7 @@ mod tests {
         AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId, PROTOCOL_VERSION,
         ParkedApproval, PendingApprovals,
     };
-    use crate::orchestration::{RunId, TaskIdentity, run_owner_id};
+    use crate::orchestration::{PersistenceRunId, TaskIdentity, run_owner_id};
     use crate::session_store::{ApprovalStore, InMemoryApprovalStore, InMemoryEventBus};
 
     fn registry_with_store() -> (PendingApprovals, Arc<InMemoryApprovalStore>) {
@@ -95,7 +95,7 @@ mod tests {
         (registry, store)
     }
 
-    fn worker_scope(run_id: RunId) -> AgentScope {
+    fn worker_scope(run_id: PersistenceRunId) -> AgentScope {
         AgentScope::Worker {
             run_id,
             task: TaskIdentity::new(0, Some("operations".to_string())),
@@ -143,7 +143,7 @@ mod tests {
     #[tokio::test]
     async fn unpublished_guard_drop_cancels_run_approvals() {
         let (registry, store) = registry_with_store();
-        let run_id: RunId = "0191e8c0-2222-7000-8000-000000000042".parse().unwrap();
+        let run_id: PersistenceRunId = "0191e8c0-2222-7000-8000-000000000042".parse().unwrap();
         let this_run = aura_events::RunId::mint();
         let (run, mut events) = crate::run_context::RunContext::channel(this_run);
 
@@ -193,7 +193,7 @@ mod tests {
     #[tokio::test]
     async fn published_guard_drop_leaves_approvals_parked() {
         let (registry, store) = registry_with_store();
-        let run_id: RunId = "0191e8c0-3333-7000-8000-000000000042".parse().unwrap();
+        let run_id: PersistenceRunId = "0191e8c0-3333-7000-8000-000000000042".parse().unwrap();
         let scope = worker_scope(run_id);
         let decision_id = DecisionId::generate();
         registry
@@ -220,7 +220,7 @@ mod tests {
     #[tokio::test]
     async fn unrecorded_guard_drop_is_inert() {
         let (registry, store) = registry_with_store();
-        let run_id: RunId = "0191e8c0-4444-7000-8000-000000000042".parse().unwrap();
+        let run_id: PersistenceRunId = "0191e8c0-4444-7000-8000-000000000042".parse().unwrap();
         let other = DecisionId::generate();
         // The ticket belongs to this run's owner id, so the arming condition
         // is load-bearing: an armed guard's drop would sweep and clear it.
