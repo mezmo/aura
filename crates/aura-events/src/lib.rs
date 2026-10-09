@@ -149,9 +149,8 @@ macro_rules! string_newtype {
     };
 }
 
-/// Generates a string newtype that cannot hold a blank string: a fallible
-/// constructor, `TryFrom` the string types, and deserialization that refuse
-/// `""` and whitespace alike.
+/// Generates a string newtype that rejects blank values (empty or only
+/// whitespace) in its constructor, its `TryFrom` impls, and deserialization.
 macro_rules! nonempty_string_newtype {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
@@ -169,6 +168,12 @@ macro_rules! nonempty_string_newtype {
                 } else {
                     Ok(Self(value))
                 }
+            }
+
+            /// Like `new`, but returns `None` for a blank value instead of an
+            /// error. Use it where a blank value should count as missing.
+            pub fn non_empty(value: impl Into<String>) -> Option<Self> {
+                Self::new(value).ok()
             }
         }
 
@@ -216,7 +221,7 @@ impl std::fmt::Display for EmptyId {
 
 impl std::error::Error for EmptyId {}
 
-string_newtype! {
+nonempty_string_newtype! {
     /// Identifier for a session: an agent's identity over time, and the key
     /// its [`SessionEvent`](run::SessionEvent) stream is ordered under.
     SessionId
@@ -1740,7 +1745,7 @@ mod tests {
     /// compares against every string type a plain one does.
     #[test]
     fn a_nonempty_id_has_the_same_surface_as_a_plain_one() {
-        let plain = SessionId::new("s");
+        let plain = ToolName::new("s");
         let nonempty = run::ObserverId::new("s").unwrap();
         assert_eq!(plain, "s");
         assert_eq!(nonempty, "s");

@@ -742,7 +742,7 @@ mod tests {
     }
 
     fn skill_log(session_id: impl Into<String>, agent_id: &str) -> SkillLogKey {
-        SkillLogKey::new(SessionId::new(session_id), agent_id)
+        SkillLogKey::new(SessionId::new(session_id).unwrap(), agent_id)
     }
 
     #[tokio::test]
@@ -931,7 +931,7 @@ mod tests {
     /// Appends one event to `session` at the newest number the store holds
     /// and returns the number it minted.
     async fn append_one(store: &InMemoryJournalStore, session: &str) -> u64 {
-        let session = SessionId::new(session);
+        let session = SessionId::new(session).unwrap();
         let expected = store.latest(&session).await.unwrap();
         append_expecting(store, &session, expected)
             .await
@@ -976,7 +976,7 @@ mod tests {
     ) -> Vec<u64> {
         store
             .read(
-                &SessionId::new(session),
+                &SessionId::new(session).unwrap(),
                 SequenceNumber::try_from(from).unwrap(),
                 SequenceNumber::try_from(to).unwrap(),
                 usize::MAX,
@@ -1017,7 +1017,7 @@ mod tests {
     async fn journal_store_read_stops_at_its_limit() {
         let store = InMemoryJournalStore::with_bounds(4, 8);
         fill(&store, "sess-1", 1..=100).await;
-        let session = SessionId::new("sess-1");
+        let session = SessionId::new("sess-1").unwrap();
         let read = |from: u64, limit: usize| {
             let (store, session) = (&store, &session);
             async move {
@@ -1045,7 +1045,7 @@ mod tests {
     #[tokio::test]
     async fn journal_store_latest_is_the_newest_or_none() {
         let store = InMemoryJournalStore::new();
-        let session = SessionId::new("sess-1");
+        let session = SessionId::new("sess-1").unwrap();
         assert_eq!(store.latest(&session).await.unwrap(), None);
 
         fill(&store, "sess-1", 1..=3).await;
@@ -1064,7 +1064,10 @@ mod tests {
 
         assert_eq!(read_seqs(&store, "sess-1", 1, 5).await, vec![3, 4, 5]);
         assert_eq!(
-            store.latest(&SessionId::new("sess-1")).await.unwrap(),
+            store
+                .latest(&SessionId::new("sess-1").unwrap())
+                .await
+                .unwrap(),
             Some(SequenceNumber::try_from(5).unwrap())
         );
     }
@@ -1108,7 +1111,7 @@ mod tests {
     async fn journal_store_refuses_an_append_expecting_another_number() {
         let store = InMemoryJournalStore::new();
         fill(&store, "sess-1", 1..=3).await;
-        let session = SessionId::new("sess-1");
+        let session = SessionId::new("sess-1").unwrap();
         let at = |n: u64| Some(SequenceNumber::try_from(n).unwrap());
 
         for expected in [at(2), at(5), None] {
@@ -1133,7 +1136,7 @@ mod tests {
     #[tokio::test]
     async fn journal_store_takes_the_writers_number_for_a_session_it_forgot() {
         let store = InMemoryJournalStore::new();
-        let session = SessionId::new("sess-forgotten");
+        let session = SessionId::new("sess-forgotten").unwrap();
         let event = append_expecting(&store, &session, Some(SequenceNumber::try_from(7).unwrap()))
             .await
             .unwrap();
@@ -1155,7 +1158,10 @@ mod tests {
 
         assert!(read_seqs(&store, "sess-a", 1, 9).await.is_empty());
         assert_eq!(
-            store.latest(&SessionId::new("sess-a")).await.unwrap(),
+            store
+                .latest(&SessionId::new("sess-a").unwrap())
+                .await
+                .unwrap(),
             Some(SequenceNumber::try_from(3).unwrap())
         );
         assert_eq!(append_one(&store, "sess-a").await, 4);
@@ -1174,7 +1180,7 @@ mod tests {
 
         let latest = |name: String| {
             let store = &store;
-            async move { store.latest(&SessionId::new(name)).await.unwrap() }
+            async move { store.latest(&SessionId::new(name).unwrap()).await.unwrap() }
         };
         assert_eq!(
             latest("sess-0".into()).await,

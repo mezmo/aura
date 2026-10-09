@@ -383,7 +383,7 @@ mod tests {
     }
 
     async fn open(name: &str, store: Arc<dyn JournalStore>) -> SessionJournal {
-        SessionJournal::open(SessionId::new(name), store)
+        SessionJournal::open(SessionId::new(name).unwrap(), store)
             .await
             .expect("the in-memory store opens")
     }

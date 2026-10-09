@@ -525,7 +525,7 @@ fn skill_record(name: &str, anchor: u32, seq: u32) -> SkillInvocationRecord {
 }
 
 fn skill_log(session_id: &str) -> SkillLogKey {
-    SkillLogKey::new(SessionId::new(session_id), "agent")
+    SkillLogKey::new(SessionId::new(session_id).unwrap(), "agent")
 }
 
 fn skill_store(dir: &tempfile::TempDir, ttl_secs: Option<u64>) -> FileSkillInvocationStore {
@@ -633,7 +633,7 @@ async fn skill_sessions_are_isolated_and_a_hostile_id_stays_inside_the_root() {
 async fn skill_agents_sharing_a_session_are_isolated() {
     let dir = tempfile::tempdir().unwrap();
     let store = skill_store(&dir, Some(60));
-    let session = SessionId::new("sess-switch");
+    let session = SessionId::new("sess-switch").unwrap();
     let first = SkillLogKey::new(session.clone(), "agent-a");
     let second = SkillLogKey::new(session, "agent-b");
 
