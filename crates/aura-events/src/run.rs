@@ -211,6 +211,9 @@ pub enum LifecycleEvent {
         timeout: Option<Duration>,
         #[serde(default, deserialize_with = "null_as_default")]
         liveness: Liveness,
+        /// The run this one continues, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        continues: Option<RunId>,
     },
 
     ObserverAttached {
@@ -422,6 +425,7 @@ mod tests {
                     policy: LivenessPolicy::Continue,
                     grace: Duration::from_secs(30),
                 },
+                continues: None,
             },
         ))
         .expect("should serialize");
@@ -471,6 +475,7 @@ mod tests {
                 prompt: "hi".to_string(),
                 timeout: None,
                 liveness: Liveness::default(),
+                continues: None,
             },
             LifecycleEvent::ObserverAttached {
                 observer: observer(ObserverKind::Claiming, true),
@@ -666,6 +671,38 @@ mod tests {
         assert_eq!(liveness.grace, Duration::ZERO);
     }
 
+    /// A run that continues another names it; one that does not carries no
+    /// `continues` on the wire, so an older payload reads as a fresh run.
+    #[test]
+    fn a_continuing_start_names_the_run_it_follows() {
+        let parked = run_id();
+        let start = LifecycleEvent::Started {
+            agent: "sre".to_string(),
+            prompt: "hi".to_string(),
+            timeout: None,
+            liveness: Liveness::default(),
+            continues: Some(parked),
+        };
+        let json = serde_json::to_value(&start).unwrap();
+        assert_eq!(json["continues"], RUN);
+
+        let LifecycleEvent::Started { continues, .. } = serde_json::from_value(json).unwrap()
+        else {
+            panic!("expected a start");
+        };
+        assert_eq!(continues, Some(parked));
+
+        let fresh = serde_json::to_value(LifecycleEvent::Started {
+            agent: "sre".to_string(),
+            prompt: "hi".to_string(),
+            timeout: None,
+            liveness: Liveness::default(),
+            continues: None,
+        })
+        .unwrap();
+        assert!(fresh.get("continues").is_none());
+    }
+
     /// A producer that writes an absent liveness as `null` gets the same
     /// default as one that omits it.
     #[test]
@@ -805,6 +842,7 @@ mod tests {
                 prompt: "hi".to_string(),
                 timeout: None,
                 liveness: Liveness::default(),
+                continues: None,
             },
             LifecycleEvent::ObserverAttached {
                 observer: observer(ObserverKind::Collecting, false),
