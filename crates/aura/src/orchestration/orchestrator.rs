@@ -450,6 +450,9 @@ pub struct Orchestrator {
     /// The underlying agent configuration (for creating workers)
     agent_config: AgentRuntimeConfig,
 
+    /// The run the orchestration serves.
+    run_id: crate::config::RunId,
+
     /// Tool call observer for coordinator visibility into worker tool execution.
     /// Wired to emit AgentEventPayload for real-time SSE streaming via spawn_tool_event_forwarder.
     pub(super) tool_call_observer: ToolCallObserver,
@@ -595,10 +598,16 @@ enum LoopStep {
 }
 
 impl Orchestrator {
-    /// Create a new orchestrator from configuration.
+    /// Create a new orchestrator from configuration, for the run
+    /// `agent_config.run_id` names, or for a fresh run when it names none.
     pub async fn new(
-        agent_config: AgentRuntimeConfig,
+        mut agent_config: AgentRuntimeConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // Minted once, here, so every agent of the orchestration begins its
+        // run within the same one.
+        let run_id = *agent_config
+            .run_id
+            .get_or_insert_with(crate::config::RunId::mint);
         let orchestration_config = agent_config.orchestration.clone().unwrap_or_default();
 
         // Initialize MCP manager (shared across coordinator and all workers via Arc)
@@ -637,7 +646,7 @@ impl Orchestrator {
 
         // Persistence names the run by an id of its own, which the park
         // owner, the checkpoint and `RunParked` carry; the run's `RunContext`
-        // is named by its `RunId`. #780 makes them one id.
+        // is named by its `RunId`. The two are distinct.
         let run_id_str = persistence.lock().await.run_id().to_string();
         // One guard per park-mode run; `ParkGuard` documents arming and drop.
         let park_guard = agent_config
@@ -665,6 +674,7 @@ impl Orchestrator {
 
         Ok(Self {
             orchestrator_id,
+            run_id,
             config: orchestration_config,
             agent_config,
             tool_call_observer,
@@ -1159,17 +1169,10 @@ impl Orchestrator {
 
     /// The run the orchestration serves, for its workers and coordinator to
     /// begin theirs within. That is the run in scope; a test driving the
-    /// orchestrator outside one gets a run nobody observes, under the run id
-    /// the config carries.
+    /// orchestrator outside one gets a run nobody observes, under the id the
+    /// orchestrator was created with.
     fn orchestration_run(&self) -> Arc<RunContext> {
-        crate::run_context::current_run().unwrap_or_else(|| {
-            RunContext::channel(
-                self.agent_config
-                    .run_id
-                    .unwrap_or_else(crate::config::RunId::mint),
-            )
-            .0
-        })
+        crate::run_context::current_run().unwrap_or_else(|| RunContext::channel(self.run_id).0)
     }
 
     /// Park-mode wiring for one worker attempt: `Some` only when this run
@@ -7505,6 +7508,33 @@ mod tests {
         let mut other = serde_json::json!({"filename": "x", "content": "kept"});
         redact_internal_tool_arguments("read_artifact", &mut other);
         assert_eq!(other["content"], "kept");
+    }
+
+    /// Every agent of an orchestration begins its run within the
+    /// orchestration's, so outside a scope they all get the same unobserved
+    /// run, under the id the orchestrator was created with.
+    #[tokio::test]
+    async fn an_unscoped_orchestration_names_one_run() {
+        let orchestrator = Orchestrator::new(crate::config::AgentRuntimeConfig::default())
+            .await
+            .unwrap();
+        let first = orchestrator.orchestration_run();
+        let second = orchestrator.orchestration_run();
+        assert_eq!(first.id(), second.id());
+        assert_eq!(
+            orchestrator.agent_config.run_id,
+            Some(first.id()),
+            "the config carries the id the orchestrator minted"
+        );
+
+        let named = crate::run_context::named_run_id("req_named");
+        let orchestrator = Orchestrator::new(crate::config::AgentRuntimeConfig {
+            run_id: Some(named),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(orchestrator.orchestration_run().id(), named);
     }
 
     /// Attached artifacts are listed in the worker's context after any
