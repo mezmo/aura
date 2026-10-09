@@ -857,7 +857,7 @@ mod tests {
 
     #[test]
     fn worker_request_wire_shape_flattens_task_and_keeps_session() {
-        let run_id: crate::orchestration::RunId =
+        let run_id: crate::orchestration::PersistenceRunId =
             "0191e8c0-1111-7000-8000-000000000000".parse().unwrap();
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
@@ -1221,8 +1221,9 @@ mod tests {
 
     #[tokio::test]
     async fn conversational_resolve_at_requested_event_succeeds() {
-        let request_id = format!("req_test_{}", uuid::Uuid::new_v4().simple());
-        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.as_str());
+        let run_id = aura_events::RunId::mint();
+        let request_id = run_id.to_string();
+        let (run, mut rx) = crate::run_context::RunContext::channel(run_id);
 
         let (registry, route) = conv_route(Duration::from_secs(60));
         let request = single_request(
@@ -2219,8 +2220,9 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_route_emits_requested_and_completed_on_channel_error() {
-        let request_id = format!("req_test_{}", uuid::Uuid::new_v4().simple());
-        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.as_str());
+        let run_id = aura_events::RunId::mint();
+        let request_id = run_id.to_string();
+        let (run, mut rx) = crate::run_context::RunContext::channel(run_id);
         let route = super::DecisionRoute::Webhook {
             client: super::WebhookClient::new(
                 super::build_webhook_client(),

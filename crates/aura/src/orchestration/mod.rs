@@ -90,6 +90,6 @@ pub use prompt_constants::{context, fields, sections};
 #[cfg(test)]
 pub(crate) use test_rig::{ScriptedAgent, ScriptedCompletionModel, ScriptedTurn};
 pub use types::{
-    BlockedCell, CellOutcome, ParkSnapshot, PendingCall, Plan, PlanningResponse, RunId, StepInput,
-    StructuredTaskOutput, Task, TaskIdentity, TaskJson, TaskState, TaskStatus,
+    BlockedCell, CellOutcome, ParkSnapshot, PendingCall, PersistenceRunId, Plan, PlanningResponse,
+    StepInput, StructuredTaskOutput, Task, TaskIdentity, TaskJson, TaskState, TaskStatus,
 };

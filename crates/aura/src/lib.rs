@@ -55,7 +55,7 @@ pub use builder::{
     Agent, AgentBuilder, BeginRunError, FilesystemTools, PreparedAgent, RunToolFactory,
     build_streaming_agent, build_streaming_agent_with_tools, no_run_tools,
 };
-pub use config::{AgentRuntimeConfig, SessionId, ToolContextFactory};
+pub use config::{AgentRuntimeConfig, RunId, SessionId, ToolContextFactory};
 // Pure config types are owned by `aura-config` and re-exported here for
 // ergonomic consumption (`aura::LlmConfig`, etc.).
 pub use aura_config::{
@@ -70,7 +70,7 @@ pub use orchestration::tools::{
 };
 pub use orchestration::{
     ArtifactsConfig, EventContext, OrchestrationConfig, OrchestrationStreamEvent, Orchestrator,
-    OrchestratorFactory, Plan, PlanningResponse, RoutingMode, RunId, Task, TaskIdentity, TaskJson,
+    OrchestratorFactory, Plan, PlanningResponse, RoutingMode, Task, TaskIdentity, TaskJson,
     TaskState, TaskStatus, TimeoutsConfig, agent_info, agent_info_with_tools, summarize_tools,
     worker_overview,
 };

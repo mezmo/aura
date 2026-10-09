@@ -1426,7 +1426,7 @@ mod tests {
             AgentScope, ApprovalDecision, DecisionId, DecisionRoute, HitlApprovalWrapper,
             PendingApprovals,
         };
-        use crate::orchestration::{RunId, TaskIdentity};
+        use crate::orchestration::{PersistenceRunId, TaskIdentity};
         use crate::session_store::{
             ApprovalStore, EventBus, InMemoryApprovalStore, InMemoryEventBus,
         };
@@ -1442,14 +1442,14 @@ mod tests {
             timeout: std::time::Duration::from_secs(60),
         });
 
-        let run_id: RunId = "0191e8c0-1111-7000-8000-000000000000".parse().unwrap();
+        let run_id: PersistenceRunId = "0191e8c0-1111-7000-8000-000000000000".parse().unwrap();
         let scope = AgentScope::Worker {
             run_id,
             task: TaskIdentity::new(2, Some("k8s-agent".to_string())),
             session_id: None,
         };
 
-        let request_id = format!("req_w2_{}", uuid::Uuid::new_v4().simple());
+        let this_run = aura_events::RunId::mint();
 
         let gate = Arc::new(HitlApprovalWrapper::new(
             Arc::from(["kubectl_*".into()]),
@@ -1460,7 +1460,7 @@ mod tests {
         ));
         // `WrappedTool` runs `pre_call` in its own task, which no scope
         // crosses, so the gate is bound the way `stream` binds it.
-        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.as_str());
+        let (run, mut rx) = crate::run_context::RunContext::channel(this_run);
         gate.bind_run(run);
         let gate: Arc<dyn ToolWrapper> = gate;
         let persistence: Arc<dyn ToolWrapper> = Arc::new(test_wrapper(Arc::new(Mutex::new(
