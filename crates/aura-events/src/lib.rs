@@ -475,7 +475,8 @@ impl SequenceNumber {
     }
 
     /// Whether this is the position immediately after `previous`. `false`
-    /// means at least one position between them was missed.
+    /// means the stream did not advance by exactly one: a position was
+    /// missed, this one was delivered again, or it arrived out of order.
     pub fn follows(self, previous: Self) -> bool {
         self.0 == previous.0.saturating_add(1)
     }
