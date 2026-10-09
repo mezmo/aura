@@ -243,7 +243,18 @@ impl AgentExecutor for AuraAgentExecutor {
         let run_tools = self.app_state.run_tools(&config);
         let mut append_tracker: HashMap<(String, String, String), bool> = HashMap::new();
 
-        Box::pin(async_stream::stream! {
+        // The run is polled inside this span, so its log lines, the agent's
+        // included, carry the run's id and the task it executes.
+        let run_id = aura::RunId::mint();
+        let span = tracing::info_span!(
+            parent: None,
+            "agent.stream",
+            run.id = %run_id,
+            a2a.task_id = %ctx.task_id,
+            a2a.context_id = %ctx.context_id,
+        );
+
+        let execution = async_stream::stream! {
             let task_id = ctx.task_id.clone();
             let context_id = ctx.context_id.clone();
 
@@ -269,11 +280,9 @@ impl AgentExecutor for AuraAgentExecutor {
                 metadata: None,
             }));
 
-            // The run's id, and in string form the request id everything
+            // In string form, the run's id is the request id everything
             // request-keyed reads: MCP cancellation, approvals, the cancel map.
-            let run_id = aura::RunId::mint();
             let request_id = run_id.to_string();
-            event!(Level::DEBUG, task_id, %run_id, "a2a task starts its run");
 
             // Registered before the agent build and history fetch, both of which
             // await, so a cancelTask during those has a token to cancel. Its
@@ -562,7 +571,8 @@ impl AgentExecutor for AuraAgentExecutor {
                     metadata: None,
                 }));
             }
-        })
+        };
+        in_span(span, Box::pin(execution))
     }
 
     fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
@@ -623,6 +633,18 @@ fn extract_text(parts: Vec<Part>) -> Result<String, A2AError> {
     }
 
     Ok(strings.join("\n"))
+}
+
+/// `stream`, polled inside `span`, so its log lines carry the span's fields.
+fn in_span<T: 'static>(
+    span: tracing::Span,
+    mut stream: BoxStream<'static, T>,
+) -> BoxStream<'static, T> {
+    futures_util::stream::poll_fn(move |cx| {
+        let _entered = span.enter();
+        stream.poll_next_unpin(cx)
+    })
+    .boxed()
 }
 
 pub(super) fn fail_status(task_id: &str, context_id: &str, error_msg: &str) -> StreamResponse {
@@ -1048,6 +1070,50 @@ mod tests {
         // What `cancel()` does: take the entry, leaving nothing to claim.
         lock_cancel_state(&state).remove(&task_id);
         assert!(claim_agent(&state, &task_id, &agent) == CancelRaced::Yes);
+    }
+
+    /// A line the run logs carries its span's fields, which is what ties a
+    /// run's id to the task it executes.
+    #[tokio::test]
+    async fn a_line_logged_inside_the_span_carries_its_fields() {
+        let written = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = {
+            let written = Arc::clone(&written);
+            move || SharedWriter(Arc::clone(&written))
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_ansi(false)
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let span = tracing::info_span!("agent.stream", a2a.task_id = %"t_1");
+        let run = futures_util::stream::once(async {
+            tracing::warn!("inside the run");
+            1
+        })
+        .boxed();
+        assert_eq!(in_span(span, run).collect::<Vec<_>>().await, vec![1]);
+
+        let written = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        let line = written
+            .lines()
+            .find(|line| line.contains("inside the run"))
+            .expect("the line is written");
+        assert!(line.contains("agent.stream{a2a.task_id=t_1}"), "{line}");
+    }
+
+    struct SharedWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     /// The guard is created before the entry, because the agent build and the
