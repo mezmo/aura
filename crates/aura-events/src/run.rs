@@ -235,6 +235,9 @@ pub enum LifecycleEvent {
     /// The run stopped resumable.
     Parked {
         checkpoint: CheckpointRef,
+        /// As [`Finished`](Self::Finished)'s.
+        #[serde(flatten)]
+        usage: TokenUsage,
     },
 
     /// The run completed its work.
@@ -251,11 +254,17 @@ pub enum LifecycleEvent {
         /// The caller's own words.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+        /// As [`Finished`](Self::Finished)'s.
+        #[serde(flatten)]
+        usage: TokenUsage,
     },
 
     /// The run ended in an error.
     Failed {
         error: String,
+        /// As [`Finished`](Self::Finished)'s.
+        #[serde(flatten)]
+        usage: TokenUsage,
     },
 
     /// Any other value on the wire, read by a version of this crate that does
@@ -498,6 +507,7 @@ mod tests {
             },
             LifecycleEvent::Parked {
                 checkpoint: CheckpointRef::new("memory/sess_1/parked/run_1.json").unwrap(),
+                usage: usage(),
             },
             LifecycleEvent::Finished { usage: usage() },
             LifecycleEvent::Cancelled {
@@ -505,25 +515,31 @@ mod tests {
                     after: Duration::from_millis(1500),
                 },
                 message: None,
+                usage: usage(),
             },
             LifecycleEvent::Cancelled {
                 reason: RunCancelReason::External,
                 message: Some("operator stopped it".to_string()),
+                usage: usage(),
             },
             LifecycleEvent::Cancelled {
                 reason: RunCancelReason::ClientTool,
                 message: None,
+                usage: usage(),
             },
             LifecycleEvent::Cancelled {
                 reason: RunCancelReason::Unclaimed,
                 message: None,
+                usage: usage(),
             },
             LifecycleEvent::Cancelled {
                 reason: RunCancelReason::Shutdown,
                 message: None,
+                usage: usage(),
             },
             LifecycleEvent::Failed {
                 error: "provider returned 500".to_string(),
+                usage: usage(),
             },
         ];
 
@@ -592,6 +608,7 @@ mod tests {
                     after: Duration::from_secs(300),
                 },
                 message: Some("request timeout".to_string()),
+                usage: usage(),
             },
         ))
         .unwrap();
@@ -602,7 +619,10 @@ mod tests {
                 "type": "cancelled",
                 "reason": "deadline",
                 "after_ms": 300_000,
-                "message": "request timeout"
+                "message": "request timeout",
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
             })
         );
 
@@ -616,12 +636,19 @@ mod tests {
                 LifecycleEvent::Cancelled {
                     reason,
                     message: None,
+                    usage: usage(),
                 },
             ))
             .unwrap();
             assert_eq!(
                 json["payload"]["event"],
-                json!({ "type": "cancelled", "reason": tag })
+                json!({
+                    "type": "cancelled",
+                    "reason": tag,
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15
+                })
             );
         }
     }
@@ -701,6 +728,35 @@ mod tests {
         })
         .unwrap();
         assert!(fresh.get("continues").is_none());
+    }
+
+    /// Every terminal event carries the run's cumulative usage at the top
+    /// level, as `Finished` does, so cost reads the same way off any of them.
+    #[test]
+    fn every_terminal_event_carries_usage_the_same_way() {
+        let terminal = [
+            LifecycleEvent::Parked {
+                checkpoint: CheckpointRef::new("c").unwrap(),
+                usage: usage(),
+            },
+            LifecycleEvent::Finished { usage: usage() },
+            LifecycleEvent::Cancelled {
+                reason: RunCancelReason::External,
+                message: None,
+                usage: usage(),
+            },
+            LifecycleEvent::Failed {
+                error: "boom".to_string(),
+                usage: usage(),
+            },
+        ];
+        for event in terminal {
+            assert!(event.ends_run());
+            let json = serde_json::to_value(&event).unwrap();
+            assert_eq!(json["prompt_tokens"], 10, "{json}");
+            assert_eq!(json["completion_tokens"], 5, "{json}");
+            assert_eq!(json["total_tokens"], 15, "{json}");
+        }
     }
 
     /// A producer that writes an absent liveness as `null` gets the same
@@ -821,14 +877,17 @@ mod tests {
         let ending = [
             LifecycleEvent::Parked {
                 checkpoint: CheckpointRef::new("c").unwrap(),
+                usage: usage(),
             },
             LifecycleEvent::Finished { usage: usage() },
             LifecycleEvent::Cancelled {
                 reason: RunCancelReason::External,
                 message: None,
+                usage: usage(),
             },
             LifecycleEvent::Failed {
                 error: "boom".to_string(),
+                usage: usage(),
             },
         ];
         for event in ending {
@@ -897,6 +956,7 @@ mod tests {
             8,
             LifecycleEvent::Parked {
                 checkpoint: CheckpointRef::new("memory/sess_1/parked/run_1.json").unwrap(),
+                usage: usage(),
             },
         );
 
@@ -941,14 +1001,18 @@ mod tests {
 
         let cancelled: LifecycleEvent = serde_json::from_value(json!({
             "type": "cancelled",
-            "reason": "preempted"
+            "reason": "preempted",
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15
         }))
         .unwrap();
         assert!(matches!(
             cancelled,
             LifecycleEvent::Cancelled {
                 reason: RunCancelReason::Unknown,
-                message: None
+                message: None,
+                ..
             }
         ));
 
