@@ -209,7 +209,7 @@ pub enum LifecycleEvent {
             with = "crate::duration_ms::option"
         )]
         timeout: Option<Duration>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_as_default")]
         liveness: Liveness,
     },
 
@@ -259,6 +259,15 @@ pub enum LifecycleEvent {
     /// not know it. It cannot be written back.
     #[serde(other, skip_serializing)]
     Unknown,
+}
+
+/// Reads `null` as the field's default, as a missing field already is.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl LifecycleEvent {
@@ -655,6 +664,29 @@ mod tests {
         assert_eq!(liveness, Liveness::default());
         assert_eq!(liveness.policy, LivenessPolicy::Cancel);
         assert_eq!(liveness.grace, Duration::ZERO);
+    }
+
+    /// A producer that writes an absent liveness as `null` gets the same
+    /// default as one that omits it.
+    #[test]
+    fn a_start_with_a_null_liveness_reads_as_cancel_at_once() {
+        let parsed: LifecycleEvent = serde_json::from_value(json!({
+            "type": "started",
+            "agent": "sre",
+            "prompt": "hi",
+            "timeout_ms": null,
+            "liveness": null
+        }))
+        .unwrap();
+
+        let LifecycleEvent::Started {
+            liveness, timeout, ..
+        } = parsed
+        else {
+            panic!("expected a start");
+        };
+        assert_eq!(liveness, Liveness::default());
+        assert_eq!(timeout, None);
     }
 
     #[test]
