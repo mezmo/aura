@@ -534,7 +534,7 @@ mod tests {
     }
 
     fn skill_log(session_id: impl Into<String>, agent_id: &str) -> SkillLogKey {
-        SkillLogKey::new(SessionId::new(session_id), agent_id)
+        SkillLogKey::new(SessionId::new(session_id).unwrap(), agent_id)
     }
 
     #[tokio::test]

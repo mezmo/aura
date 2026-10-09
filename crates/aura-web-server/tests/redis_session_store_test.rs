@@ -1481,7 +1481,7 @@ async fn corrupt_record_is_skipped_from_list() {
 // ---------------------------------------------------------------------------
 
 fn skill_log(session_id: &str) -> SkillLogKey {
-    SkillLogKey::new(SessionId::new(session_id), "agent")
+    SkillLogKey::new(SessionId::new(session_id).unwrap(), "agent")
 }
 
 /// The Redis key holding `log`, per the store's key schema.
@@ -1614,7 +1614,7 @@ async fn skill_sessions_are_isolated_by_prefix_and_session() {
 #[tokio::test]
 async fn skill_agents_sharing_a_session_are_isolated() {
     let skills = connect(&test_config(60)).await.skills();
-    let session = SessionId::new("sess-switch");
+    let session = SessionId::new("sess-switch").unwrap();
     let first = SkillLogKey::new(session.clone(), "agent-a");
     let second = SkillLogKey::new(session, "agent-b");
 
