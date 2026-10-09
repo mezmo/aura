@@ -163,6 +163,48 @@ pub struct ServerArgs {
     /// /.well-known/agent-card.json. Disabled by default.
     #[arg(long, env = "AURA_ENABLE_A2A", action = clap::ArgAction::SetTrue)]
     pub enable_a2a: bool,
+
+    /// Enable the Slack ingress: the server connects to Slack over Socket
+    /// Mode and answers @mentions and direct messages in a thread. Needs
+    /// --slack-bot-token and --slack-app-token. Disabled by default.
+    #[arg(long, env = "AURA_ENABLE_SLACK", action = clap::ArgAction::SetTrue)]
+    pub enable_slack: bool,
+
+    /// Slack bot user OAuth token (`xoxb-...`) the ingress reads threads
+    /// and posts replies with.
+    #[arg(long, env = "AURA_SLACK_BOT_TOKEN", hide_env_values = true, value_parser = parse_bot_token)]
+    pub slack_bot_token: Option<crate::slack::BotToken>,
+
+    /// Slack app-level token (`xapp-...`, scope `connections:write`) the
+    /// ingress opens its Socket Mode connection with.
+    #[arg(long, env = "AURA_SLACK_APP_TOKEN", hide_env_values = true, value_parser = parse_app_token)]
+    pub slack_app_token: Option<crate::slack::AppToken>,
+
+    /// Agent name or alias the Slack ingress runs. Falls back to
+    /// --default-agent, or to the only loaded configuration.
+    #[arg(long, env = "AURA_SLACK_AGENT")]
+    pub slack_agent: Option<String>,
+
+    /// Maximum Slack messages the ingress answers concurrently; further
+    /// messages wait for a slot.
+    #[arg(long, env = "AURA_SLACK_CONCURRENCY", default_value = "4", value_parser = parse_concurrency)]
+    pub slack_concurrency: usize,
+}
+
+fn parse_bot_token(raw: &str) -> Result<crate::slack::BotToken, String> {
+    crate::slack::BotToken::new(raw.to_owned()).map_err(|e| e.to_string())
+}
+
+fn parse_app_token(raw: &str) -> Result<crate::slack::AppToken, String> {
+    crate::slack::AppToken::new(raw.to_owned()).map_err(|e| e.to_string())
+}
+
+fn parse_concurrency(raw: &str) -> Result<usize, String> {
+    match raw.parse::<usize>() {
+        Ok(0) => Err("must be at least 1".to_owned()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Parse `argv` (leading program path ignored), titling `--help`/`--version`
@@ -449,6 +491,29 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         }
     }
 
+    let slack_api = if args.enable_slack {
+        let (Some(bot_token), Some(app_token)) =
+            (args.slack_bot_token.clone(), args.slack_app_token.clone())
+        else {
+            error!("--enable-slack needs both --slack-bot-token and --slack-app-token");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "slack ingress enabled without both tokens",
+            ));
+        };
+        Some(crate::slack::SlackApi::new(bot_token, app_token))
+    } else {
+        None
+    };
+    if slack_api.is_none() {
+        for config in configs_arc.iter().filter(|c| c.agent.enable_slack_tools) {
+            warn!(
+                agent = config.agent.name,
+                "agent opts into slack tools but the slack ingress is off (--enable-slack); none will be attached"
+            );
+        }
+    }
+
     let app_state = Arc::new(AppState {
         configs: configs_arc,
         tool_result_mode: args.tool_result_mode,
@@ -465,6 +530,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         active_requests: active_requests.clone(),
         default_agent: args.default_agent.clone(),
         additional_tools: Arc::new(Vec::new),
+        slack_api: slack_api.clone(),
         pending_approvals: aura::hitl::PendingApprovals::with_backend(
             session_store.approvals(),
             session_store.bus(),
@@ -472,6 +538,20 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         hitl_webhook_hmac: ingress_hmac.clone(),
         session_store: session_store.clone(),
     });
+
+    if let Some(api) = slack_api {
+        crate::slack::start(
+            app_state.clone(),
+            api,
+            args.slack_agent.as_deref(),
+            args.slack_concurrency,
+        )
+        .await
+        .map_err(|e| {
+            error!("Slack ingress failed to start: {e}");
+            std::io::Error::other(format!("slack ingress error: {e}"))
+        })?;
+    }
 
     info!(
         "Starting server on {}:{} (shutdown_timeout={shutdown_timeout:?})",

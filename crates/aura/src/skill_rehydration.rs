@@ -410,7 +410,15 @@ mod tests {
 
         // Turn N: history [user], anchor = 0 + 1. The LLM calls load_skill.
         let recorder = Arc::new(SkillInvocationRecorder::new(store.clone(), log.clone(), 1));
-        let toolset = SkillToolset::new(&skills, Some(recorder)).unwrap();
+        let (run, _events) = crate::run_context::RunContext::channel_for_agent(
+            "req-turn-n",
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            Some(recorder),
+        );
+        let slot = Arc::new(crate::run_context::BoundRun::holding(run));
+        let toolset = SkillToolset::new(&skills, Some(slot)).unwrap();
         toolset
             .load
             .call(LoadSkillArgs {

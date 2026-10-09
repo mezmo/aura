@@ -88,9 +88,9 @@ pub fn build_coordinator_preamble(
     include_history_tools: bool,
 ) -> String {
     let artifact_tools = if include_history_tools {
-        "two **artifact/history tools** (`read_artifact`, `list_prior_runs`)"
+        "three **artifact/history tools** (`read_artifact`, `write_artifact`, `list_prior_runs`)"
     } else {
-        "one **artifact tool** (`read_artifact`)"
+        "two **artifact tools** (`read_artifact`, `write_artifact`)"
     };
 
     let tools_section = if include_recon_tools {
@@ -255,15 +255,17 @@ mod tests {
         assert!(preamble.contains("artifact/history tools"));
         assert!(preamble.contains("list_prior_runs"));
         assert!(preamble.contains("read_artifact"));
+        assert!(preamble.contains("write_artifact"));
     }
 
     #[test]
     fn test_coordinator_preamble_without_history_tools() {
         let preamble = build_coordinator_preamble("Test prompt.", false, false);
 
-        assert!(preamble.contains("artifact tool"));
+        assert!(preamble.contains("artifact tools"));
         assert!(!preamble.contains("list_prior_runs"));
         assert!(preamble.contains("read_artifact"));
+        assert!(preamble.contains("write_artifact"));
     }
 
     #[test]

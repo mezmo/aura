@@ -11,6 +11,7 @@
 //! system prompt small.
 
 use crate::config::SkillConfig;
+use crate::run_context::BoundRun;
 use crate::session_store::{
     SKILL_INVOCATION_RECORD_VERSION, SkillInvocation, SkillInvocationRecord, SkillInvocationStore,
     SkillLogKey,
@@ -110,7 +111,7 @@ impl std::fmt::Debug for SkillInvocationRecorder {
 #[derive(Debug, Clone)]
 pub struct LoadSkillTool {
     skills: Arc<[SkillConfig]>,
-    recorder: Option<Arc<SkillInvocationRecorder>>,
+    run: Option<Arc<BoundRun>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -272,7 +273,7 @@ impl SkillResourcePath {
 #[derive(Debug, Clone)]
 pub struct ReadSkillFileTool {
     skills: Arc<[SkillConfig]>,
-    recorder: Option<Arc<SkillInvocationRecorder>>,
+    run: Option<Arc<BoundRun>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -321,7 +322,7 @@ impl Tool for ReadSkillFileTool {
             .ok_or_else(|| SkillError::UnknownSkill(args.skill.clone()))?;
 
         let content = render_read_skill_file_output(skill, &args.path).await?;
-        if let Some(recorder) = &self.recorder {
+        if let Some(recorder) = run_recorder(self.run.as_deref()) {
             recorder
                 .record(SkillInvocation::ReadSkillFile {
                     skill: args.skill,
@@ -368,11 +369,9 @@ pub struct SkillToolset {
 
 impl SkillToolset {
     /// Build both skill tools, or `None` when no skills are configured.
-    /// Both share `skills` and `recorder`.
-    pub fn new(
-        skills: &[SkillConfig],
-        recorder: Option<Arc<SkillInvocationRecorder>>,
-    ) -> Option<Self> {
+    /// Both share `skills`, and record invocations to the recorder of
+    /// whichever run `run` holds when they are called.
+    pub fn new(skills: &[SkillConfig], run: Option<Arc<BoundRun>>) -> Option<Self> {
         if skills.is_empty() {
             return None;
         }
@@ -380,11 +379,17 @@ impl SkillToolset {
         Some(Self {
             load: LoadSkillTool {
                 skills: Arc::clone(&skills),
-                recorder: recorder.clone(),
+                run: run.clone(),
             },
-            read_file: ReadSkillFileTool { skills, recorder },
+            read_file: ReadSkillFileTool { skills, run },
         })
     }
+}
+
+/// The recorder of the run bound in `run`. A tool built without a slot, or
+/// called with no run bound, records nothing.
+fn run_recorder(run: Option<&BoundRun>) -> Option<Arc<SkillInvocationRecorder>> {
+    run.and_then(BoundRun::skill_recorder)
 }
 
 impl LoadSkillTool {
@@ -395,7 +400,7 @@ impl LoadSkillTool {
     pub fn new(skills: &[SkillConfig]) -> Self {
         Self {
             skills: skills.into(),
-            recorder: None,
+            run: None,
         }
     }
 
@@ -442,7 +447,7 @@ impl Tool for LoadSkillTool {
             .ok_or_else(|| SkillError::UnknownSkill(args.name.clone()))?;
 
         let result = render_load_skill_output(skill).await?;
-        if let Some(recorder) = &self.recorder {
+        if let Some(recorder) = run_recorder(self.run.as_deref()) {
             recorder
                 .record(SkillInvocation::LoadSkill { name: args.name })
                 .await;
@@ -852,6 +857,50 @@ mod tests {
     #[test]
     fn test_skill_toolset_empty() {
         assert!(SkillToolset::new(&[], None).is_none());
+    }
+
+    /// A toolset built once records each invocation under the turn of the
+    /// run bound when it is called, and records nothing with no run bound.
+    #[tokio::test]
+    async fn skill_tools_record_under_the_run_bound_at_call_time() {
+        use crate::run_context::RunContext;
+        use crate::session_store::InMemorySkillInvocationStore;
+        use tokio_util::sync::CancellationToken;
+
+        let dir = TempDir::new().unwrap();
+        let configs = make_skill_configs(dir.path());
+        let store = Arc::new(InMemorySkillInvocationStore::new());
+        let log = SkillLogKey::new(crate::config::SessionId::new("sess-reuse"), "agent");
+        let turn = |id: &str, anchor| {
+            let recorder = Arc::new(SkillInvocationRecorder::new(
+                store.clone(),
+                log.clone(),
+                anchor,
+            ));
+            RunContext::channel_for_agent(id, CancellationToken::new(), None, None, Some(recorder))
+                .0
+        };
+        let load = |name: &str| LoadSkillArgs {
+            name: name.to_string(),
+        };
+        let slot = Arc::new(BoundRun::default());
+        let toolset = SkillToolset::new(&configs, Some(Arc::clone(&slot))).unwrap();
+
+        toolset.load.call(load("another-skill")).await.unwrap();
+        assert!(store.list(&log).await.unwrap().is_empty());
+
+        slot.bind(turn("req_a", 1));
+        toolset.load.call(load("test-skill")).await.unwrap();
+        slot.bind(turn("req_b", 3));
+        toolset.load.call(load("another-skill")).await.unwrap();
+
+        let records = store.list(&log).await.unwrap();
+        let positions: Vec<_> = records.iter().map(|r| (r.anchor, r.seq)).collect();
+        assert_eq!(
+            positions,
+            vec![(1, 0), (3, 0)],
+            "each turn's invocation carries that turn's anchor, counted from zero",
+        );
     }
 
     #[test]

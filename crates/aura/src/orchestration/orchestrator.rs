@@ -52,17 +52,18 @@ use rig::client::CompletionClient;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::Agent;
 use crate::config::{AgentRuntimeConfig, LlmConfig};
 use crate::inactivity::{Liveness, STALL_MESSAGE, liveness_of};
 use crate::mcp::McpManager;
 use crate::provider_agent::{BuilderState, ProviderAgent, StreamError, StreamItem};
+use crate::run_context::{BoundRun, RunContext};
 use crate::scratchpad;
 use crate::string_utils::safe_truncate;
 use crate::tool_call_observer::ToolCallObserver;
+use crate::{Agent, PreparedAgent};
 
 use super::tools::RoutingToolSet;
-use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
+use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool, WriteArtifactTool};
 
 use super::config::OrchestrationConfig;
 use super::park::{
@@ -82,11 +83,6 @@ use super::types::{
 
 /// Number of characters per chunk when streaming the final orchestration response.
 pub(super) const STREAM_CHUNK_SIZE: usize = 50;
-
-/// Maximum ReAct depth for the planning coordinator.
-/// Defense-in-depth alongside stream_and_collect's early exit.
-/// Allows: 1 list_tools + 1 inspect_tool_params + 1 read_artifact + 1 routing + 2 spare.
-const PLANNING_COORDINATOR_MAX_DEPTH: usize = 6;
 
 /// Maximum attempts for a worker task before giving up.
 /// Attempt 1 = normal execution. Attempt 2 = retry with correction prompt.
@@ -163,6 +159,7 @@ struct CoordinatorTools {
     vector_tools: Vec<crate::vector_dynamic::DynamicVectorSearchTool>,
     routing_tools: RoutingToolSet,
     read_artifact: Option<ReadArtifactTool>,
+    write_artifact: Option<WriteArtifactTool>,
     list_prior_runs: Option<super::tools::ListPriorRunsTool>,
     skill_tools: Option<crate::skill_tool::SkillToolset>,
 }
@@ -333,7 +330,9 @@ async fn forward_internal_tool_started(
             worker_id: worker_id.to_string(),
         },
     );
-    let arguments = serde_json::from_str(raw_arguments).unwrap_or_else(|_| serde_json::json!({}));
+    let mut arguments =
+        serde_json::from_str(raw_arguments).unwrap_or_else(|_| serde_json::json!({}));
+    redact_internal_tool_arguments(tool_name, &mut arguments);
     let _ = tx
         .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
             worker_id,
@@ -346,6 +345,23 @@ async fn forward_internal_tool_started(
             },
         )))))
         .await;
+}
+
+/// Replace `write_artifact`'s `content` argument with its size so a large
+/// document is not duplicated onto the event stream; the stored artifact holds
+/// the content.
+fn redact_internal_tool_arguments(tool_name: &str, arguments: &mut serde_json::Value) {
+    if tool_name != <WriteArtifactTool as rig::tool::Tool>::NAME {
+        return;
+    }
+    if let Some(content) = arguments.get_mut("content")
+        && let Some(text) = content.as_str()
+    {
+        *content = serde_json::Value::String(format!(
+            "[{} chars written to artifact]",
+            text.chars().count()
+        ));
+    }
 }
 
 /// Companion to [`forward_internal_tool_started`]. No-op unless a prior start
@@ -462,6 +478,8 @@ pub struct Orchestrator {
 
     /// Run-scoped park guard (park mode).
     park_guard: Option<Arc<ParkGuard>>,
+
+    pub(super) run_tools: crate::builder::RunToolFactory,
 }
 
 /// The task and worker a stream's reasoning is attributed to.
@@ -652,7 +670,33 @@ impl Orchestrator {
             usage_state: crate::UsageState::new(),
             outer_budget: None,
             park_guard,
+            run_tools: crate::builder::no_run_tools(),
         })
+    }
+
+    /// The tools a worker executes itself beside its MCP tools: `wait_for`
+    /// when an MCP manager exists, plus fresh instances of the run's own
+    /// tools. Called once per worker built.
+    fn worker_own_tools(&self) -> Vec<Box<dyn rig::tool::ToolDyn>> {
+        let mut tools: Vec<Box<dyn rig::tool::ToolDyn>> = self
+            .mcp_manager
+            .as_ref()
+            .map(|mcp| {
+                vec![
+                    Box::new(super::tools::wait_for::WaitForTool::new(Arc::clone(mcp)))
+                        as Box<dyn rig::tool::ToolDyn>,
+                ]
+            })
+            .unwrap_or_default();
+        tools.extend((self.run_tools)());
+        tools
+    }
+
+    /// The names of the run's own tools, as the planner lists them under
+    /// every worker: the planner sees names only, so it costs one throwaway
+    /// build of the tools.
+    fn run_tool_names(&self) -> Vec<String> {
+        (self.run_tools)().iter().map(|tool| tool.name()).collect()
     }
 
     /// Create a worker agent for task execution.
@@ -734,11 +778,6 @@ impl Orchestrator {
         }
 
         apply_worker_skills_override(&mut worker_config, worker_name);
-        // Workers are per-run ephemeral and receive no chat history, so their
-        // skill invocations are never rehydrated into the session — recording
-        // them would leak task-scoped loads across turns. Coordinator-side
-        // invocations keep the recorder from the top-level config.
-        worker_config.skill_recorder = None;
 
         // Per-worker scratchpad override falls back to [agent.scratchpad].
         // Each worker gets a FRESH ContextBudget scoped to its effective LLM —
@@ -748,6 +787,10 @@ impl Orchestrator {
             .or(self.agent_config.agent.scratchpad.as_ref())
             .cloned();
 
+        // The slot every wrapper and tool built below reaches this worker's
+        // run through; `begin_run_within` fills it once the worker is prepared.
+        let run = Arc::new(BoundRun::default());
+        let mut scratchpad_budget: Option<scratchpad::ContextBudget> = None;
         let mut scratchpad_tools = Vec::<Arc<dyn ToolWrapper>>::new();
         if let Some(ref sp_cfg) = effective_scratchpad
             && sp_cfg.enabled
@@ -830,10 +873,12 @@ impl Orchestrator {
                     context_window,
                     initial_used,
                     token_counter,
+                    run: Arc::clone(&run),
                 })
                 .await?;
 
                 scratchpad_tools.push(build.wrapper);
+                scratchpad_budget = Some(build.budget);
                 worker_config.scratchpad_tools_config = Some(build.tools_config);
             }
         }
@@ -882,10 +927,10 @@ impl Orchestrator {
         let mut wrappers: Vec<Arc<dyn ToolWrapper>> = vec![observer_wrapper, duplicate_guard];
         wrappers.extend(scratchpad_tools);
         wrappers.push(persistence_wrapper);
-        if let Some(ref state) = turn_nudge {
+        if turn_nudge.is_some() {
             wrappers.insert(
                 0,
-                Arc::new(crate::turn_nudge::TurnNudgeWrapper::new(state.clone())),
+                Arc::new(crate::turn_nudge::TurnNudgeWrapper::new(Arc::clone(&run))),
             );
             tracing::info!(
                 "Worker {} turn-limit nudging enabled (last_turn={}, wrap_up_threshold={:?})",
@@ -919,12 +964,10 @@ impl Orchestrator {
                 task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
                 session_id: session_id_owned.map(crate::config::SessionId::new),
             };
-            let request_id = worker_config.request_id.clone().unwrap_or_default();
             let mut gate = crate::hitl::HitlApprovalWrapper::new(
                 hitl.patterns.clone(),
                 hitl.route.clone(),
                 scope.clone(),
-                request_id.clone(),
                 worker_config.agent.name.clone(),
                 worker_config.instance_id.clone(),
             );
@@ -945,7 +988,6 @@ impl Orchestrator {
             worker_config.hitl_request_approval_tool = Some(crate::hitl::RequestApprovalTool::new(
                 hitl.route.clone(),
                 scope,
-                request_id,
                 worker_config.agent.name.clone(),
                 worker_config.instance_id.clone(),
             ));
@@ -1022,7 +1064,6 @@ impl Orchestrator {
 
         // Orchestrator owns tool wrapping decision
         worker_config.tool_wrapper = Some(wrapper);
-        worker_config.turn_nudge = turn_nudge.clone();
 
         // Give workers access to result artifacts
         worker_config.orchestration_persistence = Some(self.persistence.clone());
@@ -1069,12 +1110,16 @@ impl Orchestrator {
         // Build worker agent using shared MCP connections.
         // Client-side tools are not supported in orchestration mode and are
         // never attached to workers (or the coordinator).
-        let (provider_agent, model_name) = self.build_worker_provider_agent(&worker_config).await?;
+        let (provider_agent, model_name) = self
+            .build_worker_provider_agent(&worker_config, &run)
+            .await?;
 
-        let agent = Agent {
+        // A worker is prepared for exactly one task attempt, so its single
+        // run begins here, within the run that owns the orchestration.
+        let prepared = Arc::new(PreparedAgent {
             // A worker's gate and approval tool captured their run when
             // `create_worker` built them, inside that run, so there is nothing
-            // for `stream` to bind.
+            // for `begin_run_within` to bind.
             hitl_gate: None,
             hitl_approval_tool: None,
             inner: provider_agent,
@@ -1085,22 +1130,37 @@ impl Orchestrator {
             fallback_tool_names: vec![],
             fallback_mcp_filter: None,
             context_window: worker_config.llm.context_window(),
-            scratchpad_budget: worker_config
-                .scratchpad_tools_config
-                .as_ref()
-                .map(|sp| sp.budget.clone()),
+            scratchpad_budget,
             client_tool_names: Default::default(),
             turn_nudge,
             system_prompt: preamble.clone(),
             invocation_parameters: crate::logging::llm_invocation_parameters(&worker_config.llm),
             skills: worker_config.agent.skills.clone(),
-        };
+            forwarded_headers: worker_config.forwarded_headers.clone(),
+            run,
+            active: Default::default(),
+        });
+        // Workers are per-run ephemeral and receive no chat history, so their
+        // skill invocations are never rehydrated into the session — recording
+        // them would leak task-scoped loads across turns. Their runs record
+        // none; the coordinator's run records the request's.
+        let agent = prepared.begin_run_within(&self.orchestration_run(), None)?;
 
         Ok(AgentWithPreamble {
             agent,
             preamble,
             escalation_flag,
             submit_result_decision,
+        })
+    }
+
+    /// The run the orchestration serves, for its workers and coordinator to
+    /// begin theirs within. That is the run in scope; a test driving the
+    /// orchestrator outside one gets a run nobody observes, under the
+    /// request id the config carries.
+    fn orchestration_run(&self) -> Arc<RunContext> {
+        crate::run_context::current_run().unwrap_or_else(|| {
+            RunContext::channel(self.agent_config.request_id.clone().unwrap_or_default()).0
         })
     }
 
@@ -1449,7 +1509,7 @@ impl Orchestrator {
                 stream,
                 &self.usage_state,
                 self.config.stream_inactivity_timeout_secs(),
-                agent.scratchpad_budget.as_ref(),
+                agent.scratchpad_budget(),
                 phase,
                 event_tx,
                 stream_context,
@@ -1486,8 +1546,8 @@ impl Orchestrator {
     /// tool chains.
     ///
     /// Key behaviors:
-    /// - Opens the stream depth-capped at `PLANNING_COORDINATOR_MAX_DEPTH`
-    ///   (rig safety net, but early exit is the primary guard)
+    /// - Opens the stream depth-capped at the agent's resolved turn depth
+    ///   (`[agent].turn_depth`; rig safety net, but early exit is the primary guard)
     /// - Forwards `ReasoningDelta`/`Reasoning` items through `event_tx` when provided
     /// - Short-circuits after first `ToolResult` when `decision_ready()` returns true
     /// - Falls back to normal completion for text-only responses
@@ -2104,6 +2164,7 @@ impl Orchestrator {
             steps: vec![super::types::StepInput::LeafTask {
                 task: format!("Execute: {}", truncate_query(query, 100)),
                 worker: None,
+                artifacts: Vec::new(),
             }],
             routing_rationale: "Fallback: all routing attempts failed".to_string(),
             planning_summary: String::new(),
@@ -2146,6 +2207,7 @@ impl Orchestrator {
                     steps: vec![super::types::StepInput::LeafTask {
                         task: format!("Answer the user's query: {}", truncate_query(query, 80)),
                         worker: None,
+                        artifacts: Vec::new(),
                     }],
                     routing_rationale: format!(
                         "Config override (allow_direct_answers=false). Original rationale: {} | Original answer: {}",
@@ -2171,6 +2233,7 @@ impl Orchestrator {
                             truncate_query(query, 80)
                         ),
                         worker: None,
+                        artifacts: Vec::new(),
                     }],
                     routing_rationale: format!(
                         "Config override (allow_clarification=false). Original rationale: {} | Original question: {}",
@@ -2262,7 +2325,7 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
             r#"
 
 AVAILABLE WORKERS:
-NOTE: Worker names below are role assignments, not callable tool names. Only the tools listed under each worker are MCP tools that workers can execute.
+NOTE: Worker names below are role assignments, not callable tool names. Only the tools listed under each worker are tools that worker can execute.
 
 {}
 
@@ -2317,7 +2380,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             r#"
 
 AVAILABLE WORKERS:
-NOTE: Worker names below are role assignments, not callable tool names. Only the tools listed under each worker are MCP tools that workers can execute.
+NOTE: Worker names below are role assignments, not callable tool names. Only the tools listed under each worker are tools that worker can execute.
 
 {}
 
@@ -2357,14 +2420,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ///
     /// Returns an empty Vec if no MCP manager is present.
     fn get_all_tool_names(&self) -> Vec<String> {
-        let Some(ref mcp_manager) = self.mcp_manager else {
-            return Vec::new();
-        };
-
-        let mut names: Vec<String> = mcp_manager
-            .tool_definitions_iter()
-            .map(|tool| tool.name().to_string())
-            .collect();
+        let mut names: Vec<String> = self
+            .mcp_manager
+            .as_ref()
+            .map(|mcp_manager| {
+                mcp_manager
+                    .tool_definitions_iter()
+                    .map(|tool| tool.name().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.extend(self.run_tool_names());
 
         // Remove duplicates while preserving order
         let mut seen = std::collections::HashSet::new();
@@ -2373,21 +2439,27 @@ Assign tasks to the worker whose tools best match the required operations."#,
         names
     }
 
-    /// Get tool schemas for inspect_tool_params.
-    ///
-    /// Returns a map of tool name -> input_schema JSON value.
-    /// Used by the `inspect_tool_params` reconnaissance tool.
-    ///
-    /// Returns an empty HashMap if no MCP manager is present.
-    fn get_all_tool_schemas(&self) -> std::collections::HashMap<String, serde_json::Value> {
-        let Some(ref mcp_manager) = self.mcp_manager else {
-            return std::collections::HashMap::new();
-        };
-
-        mcp_manager
-            .tool_definitions_iter()
-            .map(|tool| (tool.name().to_string(), tool.input_schema()))
-            .collect()
+    /// Every tool's parameter schema by name, for the coordinator's
+    /// `inspect_tool_params`: the MCP tools' schemas when a manager exists,
+    /// plus the run's own tools' definitions, which are built once and
+    /// asked for their definition since a `ToolDyn` yields it
+    /// asynchronously.
+    async fn get_all_tool_schemas(&self) -> std::collections::HashMap<String, serde_json::Value> {
+        let mut schemas: std::collections::HashMap<String, serde_json::Value> = self
+            .mcp_manager
+            .as_ref()
+            .map(|mcp_manager| {
+                mcp_manager
+                    .tool_definitions_iter()
+                    .map(|tool| (tool.name().to_string(), tool.input_schema()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for tool in (self.run_tools)() {
+            let definition = tool.definition(String::new()).await;
+            schemas.insert(definition.name, definition.parameters);
+        }
+        schemas
     }
 
     /// Resolve which tools each worker can access based on their mcp_filter.
@@ -2413,6 +2485,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .map(|m| m.all_tools())
             .unwrap_or_default();
         let mut worker_tools = std::collections::HashMap::new();
+        let run_tool_names = self.run_tool_names();
 
         for (worker_name, worker_config) in &self.config.workers {
             // Omitted filter = every MCP tool (backwards compatibility);
@@ -2433,6 +2506,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
             for store_name in &worker_config.vector_stores {
                 matching_tools.push(format!("vector_search_{}", store_name));
             }
+            // The run's own tools reach every worker, filter or not.
+            matching_tools.extend(run_tool_names.iter().cloned());
 
             worker_tools.insert(worker_name.clone(), matching_tools);
         }
@@ -2517,6 +2592,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
         if let Some(artifact_tool) = tools.read_artifact {
             state = state.add_tool(artifact_tool);
         }
+        if let Some(write_artifact) = tools.write_artifact {
+            state = state.add_tool(write_artifact);
+        }
         if let Some(list_prior_runs) = tools.list_prior_runs {
             state = state.add_tool(list_prior_runs);
         }
@@ -2548,7 +2626,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Capture tool information for reconnaissance tools
         let tool_names = self.get_all_tool_names();
-        let tool_schemas = self.get_all_tool_schemas();
+        let tool_schemas = self.get_all_tool_schemas().await;
 
         // Create reconnaissance tools
         let list_tool = ListToolsTool::new(tool_names);
@@ -2642,6 +2720,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
         }
 
+        // The slot the coordinator's skill tools reach its run through;
+        // `begin_run_within` fills it once the coordinator is prepared.
+        let run = Arc::new(BoundRun::default());
+
         // Bundle all coordinator tools
         let coordinator_tools = CoordinatorTools {
             list_tools: if include_recon_tools {
@@ -2657,6 +2739,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             vector_tools,
             routing_tools,
             read_artifact: Some(ReadArtifactTool::new(self.persistence.clone())),
+            write_artifact: Some(WriteArtifactTool::new(self.persistence.clone())),
             list_prior_runs: if include_history_tools {
                 Some(super::tools::ListPriorRunsTool::new(
                     self.persistence.clone(),
@@ -2667,7 +2750,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             },
             skill_tools: crate::skill_tool::SkillToolset::new(
                 &self.agent_config.agent.skills,
-                self.agent_config.skill_recorder.clone(),
+                Some(Arc::clone(&run)),
             ),
         };
 
@@ -2683,33 +2766,48 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         let model_name = self.agent_config.llm.model_name().to_string();
 
-        // Coordinator depth budget allows recon + read_artifact + routing within one
-        // stream_and_collect call. The decision_ready early-exit is the primary guard;
-        // max_depth is defense-in-depth. GPT 5.2 observed using read_artifact during
-        // post-execute continuation routing (13 calls in 5-prompt E2E suite).
-        let max_depth = PLANNING_COORDINATOR_MAX_DEPTH;
+        // The top-level agent block configures the coordinator in orchestration
+        // mode, so the coordinator inherits `[agent].turn_depth`. The
+        // decision_ready early-exit is the primary guard; the depth cap is
+        // defense-in-depth.
+        let max_depth = self
+            .agent_config
+            .agent
+            .turn_depth
+            .unwrap_or(crate::builder::DEFAULT_MAX_DEPTH);
+
+        // The coordinator is one run of one prepared agent, under the request
+        // that owns the orchestration.
+        let prepared = Arc::new(PreparedAgent {
+            inner: provider_agent,
+            model: model_name,
+            max_depth,
+            mcp_manager: None, // Coordinator doesn't have MCP tools
+            fallback_tool_parsing: false,
+            fallback_tool_names: vec![],
+            fallback_mcp_filter: None,
+            context_window: self.agent_config.llm.context_window(),
+            scratchpad_budget: None,
+            client_tool_names: Default::default(),
+            turn_nudge: None,
+            system_prompt: preamble.clone(),
+            invocation_parameters: crate::logging::llm_invocation_parameters(
+                &self.agent_config.llm,
+            ),
+            skills: self.agent_config.agent.skills.clone(),
+            forwarded_headers: self.agent_config.forwarded_headers.clone(),
+            hitl_gate: None,
+            hitl_approval_tool: None,
+            run,
+            active: Default::default(),
+        });
+        let agent = prepared.begin_run_within(
+            &self.orchestration_run(),
+            self.agent_config.skill_recorder.clone(),
+        )?;
 
         Ok(AgentWithPreamble {
-            agent: Agent {
-                hitl_gate: None,
-                hitl_approval_tool: None,
-                inner: provider_agent,
-                model: model_name,
-                max_depth,
-                mcp_manager: None, // Coordinator doesn't have MCP tools
-                fallback_tool_parsing: false,
-                fallback_tool_names: vec![],
-                fallback_mcp_filter: None,
-                context_window: self.agent_config.llm.context_window(),
-                scratchpad_budget: None,
-                client_tool_names: Default::default(),
-                turn_nudge: None,
-                system_prompt: preamble.clone(),
-                invocation_parameters: crate::logging::llm_invocation_parameters(
-                    &self.agent_config.llm,
-                ),
-                skills: self.agent_config.agent.skills.clone(),
-            },
+            agent,
             preamble,
             escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             submit_result_decision: Arc::new(Mutex::new(None)),
@@ -2922,6 +3020,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     async fn build_worker_provider_agent(
         &self,
         worker_config: &AgentRuntimeConfig,
+        run: &Arc<BoundRun>,
     ) -> Result<(ProviderAgent, String), Box<dyn std::error::Error + Send + Sync>> {
         let preamble = worker_config.effective_preamble();
         let temperature = worker_config.llm.temperature();
@@ -2929,17 +3028,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let shared_mcp: Option<Arc<McpManager>> = self.mcp_manager.clone();
 
         // Box<dyn ToolDyn> is not Clone, so each provider arm constructs its own instance.
-        let wait_for_tools = || -> Vec<Box<dyn rig::tool::ToolDyn>> {
-            shared_mcp
-                .as_ref()
-                .map(|mcp| {
-                    vec![
-                        Box::new(super::tools::wait_for::WaitForTool::new(Arc::clone(mcp)))
-                            as Box<dyn rig::tool::ToolDyn>,
-                    ]
-                })
-                .unwrap_or_default()
-        };
+        let wait_for_tools = || self.worker_own_tools();
 
         // Test-only model injection (park/reify rig): a queued override builds
         // this worker from a scripted model. The override's extra tools go
@@ -2980,8 +3069,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     (None, _) => state = state.add_tool(shim),
                 }
             }
-            let state =
-                Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools()).await?;
+            let state = PreparedAgent::add_all_tools(
+                state,
+                worker_config,
+                &shared_mcp,
+                run,
+                wait_for_tools(),
+            )
+            .await?;
             return Ok((
                 ProviderAgent::Scripted(state.build()),
                 "scripted".to_string(),
@@ -3033,9 +3128,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.max_tokens(max);
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    run,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::OpenAI(state.build()), model.clone()))
             }
             LlmConfig::Anthropic {
@@ -3072,9 +3172,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    run,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::Anthropic(state.build()), model.clone()))
             }
             LlmConfig::Bedrock {
@@ -3119,9 +3224,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    run,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::Bedrock(state.build()), model.clone()))
             }
             LlmConfig::Gemini {
@@ -3151,9 +3261,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    run,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::Gemini(state.build()), model.clone()))
             }
             LlmConfig::Ollama {
@@ -3182,9 +3297,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
 
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    run,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::Ollama(state.build()), model.clone()))
             }
             LlmConfig::OpenRouter {
@@ -3217,9 +3337,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state =
-                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
-                        .await?;
+                let state = PreparedAgent::add_all_tools(
+                    state,
+                    worker_config,
+                    &shared_mcp,
+                    run,
+                    wait_for_tools(),
+                )
+                .await?;
                 Ok((ProviderAgent::OpenRouter(state.build()), model.clone()))
             }
         }
@@ -3519,35 +3644,40 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let task = plan.tasks.iter().find(|t| t.id == task_id)?;
 
         // Build structured dependency context — compact format to prevent scope creep
+        let mut parts: Vec<String> = task
+            .dependencies
+            .iter()
+            .filter_map(|dep_id| {
+                plan.tasks
+                    .iter()
+                    .find(|t| t.id == *dep_id)
+                    .and_then(|dep_task| match &dep_task.state {
+                        TaskState::Complete { result } => Some(format!(
+                            "{} — Task {} ({}):\n{}",
+                            sections::PRIOR_WORK,
+                            dep_task.id,
+                            dep_task.description,
+                            result
+                        )),
+                        _ => None,
+                    })
+            })
+            .collect();
 
-        if !task.dependencies.is_empty() {
-            let dep_parts: Vec<String> = task
-                .dependencies
-                .iter()
-                .filter_map(|dep_id| {
-                    plan.tasks
-                        .iter()
-                        .find(|t| t.id == *dep_id)
-                        .and_then(|dep_task| match &dep_task.state {
-                            TaskState::Complete { result } => Some(format!(
-                                "{} — Task {} ({}):\n{}",
-                                sections::PRIOR_WORK,
-                                dep_task.id,
-                                dep_task.description,
-                                result
-                            )),
-                            _ => None,
-                        })
-                })
-                .collect();
+        // Artifacts the coordinator attached to this task.
+        if !task.artifacts.is_empty() {
+            let list: Vec<String> = task.artifacts.iter().map(|a| format!("- {a}")).collect();
+            parts.push(format!(
+                "{} — load each with `read_artifact` before starting:\n{}",
+                sections::INPUT_ARTIFACTS,
+                list.join("\n")
+            ));
+        }
 
-            if dep_parts.is_empty() {
-                None
-            } else {
-                Some(dep_parts.join(context::DEPENDENCY_SEPARATOR))
-            }
-        } else {
+        if parts.is_empty() {
             None
+        } else {
+            Some(parts.join(context::DEPENDENCY_SEPARATOR))
         }
     }
 
@@ -3693,7 +3823,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             // their hook-carrying stream (`stream_chat_with_timeout`) seeds
             // the budget itself, from the prompt *and* the retry history.
             if park.is_none()
-                && let Some(ref budget) = worker.scratchpad_budget
+                && let Some(budget) = worker.scratchpad_budget()
             {
                 let task_prompt_tokens = budget.count_tokens(&prompt);
                 budget.record_usage(task_prompt_tokens);
@@ -3778,7 +3908,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
 
             // Emit per-agent ScratchpadUsage event if this worker used scratchpad.
-            if let (Some(budget), Some(tx)) = (worker.scratchpad_budget.as_ref(), event_tx) {
+            if let (Some(budget), Some(tx)) = (worker.scratchpad_budget(), event_tx) {
                 let agent_id = worker_name
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| self.orchestrator_id.clone());
@@ -4021,7 +4151,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 worker.max_depth,
                 crate::streaming::RunOptions::default(),
                 &park.key,
-                worker.scratchpad_budget.clone(),
+                worker.scratchpad_budget().cloned(),
                 worker.client_tool_names.clone(),
             )
             .await
@@ -4030,7 +4160,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             stream,
             &self.usage_state,
             self.config.stream_inactivity_timeout_secs(),
-            worker.scratchpad_budget.as_ref(),
+            worker.scratchpad_budget(),
             "Worker resume",
             event_tx,
             worker_name.map(|name| StreamContext {
@@ -4414,7 +4544,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // Recon tools registered unconditionally — the persistent conversation
         // means we can't vary the tool set between calls, and the conversation
         // context guides usage (coordinator won't call list_tools on continuation).
-        let routing_toolset = RoutingToolSet::new();
+        let routing_toolset = RoutingToolSet::new().with_persistence(self.persistence.clone());
         let routing_decision = routing_toolset.decision.clone();
         let AgentWithPreamble {
             agent: coordinator,
@@ -6394,7 +6524,7 @@ mod tests {
                 assert_eq!(goal, "what is the meaning?");
                 assert_eq!(steps.len(), 1);
                 match &steps[0] {
-                    StepInput::LeafTask { task, worker } => {
+                    StepInput::LeafTask { task, worker, .. } => {
                         assert!(task.starts_with("Answer the user's query:"));
                         assert!(task.contains("what is the meaning?"));
                         assert!(worker.is_none());
@@ -6454,6 +6584,7 @@ mod tests {
             steps: vec![StepInput::LeafTask {
                 task: "compute mean of 1,2,3".to_string(),
                 worker: Some("statistics".to_string()),
+                artifacts: Vec::new(),
             }],
             routing_rationale: "needs tool".to_string(),
             planning_summary: "single step".to_string(),
@@ -6497,6 +6628,7 @@ mod tests {
             steps: vec![StepInput::LeafTask {
                 task: "do it".to_string(),
                 worker: None,
+                artifacts: Vec::new(),
             }],
             routing_rationale: "complex".to_string(),
             planning_summary: "A plan to do it".to_string(),
@@ -7355,6 +7487,59 @@ mod tests {
         assert!(park_verdict_lines(&plan).is_empty());
     }
 
+    #[test]
+    fn redact_internal_tool_arguments_hides_write_artifact_content() {
+        let mut args = serde_json::json!({"filename": "draft.md", "content": "abcdé"});
+        redact_internal_tool_arguments("write_artifact", &mut args);
+        assert_eq!(args["filename"], "draft.md");
+        assert_eq!(args["content"], "[5 chars written to artifact]");
+
+        let mut other = serde_json::json!({"filename": "x", "content": "kept"});
+        redact_internal_tool_arguments("read_artifact", &mut other);
+        assert_eq!(other["content"], "kept");
+    }
+
+    /// Attached artifacts are listed in the worker's context after any
+    /// dependency results, and alone when the task has no dependencies.
+    #[tokio::test]
+    async fn task_context_lists_attached_artifacts() {
+        let orchestrator = Orchestrator::new(crate::config::AgentRuntimeConfig::default())
+            .await
+            .unwrap();
+        let mut plan = Plan::new("Artifacts");
+        let mut first = Task::new(0, "Draft", "r");
+        first.artifacts = vec!["coordinator-brief.md".to_string()];
+        plan.add_task(first);
+        let mut second = Task::new(1, "Review", "r").with_dependency(0);
+        second.artifacts = vec![
+            "coordinator-draft.md".to_string(),
+            "task-0-sre-iter-1-result.txt".to_string(),
+        ];
+        plan.add_task(second);
+        plan.add_task(Task::new(2, "Plain", "r"));
+        plan.get_task_mut(0).unwrap().complete("draft done");
+
+        let first_ctx = orchestrator.build_task_context(&plan, 0).unwrap();
+        assert_eq!(
+            first_ctx,
+            "INPUT ARTIFACTS — load each with `read_artifact` before starting:\n\
+             - coordinator-brief.md"
+        );
+
+        let second_ctx = orchestrator.build_task_context(&plan, 1).unwrap();
+        let completed = second_ctx.find("COMPLETED — Task 0 (Draft):\ndraft done");
+        let artifacts = second_ctx.find(
+            "INPUT ARTIFACTS — load each with `read_artifact` before starting:\n\
+             - coordinator-draft.md\n- task-0-sre-iter-1-result.txt",
+        );
+        assert!(
+            completed.is_some() && artifacts.is_some() && completed < artifacts,
+            "{second_ctx}"
+        );
+
+        assert!(orchestrator.build_task_context(&plan, 2).is_none());
+    }
+
     /// The real `execute()` loop parks at quiescence: no worker is dispatched
     /// for the awaiting task or its dependent, the run does not spin, and the
     /// awaiting state survives untouched.
@@ -7396,6 +7581,76 @@ mod tests {
 
     /// `park_enabled` requires the flag AND the conversational route — the
     /// webhook arm of park mode is out of V1 scope.
+    #[tokio::test]
+    async fn workers_get_fresh_instances_of_the_run_tools() {
+        use rig::tool::Tool as _;
+
+        #[derive(Debug, serde::Deserialize)]
+        struct NoArgs {}
+        struct Marker;
+        impl rig::tool::Tool for Marker {
+            const NAME: &'static str = "run_marker";
+            type Error = std::convert::Infallible;
+            type Args = NoArgs;
+            type Output = String;
+            async fn definition(&self, _p: String) -> rig::completion::ToolDefinition {
+                rig::completion::ToolDefinition {
+                    name: Self::NAME.to_owned(),
+                    description: String::new(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+            async fn call(&self, _a: Self::Args) -> Result<Self::Output, Self::Error> {
+                Ok(String::new())
+            }
+        }
+
+        let mut orchestrator = Orchestrator::new(AgentRuntimeConfig::default())
+            .await
+            .unwrap();
+        assert!(orchestrator.worker_own_tools().is_empty());
+
+        let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&built);
+        orchestrator.run_tools = Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![Box::new(Marker) as Box<dyn rig::tool::ToolDyn>]
+        });
+        let first = orchestrator.worker_own_tools();
+        let second = orchestrator.worker_own_tools();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].name(), Marker::NAME);
+        assert_eq!(second[0].name(), Marker::NAME);
+        assert_eq!(built.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // The planner's inventory lists them under a worker that has no MCP
+        // tools at all, and the recon tool's name list carries them too.
+        let worker: aura_config::WorkerConfig = serde_json::from_value(serde_json::json!({
+            "description": "searches",
+            "preamble": "You search.",
+            "mcp_filter": []
+        }))
+        .unwrap();
+        orchestrator
+            .config
+            .workers
+            .insert("finder".to_owned(), worker);
+        let inventory = orchestrator.resolve_worker_tools();
+        assert_eq!(inventory["finder"], vec![Marker::NAME.to_owned()]);
+        assert!(
+            orchestrator
+                .get_all_tool_names()
+                .contains(&Marker::NAME.to_owned())
+        );
+        let schemas = orchestrator.get_all_tool_schemas().await;
+        assert_eq!(schemas[Marker::NAME], serde_json::json!({"type": "object"}));
+        assert!(
+            orchestrator
+                .build_workers_section_with_tools()
+                .contains("Tools: run_marker")
+        );
+    }
+
     #[tokio::test]
     async fn park_enabled_requires_flag_and_conversational_route() {
         fn config(park_enabled: bool, conversational: bool) -> AgentRuntimeConfig {
@@ -8493,6 +8748,41 @@ mod tests {
         crate::orchestration::park::ResumingDocumentHandle::open(path)
             .await
             .expect("the published document opens")
+    }
+
+    /// The snapshot ends the worker's run, so the model never answers the
+    /// parked call's sentinel result.
+    #[tokio::test]
+    async fn parking_ends_the_worker_run_before_another_model_turn() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _store) = file_store_registry(&dir.path().join("approvals"));
+        let (orchestrator, _run_id) =
+            file_backed_park_orchestrator(&registry, dir.path(), "park-ends-run").await;
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+
+        let (park_model, _invocations) = gated_worker_override(vec![
+            ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                "call_apply_1",
+                test_rig::ECHO_TOOL_NAME,
+                serde_json::json!({"namespace": "prod"}),
+            )]),
+            ScriptedTurn::text("answered the parked call's sentinel"),
+        ]);
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
+        orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+
+        assert!(matches!(
+            plan.tasks[0].state,
+            TaskState::AwaitingApproval { .. }
+        ));
+        assert_eq!(
+            park_model.requests().lock().unwrap().len(),
+            1,
+            "the parking turn is the worker's last model turn"
+        );
     }
 
     /// The shared full-loop harness: park over the file-backed store, drop

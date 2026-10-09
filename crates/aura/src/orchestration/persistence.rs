@@ -71,6 +71,26 @@ pub fn sanitize_filename_component(s: &str) -> String {
     }
 }
 
+/// Normalize a coordinator-requested artifact name to
+/// `coordinator-{stem}.{ext}`. The stem is sanitized with
+/// [`sanitize_filename_component`], a leading `coordinator-` in the request is
+/// not doubled, and a missing or non-alphanumeric extension becomes `txt`.
+pub(crate) fn coordinator_artifact_filename(requested: &str) -> String {
+    let (stem, ext) = match requested.rsplit_once('.') {
+        Some((stem, ext))
+            if !stem.is_empty()
+                && !ext.is_empty()
+                && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            (stem, ext.to_ascii_lowercase())
+        }
+        _ => (requested, "txt".to_string()),
+    };
+    let stem = sanitize_filename_component(stem);
+    let stem = stem.strip_prefix("coordinator-").unwrap_or(&stem);
+    format!("coordinator-{stem}.{ext}")
+}
+
 /// True when `s` is safe to use as a single path component: non-empty, no path
 /// separators, no parent references. Artifact filenames and run IDs come from
 /// untrusted tool/LLM input and are validated with this before being joined
@@ -255,6 +275,9 @@ pub struct TaskExecutionRecord {
     /// Notes for orchestrator (retry hints, blockers, etc.)
     pub orchestrator_notes: Option<String>,
 }
+
+/// Most artifact filenames `list_artifacts_capped` returns.
+pub const MAX_LISTED_ARTIFACTS: usize = 40;
 
 /// Manages execution artifact persistence (async).
 ///
@@ -660,6 +683,53 @@ impl ExecutionPersistence {
         Ok(filename)
     }
 
+    /// Write coordinator-authored content to an artifact file.
+    ///
+    /// Returns the artifact filename and whether an existing artifact was
+    /// replaced. The requested name is normalized by
+    /// [`coordinator_artifact_filename`] so the coordinator can never
+    /// overwrite a worker result or tool output artifact; the returned
+    /// filename is the one to hand to `read_artifact`.
+    pub async fn write_coordinator_artifact(
+        &self,
+        requested_name: &str,
+        content: &str,
+    ) -> io::Result<(String, bool)> {
+        if !self.enabled {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Persistence is disabled",
+            ));
+        }
+
+        let filename = coordinator_artifact_filename(requested_name);
+        let artifacts_dir = self.artifacts_path();
+        fs::create_dir_all(&artifacts_dir).await?;
+
+        let artifact_path = artifacts_dir.join(&filename);
+        let replaced = fs::try_exists(&artifact_path).await.unwrap_or(false);
+        // Write beside the target and rename into place, so a failed or
+        // interrupted write never leaves a truncated artifact under a name a
+        // plan may already reference.
+        let tmp_path = artifacts_dir.join(format!(".{filename}.tmp"));
+        let written = match fs::write(&tmp_path, content).await {
+            Ok(()) => fs::rename(&tmp_path, &artifact_path).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = written {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(e);
+        }
+
+        tracing::info!(
+            "Written coordinator artifact ({} chars, replaced={}) to: {}",
+            content.len(),
+            replaced,
+            artifact_path.display()
+        );
+        Ok((filename, replaced))
+    }
+
     /// Read an artifact file by filename.
     ///
     /// Resolves the path via [`artifact_path`](Self::artifact_path) (which
@@ -776,12 +846,25 @@ impl ExecutionPersistence {
         };
         let mut filenames = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
-            if let Some(name) = entry.file_name().to_str() {
+            if let Some(name) = entry.file_name().to_str()
+                && !name.starts_with('.')
+            {
                 filenames.push(name.to_string());
             }
         }
         filenames.sort();
         Ok(filenames)
+    }
+
+    /// List artifact filenames for naming in a recovery hint, task results and
+    /// coordinator artifacts ahead of tool outputs, keeping the first
+    /// `MAX_LISTED_ARTIFACTS`. Returns the kept names and how many were dropped.
+    pub async fn list_artifacts_capped(&self) -> io::Result<(Vec<String>, usize)> {
+        let mut filenames = self.list_artifacts().await?;
+        filenames.sort_by_key(|name| (name.ends_with("-output.txt"), name.clone()));
+        let omitted = filenames.len().saturating_sub(MAX_LISTED_ARTIFACTS);
+        filenames.truncate(MAX_LISTED_ARTIFACTS);
+        Ok((filenames, omitted))
     }
 
     /// List all artifact filenames with file sizes.
@@ -1305,6 +1388,167 @@ mod tests {
         assert_eq!(artifacts.len(), 2);
         assert!(artifacts.contains(&"task-0-default-iter-1-result.txt".to_string()));
         assert!(artifacts.contains(&"task-1-stats-iter-1-result.txt".to_string()));
+    }
+
+    #[test]
+    fn test_coordinator_artifact_filename() {
+        let cases = [
+            ("draft", "coordinator-draft.txt"),
+            ("runbook-draft.md", "coordinator-runbook-draft.md"),
+            (
+                "Verified Literals.JSON",
+                "coordinator-verified-literals.json",
+            ),
+            ("coordinator-plan.md", "coordinator-plan.md"),
+            ("../../etc/passwd", "coordinator-etc-passwd.txt"),
+            ("notes.", "coordinator-notes.txt"),
+            (".md", "coordinator-md.txt"),
+            ("a.tar/gz", "coordinator-a-tar-gz.txt"),
+            (
+                "task-0-sre-iter-1-result.txt",
+                "coordinator-task-0-sre-iter-1-result.txt",
+            ),
+            ("", "coordinator-unknown.txt"),
+        ];
+        for (requested, expected) in cases {
+            let filename = coordinator_artifact_filename(requested);
+            assert_eq!(filename, expected, "requested={requested:?}");
+            assert!(is_safe_path_component(&filename));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_coordinator_artifact_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+
+        let (filename, replaced) = persistence
+            .write_coordinator_artifact("runbook-draft.md", "first draft")
+            .await
+            .unwrap();
+        assert_eq!(filename, "coordinator-runbook-draft.md");
+        assert!(!replaced);
+        assert_eq!(
+            persistence.read_artifact(&filename).await.unwrap(),
+            "first draft"
+        );
+
+        let (filename, replaced) = persistence
+            .write_coordinator_artifact("runbook-draft.md", "second draft")
+            .await
+            .unwrap();
+        assert!(replaced);
+        assert_eq!(
+            persistence.read_artifact(&filename).await.unwrap(),
+            "second draft"
+        );
+        assert_eq!(persistence.list_artifacts().await.unwrap(), vec![filename]);
+    }
+
+    #[tokio::test]
+    async fn test_list_artifacts_capped_prefers_results() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+        persistence
+            .write_result_artifact(1, Some("b"), 1, "result")
+            .await
+            .unwrap();
+        for i in 0..MAX_LISTED_ARTIFACTS {
+            tokio::fs::write(
+                persistence
+                    .artifact_path(&format!("task-0-a-iter-1-tool-{i:02}-output.txt"))
+                    .unwrap(),
+                "out",
+            )
+            .await
+            .unwrap();
+        }
+
+        let (listed, omitted) = persistence.list_artifacts_capped().await.unwrap();
+        assert_eq!(listed.len(), MAX_LISTED_ARTIFACTS);
+        assert_eq!(omitted, 1);
+        assert_eq!(listed[0], "task-1-b-iter-1-result.txt");
+    }
+
+    #[tokio::test]
+    async fn test_list_artifacts_skips_temp_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+        let (filename, _) = persistence
+            .write_coordinator_artifact("notes.md", "notes")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            persistence
+                .artifact_path(".coordinator-draft.md.tmp")
+                .unwrap(),
+            "partial",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(persistence.list_artifacts().await.unwrap(), vec![filename]);
+    }
+
+    #[tokio::test]
+    async fn test_write_coordinator_artifact_cannot_clobber_worker_result() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+        let worker_file = persistence
+            .write_result_artifact(0, Some("sre"), 1, "worker result")
+            .await
+            .unwrap();
+
+        persistence
+            .write_coordinator_artifact(&worker_file, "coordinator content")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            persistence.read_artifact(&worker_file).await.unwrap(),
+            "worker result"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_coordinator_artifact_failed_replace_leaves_no_temp_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+        // A directory at the target name makes the rename fail.
+        let target = persistence.artifacts_path().join("coordinator-draft.txt");
+        fs::create_dir_all(&target).await.unwrap();
+
+        let result = persistence
+            .write_coordinator_artifact("draft", "content")
+            .await;
+
+        assert!(result.is_err());
+        assert!(target.is_dir(), "the existing entry is left untouched");
+        assert_eq!(
+            persistence.list_artifacts().await.unwrap(),
+            vec!["coordinator-draft.txt".to_string()],
+            "no temp file is left behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_coordinator_artifact_disabled() {
+        let persistence = ExecutionPersistence::disabled();
+        let err = persistence
+            .write_coordinator_artifact("draft", "content")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     }
 
     #[tokio::test]

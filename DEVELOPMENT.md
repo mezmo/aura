@@ -214,6 +214,13 @@ Prompt routing and execution model:
 - Direct Mode (`orchestration.enabled = false`): single `Agent` handles the turn.
 - Orchestration Mode (`orchestration.enabled = true`): `Orchestrator` coordinates worker execution.
 - Both `Agent` and `Orchestrator` implement `StreamingAgent`, so they are interchangeable at the API boundary.
+- An agent is two halves: `PreparedAgent` is built once from config (provider client, discovered tools, MCP connections) and `Agent` is one run of it, begun with `PreparedAgent::begin_run`. Per-run state (the `RunContext`: request id, event channel, tool-call queue, scratchpad budget, turn-nudge counters, skill-invocation recorder) reaches tools through the prepared agent's `BoundRun` slot, and a prepared agent serves one run at a time; see `crates/aura/src/run_context.rs`. A prepared agent also forwards the `headers_from_request` values of the request that prepared it, and `begin_run` refuses a request that forwards different ones (`crates/aura/src/forwarded_headers.rs`). Today every request prepares a fresh agent; the split is what lets a session reuse one.
+
+Ingress paths into the web server (all end in the same `StreamingAgent::stream` call):
+
+- `/v1/chat/completions`: OpenAI-compatible HTTP and SSE, the primary path.
+- A2A (`--enable-a2a`): JSON-RPC and REST task endpoints, driven by `a2a::AuraAgentExecutor`.
+- Slack (`--enable-slack`): an outbound Socket Mode WebSocket; `slack::runner` answers channel @mentions in a thread and DMs inline, rebuilding history from the Slack thread or DM on each message. See the `crates/aura-web-server/src/slack/` module docs and the Slack Ingress section of `CLAUDE.md`.
 
 Orchestrator components and loop:
 

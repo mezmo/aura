@@ -8,14 +8,16 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::orchestration::persistence::ExecutionPersistence;
+use crate::run_context::BoundRun;
+use crate::scratchpad::ScratchpadStorage;
 use crate::scratchpad::storage::{ContentFormat, ScratchpadPathError};
 use crate::scratchpad::tools::check_and_record_budget;
 use crate::scratchpad::wrapper::build_file_pointer;
-use crate::scratchpad::{ContextBudget, ScratchpadStorage};
 
 #[derive(Clone)]
 struct ReadArtifactScratchpad {
-    budget: ContextBudget,
+    /// The prepared agent's run slot.
+    run: Arc<BoundRun>,
     storage: Arc<ScratchpadStorage>,
 }
 
@@ -38,12 +40,8 @@ impl ReadArtifactTool {
     }
 
     /// With scratchpad, oversized artifacts are returned as a pointer.
-    pub fn with_scratchpad(
-        mut self,
-        budget: ContextBudget,
-        storage: Arc<ScratchpadStorage>,
-    ) -> Self {
-        self.scratchpad = Some(ReadArtifactScratchpad { budget, storage });
+    pub fn with_scratchpad(mut self, run: Arc<BoundRun>, storage: Arc<ScratchpadStorage>) -> Self {
+        self.scratchpad = Some(ReadArtifactScratchpad { run, storage });
         self
     }
 
@@ -59,12 +57,25 @@ impl ReadArtifactTool {
         let Some(sp) = &self.scratchpad else {
             return content;
         };
+        // No run bound means no budget to check the artifact against;
+        // withhold it rather than inline an unbounded read, as the
+        // scratchpad read tools do with `ScratchpadToolError::NoRun`.
+        let Some(budget) = sp.run.scratchpad_budget() else {
+            tracing::warn!(
+                "read_artifact: artifact {} withheld — no run is bound",
+                filename
+            );
+            return format!(
+                "[artifact '{filename}' withheld: no run is bound to count it against. \
+                 Retry the read_artifact call.]"
+            );
+        };
 
-        if check_and_record_budget(&sp.budget, &content).is_ok() {
+        if check_and_record_budget(&budget, &content).is_ok() {
             return content;
         }
 
-        let tokens = sp.budget.count_tokens(&content);
+        let tokens = budget.count_tokens(&content);
         let line_count = content.lines().count();
         let (format, _) = ContentFormat::detect_and_parse(&content);
         match sp.storage.relative_ref(abs_path).await {
@@ -126,6 +137,16 @@ pub struct ReadArtifactOutput {
     pub found: bool,
     pub filename: String,
     pub content: String,
+    /// Artifact filenames in the current run.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub available: Vec<String>,
+    /// Number of current-run artifact filenames left out of `available`.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub available_omitted: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// Error type for ReadArtifactTool.
@@ -149,7 +170,8 @@ impl Tool for ReadArtifactTool {
                 the current run. Supply an optional run_id to read artifacts from a prior run \
                 in this session (see session history for available run_id values). A large \
                 artifact is returned as a scratchpad pointer to explore in place (with head, \
-                grep, slice, etc.) rather than inlined."
+                grep, slice, etc.) rather than inlined. A filename that is not found returns \
+                found=false with the run's artifact filenames in `available`."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -171,7 +193,7 @@ impl Tool for ReadArtifactTool {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let persistence = self.persistence.lock().await;
 
-        let (result, abs_path) = if let Some(ref run_id) = args.run_id {
+        let (result, abs_path, available) = if let Some(ref run_id) = args.run_id {
             tracing::info!(
                 "read_artifact cross-run: filename={}, run_id={}",
                 args.filename,
@@ -184,12 +206,24 @@ impl Tool for ReadArtifactTool {
                 persistence
                     .artifact_path_cross_run(&args.filename, run_id)
                     .ok(),
+                (Vec::new(), 0),
             )
         } else {
             tracing::info!("read_artifact called for: {}", args.filename);
+            let result = persistence.read_artifact(&args.filename).await;
+            // A miss names what does exist, so the caller can correct the
+            // filename instead of guessing again.
+            let available = match &result {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => persistence
+                    .list_artifacts_capped()
+                    .await
+                    .unwrap_or_default(),
+                _ => (Vec::new(), 0),
+            };
             (
-                persistence.read_artifact(&args.filename).await,
+                result,
                 persistence.artifact_path(&args.filename).ok(),
+                available,
             )
         };
         drop(persistence);
@@ -206,12 +240,16 @@ impl Tool for ReadArtifactTool {
                     found: true,
                     filename: args.filename,
                     content,
+                    available: Vec::new(),
+                    available_omitted: 0,
                 })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ReadArtifactOutput {
                 found: false,
                 filename: args.filename,
                 content: String::new(),
+                available: available.0,
+                available_omitted: available.1,
             }),
             Err(e) => Err(ReadArtifactError::Io(e)),
         }
@@ -270,6 +308,8 @@ mod tests {
 
         assert!(!result.found);
         assert!(result.content.is_empty());
+        assert_eq!(result.available, vec!["task-0-research-iter-1-result.txt"]);
+        assert_eq!(result.available_omitted, 0);
     }
 
     #[tokio::test]
@@ -398,7 +438,7 @@ mod tests {
     // Budget-aware behavior (scratchpad active)
     // ------------------------------------------------------------------
 
-    use crate::scratchpad::TiktokenCounter;
+    use crate::scratchpad::{ContextBudget, TiktokenCounter};
 
     /// A standard 128k-window budget with the given per-call extraction limit.
     fn test_budget(max_extraction_tokens: usize) -> ContextBudget {
@@ -448,8 +488,10 @@ mod tests {
         );
         let budget = test_budget(max_extraction_tokens);
 
-        let tool = ReadArtifactTool::new(Arc::new(Mutex::new(persistence)))
-            .with_scratchpad(budget.clone(), storage.clone());
+        let tool = ReadArtifactTool::new(Arc::new(Mutex::new(persistence))).with_scratchpad(
+            Arc::new(BoundRun::pinned_budget(budget.clone())),
+            storage.clone(),
+        );
         (tool, storage, temp_dir)
     }
 
@@ -462,7 +504,9 @@ mod tests {
             .scratchpad
             .as_ref()
             .unwrap()
-            .budget
+            .run
+            .scratchpad_budget()
+            .unwrap()
             .scratchpad_usage()
             .1;
         assert_eq!(extracted_before, 0);
@@ -482,7 +526,9 @@ mod tests {
             .scratchpad
             .as_ref()
             .unwrap()
-            .budget
+            .run
+            .scratchpad_budget()
+            .unwrap()
             .scratchpad_usage()
             .1;
         assert!(
@@ -550,7 +596,10 @@ mod tests {
 
         // A read tool resolves the pointer's token to the artifact in place.
         let file_ref = file_ref_from_pointer(&result.content);
-        let head = HeadTool::new(storage, test_budget(10_000));
+        let head = HeadTool::new(
+            storage,
+            Arc::new(BoundRun::pinned_budget(test_budget(10_000))),
+        );
         let head_out = head
             .call(HeadArgs {
                 file: file_ref,
@@ -601,8 +650,10 @@ mod tests {
                 .unwrap()
                 .with_read_root(read_root),
         );
-        let tool = ReadArtifactTool::new(Arc::new(Mutex::new(run_b)))
-            .with_scratchpad(test_budget(50), storage.clone());
+        let tool = ReadArtifactTool::new(Arc::new(Mutex::new(run_b))).with_scratchpad(
+            Arc::new(BoundRun::pinned_budget(test_budget(50))),
+            storage.clone(),
+        );
 
         let result = tool
             .call(ReadArtifactArgs {
@@ -634,7 +685,10 @@ mod tests {
 
         // The token reads the sibling-run artifact in place.
         let file_ref = file_ref_from_pointer(&result.content);
-        let head = HeadTool::new(storage, test_budget(10_000));
+        let head = HeadTool::new(
+            storage,
+            Arc::new(BoundRun::pinned_budget(test_budget(10_000))),
+        );
         let head_out = head
             .call(HeadArgs {
                 file: file_ref,

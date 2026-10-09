@@ -11,6 +11,7 @@ pub(crate) mod read_artifact;
 pub mod routing_tools;
 pub mod submit_result;
 pub mod wait_for;
+pub(crate) mod write_artifact;
 
 pub use inspect_tool_params::InspectToolParamsTool;
 pub use list_prior_runs::ListPriorRunsTool;
@@ -21,3 +22,4 @@ pub use routing_tools::{
 };
 pub use submit_result::{Confidence, SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 pub use wait_for::{StopReason, WaitForArgs, WaitForError, WaitForOutput, WaitForTool};
+pub use write_artifact::WriteArtifactTool;

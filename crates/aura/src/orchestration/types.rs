@@ -85,6 +85,9 @@ pub enum StepInput {
         task: String,
         #[serde(default)]
         worker: Option<String>,
+        /// Run artifact filenames attached to this task.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        artifacts: Vec<String>,
     },
 }
 
@@ -132,12 +135,17 @@ fn flatten_one(
     depth: usize,
 ) -> Result<Vec<usize>, String> {
     match step {
-        StepInput::LeafTask { task, worker } => {
+        StepInput::LeafTask {
+            task,
+            worker,
+            artifacts,
+        } => {
             let id = *counter;
             *counter += 1;
             let mut t = Task::new(id, task.clone(), String::new());
             t.dependencies = frontier.to_vec();
             t.worker = worker.clone();
+            t.artifacts = artifacts.clone();
             tasks.push(t);
             Ok(vec![id])
         }
@@ -331,6 +339,8 @@ pub struct Task {
     /// Top-level because it's orthogonal to pass/fail — workers can submit
     /// structured output regardless of task outcome.
     pub structured_output: Option<StructuredTaskOutput>,
+    /// Run artifact filenames attached to this task.
+    pub artifacts: Vec<String>,
 }
 
 impl Serialize for Task {
@@ -361,6 +371,9 @@ impl Serialize for Task {
         if let Some(ref so) = self.structured_output {
             map.serialize_entry("structured_output", so)?;
         }
+        if !self.artifacts.is_empty() {
+            map.serialize_entry("artifacts", &self.artifacts)?;
+        }
         map.end()
     }
 }
@@ -386,6 +399,8 @@ impl<'de> Deserialize<'de> for Task {
             rationale: String,
             #[serde(default)]
             structured_output: Option<StructuredTaskOutput>,
+            #[serde(default)]
+            artifacts: Vec<String>,
         }
         let h = TaskHelper::deserialize(deserializer)?;
         let state = match h.status {
@@ -410,6 +425,7 @@ impl<'de> Deserialize<'de> for Task {
             worker: h.worker,
             rationale: h.rationale,
             structured_output: h.structured_output,
+            artifacts: h.artifacts,
         })
     }
 }
@@ -433,6 +449,7 @@ impl Task {
             worker: None,
             rationale: rationale.into(),
             structured_output: None,
+            artifacts: Vec::new(),
         }
     }
 
@@ -1507,6 +1524,38 @@ mod tests {
     }
 
     #[test]
+    fn test_task_serde_artifacts() {
+        let mut task = Task::new(0, "Review", "r");
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(!json.contains("artifacts"), "empty list is omitted: {json}");
+        assert!(
+            serde_json::from_str::<Task>(&json)
+                .unwrap()
+                .artifacts
+                .is_empty()
+        );
+
+        task.artifacts = vec!["coordinator-draft.md".to_string()];
+        let json = serde_json::to_string(&task).unwrap();
+        let roundtripped: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtripped.artifacts, task.artifacts);
+    }
+
+    #[test]
+    fn test_step_input_artifacts_default_and_flatten() {
+        let steps: Vec<StepInput> = serde_json::from_str(
+            r#"[{"type":"task","task":"a","worker":"w"},
+                {"type":"task","task":"b","artifacts":["coordinator-x.txt"]}]"#,
+        )
+        .unwrap();
+        let tasks = flatten_steps(&steps).unwrap();
+        assert!(tasks[0].artifacts.is_empty());
+        assert_eq!(tasks[1].artifacts, vec!["coordinator-x.txt".to_string()]);
+        let json = serde_json::to_string(&steps[0]).unwrap();
+        assert!(!json.contains("artifacts"), "{json}");
+    }
+
+    #[test]
     fn test_task_deserialize_legacy_null_fields() {
         let json = r#"{"id":0,"description":"Test","dependencies":[],"status":"pending","result":null,"error":null,"rationale":"test"}"#;
         let task: Task = serde_json::from_str(json).unwrap();
@@ -2191,6 +2240,7 @@ mod tests {
             steps: vec![StepInput::LeafTask {
                 task: "t".to_string(),
                 worker: None,
+                artifacts: Vec::new(),
             }],
             routing_rationale: "reason_o".to_string(),
             planning_summary: "summary".to_string(),
@@ -2212,6 +2262,7 @@ mod tests {
             steps: vec![StepInput::LeafTask {
                 task: "Do thing".to_string(),
                 worker: None,
+                artifacts: Vec::new(),
             }],
             routing_rationale: "Needs tool".to_string(),
             planning_summary: "Just do it".to_string(),
@@ -2232,10 +2283,12 @@ mod tests {
             StepInput::LeafTask {
                 task: "Compute mean of [10,20,30]".into(),
                 worker: Some("statistics".into()),
+                artifacts: Vec::new(),
             },
             StepInput::LeafTask {
                 task: "Multiply the result by 3".into(),
                 worker: Some("arithmetic".into()),
+                artifacts: Vec::new(),
             },
         ];
         let tasks = flatten_steps(&steps).unwrap();
@@ -2256,16 +2309,19 @@ mod tests {
                     StepInput::LeafTask {
                         task: "Compute median".into(),
                         worker: Some("statistics".into()),
+                        artifacts: Vec::new(),
                     },
                     StepInput::LeafTask {
                         task: "Compute sin(45)".into(),
                         worker: Some("trigonometry".into()),
+                        artifacts: Vec::new(),
                     },
                 ],
             },
             StepInput::LeafTask {
                 task: "Multiply the two results".into(),
                 worker: Some("arithmetic".into()),
+                artifacts: Vec::new(),
             },
         ];
         let tasks = flatten_steps(&steps).unwrap();
@@ -2288,22 +2344,26 @@ mod tests {
                             StepInput::LeafTask {
                                 task: "Get A".into(),
                                 worker: Some("ops".into()),
+                                artifacts: Vec::new(),
                             },
                             StepInput::LeafTask {
                                 task: "Transform A".into(),
                                 worker: Some("ops".into()),
+                                artifacts: Vec::new(),
                             },
                         ],
                     },
                     StepInput::LeafTask {
                         task: "Get B".into(),
                         worker: Some("ops".into()),
+                        artifacts: Vec::new(),
                     },
                 ],
             },
             StepInput::LeafTask {
                 task: "Combine".into(),
                 worker: Some("ops".into()),
+                artifacts: Vec::new(),
             },
         ];
         let tasks = flatten_steps(&steps).unwrap();
@@ -2347,6 +2407,7 @@ mod tests {
                     items: vec![StepInput::LeafTask {
                         task: "too deep".into(),
                         worker: None,
+                        artifacts: Vec::new(),
                     }],
                 }],
             }],
@@ -2361,6 +2422,7 @@ mod tests {
         let steps = vec![StepInput::LeafTask {
             task: "Just one thing".into(),
             worker: None,
+            artifacts: Vec::new(),
         }];
         let tasks = flatten_steps(&steps).unwrap();
         assert_eq!(tasks.len(), 1);
@@ -2388,7 +2450,7 @@ mod tests {
         let steps: Vec<StepInput> = serde_json::from_str(json).unwrap();
         assert_eq!(steps.len(), 2);
         match &steps[0] {
-            StepInput::LeafTask { task, worker } => {
+            StepInput::LeafTask { task, worker, .. } => {
                 assert_eq!(task, "Compute mean");
                 assert_eq!(worker.as_deref(), Some("stats"));
             }
@@ -2441,10 +2503,12 @@ mod tests {
                 StepInput::LeafTask {
                     task: "Step 1".into(),
                     worker: Some("w1".into()),
+                    artifacts: Vec::new(),
                 },
                 StepInput::LeafTask {
                     task: "Step 2".into(),
                     worker: Some("w2".into()),
+                    artifacts: Vec::new(),
                 },
             ],
             routing_rationale: "Needs orchestration".into(),
@@ -2477,7 +2541,7 @@ mod tests {
         let json = r#"{"type": "task", "task": "Fresh work", "worker": "ops"}"#;
         let step: StepInput = serde_json::from_str(json).unwrap();
         match &step {
-            StepInput::LeafTask { task, worker } => {
+            StepInput::LeafTask { task, worker, .. } => {
                 assert_eq!(task, "Fresh work");
                 assert_eq!(worker.as_deref(), Some("ops"));
             }

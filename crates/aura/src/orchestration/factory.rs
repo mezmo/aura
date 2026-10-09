@@ -25,6 +25,7 @@ use super::orchestrator::{
 /// allocation and ensure MCP progress notifications route correctly.
 pub struct OrchestratorFactory {
     agent_config: AgentRuntimeConfig,
+    run_tools: crate::builder::RunToolFactory,
 }
 
 /// A run's cancellation, and the signal that its task ended.
@@ -64,7 +65,17 @@ fn final_response(
 
 impl OrchestratorFactory {
     pub fn new(agent_config: AgentRuntimeConfig) -> Self {
-        Self { agent_config }
+        Self {
+            agent_config,
+            run_tools: crate::builder::no_run_tools(),
+        }
+    }
+
+    /// Give every worker of every run the tools `run_tools` builds, one
+    /// instance per worker.
+    pub fn with_run_tools(mut self, run_tools: crate::builder::RunToolFactory) -> Self {
+        self.run_tools = run_tools;
+        self
     }
 
     /// Spawn the background orchestration task and return its event stream.
@@ -83,6 +94,7 @@ impl OrchestratorFactory {
         outer_budget: Option<Duration>,
     ) -> BoxStream<'static, Result<StreamItem, StreamError>> {
         let agent_config = self.agent_config.clone();
+        let run_tools = std::sync::Arc::clone(&self.run_tools);
 
         // Create channel for orchestrator events
         let (event_tx, event_rx) =
@@ -111,6 +123,7 @@ impl OrchestratorFactory {
                 // are visible to the streaming handler (UsageState is Arc-backed).
                 orchestrator.usage_state = usage_state.clone();
                 orchestrator.outer_budget = outer_budget;
+                orchestrator.run_tools = run_tools;
 
                 // Surface per-server connection status so degraded/unavailable
                 // MCP servers are visible in orchestration mode too (workers

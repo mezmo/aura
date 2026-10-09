@@ -26,7 +26,6 @@ use super::route::{ApprovalError, DecisionRoute};
 pub struct RequestApprovalTool {
     route: Arc<DecisionRoute>,
     scope: AgentScope,
-    request_id: String,
     run: Arc<crate::run_context::BoundRun>,
     agent_name: String,
     /// Instance ID of the AURA process that built this tool.
@@ -38,16 +37,14 @@ impl RequestApprovalTool {
     pub fn new(
         route: Arc<DecisionRoute>,
         scope: AgentScope,
-        request_id: String,
         agent_name: String,
         instance_id: String,
     ) -> Self {
         Self {
             route,
             scope,
-            request_id,
             // A worker's tool is built inside its run; a single agent's is built
-            // before one exists and is bound by `stream`.
+            // before one exists and is bound by `begin_run`.
             run: Arc::new(crate::run_context::BoundRun::captured()),
             agent_name,
             instance_id,
@@ -158,13 +155,18 @@ impl Tool for RequestApprovalTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let run = self.run();
+        let request_id = run
+            .as_ref()
+            .map(|run| run.id().to_string())
+            .unwrap_or_default();
         // Blank reasoning collapses to absent, consistent with the config_gate path.
         let tool_call_intent = normalize_tool_call_intent(args.tool_call_intent.as_deref());
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
             instance_id: self.instance_id.clone(),
             decision_id: DecisionId::generate(),
-            request_id: self.request_id.clone(),
+            request_id: request_id.clone(),
             scope: self.scope.clone(),
             origin: ApprovalOrigin::AgentRequested {
                 reason: args.risk_rationale.clone(),
@@ -177,7 +179,6 @@ impl Tool for RequestApprovalTool {
                 tool_call_intent,
             }],
         };
-        let run = self.run();
         let cancel = run
             .as_ref()
             .map(|run| {
@@ -337,7 +338,6 @@ mod tests {
         let tool = RequestApprovalTool::new(
             route.clone(),
             AgentScope::Single { session_id: None },
-            request_id.clone(),
             "test-agent".to_string(),
             "test-instance-id".to_string(),
         );
@@ -504,7 +504,6 @@ mod tests {
             let tool = RequestApprovalTool::new(
                 route,
                 AgentScope::Single { session_id: None },
-                request_id.clone(),
                 "test-agent".to_string(),
                 "test-instance-id".to_string(),
             );

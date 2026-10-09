@@ -34,27 +34,15 @@ impl std::fmt::Debug for dyn TokenCounter {
     }
 }
 
-/// Token counter using tiktoken-rs BPE tokenizers.
-///
-/// For OpenAI models, resolves the exact tokenizer (o200k_base for GPT-5/GPT-4o/o-series,
-/// cl100k_base for GPT-4/3.5). For all other providers, falls back to o200k_base.
-///
-/// The wrapped `CoreBPE` is borrowed from tiktoken-rs's process-wide
-/// `lazy_static` singletons (e.g. `o200k_base_singleton()`), so constructing
-/// a `TiktokenCounter` is effectively free — no vocabulary parsing, no
-/// HashMap allocation. The previous implementation called `o200k_base()` /
-/// `get_bpe_from_model()`, which rebuild a fresh `CoreBPE` from the embedded
-/// vocab file on every call (~3 MB include_str + ~200K HashMap inserts +
-/// ~20–40 MB heap, ~50–200 ms). With per-request `Agent::new()` and
-/// per-worker `create_worker()` paths in the hot path, that churn caused
-/// noticeable RSS bloat and host-level slowdown over long-running sessions.
+/// Token counter using tiktoken-rs's process-wide BPE tokenizers.
 pub struct TiktokenCounter {
     bpe: &'static tiktoken_rs::CoreBPE,
 }
 
 impl TiktokenCounter {
-    /// Create a counter for a specific model.
-    /// Falls back to `o200k_base` if the model isn't recognized.
+    /// Create a counter for a specific model: the exact tokenizer for an
+    /// OpenAI model (o200k_base for GPT-5/GPT-4o/o-series, cl100k_base for
+    /// GPT-4/3.5), and `o200k_base` for any model it doesn't recognize.
     pub fn for_model(model: &str) -> Self {
         Self {
             bpe: bpe_singleton_for_model(model),
@@ -72,10 +60,12 @@ impl TiktokenCounter {
 /// Resolve a model name to the matching tiktoken singleton `CoreBPE`.
 ///
 /// `tiktoken_rs::get_bpe_from_model` exists but builds a fresh `CoreBPE`
-/// every call. The `_singleton()` variants return a `&'static CoreBPE` from
-/// a `lazy_static`, so we map model → tokenizer ourselves and dispatch to
-/// the right one. Unknown models fall back to `o200k_base` (matches the
-/// previous default).
+/// every call from the embedded vocab file: ~3 MB of `include_str`, ~200K
+/// HashMap inserts, ~20–40 MB of heap, and ~50–200 ms, which a counter built
+/// for every agent would pay on every request. The `_singleton()` variants
+/// return a `&'static CoreBPE` from a `lazy_static`, so we map model →
+/// tokenizer ourselves and dispatch to the right one. Unknown models fall
+/// back to `o200k_base`.
 fn bpe_singleton_for_model(model: &str) -> &'static tiktoken_rs::CoreBPE {
     use tiktoken_rs::tokenizer::{Tokenizer, get_tokenizer};
     match get_tokenizer(model) {
@@ -257,6 +247,20 @@ impl ContextBudget {
     /// Get the per-call extraction token limit, if set.
     pub fn max_extraction_tokens(&self) -> Option<usize> {
         self.max_extraction_tokens
+    }
+
+    /// A budget with the same limits and no usage: the counters start over
+    /// from `initial_used`, as they did when this budget was created.
+    pub fn fresh(&self) -> Self {
+        Self {
+            max_extraction_tokens: self.max_extraction_tokens,
+            ..Self::new(
+                self.context_window,
+                self.safety_margin,
+                self.initial_used,
+                Arc::clone(&self.token_counter),
+            )
+        }
     }
 
     /// Usable token budget (context window minus safety margin).

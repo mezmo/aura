@@ -1,7 +1,7 @@
 use a2a::VERSION;
 use aura::RigBuilder;
 use aura::{ResponseContent, StreamingAgent, UsageState};
-use aura_events::{AgentInfo, ServerInfo};
+use aura_events::{AgentInfo, NativeToolOverview, ServerInfo};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Query, State};
@@ -277,8 +277,10 @@ pub async fn prepare_request(
 
     validate_hitl_delivery_mode(&config, req)?;
 
-    // Get additional tools from the factory (e.g., CLI tools in standalone mode)
+    // Tools the server executes for the agent: the deployment's (CLI tools in
+    // standalone mode) and the run's (Slack tools for an opted-in agent).
     let additional_tools = (data.additional_tools)();
+    let run_tools = data.run_tools(&config);
 
     // Convert request-supplied client tool definitions once; both paths use them.
     let client_tools_vec: Option<Vec<aura::builder::ClientTool>> = req
@@ -317,11 +319,12 @@ pub async fn prepare_request(
                 .with_hitl_hmac(data.hitl_webhook_hmac.clone())
                 .with_skill_recorder(skill_recorder.clone());
             let agent = builder
-                .build_streaming_agent_with_headers(
+                .build_streaming_agent_with_tools(
                     Some(req_headers_map),
                     Some(chat_session_id.to_string()),
                     client_tools_vec.clone(),
                     Some(request_id.clone()),
+                    run_tools,
                 )
                 .await
                 .map_err(|e| {
@@ -341,6 +344,8 @@ pub async fn prepare_request(
             let builder = RigBuilder::new(config.clone(), data.pending_approvals.clone())
                 .with_hitl_hmac(data.hitl_webhook_hmac.clone())
                 .with_skill_recorder(skill_recorder.clone());
+            let mut additional_tools = additional_tools;
+            additional_tools.extend(run_tools());
             let agent = build_agent_for_request(
                 builder,
                 req_headers_map,
@@ -440,21 +445,7 @@ pub async fn chat_completions(
         );
     }
 
-    // Extract or generate chat_session_id
-    // Priority: metadata > X-Chat-Session-Id header > x-openwebui-chat-id header > generate new
-    let chat_session_id = req
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("chat_session_id"))
-        .cloned()
-        .or_else(|| {
-            headers
-                .get("X-Chat-Session-Id")
-                .or_else(|| headers.get("x-openwebui-chat-id"))
-                .and_then(|h| h.to_str().ok())
-                .map(String::from)
-        })
-        .unwrap_or_else(generate_chat_session_id);
+    let chat_session_id = chat_session_id(req.metadata.as_ref(), &headers);
 
     // Convert HeaderMap to HashMap for framework-agnostic passing
     let req_headers_map: HashMap<String, String> = headers
@@ -1166,6 +1157,19 @@ impl ToolDetail {
     }
 }
 
+/// Name and description of each tool `factory` builds, for `/aura/info`.
+async fn native_tool_overviews(factory: aura::RunToolFactory) -> Vec<NativeToolOverview> {
+    let mut tools = Vec::new();
+    for tool in factory() {
+        let definition = tool.definition(String::new()).await;
+        tools.push(NativeToolOverview {
+            name: definition.name,
+            description: Some(definition.description),
+        });
+    }
+    tools
+}
+
 /// `GET /aura/info`: aura-native introspection. Off `/v1/` to keep the OpenAI surface clean.
 ///
 /// `?detail=tools` (or `tools:summary`) additionally connects to every visible
@@ -1196,10 +1200,20 @@ pub async fn info(
             .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
             .collect();
 
-        let mut agents: Vec<AgentInfo> = futures_util::future::join_all(visible.map(|config| {
-            aura::agent_info_with_tools(config, Some(&req_headers), INFO_TOOL_DISCOVERY_TIMEOUT)
-        }))
-        .await;
+        let req_headers = &req_headers;
+        let state = &state;
+        let mut agents: Vec<AgentInfo> =
+            futures_util::future::join_all(visible.map(|config| async move {
+                let mut info = aura::agent_info_with_tools(
+                    config,
+                    Some(req_headers),
+                    INFO_TOOL_DISCOVERY_TIMEOUT,
+                )
+                .await;
+                info.tools = native_tool_overviews(state.run_tools(config)).await;
+                info
+            }))
+            .await;
 
         if detail == ToolDetail::Summary {
             agents.iter_mut().for_each(aura::summarize_tools);
@@ -1318,6 +1332,29 @@ pub async fn resolve_approval(
             "internal_error",
         ),
     }
+}
+
+/// The chat session a request belongs to: the id the client gave in its
+/// metadata, then `X-Chat-Session-Id`, then `x-openwebui-chat-id`, else a
+/// fresh one.
+///
+/// A blank value counts as none given. Taken as given, every client that sends
+/// one would share a single session, and with it each other's recorded skill
+/// invocations; orchestration persistence would refuse it outright.
+fn chat_session_id(metadata: Option<&HashMap<String, String>>, headers: &HeaderMap) -> String {
+    let given = |value: &str| (!value.trim().is_empty()).then(|| value.to_owned());
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(given)
+    };
+    metadata
+        .and_then(|m| m.get("chat_session_id"))
+        .and_then(|value| given(value))
+        .or_else(|| header("X-Chat-Session-Id"))
+        .or_else(|| header("x-openwebui-chat-id"))
+        .unwrap_or_else(generate_chat_session_id)
 }
 
 /// Generate a chat session ID (simple GUID)
@@ -1441,6 +1478,58 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
+
+    mod chat_session_id {
+        use super::super::chat_session_id;
+        use axum::http::{HeaderMap, HeaderValue};
+        use std::collections::HashMap;
+
+        fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+            let mut map = HeaderMap::new();
+            for (name, value) in pairs {
+                map.insert(*name, HeaderValue::from_static(value));
+            }
+            map
+        }
+
+        fn metadata(value: &str) -> HashMap<String, String> {
+            HashMap::from([("chat_session_id".to_owned(), value.to_owned())])
+        }
+
+        #[test]
+        fn metadata_wins_over_the_headers() {
+            let id = chat_session_id(
+                Some(&metadata("from-metadata")),
+                &headers(&[("X-Chat-Session-Id", "from-header")]),
+            );
+            assert_eq!(id, "from-metadata");
+        }
+
+        #[test]
+        fn the_openwebui_header_is_the_last_given_source() {
+            let id = chat_session_id(None, &headers(&[("x-openwebui-chat-id", "owui-1")]));
+            assert_eq!(id, "owui-1");
+        }
+
+        #[test]
+        fn a_blank_value_falls_through_to_the_next_source() {
+            let id = chat_session_id(
+                Some(&metadata("  ")),
+                &headers(&[("X-Chat-Session-Id", ""), ("x-openwebui-chat-id", "owui-1")]),
+            );
+            assert_eq!(id, "owui-1");
+        }
+
+        #[test]
+        fn only_blank_values_get_a_fresh_id_each_time() {
+            let blank = headers(&[("X-Chat-Session-Id", "")]);
+            let first = chat_session_id(Some(&metadata("")), &blank);
+            let second = chat_session_id(Some(&metadata("")), &blank);
+
+            assert!(first.starts_with("cs_"), "got: {first}");
+            assert_ne!(first, second);
+        }
+    }
 
     /// `--streaming-timeout-secs 0` is documented as disabling the bound, so a
     /// run configured that way has to outlive the first deadline check rather
@@ -1920,6 +2009,7 @@ mod tests {
             active_requests: Arc::new(crate::types::ActiveRequestTracker::new()),
             default_agent: None,
             additional_tools: Arc::new(Vec::new),
+            slack_api: None,
             pending_approvals: aura::hitl::PendingApprovals::new(),
             hitl_webhook_hmac: None,
             session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
@@ -2012,6 +2102,14 @@ model = "gpt-4o"
         configs: Vec<aura_config::Config>,
         default_agent: Option<&str>,
     ) -> Arc<AppState> {
+        info_state(configs, default_agent, None)
+    }
+
+    fn info_state(
+        configs: Vec<aura_config::Config>,
+        default_agent: Option<&str>,
+        slack_api: Option<crate::slack::SlackApi>,
+    ) -> Arc<AppState> {
         Arc::new(AppState {
             configs: Arc::new(configs),
             tool_result_mode: crate::streaming::ToolResultMode::None,
@@ -2027,6 +2125,7 @@ model = "gpt-4o"
             active_requests: Arc::new(crate::types::ActiveRequestTracker::new()),
             default_agent: default_agent.map(str::to_owned),
             additional_tools: Arc::new(Vec::new),
+            slack_api,
             debug_provider_errors: false,
             pending_approvals: aura::hitl::PendingApprovals::new(),
             hitl_webhook_hmac: None,
@@ -2276,6 +2375,56 @@ url = "http://127.0.0.1:9"
         assert!(server.get("tools").is_none(), "{body}");
     }
 
+    /// The post tool is listed under the agent that opted in, only while the
+    /// server has a Slack client, and never without `detail`.
+    #[tokio::test]
+    async fn test_info_lists_slack_tools_for_opted_in_agents_only() {
+        let configs = || {
+            vec![
+                info_config("poster", "enable_slack_tools = true", ""),
+                solo_info_config("quiet"),
+            ]
+        };
+        let api = crate::slack::SlackApi::new(
+            crate::slack::BotToken::new("xoxb-t".to_owned()).unwrap(),
+            crate::slack::AppToken::new("xapp-t".to_owned()).unwrap(),
+        );
+        let tools_query = || {
+            Query(InfoQuery {
+                detail: Some("tools".to_string()),
+            })
+        };
+        let names = |agent: &AgentInfo| -> Vec<String> {
+            agent.tools.iter().map(|t| t.name.clone()).collect()
+        };
+
+        let state = info_state(configs(), None, Some(api.clone()));
+        let parsed =
+            parse_info_response(info(State(state), HeaderMap::new(), tools_query()).await).await;
+        assert_eq!(names(&parsed.agents[0]), [crate::slack::POST_TOOL_NAME]);
+        assert!(
+            parsed.agents[0].tools[0]
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("permalink")
+        );
+        assert!(names(&parsed.agents[1]).is_empty());
+
+        let state = info_state(configs(), None, Some(api));
+        let resp = info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["agents"][0].get("tools").is_none(), "{body}");
+
+        let state = info_state(configs(), None, None);
+        let parsed =
+            parse_info_response(info(State(state), HeaderMap::new(), tools_query()).await).await;
+        assert!(parsed.agents.iter().all(|agent| agent.tools.is_empty()));
+    }
+
     /// An unreachable server reports no tools under either detail level, and
     /// the config view survives intact.
     #[tokio::test]
@@ -2500,6 +2649,7 @@ url = "http://127.0.0.1:9"
                 active_requests: Arc::new(ActiveRequestTracker::default()),
                 default_agent: None,
                 additional_tools: Arc::new(Vec::new),
+                slack_api: None,
                 pending_approvals: aura::hitl::PendingApprovals::new(),
                 hitl_webhook_hmac: None,
                 session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
@@ -2962,6 +3112,7 @@ source = '{}'
                 additional_tools: Arc::new(Vec::new),
                 pending_approvals: aura::hitl::PendingApprovals::new(),
                 hitl_webhook_hmac: None,
+                slack_api: None,
                 session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
             }
         }

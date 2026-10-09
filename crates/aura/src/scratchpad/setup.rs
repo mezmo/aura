@@ -10,6 +10,7 @@ use super::{
     ScratchpadWrapper, TokenCounter, scratchpad_tool_schema_tokens,
 };
 use crate::mcp::AuraTool;
+use crate::run_context::BoundRun;
 use crate::tool_wrapper::ToolWrapper;
 use std::collections::HashMap;
 use std::path::Path;
@@ -28,12 +29,13 @@ pub struct ScratchpadBuildInputs<'a> {
     pub context_window: usize,
     pub initial_used: usize,
     pub token_counter: Arc<dyn TokenCounter>,
+    /// The prepared agent's run slot.
+    pub run: Arc<BoundRun>,
 }
 
-/// Output of `build_scratchpad`: the budget the caller records on its `Agent`
-/// struct, the wrapper it composes into its tool pipeline, the storage handle,
-/// and a ready-to-assign `ScratchpadToolsConfig` for `AgentRuntimeConfig`.
+/// Output of `build_scratchpad`.
 pub struct ScratchpadBuild {
+    /// Seed context budget: the limits, with no usage recorded.
     pub budget: ContextBudget,
     pub storage: Arc<ScratchpadStorage>,
     pub wrapper: Arc<dyn ToolWrapper>,
@@ -71,12 +73,12 @@ pub async fn build_scratchpad(
     let wrapper: Arc<dyn ToolWrapper> = Arc::new(ScratchpadWrapper::new(
         inputs.scratchpad_tool_map.clone(),
         storage.clone(),
-        budget.clone(),
+        inputs.run.clone(),
     ));
 
     let tools_config = ScratchpadToolsConfig {
         storage: storage.clone(),
-        budget: budget.clone(),
+        run: inputs.run,
         scratchpad_tools: inputs.scratchpad_tool_map,
     };
 
@@ -280,6 +282,7 @@ mod tests {
         };
         let mut tool_map = HashMap::new();
         tool_map.insert("search_*".into(), 512);
+        let run = Arc::new(BoundRun::default());
 
         let build = build_scratchpad(ScratchpadBuildInputs {
             sp_cfg: &sp_cfg,
@@ -289,6 +292,7 @@ mod tests {
             context_window: 128_000,
             initial_used: 1_000,
             token_counter: counter(),
+            run: run.clone(),
         })
         .await
         .expect("build should succeed");
@@ -296,8 +300,28 @@ mod tests {
         assert_eq!(build.budget.max_extraction_tokens(), Some(5_000));
         assert_eq!(build.tools_config.scratchpad_tools.len(), 1);
         assert!(tmp.path().join("scratchpad").exists());
-        // Budget in the returned struct and in tools_config share the same counters.
-        build.budget.record_intercepted(42);
-        assert_eq!(build.tools_config.budget.scratchpad_usage().0, 42);
+
+        // The tools reach a run's budget through the slot they were built
+        // with; the returned budget is only what a run starts from.
+        assert!(build.tools_config.run.scratchpad_budget().is_none());
+        let run_budget = build.budget.fresh();
+        run.bind(crate::run_context::RunContext::detached_with(
+            "req",
+            Some(run_budget.clone()),
+            None,
+        ));
+        build
+            .tools_config
+            .run
+            .scratchpad_budget()
+            .expect("the bound run's budget resolves")
+            .record_intercepted(42);
+        assert_eq!(run_budget.scratchpad_usage().0, 42);
+        assert_eq!(run_budget.max_extraction_tokens(), Some(5_000));
+        assert_eq!(
+            build.budget.scratchpad_usage().0,
+            0,
+            "a run's usage never lands on the seed budget",
+        );
     }
 }

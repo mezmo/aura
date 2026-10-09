@@ -23,15 +23,26 @@ use tokio::sync::mpsc;
 
 use aura_events::ToolCallId;
 
+use crate::scratchpad::ContextBudget;
+use crate::skill_tool::SkillInvocationRecorder;
+use crate::turn_nudge::TurnNudgeState;
+
 /// Events a run may buffer before its observer reads them.
 pub const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
-/// One run — what its own work needs to correlate, and where its events go.
+/// One run — what its own work needs to correlate, where its events go, and
+/// the state an agent's tools keep for it.
 pub struct RunContext {
     id: Arc<str>,
     tool_calls: Mutex<VecDeque<ToolCallId>>,
     events: mpsc::Sender<AgentEvent>,
     cancel: CancellationToken,
+    /// The run's context budget.
+    scratchpad_budget: Option<ContextBudget>,
+    /// The run's turn-limit tracking.
+    turn_nudge: Option<Arc<TurnNudgeState>>,
+    /// Where the run's skill-tool invocations are recorded.
+    skill_recorder: Option<Arc<SkillInvocationRecorder>>,
 }
 
 /// Pending tool ids before warning, in case results never arrive to pop them.
@@ -50,14 +61,50 @@ impl RunContext {
         id: impl Into<Arc<str>>,
         cancel: CancellationToken,
     ) -> (Arc<Self>, mpsc::Receiver<AgentEvent>) {
+        Self::channel_for_agent(id, cancel, None, None, None)
+    }
+
+    /// A run on `cancel` carrying the state a prepared agent's tools keep for
+    /// it, and the receiver its observer reads.
+    pub fn channel_for_agent(
+        id: impl Into<Arc<str>>,
+        cancel: CancellationToken,
+        scratchpad_budget: Option<ContextBudget>,
+        turn_nudge: Option<Arc<TurnNudgeState>>,
+        skill_recorder: Option<Arc<SkillInvocationRecorder>>,
+    ) -> (Arc<Self>, mpsc::Receiver<AgentEvent>) {
         let (events, receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let run = Arc::new(Self {
             id: id.into(),
             tool_calls: Mutex::new(VecDeque::new()),
             events,
             cancel,
+            scratchpad_budget,
+            turn_nudge,
+            skill_recorder,
         });
         (run, receiver)
+    }
+
+    /// A run within `parent` for one agent of it, an orchestration worker or
+    /// coordinator: the same id, observer and cancellation, with tool state
+    /// of its own. Its tool-call queue stays empty, an agent within a run
+    /// streaming under a key of its own rather than the run's id.
+    pub fn child(
+        parent: &Arc<Self>,
+        scratchpad_budget: Option<ContextBudget>,
+        turn_nudge: Option<Arc<TurnNudgeState>>,
+        skill_recorder: Option<Arc<SkillInvocationRecorder>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            id: Arc::clone(&parent.id),
+            tool_calls: Mutex::new(VecDeque::new()),
+            events: parent.events.clone(),
+            cancel: parent.cancel.clone(),
+            scratchpad_budget,
+            turn_nudge,
+            skill_recorder,
+        })
     }
 
     /// A run nobody observes, for a test that needs one to exist without
@@ -66,6 +113,38 @@ impl RunContext {
     #[cfg(test)]
     pub fn detached(id: impl Into<Arc<str>>) -> Arc<Self> {
         Self::channel(id).0
+    }
+
+    /// [`detached`](Self::detached), carrying tool state.
+    #[cfg(test)]
+    pub(crate) fn detached_with(
+        id: impl Into<Arc<str>>,
+        scratchpad_budget: Option<ContextBudget>,
+        turn_nudge: Option<Arc<TurnNudgeState>>,
+    ) -> Arc<Self> {
+        Self::channel_for_agent(
+            id,
+            CancellationToken::new(),
+            scratchpad_budget,
+            turn_nudge,
+            None,
+        )
+        .0
+    }
+
+    /// The run's context budget.
+    pub fn scratchpad_budget(&self) -> Option<&ContextBudget> {
+        self.scratchpad_budget.as_ref()
+    }
+
+    /// The run's turn-limit tracking.
+    pub fn turn_nudge(&self) -> Option<&Arc<TurnNudgeState>> {
+        self.turn_nudge.as_ref()
+    }
+
+    /// Where the run's skill-tool invocations are recorded.
+    pub fn skill_recorder(&self) -> Option<&Arc<SkillInvocationRecorder>> {
+        self.skill_recorder.as_ref()
     }
 
     /// Hands an event to whoever is observing the run. `false` when nothing is
@@ -144,8 +223,14 @@ impl BoundRun {
         Self(Mutex::new(current_run()))
     }
 
-    /// Replaces any run already bound. One slot is enough while an agent is
-    /// built per request and owns the tools it gates.
+    /// A slot holding `run`.
+    pub fn holding(run: Arc<RunContext>) -> Self {
+        Self(Mutex::new(Some(run)))
+    }
+
+    /// Replaces any run already bound. One slot is enough because a prepared
+    /// agent serves one run at a time; `PreparedAgent::begin_run` is what
+    /// refuses a second while the first is alive.
     pub fn bind(&self, run: Arc<RunContext>) {
         *self
             .0
@@ -161,6 +246,72 @@ impl BoundRun {
             .clone()
             .or_else(current_run)
     }
+
+    /// The run's id, or empty outside a run so an approval raised then still
+    /// carries a well-formed id even though nothing routes it.
+    pub fn id_or_empty(&self) -> String {
+        self.get()
+            .map(|run| run.id().to_string())
+            .unwrap_or_default()
+    }
+
+    /// The run's context budget.
+    pub fn scratchpad_budget(&self) -> Option<ContextBudget> {
+        self.get().and_then(|run| run.scratchpad_budget().cloned())
+    }
+
+    /// The run's turn-limit tracking.
+    pub fn turn_nudge(&self) -> Option<Arc<TurnNudgeState>> {
+        self.get().and_then(|run| run.turn_nudge().cloned())
+    }
+
+    /// Where the run's skill-tool invocations are recorded.
+    pub fn skill_recorder(&self) -> Option<Arc<SkillInvocationRecorder>> {
+        self.get().and_then(|run| run.skill_recorder().cloned())
+    }
+
+    /// A slot holding an unobserved run that carries only `budget`.
+    #[cfg(test)]
+    pub(crate) fn pinned_budget(budget: ContextBudget) -> Self {
+        Self::holding(RunContext::detached_with("pinned", Some(budget), None))
+    }
+
+    /// A slot holding an unobserved run that carries only `turn_nudge`.
+    #[cfg(test)]
+    pub(crate) fn pinned_nudge(turn_nudge: Arc<TurnNudgeState>) -> Self {
+        Self::holding(RunContext::detached_with("pinned", None, Some(turn_nudge)))
+    }
+}
+
+impl std::fmt::Debug for BoundRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundRun")
+            .field("run_id", &self.get().map(|run| run.id().to_string()))
+            .finish()
+    }
+}
+
+/// A run in progress on a prepared agent.
+pub struct RunLease {
+    run: Arc<RunContext>,
+}
+
+impl RunLease {
+    pub(crate) fn new(run: Arc<RunContext>) -> Self {
+        Self { run }
+    }
+
+    pub fn run(&self) -> &Arc<RunContext> {
+        &self.run
+    }
+}
+
+/// A prepared agent was asked to begin a run while it still serves another.
+#[derive(Debug, thiserror::Error)]
+#[error("prepared agent already serves request `{active}`; it runs one request at a time")]
+pub struct RunInProgress {
+    /// Id of the run holding the agent.
+    pub active: String,
 }
 
 tokio::task_local! {
@@ -361,6 +512,77 @@ mod tests {
         .await;
 
         assert_eq!(seen, None);
+    }
+
+    #[test]
+    fn an_unbound_slot_outside_a_run_resolves_nothing() {
+        let slot = BoundRun::default();
+        assert!(slot.get().is_none());
+        assert_eq!(slot.id_or_empty(), "");
+        assert!(slot.scratchpad_budget().is_none());
+        assert!(slot.turn_nudge().is_none());
+    }
+
+    /// The state a prepared agent's tools keep for a run reaches them through
+    /// the slot they were built with, and follows whichever run is bound.
+    #[test]
+    fn tool_state_reaches_the_slot_from_the_bound_run() {
+        use crate::scratchpad::TiktokenCounter;
+
+        let budget =
+            ContextBudget::new(1_000, 0.0, 0, Arc::new(TiktokenCounter::default_counter()));
+        let nudge = TurnNudgeState::new(true, None, 2).unwrap();
+        let slot = BoundRun::default();
+        slot.bind(RunContext::detached_with(
+            "req_a",
+            Some(budget.clone()),
+            Some(Arc::clone(&nudge)),
+        ));
+
+        assert_eq!(slot.id_or_empty(), "req_a");
+        slot.scratchpad_budget().unwrap().record_intercepted(7);
+        assert_eq!(
+            budget.scratchpad_usage().0,
+            7,
+            "the slot hands out the run's own budget, counters shared",
+        );
+        assert!(Arc::ptr_eq(&slot.turn_nudge().unwrap(), &nudge));
+
+        slot.bind(RunContext::detached("req_b"));
+        assert_eq!(slot.id_or_empty(), "req_b");
+        assert!(slot.scratchpad_budget().is_none());
+    }
+
+    /// A worker's run is the orchestration run as its observer and its
+    /// cancellation see it, with the worker's own tool state.
+    #[tokio::test]
+    async fn a_child_shares_its_parents_identity_and_keeps_its_own_state() {
+        let (parent, mut events) = RunContext::channel("req_parent");
+        let nudge = TurnNudgeState::new(true, None, 2).unwrap();
+        let child = RunContext::child(&parent, None, Some(Arc::clone(&nudge)), None);
+
+        assert_eq!(child.id().as_ref(), "req_parent");
+        assert!(Arc::ptr_eq(child.turn_nudge().unwrap(), &nudge));
+        assert!(parent.turn_nudge().is_none(), "the parent keeps none of it");
+
+        child
+            .emit(AgentEvent::new(
+                aura_events::AgentContext::single_agent(),
+                aura_events::agent::AgentEventPayload::TextDelta {
+                    content: "hi".into(),
+                },
+            ))
+            .await;
+        assert!(
+            events.try_recv().is_ok(),
+            "what the child emits reaches the parent's observer",
+        );
+
+        parent.cancel_token().cancel();
+        assert!(
+            child.cancel_token().is_cancelled(),
+            "stopping the run stops the worker",
+        );
     }
 
     #[test]

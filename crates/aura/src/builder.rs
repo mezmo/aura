@@ -1,25 +1,31 @@
 use crate::{
     config::{AgentRuntimeConfig, LlmConfig, McpServerConfig, VectorStoreType},
     error::{BuilderError, BuilderResult},
+    forwarded_headers::ForwardedHeaders,
     mcp::McpManager,
     passthrough_tool::PassthroughTool,
     provider_agent::{
         BuilderState, CompletionResponse, ProviderAgent, StreamError, StreamItem,
         StreamedAssistantContent,
     },
-    scratchpad,
-    skill_tool::{SkillToolset, render_skill_catalog},
+    run_context::{BoundRun, RunContext, RunInProgress, RunLease},
+    scratchpad::{self, ContextBudget},
+    skill_tool::{SkillInvocationRecorder, SkillToolset, render_skill_catalog},
     tool_wrapper::{ToolCallContext, WrappedTool},
     tools::{FilesystemTool, ListDirTool, ReadFileTool, WriteFileTool},
+    turn_nudge::TurnNudgeState,
     vector_dynamic::DynamicVectorSearchTool,
     vector_store::VectorStoreManager,
 };
+use aura_events::agent::AgentEvent;
 use futures::StreamExt;
 use rig::client::CompletionClient;
 use rig::completion::Usage;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// A client-side tool definition supplied with a request.
 ///
@@ -106,7 +112,10 @@ pub(crate) fn scratchpad_usage_event(
     })
 }
 
-/// Rig-native agent wrapper using provider-specific agents.
+/// An agent built once from configuration: the provider client, the tools
+/// discovered at build time, and the open MCP connections. Its runs are
+/// [`Agent`]s; see [`begin_run`](Self::begin_run) and the
+/// [`run_context`](crate::run_context) module.
 ///
 /// # Tool Execution Paths
 ///
@@ -120,34 +129,25 @@ pub(crate) fn scratchpad_usage_event(
 ///    is wrapped with `FallbackToolExecutor`. It buffers text, detects tool call
 ///    patterns (JSON/XML), and executes via `McpManager::execute_fallback_tool()`.
 ///    This bypasses Rig's tool infrastructure entirely.
-pub struct Agent {
+pub struct PreparedAgent {
     pub(crate) inner: ProviderAgent,
     pub(crate) model: String,
     pub(crate) max_depth: usize,
     pub(crate) mcp_manager: Option<Arc<crate::mcp::McpManager>>,
-    /// Ollama text-to-tool parsing: when enabled, intercepts text output containing
-    /// tool calls (JSON/XML) and executes them. Only applies to Ollama provider.
-    /// See `maybe_wrap_with_fallback()` for the wrapping logic.
+    /// Whether Ollama text-to-tool parsing is on.
     pub(crate) fallback_tool_parsing: bool,
-    /// Cached tool names for fallback parsing (avoids recomputing on each stream).
-    /// Only populated when `fallback_tool_parsing` is enabled.
+    /// Tool names for fallback parsing.
     pub(crate) fallback_tool_names: Vec<String>,
     /// The `mcp_filter` effective for `fallback_tool_names`.
     pub(crate) fallback_mcp_filter: Option<Vec<aura_config::GlobPattern>>,
-    /// Configured context window size in tokens (from LLM TOML config).
-    /// Used for usage percentage reporting in streaming events.
+    /// Configured context window size in tokens (`[agent.llm].context_window`).
     pub(crate) context_window: Option<u64>,
-    /// Per-agent scratchpad budget for context tracking.
-    /// Set by orchestration workers (from resolved worker LLM + scratchpad config);
-    /// `None` for coordinator agents and non-scratchpad use.
-    pub(crate) scratchpad_budget: Option<scratchpad::ContextBudget>,
-    /// Names of client-side (passthrough) tools registered for this agent.
-    /// When the LLM calls one of these, the streaming layer terminates the
-    /// stream with `finish_reason: "tool_calls"` so the caller can execute
-    /// the tool and resume in a follow-up request.
+    /// Seed context budget: the limits, with no usage recorded.
+    pub(crate) scratchpad_budget: Option<ContextBudget>,
+    /// Names of the client-side (passthrough) tools registered on the agent.
     pub(crate) client_tool_names: HashSet<String>,
-    /// Turn-limit nudge state shared with this agent's `TurnNudgeWrapper`.
-    pub(crate) turn_nudge: Option<Arc<crate::turn_nudge::TurnNudgeState>>,
+    /// Seed turn-limit tracking: the limits, with no turns completed.
+    pub(crate) turn_nudge: Option<Arc<TurnNudgeState>>,
     /// The HITL config gate.
     pub(crate) hitl_gate: Option<Arc<crate::hitl::HitlApprovalWrapper>>,
     /// The `request_approval` tool.
@@ -159,25 +159,79 @@ pub struct Agent {
     pub(crate) invocation_parameters: Option<String>,
     /// Skills discovered for this agent.
     pub(crate) skills: Vec<crate::config::SkillConfig>,
+    /// The request headers forwarded when this agent was prepared.
+    pub(crate) forwarded_headers: ForwardedHeaders,
+    /// The run slot the tools were built with.
+    pub(crate) run: Arc<BoundRun>,
+    /// The run in progress.
+    pub(crate) active: Mutex<Weak<RunLease>>,
 }
 
-impl Agent {
+/// Why a prepared agent refused to begin a run.
+#[derive(Debug, thiserror::Error)]
+pub enum BeginRunError {
+    #[error(transparent)]
+    RunInProgress(#[from] RunInProgress),
+    #[error(
+        "prepared agent forwards request header `{header}` and this request carries a \
+         different value for it; prepare an agent for this request"
+    )]
+    ForwardedHeaderDiffers { header: String },
+}
+
+/// One run of a [`PreparedAgent`].
+pub struct Agent {
+    prepared: Arc<PreparedAgent>,
+    lease: Arc<RunLease>,
+    /// The run's events, for its observer.
+    events: Mutex<Option<mpsc::Receiver<AgentEvent>>>,
+}
+
+/// A run reads its prepared agent's fields and calls its methods directly, so
+/// the orchestrator and the `StreamingAgent` impl need no forwarders.
+impl std::ops::Deref for Agent {
+    type Target = PreparedAgent;
+
+    fn deref(&self) -> &PreparedAgent {
+        &self.prepared
+    }
+}
+
+impl std::fmt::Debug for PreparedAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedAgent")
+            .field("provider", &self.inner.provider_name())
+            .field("model", &self.model)
+            .field("run", &self.run)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Agent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Agent")
+            .field("request_id", &self.request_id())
+            .field("prepared", &self.prepared)
+            .finish()
+    }
+}
+
+impl PreparedAgent {
     /// Wire up scratchpad for a single-agent config. Skipped in orchestration
     /// mode (workers build their own per-worker budget in `create_worker()`)
     /// and when no accessible MCP tool matches a scratchpad threshold.
     ///
-    /// Per-request lifecycle: this runs inside `Agent::new`, which is called
-    /// fresh per chat request from
-    /// `aura-web-server::handlers::build_agent_for_request`. The `Agent` (and
-    /// this `ContextBudget`) is dropped when the request stream ends — there
-    /// is no cross-request budget state to manage. Request-specific data
-    /// (user query + chat history) is seeded into the budget at stream-start
-    /// in `Agent::stream_*_with_timeout`, not here, so this constructor
-    /// stays free of request-shape parameters.
+    /// The wrapper and tools composed here reach a run's budget through
+    /// `run`; the budget returned is what each run starts from (`begin_run`
+    /// hands every run a fresh copy). Request-specific data (user query +
+    /// chat history) is seeded into the run's budget at stream-start in
+    /// `Agent::stream_*_with_timeout`, not here, so this constructor stays
+    /// free of request-shape parameters.
     async fn setup_single_agent_scratchpad(
         config: &mut AgentRuntimeConfig,
         mcp_manager: Option<&Arc<McpManager>>,
-    ) -> Result<Option<scratchpad::ContextBudget>, Box<dyn std::error::Error + Send + Sync>> {
+        run: &Arc<BoundRun>,
+    ) -> Result<Option<ContextBudget>, Box<dyn std::error::Error + Send + Sync>> {
         if config.orchestration_enabled() {
             return Ok(None);
         }
@@ -253,6 +307,7 @@ impl Agent {
             context_window,
             initial_used,
             token_counter,
+            run: Arc::clone(run),
         })
         .await?;
 
@@ -287,7 +342,7 @@ impl Agent {
         Ok(Some(build.budget))
     }
 
-    /// Create a new agent from configuration with optional additional tools.
+    /// Build an agent from configuration with optional additional tools.
     ///
     /// `additional_tools` registers extra rig tools the agent will execute itself
     /// (e.g. tools other applications using Aura as a library want to expose).
@@ -296,11 +351,17 @@ impl Agent {
     /// `client_tools` registers passthrough tools — the LLM sees them as callable,
     /// but the streaming layer terminates the stream when one is invoked so the
     /// client can execute the tool locally. Pass `None` to disable.
-    pub async fn new(
+    ///
+    /// Nothing here depends on a request: the HITL gate, turn nudge, and
+    /// scratchpad wrappers composed below reach the run they serve through
+    /// the agent's [`BoundRun`], filled in by [`begin_run`](Self::begin_run).
+    pub async fn prepare(
         config: &AgentRuntimeConfig,
         additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
         client_tools: Option<Vec<ClientTool>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let run = Arc::new(BoundRun::default());
+
         // Initialize MCP manager first (shared across all providers)
         let mcp_manager = if let Some(mcp_config) = &config.mcp {
             tracing::info!("Initializing MCP tools using dynamic adaptors");
@@ -316,7 +377,8 @@ impl Agent {
         // hitl_request_approval_tool).
         let mut config_owned = config.clone();
         let agent_scratchpad_budget =
-            Self::setup_single_agent_scratchpad(&mut config_owned, mcp_manager.as_ref()).await?;
+            Self::setup_single_agent_scratchpad(&mut config_owned, mcp_manager.as_ref(), &run)
+                .await?;
 
         // HITL gate for single-agent mode. Orchestration workers wire their
         // own gate in create_worker with per-task AgentScope::Worker; this
@@ -332,12 +394,10 @@ impl Agent {
                     .clone()
                     .map(crate::config::SessionId::new),
             };
-            let request_id = config_owned.request_id.clone().unwrap_or_default();
             let wrapper = Arc::new(crate::hitl::HitlApprovalWrapper::new(
                 hitl.patterns.clone(),
                 hitl.route.clone(),
                 scope.clone(),
-                request_id.clone(),
                 config_owned.agent.name.clone(),
                 config_owned.instance_id.clone(),
             ));
@@ -352,7 +412,6 @@ impl Agent {
             let approval_tool = crate::hitl::RequestApprovalTool::new(
                 hitl.route.clone(),
                 scope,
-                request_id,
                 config_owned.agent.name.clone(),
                 config_owned.instance_id.clone(),
             );
@@ -372,22 +431,23 @@ impl Agent {
         let max_depth = base_depth + scratchpad_bonus;
 
         // Turn-limit nudging for single-agent mode; orchestration workers
-        // wire their own state in `create_worker`.
+        // wire their own in `create_worker`. The wrapper reads the run's
+        // counters through the slot; `turn_nudge` here is what each run's
+        // counters start from.
         let turn_nudge = if config_owned.orchestration_enabled() {
             None
         } else {
-            crate::turn_nudge::TurnNudgeState::new(
+            TurnNudgeState::new(
                 config_owned.agent.nudge_last_turn,
                 config_owned.agent.nudge_turns_remaining,
                 max_depth,
             )
         };
-        config_owned.turn_nudge = turn_nudge.clone();
-        if let Some(ref state) = turn_nudge {
+        if turn_nudge.is_some() {
             // First in the vec → transform_output runs last, on the text the
             // LLM actually sees (after any scratchpad pointer rewrite).
             let nudge: Arc<dyn crate::tool_wrapper::ToolWrapper> =
-                Arc::new(crate::turn_nudge::TurnNudgeWrapper::new(state.clone()));
+                Arc::new(crate::turn_nudge::TurnNudgeWrapper::new(Arc::clone(&run)));
             config_owned.tool_wrapper = Some(match config_owned.tool_wrapper.take() {
                 Some(existing) => Arc::new(crate::tool_wrapper::ComposedWrapper::new(vec![
                     nudge, existing,
@@ -541,9 +601,14 @@ impl Agent {
                 } else {
                     builder_state
                 };
-                let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
-                        .await?;
+                let builder_state = Self::add_all_tools(
+                    builder_state,
+                    config,
+                    &mcp_manager,
+                    &run,
+                    additional_tools,
+                )
+                .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::OpenAI(agent)
@@ -602,9 +667,14 @@ impl Agent {
                 } else {
                     builder_state
                 };
-                let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
-                        .await?;
+                let builder_state = Self::add_all_tools(
+                    builder_state,
+                    config,
+                    &mcp_manager,
+                    &run,
+                    additional_tools,
+                )
+                .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Anthropic(agent)
@@ -679,9 +749,14 @@ impl Agent {
                 } else {
                     builder_state
                 };
-                let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
-                        .await?;
+                let builder_state = Self::add_all_tools(
+                    builder_state,
+                    config,
+                    &mcp_manager,
+                    &run,
+                    additional_tools,
+                )
+                .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Bedrock(agent)
@@ -730,9 +805,14 @@ impl Agent {
                 } else {
                     builder_state
                 };
-                let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
-                        .await?;
+                let builder_state = Self::add_all_tools(
+                    builder_state,
+                    config,
+                    &mcp_manager,
+                    &run,
+                    additional_tools,
+                )
+                .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Gemini(agent)
@@ -780,9 +860,14 @@ impl Agent {
                 } else {
                     builder_state
                 };
-                let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
-                        .await?;
+                let builder_state = Self::add_all_tools(
+                    builder_state,
+                    config,
+                    &mcp_manager,
+                    &run,
+                    additional_tools,
+                )
+                .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Ollama(agent)
@@ -835,9 +920,14 @@ impl Agent {
                 } else {
                     builder_state
                 };
-                let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
-                        .await?;
+                let builder_state = Self::add_all_tools(
+                    builder_state,
+                    config,
+                    &mcp_manager,
+                    &run,
+                    additional_tools,
+                )
+                .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::OpenRouter(agent)
@@ -849,7 +939,7 @@ impl Agent {
             .map(|tools| tools.iter().map(|t| t.name.clone()).collect())
             .unwrap_or_default();
 
-        Ok(Agent {
+        Ok(PreparedAgent {
             inner: provider_agent,
             model: model_name,
             max_depth,
@@ -866,6 +956,107 @@ impl Agent {
             system_prompt,
             invocation_parameters: crate::logging::llm_invocation_parameters(&config.llm),
             skills: config.agent.skills.clone(),
+            forwarded_headers: config.forwarded_headers.clone(),
+            run,
+            active: Mutex::new(Weak::new()),
+        })
+    }
+
+    /// The request headers forwarded when this agent was prepared.
+    pub fn forwarded_headers(&self) -> &ForwardedHeaders {
+        &self.forwarded_headers
+    }
+
+    /// Begin a run of this agent for the request `request_id`, whose headers
+    /// are `req_headers`.
+    ///
+    /// The run is a [`RunContext`] of its own, on a token of its own, with a
+    /// fresh scratchpad budget and turn-limit counters starting from what
+    /// `prepare` computed, and `skill_recorder` recording its skill-tool
+    /// invocations; `start_run` binds it where the tools read.
+    ///
+    /// Refused while another run is alive (see `start_run`), and refused when
+    /// the request forwards a different value for a header this agent was
+    /// prepared with: the MCP connections were opened with the preparing
+    /// request's credentials, so serving this request would run its tool
+    /// calls as someone else. Prepare an agent for it instead.
+    pub fn begin_run(
+        self: &Arc<Self>,
+        request_id: impl Into<String>,
+        req_headers: Option<&HashMap<String, String>>,
+        skill_recorder: Option<Arc<SkillInvocationRecorder>>,
+    ) -> Result<Agent, BeginRunError> {
+        if let Some(header) = self.forwarded_headers.first_difference(req_headers) {
+            return Err(BeginRunError::ForwardedHeaderDiffers {
+                header: header.to_owned(),
+            });
+        }
+        let (run, events) = RunContext::channel_for_agent(
+            request_id.into(),
+            CancellationToken::new(),
+            self.scratchpad_budget.as_ref().map(ContextBudget::fresh),
+            self.turn_nudge.as_ref().map(|seed| seed.fresh()),
+            skill_recorder,
+        );
+        Ok(self.start_run(run, Some(events))?)
+    }
+
+    /// Begin a run of this agent within `parent`, for an orchestration
+    /// worker or coordinator: the same id, observer and cancellation as the
+    /// run that owns the orchestration, with fresh tool state of its own and
+    /// `skill_recorder` recording its skill-tool invocations. The parent's
+    /// request already carries the forwarded headers this agent was prepared
+    /// with, so there is nothing to check.
+    pub fn begin_run_within(
+        self: &Arc<Self>,
+        parent: &Arc<RunContext>,
+        skill_recorder: Option<Arc<SkillInvocationRecorder>>,
+    ) -> Result<Agent, RunInProgress> {
+        let run = RunContext::child(
+            parent,
+            self.scratchpad_budget.as_ref().map(ContextBudget::fresh),
+            self.turn_nudge.as_ref().map(|seed| seed.fresh()),
+            skill_recorder,
+        );
+        self.start_run(run, None)
+    }
+
+    /// Bind `run` where the tools read it and lease the agent to it.
+    ///
+    /// Rig spawns the agent's tool server once, so every tool call arrives on
+    /// one long-lived task with no way to tell two runs apart; the slot holds
+    /// one run and this refuses a second while the first is alive. Alive means
+    /// the lease has a holder: the `Agent`, or a stream it produced that
+    /// `Agent::hold_run` gave a handle. The slots keep the last run bound
+    /// after that, which is harmless — nothing calls a tool of a run that
+    /// has ended — and the next run replaces it.
+    fn start_run(
+        self: &Arc<Self>,
+        run: Arc<RunContext>,
+        events: Option<mpsc::Receiver<AgentEvent>>,
+    ) -> Result<Agent, RunInProgress> {
+        let lease = {
+            let mut active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(alive) = active.upgrade() {
+                return Err(RunInProgress {
+                    active: alive.run().id().to_string(),
+                });
+            }
+            let lease = Arc::new(RunLease::new(Arc::clone(&run)));
+            *active = Arc::downgrade(&lease);
+            lease
+        };
+        self.run.bind(Arc::clone(&run));
+        if let Some(gate) = &self.hitl_gate {
+            gate.bind_run(Arc::clone(&run));
+        }
+        if let Some(tool) = &self.hitl_approval_tool {
+            tool.bind_run(run);
+        }
+        Ok(Agent {
+            prepared: Arc::clone(self),
+            lease,
+            events: Mutex::new(events),
         })
     }
 
@@ -904,6 +1095,7 @@ impl Agent {
         mut builder_state: BuilderState<M>,
         config: &AgentRuntimeConfig,
         mcp_manager: &Option<Arc<McpManager>>,
+        run: &Arc<BoundRun>,
         additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
     ) -> Result<BuilderState<M>, Box<dyn std::error::Error + Send + Sync>>
     where
@@ -1076,40 +1268,39 @@ impl Agent {
                 "Adding scratchpad tools (head, slice, grep, schema, item_schema, get_in, iterate_over, read)"
             );
             let s = &scratchpad.storage;
-            let b = &scratchpad.budget;
-            let n = &config.turn_nudge;
+            let r = &scratchpad.run;
             builder_state = builder_state
                 .add_tool(NudgedTool::new(
-                    HeadTool::new(s.clone(), b.clone()),
-                    n.clone(),
+                    HeadTool::new(s.clone(), r.clone()),
+                    r.clone(),
                 ))
                 .add_tool(NudgedTool::new(
-                    SliceTool::new(s.clone(), b.clone()),
-                    n.clone(),
+                    SliceTool::new(s.clone(), r.clone()),
+                    r.clone(),
                 ))
                 .add_tool(NudgedTool::new(
-                    GrepTool::new(s.clone(), b.clone()),
-                    n.clone(),
+                    GrepTool::new(s.clone(), r.clone()),
+                    r.clone(),
                 ))
                 .add_tool(NudgedTool::new(
-                    SchemaTool::new(s.clone(), b.clone()),
-                    n.clone(),
+                    SchemaTool::new(s.clone(), r.clone()),
+                    r.clone(),
                 ))
                 .add_tool(NudgedTool::new(
-                    ItemSchemaTool::new(s.clone(), b.clone()),
-                    n.clone(),
+                    ItemSchemaTool::new(s.clone(), r.clone()),
+                    r.clone(),
                 ))
                 .add_tool(NudgedTool::new(
-                    GetInTool::new(s.clone(), b.clone()),
-                    n.clone(),
+                    GetInTool::new(s.clone(), r.clone()),
+                    r.clone(),
                 ))
                 .add_tool(NudgedTool::new(
-                    IterateOverTool::new(s.clone(), b.clone()),
-                    n.clone(),
+                    IterateOverTool::new(s.clone(), r.clone()),
+                    r.clone(),
                 ))
                 .add_tool(NudgedTool::new(
-                    ReadTool::new(s.clone(), b.clone()),
-                    n.clone(),
+                    ReadTool::new(s.clone(), r.clone()),
+                    r.clone(),
                 ));
         }
 
@@ -1133,7 +1324,7 @@ impl Agent {
                     );
                 }
                 read_artifact = read_artifact
-                    .with_scratchpad(scratchpad.budget.clone(), scratchpad.storage.clone());
+                    .with_scratchpad(scratchpad.run.clone(), scratchpad.storage.clone());
             }
             builder_state = builder_state.add_tool(read_artifact);
         }
@@ -1157,9 +1348,7 @@ impl Agent {
             builder_state = builder_state.add_tools_dyn(additional_tools);
         }
 
-        if let Some(toolset) =
-            SkillToolset::new(&config.agent.skills, config.skill_recorder.clone())
-        {
+        if let Some(toolset) = SkillToolset::new(&config.agent.skills, Some(Arc::clone(run))) {
             tracing::info!(
                 "Adding skill tools (load_skill, read_skill_file) with {} skills",
                 config.agent.skills.len(),
@@ -1216,195 +1405,6 @@ impl Agent {
         }
     }
 
-    /// Process a query with the agent (no chat history).
-    ///
-    /// Uses the streaming pipeline internally and collects the result.
-    #[tracing::instrument(name = "agent.prompt", skip(self), fields(model = %self.model))]
-    pub async fn prompt(
-        &self,
-        query: &str,
-    ) -> Result<crate::provider_agent::CompletionResponse, Box<dyn std::error::Error + Send + Sync>>
-    {
-        let span = tracing::Span::current();
-        record_input_attributes(
-            &span,
-            self.inner.provider_name(),
-            &self.model,
-            query,
-            &self.system_prompt,
-        );
-        self.record_llm_call_attributes(&span);
-
-        let stream = self.stream_prompt(query).await;
-        let result = self.collect_stream_response(stream).await;
-        record_completion_result(&span, &result);
-        result
-    }
-
-    /// Process a chat query with conversation history.
-    ///
-    /// Uses the streaming pipeline internally and collects the result.
-    #[tracing::instrument(name = "agent.chat", skip(self, chat_history), fields(model = %self.model, history_len = chat_history.len()))]
-    pub async fn chat(
-        &self,
-        query: &str,
-        chat_history: Vec<rig::completion::Message>,
-    ) -> Result<crate::provider_agent::CompletionResponse, Box<dyn std::error::Error + Send + Sync>>
-    {
-        let span = tracing::Span::current();
-        record_input_attributes(
-            &span,
-            self.inner.provider_name(),
-            &self.model,
-            query,
-            &self.system_prompt,
-        );
-        self.record_llm_call_attributes(&span);
-
-        let stream = self.stream_chat(query, chat_history).await;
-        let result = self.collect_stream_response(stream).await;
-        record_completion_result(&span, &result);
-        result
-    }
-
-    /// Record invocation parameters and the advertised tool schemas on a span.
-    fn record_llm_call_attributes(&self, span: &tracing::Span) {
-        if let Some(params) = &self.invocation_parameters {
-            crate::logging::set_llm_invocation_parameters(span, params);
-        }
-        let tools = self.otel_llm_tools();
-        if !tools.is_empty() {
-            crate::logging::set_llm_tools(span, &tools);
-        }
-    }
-
-    /// Internal: Collect a stream into a CompletionResponse.
-    ///
-    /// Consumes stream items, accumulating text content until a `Final` or `FinalMarker`
-    /// is received. The `Final` variant provides authoritative content and usage stats;
-    /// accumulated text serves as fallback when only `FinalMarker` is received.
-    async fn collect_stream_response(
-        &self,
-        mut stream: Pin<
-            Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>,
-        >,
-    ) -> Result<CompletionResponse, Box<dyn std::error::Error + Send + Sync>> {
-        // Accumulate text as fallback; Final variant provides authoritative response
-        let mut content = String::new();
-        let mut usage = Usage {
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
-        };
-
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
-                    content.push_str(&text);
-                }
-                Ok(StreamItem::Final(response)) => {
-                    content = response.content;
-                    usage = response.usage;
-                    break;
-                }
-                Ok(StreamItem::FinalMarker) | Ok(StreamItem::TurnUsage(..)) => {
-                    // Per-turn marker — not end-of-stream. Continue collecting.
-                }
-                Ok(_) => {
-                    // Tool calls, deltas, reasoning - handled by fallback executor
-                }
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-        }
-
-        tracing::info!("Turn complete - response ready");
-        Ok(CompletionResponse { content, usage })
-    }
-
-    /// Stream a query with the agent (no chat history) - returns true streaming response with multi-turn tool support
-    pub async fn stream_prompt(
-        &self,
-        query: &str,
-    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
-        let stream = self.inner.stream_prompt(query, self.max_depth).await;
-        self.maybe_wrap_with_fallback(self.count_turns(stream))
-    }
-
-    /// Stream a chat query with conversation history - returns true streaming response with multi-turn tool support
-    pub async fn stream_chat(
-        &self,
-        query: &str,
-        chat_history: Vec<rig::completion::Message>,
-    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
-        let stream = self
-            .inner
-            .stream_chat(query, chat_history, self.max_depth)
-            .await;
-        self.maybe_wrap_with_fallback(self.count_turns(stream))
-    }
-
-    /// Stream a chat with explicit max_depth override.
-    ///
-    /// Unlike `stream_chat()` which uses `self.max_depth`, this allows callers
-    /// to specify depth. Used by orchestration phases that need tighter bounds.
-    #[tracing::instrument(name = "agent.stream_chat", skip(self, chat_history),
-        fields(model = %self.model, history_len = chat_history.len(), max_depth))]
-    pub async fn stream_chat_with_depth(
-        &self,
-        query: &str,
-        chat_history: Vec<rig::completion::Message>,
-        max_depth: usize,
-    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
-        let stream = self.inner.stream_chat(query, chat_history, max_depth).await;
-        self.maybe_wrap_with_fallback(self.count_turns(stream))
-    }
-
-    /// Count completed turns into the turn-nudge state. Rig yields exactly
-    /// one `StreamItem::TurnUsage` per turn, and a turn's tool calls execute
-    /// before its `TurnUsage` arrives, so mid-turn the current turn is
-    /// `turns_completed + 1`. No-op when nudging is disabled.
-    fn count_turns(
-        &self,
-        stream: Pin<
-            Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>,
-        >,
-    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
-        use futures::StreamExt;
-
-        let Some(state) = self.turn_nudge.clone() else {
-            return stream;
-        };
-        state.reset();
-        Box::pin(stream.map(move |item| {
-            if matches!(item, Ok(StreamItem::TurnUsage(..))) {
-                state.record_turn_completed();
-            }
-            item
-        }))
-    }
-
-    /// Append a final `StreamItem::ScratchpadUsage` if this agent has a
-    /// scratchpad budget with non-zero activity. Mirrors the per-worker event
-    /// the orchestrator emits after each task — the web server handler
-    /// converts this into the `aura.scratchpad_usage` SSE event for the UI.
-    fn append_scratchpad_usage(
-        &self,
-        stream: Pin<
-            Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>,
-        >,
-    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
-        let Some(budget) = self.scratchpad_budget.clone() else {
-            return stream;
-        };
-        let tail = futures::stream::once(async move {
-            scratchpad_usage_event(&budget, aura_events::CONVERSATION_AGENT_ID)
-        })
-        .filter_map(|opt| async move { opt.map(Ok) });
-        Box::pin(stream.chain(tail))
-    }
-
     /// Conditionally wrap stream for Ollama text-to-tool parsing.
     ///
     /// When `fallback_tool_parsing` is enabled (Ollama config), this wraps the stream
@@ -1437,108 +1437,6 @@ impl Agent {
         }
 
         stream
-    }
-
-    /// Stream a query with timeout and cancellation support.
-    ///
-    /// Returns the run: its stream, the token that cancels it, and its usage.
-    ///
-    /// # Arguments
-    /// * `query` - The user query
-    /// * `options` - How the run is bounded and cancelled
-    /// * `request_id` - Unique request ID for MCP tool cancellation context
-    ///
-    /// # Cancellation
-    /// The StreamingRequestHook checks for cancellation at key points during streaming:
-    /// - Before each LLM completion call
-    /// - On each text delta (periodic)
-    /// - Before each tool call (sets active request context for MCP cancellation)
-    /// - After each tool result (clears active request context, adds to pending_tool_ids)
-    /// - After each streaming completion (captures usage, emits aura.tool_usage)
-    ///
-    /// To cancel externally (e.g., on client disconnect), cancel the run's token.
-    pub async fn stream_prompt_with_timeout(
-        &self,
-        query: &str,
-        options: crate::streaming::RunOptions,
-        request_id: &str,
-    ) -> crate::streaming::AgentRun {
-        self.seed_scratchpad_request_input(query, &[]);
-        self.inner
-            .stream_prompt_with_timeout(
-                query,
-                self.max_depth,
-                options,
-                request_id,
-                self.scratchpad_budget.clone(),
-                self.client_tool_names.clone(),
-            )
-            .await
-            .map_stream(|stream| {
-                self.append_scratchpad_usage(
-                    self.maybe_wrap_with_fallback(self.count_turns(stream)),
-                )
-            })
-    }
-
-    /// Stream a chat query with timeout and cancellation support.
-    ///
-    /// # Arguments
-    /// * `query` - The user query
-    /// * `chat_history` - Previous conversation messages
-    /// * `options` - How the run is bounded and cancelled
-    /// * `request_id` - Unique request ID for MCP tool cancellation context
-    ///
-    ///
-    /// # Cancellation
-    /// See `stream_prompt_with_timeout` for cancellation details.
-    pub async fn stream_chat_with_timeout(
-        &self,
-        query: &str,
-        chat_history: Vec<rig::completion::Message>,
-        options: crate::streaming::RunOptions,
-        request_id: &str,
-    ) -> crate::streaming::AgentRun {
-        self.seed_scratchpad_request_input(query, &chat_history);
-        self.inner
-            .stream_chat_with_timeout(
-                query,
-                chat_history,
-                self.max_depth,
-                options,
-                request_id,
-                self.scratchpad_budget.clone(),
-                self.client_tool_names.clone(),
-            )
-            .await
-            .map_stream(|stream| {
-                self.append_scratchpad_usage(
-                    self.maybe_wrap_with_fallback(self.count_turns(stream)),
-                )
-            })
-    }
-
-    /// Seed the scratchpad budget's running estimate with the user query +
-    /// chat history at stream-start so early extraction budget checks see
-    /// the request shape before turn-1 LLM-reported `input_tokens` arrives.
-    /// No-op when scratchpad isn't wired up. `Debug` formatting on history
-    /// over-counts vs. per-provider serialization — conservative direction
-    /// for budget gating, and `set_estimated_used` corrects from LLM ground
-    /// truth after each turn anyway.
-    fn seed_scratchpad_request_input(
-        &self,
-        query: &str,
-        chat_history: &[rig::completion::Message],
-    ) {
-        let Some(budget) = &self.scratchpad_budget else {
-            return;
-        };
-        let query_tokens = budget.count_tokens(query);
-        let history_tokens: usize = chat_history
-            .iter()
-            .map(|m| budget.count_tokens(&format!("{m:?}")))
-            .sum();
-        budget.record_usage(query_tokens + history_tokens);
     }
 
     /// Get provider information
@@ -1609,6 +1507,16 @@ impl Agent {
         self.mcp_manager.as_deref()
     }
 
+    /// The configured context window size in tokens.
+    pub fn context_window(&self) -> Option<u64> {
+        self.context_window
+    }
+
+    /// The assembled system prompt sent to the provider.
+    pub fn system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
+
     /// MCP tool schemas serialized for the `llm.tools.{i}.tool.json_schema`
     /// span attributes. Empty when no MCP manager is configured.
     pub fn otel_llm_tools(&self) -> Vec<String> {
@@ -1621,6 +1529,387 @@ impl Agent {
     /// `llm.invocation_parameters` JSON for OTel spans.
     pub fn otel_invocation_parameters(&self) -> Option<&str> {
         self.invocation_parameters.as_deref()
+    }
+}
+
+impl Agent {
+    /// Prepare an agent from configuration and begin its single run.
+    ///
+    /// The run is for the request `config` was resolved for: its id is
+    /// `config.request_id` (empty when unset), its headers are the ones
+    /// `config.forwarded_headers` recorded, and `config.skill_recorder`
+    /// records its skill-tool invocations. See [`PreparedAgent::prepare`] for
+    /// `additional_tools` and `client_tools`; callers that want to reuse the
+    /// prepared half across turns call that and [`PreparedAgent::begin_run`]
+    /// themselves.
+    pub async fn new(
+        config: &AgentRuntimeConfig,
+        additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
+        client_tools: Option<Vec<ClientTool>>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let prepared =
+            Arc::new(PreparedAgent::prepare(config, additional_tools, client_tools).await?);
+        let req_headers = config.forwarded_headers.as_request();
+        Ok(prepared.begin_run(
+            config.request_id.clone().unwrap_or_default(),
+            Some(&req_headers),
+            config.skill_recorder.clone(),
+        )?)
+    }
+
+    /// The run.
+    pub fn run(&self) -> &Arc<RunContext> {
+        self.lease.run()
+    }
+
+    /// Request id of this run.
+    pub fn request_id(&self) -> &str {
+        self.lease.run().id()
+    }
+
+    /// This run's scratchpad budget, when scratchpad is wired up.
+    pub fn scratchpad_budget(&self) -> Option<&ContextBudget> {
+        self.lease.run().scratchpad_budget()
+    }
+
+    /// Process a query with the agent (no chat history).
+    ///
+    /// Uses the streaming pipeline internally and collects the result.
+    #[tracing::instrument(name = "agent.prompt", skip(self), fields(model = %self.prepared.model))]
+    pub async fn prompt(
+        &self,
+        query: &str,
+    ) -> Result<crate::provider_agent::CompletionResponse, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let span = tracing::Span::current();
+        record_input_attributes(
+            &span,
+            self.prepared.inner.provider_name(),
+            &self.prepared.model,
+            query,
+            &self.prepared.system_prompt,
+        );
+        self.record_llm_call_attributes(&span);
+
+        let stream = self.stream_prompt(query).await;
+        let result = self.collect_stream_response(stream).await;
+        record_completion_result(&span, &result);
+        result
+    }
+
+    /// Process a chat query with conversation history.
+    ///
+    /// Uses the streaming pipeline internally and collects the result.
+    #[tracing::instrument(name = "agent.chat", skip(self, chat_history), fields(model = %self.prepared.model, history_len = chat_history.len()))]
+    pub async fn chat(
+        &self,
+        query: &str,
+        chat_history: Vec<rig::completion::Message>,
+    ) -> Result<crate::provider_agent::CompletionResponse, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let span = tracing::Span::current();
+        record_input_attributes(
+            &span,
+            self.prepared.inner.provider_name(),
+            &self.prepared.model,
+            query,
+            &self.prepared.system_prompt,
+        );
+        self.record_llm_call_attributes(&span);
+
+        let stream = self.stream_chat(query, chat_history).await;
+        let result = self.collect_stream_response(stream).await;
+        record_completion_result(&span, &result);
+        result
+    }
+
+    /// Record invocation parameters and the advertised tool schemas on a span.
+    fn record_llm_call_attributes(&self, span: &tracing::Span) {
+        if let Some(params) = &self.prepared.invocation_parameters {
+            crate::logging::set_llm_invocation_parameters(span, params);
+        }
+        let tools = self.prepared.otel_llm_tools();
+        if !tools.is_empty() {
+            crate::logging::set_llm_tools(span, &tools);
+        }
+    }
+
+    /// Internal: Collect a stream into a CompletionResponse.
+    ///
+    /// Consumes stream items, accumulating text content until a `Final` or `FinalMarker`
+    /// is received. The `Final` variant provides authoritative content and usage stats;
+    /// accumulated text serves as fallback when only `FinalMarker` is received.
+    async fn collect_stream_response(
+        &self,
+        mut stream: Pin<
+            Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>,
+        >,
+    ) -> Result<CompletionResponse, Box<dyn std::error::Error + Send + Sync>> {
+        // Accumulate text as fallback; Final variant provides authoritative response
+        let mut content = String::new();
+        let mut usage = Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+        };
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
+                    content.push_str(&text);
+                }
+                Ok(StreamItem::Final(response)) => {
+                    content = response.content;
+                    usage = response.usage;
+                    break;
+                }
+                Ok(StreamItem::FinalMarker) | Ok(StreamItem::TurnUsage(..)) => {
+                    // Per-turn marker — not end-of-stream. Continue collecting.
+                }
+                Ok(_) => {
+                    // Tool calls, deltas, reasoning - handled by fallback executor
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+
+        tracing::info!("Turn complete - response ready");
+        Ok(CompletionResponse { content, usage })
+    }
+
+    /// Stream a query with the agent (no chat history) - returns true streaming response with multi-turn tool support
+    pub async fn stream_prompt(
+        &self,
+        query: &str,
+    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
+        let stream = self
+            .prepared
+            .inner
+            .stream_prompt(query, self.prepared.max_depth)
+            .await;
+        self.hold_run(
+            self.prepared
+                .maybe_wrap_with_fallback(self.count_turns(stream)),
+        )
+    }
+
+    /// Stream a chat query with conversation history - returns true streaming response with multi-turn tool support
+    pub async fn stream_chat(
+        &self,
+        query: &str,
+        chat_history: Vec<rig::completion::Message>,
+    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
+        let stream = self
+            .prepared
+            .inner
+            .stream_chat(query, chat_history, self.prepared.max_depth)
+            .await;
+        self.hold_run(
+            self.prepared
+                .maybe_wrap_with_fallback(self.count_turns(stream)),
+        )
+    }
+
+    /// Stream a chat with explicit max_depth override.
+    ///
+    /// Unlike `stream_chat()` which uses the prepared agent's `max_depth`,
+    /// this allows callers to specify depth. Used by orchestration phases
+    /// that need tighter bounds.
+    #[tracing::instrument(name = "agent.stream_chat", skip(self, chat_history),
+        fields(model = %self.prepared.model, history_len = chat_history.len(), max_depth))]
+    pub async fn stream_chat_with_depth(
+        &self,
+        query: &str,
+        chat_history: Vec<rig::completion::Message>,
+        max_depth: usize,
+    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
+        let stream = self
+            .prepared
+            .inner
+            .stream_chat(query, chat_history, max_depth)
+            .await;
+        self.hold_run(
+            self.prepared
+                .maybe_wrap_with_fallback(self.count_turns(stream)),
+        )
+    }
+
+    /// Keep this run leased for as long as `stream` is alive, so a stream
+    /// that outlives the `Agent` it came from keeps the prepared agent from
+    /// beginning another run until the stream itself is dropped.
+    fn hold_run(
+        &self,
+        stream: Pin<
+            Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>,
+        >,
+    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
+        let lease = Arc::clone(&self.lease);
+        Box::pin(stream.map(move |item| {
+            let _leased = &lease;
+            item
+        }))
+    }
+
+    /// Count completed turns into the turn-nudge state. Rig yields exactly
+    /// one `StreamItem::TurnUsage` per turn, and a turn's tool calls execute
+    /// before its `TurnUsage` arrives, so mid-turn the current turn is
+    /// `turns_completed + 1`. No-op when nudging is disabled.
+    ///
+    /// The count restarts at every stream start: rig's depth limit is per
+    /// stream, so a run that streams more than once (`prompt` then `chat`)
+    /// is nudged against each stream's limit, not the run's total. The
+    /// counters are still the run's own; `begin_run` is what keeps one run's
+    /// count from ever reaching another.
+    fn count_turns(
+        &self,
+        stream: Pin<
+            Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>,
+        >,
+    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
+        use futures::StreamExt;
+
+        let Some(state) = self.lease.run().turn_nudge().cloned() else {
+            return stream;
+        };
+        state.reset();
+        Box::pin(stream.map(move |item| {
+            if matches!(item, Ok(StreamItem::TurnUsage(..))) {
+                state.record_turn_completed();
+            }
+            item
+        }))
+    }
+
+    /// Append a final `StreamItem::ScratchpadUsage` if this agent has a
+    /// scratchpad budget with non-zero activity. Mirrors the per-worker event
+    /// the orchestrator emits after each task — the web server handler
+    /// converts this into the `aura.scratchpad_usage` SSE event for the UI.
+    fn append_scratchpad_usage(
+        &self,
+        stream: Pin<
+            Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>,
+        >,
+    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
+        let Some(budget) = self.scratchpad_budget().cloned() else {
+            return stream;
+        };
+        let tail = futures::stream::once(async move {
+            scratchpad_usage_event(&budget, aura_events::CONVERSATION_AGENT_ID)
+        })
+        .filter_map(|opt| async move { opt.map(Ok) });
+        Box::pin(stream.chain(tail))
+    }
+
+    /// Stream a query with timeout and cancellation support.
+    ///
+    /// Returns the run: its stream, the token that cancels it, and its usage.
+    ///
+    /// # Arguments
+    /// * `query` - The user query
+    /// * `options` - How the run is bounded and cancelled
+    /// * `request_id` - Unique request ID for MCP tool cancellation context
+    ///
+    /// # Cancellation
+    /// The StreamingRequestHook checks for cancellation at key points during streaming:
+    /// - Before each LLM completion call
+    /// - On each text delta (periodic)
+    /// - Before each tool call (sets active request context for MCP cancellation)
+    /// - After each tool result (clears active request context, adds to pending_tool_ids)
+    /// - After each streaming completion (captures usage, emits aura.tool_usage)
+    ///
+    /// To cancel externally (e.g., on client disconnect), cancel the run's token.
+    pub async fn stream_prompt_with_timeout(
+        &self,
+        query: &str,
+        options: crate::streaming::RunOptions,
+        request_id: &str,
+    ) -> crate::streaming::AgentRun {
+        self.seed_scratchpad_request_input(query, &[]);
+        self.prepared
+            .inner
+            .stream_prompt_with_timeout(
+                query,
+                self.prepared.max_depth,
+                options,
+                request_id,
+                self.scratchpad_budget().cloned(),
+                self.prepared.client_tool_names.clone(),
+            )
+            .await
+            .map_stream(|stream| {
+                self.hold_run(
+                    self.append_scratchpad_usage(
+                        self.prepared
+                            .maybe_wrap_with_fallback(self.count_turns(stream)),
+                    ),
+                )
+            })
+    }
+
+    /// Stream a chat query with timeout and cancellation support.
+    ///
+    /// # Arguments
+    /// * `query` - The user query
+    /// * `chat_history` - Previous conversation messages
+    /// * `options` - How the run is bounded and cancelled
+    /// * `request_id` - Unique request ID for MCP tool cancellation context
+    ///
+    ///
+    /// # Cancellation
+    /// See `stream_prompt_with_timeout` for cancellation details.
+    pub async fn stream_chat_with_timeout(
+        &self,
+        query: &str,
+        chat_history: Vec<rig::completion::Message>,
+        options: crate::streaming::RunOptions,
+        request_id: &str,
+    ) -> crate::streaming::AgentRun {
+        self.seed_scratchpad_request_input(query, &chat_history);
+        self.prepared
+            .inner
+            .stream_chat_with_timeout(
+                query,
+                chat_history,
+                self.prepared.max_depth,
+                options,
+                request_id,
+                self.scratchpad_budget().cloned(),
+                self.prepared.client_tool_names.clone(),
+            )
+            .await
+            .map_stream(|stream| {
+                self.hold_run(
+                    self.append_scratchpad_usage(
+                        self.prepared
+                            .maybe_wrap_with_fallback(self.count_turns(stream)),
+                    ),
+                )
+            })
+    }
+
+    /// Seed the scratchpad budget's running estimate with the user query +
+    /// chat history at stream-start so early extraction budget checks see
+    /// the request shape before turn-1 LLM-reported `input_tokens` arrives.
+    /// No-op when scratchpad isn't wired up. `Debug` formatting on history
+    /// over-counts vs. per-provider serialization — conservative direction
+    /// for budget gating, and `set_estimated_used` corrects from LLM ground
+    /// truth after each turn anyway.
+    fn seed_scratchpad_request_input(
+        &self,
+        query: &str,
+        chat_history: &[rig::completion::Message],
+    ) {
+        let Some(budget) = self.scratchpad_budget() else {
+            return;
+        };
+        let query_tokens = budget.count_tokens(query);
+        let history_tokens: usize = chat_history
+            .iter()
+            .map(|m| budget.count_tokens(&format!("{m:?}")))
+            .sum();
+        budget.record_usage(query_tokens + history_tokens);
     }
 }
 
@@ -1692,7 +1981,7 @@ use async_trait::async_trait;
 #[async_trait]
 impl StreamingAgent for Agent {
     fn get_provider_info(&self) -> (&str, &str) {
-        Agent::get_provider_info(self)
+        self.prepared.get_provider_info()
     }
 
     async fn stream(
@@ -1702,75 +1991,95 @@ impl StreamingAgent for Agent {
         options: crate::streaming::RunOptions,
         request_id: &str,
     ) -> crate::streaming::AgentRun {
-        // The run is built on the token it will stop on, so the work that awaits
-        // cancellation finds it there from the start.
-        let (timeout, cancel) = options.into_parts();
-        let cancel = cancel.unwrap_or_default();
-        let (run, run_events) =
-            crate::run_context::RunContext::channel_on(request_id, cancel.clone());
-        let options = crate::streaming::RunOptions::on_token(timeout, cancel);
+        // The run began at `begin_run`, so its context is what this streams
+        // under; the id is the run's.
+        let run = Arc::clone(self.lease.run());
+        if request_id != run.id().as_ref() {
+            tracing::debug!(
+                run_id = %run.id(),
+                request_id,
+                "streaming under the run's id rather than the one passed",
+            );
+        }
+        let run_id = run.id().to_string();
 
-        // The gate and the approval tool are built with the agent, before any
-        // run exists, and rig runs tools on its own server task. So bind the run
-        // where a tool call can still find it.
-        if let Some(gate) = &self.hitl_gate {
-            gate.bind_run(std::sync::Arc::clone(&run));
+        // The run's token is what its work watches and what dropping the
+        // handle cancels. A caller that handed in a token of its own gets the
+        // run stopped when that token is, and its token left alone: the run's
+        // predates the options, so the link is watched rather than built in.
+        let (timeout, cancel) = options.into_parts();
+        if let Some(parent) = cancel {
+            let child = run.cancel_token().clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = parent.cancelled() => child.cancel(),
+                    () = child.cancelled() => {}
+                }
+            });
         }
-        if let Some(tool) = &self.hitl_approval_tool {
-            tool.bind_run(std::sync::Arc::clone(&run));
-        }
-        if let Some(mcp_manager) = &self.mcp_manager {
+        let options = crate::streaming::RunOptions::on_token(timeout, run.cancel_token().clone());
+
+        // Rig runs tools on its own server task, so bind the run where a tool
+        // call can still find it.
+        if let Some(mcp_manager) = &self.prepared.mcp_manager {
             mcp_manager
-                .bind_call(
-                    std::sync::Arc::clone(&run),
-                    aura_events::AgentContext::single_agent(),
-                )
+                .bind_call(Arc::clone(&run), aura_events::AgentContext::single_agent())
                 .await;
         }
 
         let started = if chat_history.is_empty() {
-            self.stream_prompt_with_timeout(query, options, request_id)
+            self.stream_prompt_with_timeout(query, options, &run_id)
                 .await
         } else {
-            self.stream_chat_with_timeout(query, chat_history, options, request_id)
+            self.stream_chat_with_timeout(query, chat_history, options, &run_id)
                 .await
         };
 
-        started
-            .map_stream(move |stream| {
-                Box::pin(crate::run_context::scope_stream(
-                    std::sync::Arc::clone(&run),
-                    Box::pin(crate::streaming::tee_content(
-                        run,
-                        aura_events::AgentContext::single_agent(),
-                        stream,
-                    )),
-                ))
-            })
-            .observed_by(run_events)
+        let started = started.map_stream(move |stream| {
+            Box::pin(crate::run_context::scope_stream(
+                Arc::clone(&run),
+                Box::pin(crate::streaming::tee_content(
+                    run,
+                    aura_events::AgentContext::single_agent(),
+                    stream,
+                )),
+            ))
+        });
+        // One observer per run: the first stream hands the receiver over,
+        // a later stream of the same run has no second one to give.
+        match self
+            .events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            Some(events) => started.observed_by(events),
+            None => started,
+        }
     }
 
     async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize {
-        Agent::cancel_and_close_mcp(self, request_id, reason).await
+        self.prepared.cancel_and_close_mcp(request_id, reason).await
     }
 
     fn context_window(&self) -> Option<u64> {
-        self.context_window
+        self.prepared.context_window
     }
 
     fn mcp_server_status(&self) -> Vec<aura_events::McpServerStatus> {
-        self.mcp_manager
+        self.prepared
+            .mcp_manager
             .as_ref()
             .map(|m| m.server_status_snapshot())
             .unwrap_or_default()
     }
 
     fn skills(&self) -> &[aura_config::SkillConfig] {
-        &self.skills
+        &self.prepared.skills
     }
 
     fn system_prompt(&self) -> Option<&str> {
-        Some(&self.system_prompt)
+        Some(&self.prepared.system_prompt)
     }
 }
 
@@ -1788,6 +2097,28 @@ pub async fn build_streaming_agent(
     config: &crate::config::AgentRuntimeConfig,
     client_tools: Option<Vec<ClientTool>>,
 ) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
+    build_streaming_agent_with_tools(config, client_tools, no_run_tools()).await
+}
+
+/// A factory for the rig tools that exist for one run.
+pub type RunToolFactory = Arc<dyn Fn() -> Vec<Box<dyn rig::tool::ToolDyn>> + Send + Sync>;
+
+/// A factory that yields no tools.
+pub fn no_run_tools() -> RunToolFactory {
+    Arc::new(Vec::new)
+}
+
+/// [`build_streaming_agent`] plus `run_tools`, the rig tools the agent
+/// executes itself that exist for this one run. A boxed tool cannot be
+/// cloned, so they come from a factory: in single-agent mode it is called
+/// once and its tools join the agent's; in orchestration mode it is called
+/// once per worker and every worker gets its own instances, while the
+/// coordinator, whose tool set is routing only, gets none.
+pub async fn build_streaming_agent_with_tools(
+    config: &crate::config::AgentRuntimeConfig,
+    client_tools: Option<Vec<ClientTool>>,
+    run_tools: RunToolFactory,
+) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
     use crate::orchestration::OrchestratorFactory;
 
     if config.orchestration_enabled() {
@@ -1799,7 +2130,7 @@ pub async fn build_streaming_agent(
                  will be ignored. Use a non-orchestrated agent config to enable them."
             );
         }
-        let factory = OrchestratorFactory::new(config.clone());
+        let factory = OrchestratorFactory::new(config.clone()).with_run_tools(run_tools);
         Ok(Arc::new(factory))
     } else {
         // Standard single-agent mode: gate client tools on the agent's TOML opt-in
@@ -1821,7 +2152,7 @@ pub async fn build_streaming_agent(
         } else {
             None
         };
-        let agent = Agent::new(config, vec![], attached).await?;
+        let agent = Agent::new(config, run_tools(), attached).await?;
         Ok(Arc::new(agent))
     }
 }
@@ -2129,7 +2460,7 @@ mod tests {
             };
             let manager = Some(Arc::new(manager_serving_all_transports(server).await));
             let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
-            Agent::add_all_tools(state, &config, &manager, Vec::new())
+            PreparedAgent::add_all_tools(state, &config, &manager, &Arc::default(), Vec::new())
                 .await
                 .expect("composition succeeds")
                 .build()
@@ -2205,7 +2536,7 @@ mod tests {
         /// A manager offering one HTTP-streamable tool, keyed by `namespace`.
         /// HTTP rather than stdio so the transport's fail-closed check cannot
         /// be mistaken for the gate's decision.
-        async fn manager_serving(
+        pub(super) async fn manager_serving(
             server: &RecordingMcpServer,
             namespace: &str,
             tool: &str,
@@ -2241,7 +2572,6 @@ mod tests {
         /// because rig calls the tool on its server task and no scope reaches
         /// there.
         fn gated_config(
-            request_id: &str,
             pattern: &str,
             run: Arc<crate::run_context::RunContext>,
         ) -> AgentRuntimeConfig {
@@ -2252,7 +2582,6 @@ mod tests {
                     timeout: Duration::from_millis(50),
                 }),
                 AgentScope::Single { session_id: None },
-                request_id.to_owned(),
                 "test-agent".to_owned(),
                 "test-instance-id".to_owned(),
             );
@@ -2265,16 +2594,15 @@ mod tests {
 
         async fn compose_gated_agent(
             server: &RecordingMcpServer,
-            request_id: &str,
             pattern: &str,
             namespace: &str,
             tool: &str,
             run: Arc<crate::run_context::RunContext>,
         ) -> rig::agent::Agent<UnpromptedModel> {
-            let config = gated_config(request_id, pattern, run);
+            let config = gated_config(pattern, run);
             let manager = Some(Arc::new(manager_serving(server, namespace, tool).await));
             let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
-            Agent::add_all_tools(state, &config, &manager, Vec::new())
+            PreparedAgent::add_all_tools(state, &config, &manager, &Arc::default(), Vec::new())
                 .await
                 .expect("composition succeeds")
                 .build()
@@ -2288,9 +2616,7 @@ mod tests {
             let request_id = "req_ns_gating_match";
             let server = RecordingMcpServer::start().await;
             let (run, mut rx) = crate::run_context::RunContext::channel(request_id);
-            let agent =
-                compose_gated_agent(&server, request_id, "github:*", "github", "list_repos", run)
-                    .await;
+            let agent = compose_gated_agent(&server, "github:*", "github", "list_repos", run).await;
 
             // The parked approval expires unanswered; the call's own outcome is
             // not what this test is about.
@@ -2322,9 +2648,7 @@ mod tests {
             let request_id = "req_ns_gating_miss";
             let server = RecordingMcpServer::start().await;
             let (run, mut rx) = crate::run_context::RunContext::channel(request_id);
-            let agent =
-                compose_gated_agent(&server, request_id, "github:*", "k8s", "list_repos", run)
-                    .await;
+            let agent = compose_gated_agent(&server, "github:*", "k8s", "list_repos", run).await;
 
             agent
                 .tool_server_handle
@@ -2360,10 +2684,16 @@ mod tests {
                 ..Default::default()
             };
             let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
-            let agent = Agent::add_all_tools(state, &config, &Some(Arc::new(manager)), Vec::new())
-                .await
-                .expect("composition succeeds")
-                .build();
+            let agent = PreparedAgent::add_all_tools(
+                state,
+                &config,
+                &Some(Arc::new(manager)),
+                &Arc::default(),
+                Vec::new(),
+            )
+            .await
+            .expect("composition succeeds")
+            .build();
 
             agent
                 .tool_server_handle
@@ -2412,10 +2742,16 @@ mod tests {
         async fn compose_over(manager: McpManager) -> rig::agent::Agent<UnpromptedModel> {
             let config = AgentRuntimeConfig::default();
             let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
-            Agent::add_all_tools(state, &config, &Some(Arc::new(manager)), Vec::new())
-                .await
-                .expect("composition succeeds")
-                .build()
+            PreparedAgent::add_all_tools(
+                state,
+                &config,
+                &Some(Arc::new(manager)),
+                &Arc::default(),
+                Vec::new(),
+            )
+            .await
+            .expect("composition succeeds")
+            .build()
         }
 
         #[tokio::test]
@@ -2633,8 +2969,11 @@ mod tests {
         let sp_budget = scratchpad::ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
 
         let scratchpad_tools = HashMap::from([("big_tool".to_string(), 10_usize)]);
-        let scratchpad: Arc<dyn ToolWrapper> =
-            Arc::new(ScratchpadWrapper::new(scratchpad_tools, storage, sp_budget));
+        let scratchpad: Arc<dyn ToolWrapper> = Arc::new(ScratchpadWrapper::new(
+            scratchpad_tools,
+            storage,
+            Arc::new(BoundRun::pinned_budget(sp_budget)),
+        ));
 
         let recording = Arc::new(RecordingWrapper::default());
         let recording_dyn: Arc<dyn ToolWrapper> = recording.clone();
@@ -2686,5 +3025,296 @@ mod tests {
             "scratchpad must rewrite the LLM-facing output to a pointer, got: {}",
             &result.output[..result.output.len().min(120)]
         );
+    }
+
+    /// The split the run slot exists for: a prepared agent is built once and
+    /// serves runs in turn, each owning state of its own, and refuses to
+    /// serve two at once.
+    mod prepared_runs {
+        use super::*;
+        use crate::orchestration::{ScriptedCompletionModel, ScriptedTurn};
+
+        /// A prepared agent over a scripted model, seeded with a scratchpad
+        /// budget and a turn nudge that fires on the second turn, so a run
+        /// has state to own.
+        fn prepared() -> Arc<PreparedAgent> {
+            prepared_forwarding(ForwardedHeaders::default())
+        }
+
+        /// Like [`prepared`], bound to the request headers `forwarded`.
+        fn prepared_forwarding(forwarded_headers: ForwardedHeaders) -> Arc<PreparedAgent> {
+            let model = ScriptedCompletionModel::new(vec![ScriptedTurn::text("done")]);
+            prepared_over(
+                ProviderAgent::Scripted(rig::agent::AgentBuilder::new(model).build()),
+                forwarded_headers,
+                None,
+            )
+        }
+
+        /// Like [`prepared`], over `inner` with its HITL gate `hitl_gate`.
+        fn prepared_over(
+            inner: ProviderAgent,
+            forwarded_headers: ForwardedHeaders,
+            hitl_gate: Option<Arc<crate::hitl::HitlApprovalWrapper>>,
+        ) -> Arc<PreparedAgent> {
+            Arc::new(PreparedAgent {
+                inner,
+                model: "scripted".to_owned(),
+                max_depth: 1,
+                mcp_manager: None,
+                fallback_tool_parsing: false,
+                fallback_tool_names: Vec::new(),
+                fallback_mcp_filter: None,
+                context_window: None,
+                scratchpad_budget: Some(budget()),
+                client_tool_names: HashSet::new(),
+                turn_nudge: TurnNudgeState::new(true, None, 1),
+                system_prompt: String::new(),
+                invocation_parameters: None,
+                skills: Vec::new(),
+                forwarded_headers,
+                hitl_gate,
+                hitl_approval_tool: None,
+                run: Arc::new(BoundRun::default()),
+                active: Mutex::new(Weak::new()),
+            })
+        }
+
+        /// A web request's approvals are released by its request id when the
+        /// request ends (the server's `RequestResourceGuard`). The gate stamps
+        /// the id of the run `begin_run` bound, so each run of one prepared
+        /// agent parks under its own request id, and ending one request
+        /// releases only that request's approvals.
+        #[tokio::test]
+        async fn each_run_parks_its_approvals_under_its_own_request_id() {
+            use std::time::Duration;
+
+            use crate::hitl::{AgentScope, DecisionRoute, HitlApprovalWrapper, PendingApprovals};
+            use crate::mcp::client::tests::RecordingMcpServer;
+            use aura_events::agent::AgentEventPayload;
+
+            let server = RecordingMcpServer::start().await;
+            let registry = PendingApprovals::new();
+            let gate = Arc::new(HitlApprovalWrapper::new(
+                Arc::from(["github:*".into()]),
+                Arc::new(DecisionRoute::Conversational {
+                    registry: registry.clone(),
+                    timeout: Duration::from_secs(60),
+                }),
+                AgentScope::Single { session_id: None },
+                "test-agent".to_owned(),
+                "test-instance-id".to_owned(),
+            ));
+            let config = AgentRuntimeConfig {
+                tool_wrapper: Some(Arc::clone(&gate) as Arc<dyn crate::tool_wrapper::ToolWrapper>),
+                ..Default::default()
+            };
+            let manager = Some(Arc::new(
+                super::namespace_gating::manager_serving(&server, "github", "list_repos").await,
+            ));
+            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(
+                ScriptedCompletionModel::new(Vec::new()),
+            ));
+            let inner =
+                PreparedAgent::add_all_tools(state, &config, &manager, &Arc::default(), Vec::new())
+                    .await
+                    .expect("composition succeeds")
+                    .build();
+            let prepared = prepared_over(
+                ProviderAgent::Scripted(inner),
+                ForwardedHeaders::default(),
+                Some(gate),
+            );
+
+            // Begin a run, make the gated call, and return once the call has
+            // parked (the conversational route registers before it announces).
+            async fn park(
+                prepared: &Arc<PreparedAgent>,
+                request_id: &str,
+            ) -> (Agent, tokio::task::JoinHandle<()>) {
+                let agent = prepared.begin_run(request_id, None, None).unwrap();
+                let mut events = agent.events.lock().unwrap().take().unwrap();
+                let call = tokio::spawn({
+                    let prepared = Arc::clone(prepared);
+                    async move {
+                        let _ = prepared.inner.call_tool("list_repos", "{}").await;
+                    }
+                });
+                let raised = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                    .await
+                    .expect("the gated call raises an approval")
+                    .expect("the run's channel is open");
+                assert!(
+                    matches!(raised.payload, AgentEventPayload::ApprovalRequested(_)),
+                    "got: {:?}",
+                    raised.payload,
+                );
+                (agent, call)
+            }
+            let released = |call: tokio::task::JoinHandle<()>| async move {
+                tokio::time::timeout(Duration::from_secs(5), call)
+                    .await
+                    .is_ok_and(|joined| joined.is_ok())
+            };
+
+            let (first, call) = park(&prepared, "req_a").await;
+            registry.cancel_request_local("req_a");
+            assert!(
+                released(call).await,
+                "ending req_a releases the approval it parked"
+            );
+            drop(first);
+
+            let (_second, call) = park(&prepared, "req_b").await;
+            registry.cancel_request_local("req_a");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                !call.is_finished(),
+                "ending req_a leaves req_b's approval parked"
+            );
+            registry.cancel_request_local("req_b");
+            assert!(
+                released(call).await,
+                "ending req_b releases the approval it parked"
+            );
+            assert!(
+                server.tool_calls().is_empty(),
+                "a cancelled approval never runs the tool",
+            );
+        }
+
+        #[tokio::test]
+        async fn a_prepared_agent_serves_one_run_at_a_time() {
+            let prepared = prepared();
+            let first = prepared
+                .begin_run("req_a", None, None)
+                .expect("a fresh agent has no run");
+
+            let refused = prepared
+                .begin_run("req_b", None, None)
+                .expect_err("the slot is taken");
+            assert!(
+                matches!(refused, BeginRunError::RunInProgress(RunInProgress { ref active }) if active == "req_a"),
+                "got: {refused:?}",
+            );
+
+            drop(first);
+            let second = prepared
+                .begin_run("req_b", None, None)
+                .expect("the slot is free again");
+            assert_eq!(second.request_id(), "req_b");
+        }
+
+        /// Each run starts from the prepared seeds, and the slot the tools
+        /// hold resolves to that run and nothing else.
+        #[tokio::test]
+        async fn each_run_owns_fresh_state_that_the_tools_reach_through_the_slot() {
+            let prepared = prepared();
+            let seed = prepared.scratchpad_budget.as_ref().unwrap();
+
+            let first = prepared.begin_run("req_a", None, None).unwrap();
+            assert_eq!(
+                prepared
+                    .run
+                    .get()
+                    .map(|run| run.id().to_string())
+                    .as_deref(),
+                Some("req_a")
+            );
+            prepared
+                .run
+                .scratchpad_budget()
+                .expect("the run's budget resolves")
+                .record_intercepted(9);
+            assert_eq!(
+                first.scratchpad_budget().unwrap().scratchpad_usage().0,
+                9,
+                "the slot hands out the run's own budget",
+            );
+            assert_eq!(seed.scratchpad_usage().0, 0, "the seed stays unused");
+            let nudge = prepared.run.turn_nudge().expect("the run's nudge resolves");
+            nudge.record_turn_completed();
+            assert!(
+                nudge.nudge_message().is_some(),
+                "one completed turn puts the first run on its final turn",
+            );
+
+            drop(first);
+
+            let second = prepared.begin_run("req_b", None, None).unwrap();
+            assert_eq!(
+                prepared
+                    .run
+                    .get()
+                    .map(|run| run.id().to_string())
+                    .as_deref(),
+                Some("req_b")
+            );
+            assert_eq!(
+                second.scratchpad_budget().unwrap().scratchpad_usage().0,
+                0,
+                "a new run's budget starts over",
+            );
+            assert!(
+                prepared.run.turn_nudge().unwrap().nudge_message().is_none(),
+                "a new run's turn count starts over",
+            );
+        }
+
+        /// The MCP connections were opened with the preparing request's
+        /// forwarded headers, so a request forwarding different values gets
+        /// a fresh agent rather than someone else's credentials.
+        #[tokio::test]
+        async fn a_request_forwarding_different_headers_is_refused() {
+            let token =
+                |value: &str| HashMap::from([("x-user-token".to_owned(), value.to_owned())]);
+            let prepared = prepared_forwarding(ForwardedHeaders::of(
+                ["x-user-token".to_owned()],
+                Some(&token("alice")),
+            ));
+
+            let refused = prepared
+                .begin_run("req_bob", Some(&token("bob")), None)
+                .expect_err("bob's token is not alice's");
+            assert!(
+                matches!(refused, BeginRunError::ForwardedHeaderDiffers { ref header } if header == "x-user-token"),
+                "got: {refused:?}",
+            );
+            assert!(
+                prepared.begin_run("req_none", None, None).is_err(),
+                "a request carrying no token is not alice's either",
+            );
+
+            let served = prepared
+                .begin_run("req_alice", Some(&token("alice")), None)
+                .expect("the same credentials are served");
+            assert_eq!(served.request_id(), "req_alice");
+        }
+
+        /// A stream still driving tools after its `Agent` is dropped keeps
+        /// the run bound; the slot frees only once the stream is gone too.
+        #[tokio::test]
+        async fn a_live_stream_keeps_the_run_bound_after_the_agent_drops() {
+            let prepared = prepared();
+            let agent = prepared.begin_run("req_a", None, None).unwrap();
+            let stream = agent.stream_prompt("hello").await;
+            drop(agent);
+
+            assert_eq!(
+                prepared
+                    .run
+                    .get()
+                    .map(|run| run.id().to_string())
+                    .as_deref(),
+                Some("req_a"),
+                "the stream holds the run",
+            );
+            assert!(prepared.begin_run("req_b", None, None).is_err());
+
+            drop(stream);
+            prepared
+                .begin_run("req_b", None, None)
+                .expect("the slot frees with the stream");
+        }
     }
 }
