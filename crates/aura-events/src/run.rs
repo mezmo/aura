@@ -34,7 +34,9 @@
 //! by a relay or projection.
 //!
 //! Order by `seq`, never by `at`. The [`Timestamp`] is wall-clock time, for
-//! display.
+//! display. It is Unix milliseconds, a number, where other instants on the wire,
+//! such as an approval's `expires_at`, are RFC 3339 strings: it is stamped on
+//! every event, and a consumer only displays it.
 //!
 //! # Tags and formats
 //!
@@ -66,98 +68,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentEvent;
-use crate::{nonempty_string_newtype, RunId, SessionId, TokenUsage};
-
-/// An instant as Unix time in milliseconds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct Timestamp(u64);
-
-impl Timestamp {
-    pub fn from_unix_millis(millis: u64) -> Self {
-        Self(millis)
-    }
-
-    pub fn unix_millis(self) -> u64 {
-        self.0
-    }
-
-    /// The current instant. A clock set before the Unix epoch reads as the
-    /// epoch itself.
-    pub fn now() -> Self {
-        let since_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        Self(u64::try_from(since_epoch.as_millis()).unwrap_or(u64::MAX))
-    }
-}
-
-impl std::fmt::Display for Timestamp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-/// An event's position in its session's stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(try_from = "u64", into = "u64")]
-pub struct SequenceNumber(u64);
-
-impl SequenceNumber {
-    /// The number of a session's first event.
-    pub const FIRST: Self = Self(1);
-
-    pub fn get(self) -> u64 {
-        self.0
-    }
-
-    /// The number the event after this one carries.
-    pub fn next(self) -> Self {
-        Self(self.0.saturating_add(1))
-    }
-
-    /// Whether this is the event immediately after `previous`. `false` means
-    /// the consumer missed at least one event between them.
-    pub fn follows(self, previous: Self) -> bool {
-        self.0 == previous.0.saturating_add(1)
-    }
-}
-
-impl std::fmt::Display for SequenceNumber {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-/// A sequence number of zero, which no event carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ZeroSequenceNumber;
-
-impl std::fmt::Display for ZeroSequenceNumber {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("a session's sequence numbers start at 1")
-    }
-}
-
-impl std::error::Error for ZeroSequenceNumber {}
-
-impl TryFrom<u64> for SequenceNumber {
-    type Error = ZeroSequenceNumber;
-
-    fn try_from(value: u64) -> Result<Self, Self::Error> {
-        if value == 0 {
-            Err(ZeroSequenceNumber)
-        } else {
-            Ok(Self(value))
-        }
-    }
-}
-
-impl From<SequenceNumber> for u64 {
-    fn from(seq: SequenceNumber) -> Self {
-        seq.0
-    }
-}
+use crate::{nonempty_string_newtype, RunId, SequenceNumber, SessionId, Timestamp, TokenUsage};
 
 nonempty_string_newtype! {
     /// Identifier for one observer of a session, unique among its observers.
@@ -218,7 +129,7 @@ pub enum LivenessPolicy {
 pub struct Liveness {
     pub policy: LivenessPolicy,
     /// How long the run goes unclaimed before `policy` acts.
-    #[serde(rename = "grace_ms", with = "duration_ms")]
+    #[serde(rename = "grace_ms", with = "crate::duration_ms")]
     pub grace: Duration,
 }
 
@@ -239,7 +150,7 @@ impl Default for Liveness {
 pub enum RunCancelReason {
     /// The run outlived the bound it was started with.
     Deadline {
-        #[serde(rename = "after_ms", with = "duration_ms")]
+        #[serde(rename = "after_ms", with = "crate::duration_ms")]
         after: Duration,
     },
     /// Something outside the run cancelled it.
@@ -270,7 +181,7 @@ pub enum LifecycleEvent {
             rename = "timeout_ms",
             default,
             skip_serializing_if = "Option::is_none",
-            with = "duration_ms::option"
+            with = "crate::duration_ms::option"
         )]
         timeout: Option<Duration>,
         #[serde(default)]
@@ -370,45 +281,6 @@ impl SessionEvent {
     }
 }
 
-/// Serializes a [`Duration`] as whole milliseconds, the unit every other
-/// duration in this crate is expressed in on the wire.
-mod duration_ms {
-    use std::time::Duration;
-
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
-        u64::try_from(duration.as_millis())
-            .unwrap_or(u64::MAX)
-            .serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
-        u64::deserialize(deserializer).map(Duration::from_millis)
-    }
-
-    pub mod option {
-        use std::time::Duration;
-
-        use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-        pub fn serialize<S: Serializer>(
-            duration: &Option<Duration>,
-            serializer: S,
-        ) -> Result<S::Ok, S::Error> {
-            duration
-                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-                .serialize(serializer)
-        }
-
-        pub fn deserialize<'de, D: Deserializer<'de>>(
-            deserializer: D,
-        ) -> Result<Option<Duration>, D::Error> {
-            Ok(Option::<u64>::deserialize(deserializer)?.map(Duration::from_millis))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,7 +298,7 @@ mod tests {
         SessionEvent {
             session_id: SessionId::new("sess_1"),
             run_id: run,
-            seq: SequenceNumber(seq),
+            seq: SequenceNumber::try_from(seq).expect("a sequence starts at 1"),
             at: Timestamp::from_unix_millis(1_700_000_000_000),
             payload,
         }
@@ -835,64 +707,12 @@ mod tests {
         assert!(parsed.is_err());
     }
 
-    /// A session's sequence starts at 1, so a zero is refused rather than
-    /// read as an event before the first.
-    #[test]
-    fn a_zero_sequence_number_is_refused() {
-        assert_eq!(SequenceNumber::try_from(0), Err(ZeroSequenceNumber));
-        assert!(serde_json::from_value::<SequenceNumber>(json!(0)).is_err());
-        assert_eq!(
-            serde_json::from_value::<SequenceNumber>(json!(1)).unwrap(),
-            SequenceNumber::FIRST
-        );
-    }
-
     /// Version 7 puts the mint time in the leading bits, which is what lets
     /// ids order by when their runs started.
     #[test]
     fn a_minted_run_id_is_version_7() {
         assert_eq!(RunId::mint().as_uuid().get_version_num(), 7);
         assert_ne!(RunId::mint(), RunId::mint());
-    }
-
-    /// Dense numbering is what lets a consumer tell a missed event from a
-    /// quiet session: the next number is always exactly one more.
-    #[test]
-    fn sequence_numbers_are_dense() {
-        let first = SequenceNumber::FIRST;
-        assert_eq!(first.get(), 1);
-
-        let second = first.next();
-        assert!(second.follows(first));
-        assert!(!second.next().follows(first), "a skipped number is a gap");
-        assert!(!first.follows(second), "order matters");
-        assert!(!first.follows(first), "a repeat is not a successor");
-    }
-
-    #[test]
-    fn a_sequence_number_serializes_as_a_bare_integer() {
-        let json = serde_json::to_value(SequenceNumber::FIRST.next()).unwrap();
-        assert_eq!(json, json!(2));
-        assert_eq!(
-            serde_json::from_value::<SequenceNumber>(json).unwrap(),
-            SequenceNumber(2)
-        );
-    }
-
-    #[test]
-    fn a_timestamp_is_unix_milliseconds() {
-        let at = Timestamp::from_unix_millis(1_700_000_000_000);
-        assert_eq!(
-            serde_json::to_value(at).unwrap(),
-            json!(1_700_000_000_000_u64)
-        );
-        assert_eq!(at.unix_millis(), 1_700_000_000_000);
-
-        let now = Timestamp::now();
-        assert!(
-            now > at,
-            "now ({now}) should be after November 2023 ({at}) on any sane clock"
-        );
     }
 
     /// A consumer that closes a run's view on its last event must agree with
