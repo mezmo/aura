@@ -48,6 +48,13 @@
 //! [`LifecycleEvent::Cancelled`] — would collide; the roundtrip test over
 //! every variant is what catches one.
 //!
+//! A reader older than its producer meets variants it does not know. Every
+//! tagged enum here reads any other tag as its `Unknown` variant, so the event
+//! still parses and its `seq` still counts. [`SessionEventPayload`] is the
+//! exception: serde cannot fall back on an adjacent tag that carries content,
+//! and its two kinds are not expected to grow. An `Unknown` cannot be written
+//! back, so a relay forwards the bytes it received, never a re-encoded event.
+//!
 //! Internal tagging and `#[serde(flatten)]` need a self-describing format.
 //! These types round-trip through JSON or MessagePack, not `bincode` or
 //! `postcard`, and a store that persists them inherits that.
@@ -83,11 +90,16 @@ nonempty_string_newtype! {
 /// What an observer's subscription does to the live run's lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ObserverKind {
     /// Reads the stream without a claim on any run.
     Collecting,
     /// Holds the live run's right to continue.
     Claiming,
+    /// Any other value on the wire, read by a version of this crate that does
+    /// not know it. It cannot be written back.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// One observer of a session.
@@ -102,6 +114,7 @@ pub struct Observer {
 /// Why an observer stopped observing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum DetachCause {
     /// The observer let go.
     Released,
@@ -109,6 +122,10 @@ pub enum DetachCause {
     Expired,
     /// Another claimant took over.
     Displaced,
+    /// Any other value on the wire, read by a version of this crate that does
+    /// not know it. It cannot be written back.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// What a run does once nothing claims it.
@@ -122,6 +139,10 @@ pub enum LivenessPolicy {
     Continue,
     /// Checkpoint and end the run resumable.
     Park,
+    /// Any other value on the wire, read by a version of this crate that does
+    /// not know it. It cannot be written back.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// How a run reacts to going unclaimed.
@@ -161,6 +182,10 @@ pub enum RunCancelReason {
     Unclaimed,
     /// The process stopped serving runs.
     Shutdown,
+    /// Any other value on the wire, read by a version of this crate that does
+    /// not know it. It cannot be written back.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// What happened to a session's run, or to the session itself, as distinct
@@ -229,6 +254,11 @@ pub enum LifecycleEvent {
     Failed {
         error: String,
     },
+
+    /// Any other value on the wire, read by a version of this crate that does
+    /// not know it. It cannot be written back.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 impl LifecycleEvent {
@@ -812,5 +842,109 @@ mod tests {
 
         assert!(!from_agent.ends_run());
         assert!(from_owner.ends_run());
+    }
+
+    /// A reader older than its producer keeps the stream: a variant it does
+    /// not know reads as `Unknown`, and the event's `seq` still counts.
+    #[test]
+    fn an_unknown_variant_reads_as_unknown_and_keeps_the_envelope() {
+        let event: SessionEvent = serde_json::from_value(json!({
+            "session_id": "sess_1",
+            "run_id": RUN,
+            "seq": 7,
+            "at": 0,
+            "payload": {
+                "kind": "lifecycle",
+                "event": { "type": "suspended", "until_ms": 5 }
+            }
+        }))
+        .unwrap();
+        assert_eq!(event.seq.get(), 7);
+        assert!(matches!(
+            event.payload,
+            SessionEventPayload::Lifecycle(LifecycleEvent::Unknown)
+        ));
+        assert!(
+            !event.ends_run(),
+            "an unknown event is not known to end its run"
+        );
+
+        let cancelled: LifecycleEvent = serde_json::from_value(json!({
+            "type": "cancelled",
+            "reason": "preempted"
+        }))
+        .unwrap();
+        assert!(matches!(
+            cancelled,
+            LifecycleEvent::Cancelled {
+                reason: RunCancelReason::Unknown,
+                message: None
+            }
+        ));
+
+        let started: LifecycleEvent = serde_json::from_value(json!({
+            "type": "started",
+            "agent": "sre",
+            "prompt": "hi",
+            "liveness": { "policy": "hibernate", "grace_ms": 1 }
+        }))
+        .unwrap();
+        assert!(matches!(
+            started,
+            LifecycleEvent::Started {
+                liveness: Liveness {
+                    policy: LivenessPolicy::Unknown,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let detached: LifecycleEvent = serde_json::from_value(json!({
+            "type": "observer_detached",
+            "observer": { "id": "obs_1", "kind": "mirroring", "presence": false },
+            "because": "preempted"
+        }))
+        .unwrap();
+        assert!(matches!(
+            detached,
+            LifecycleEvent::ObserverDetached {
+                observer: Observer {
+                    kind: ObserverKind::Unknown,
+                    ..
+                },
+                because: DetachCause::Unknown
+            }
+        ));
+    }
+
+    /// An `Unknown` is read, never written: a relay forwards the bytes it
+    /// received rather than re-encoding an event it could not read.
+    #[test]
+    fn an_unknown_variant_cannot_be_serialized() {
+        assert!(serde_json::to_value(LifecycleEvent::Unknown).is_err());
+        assert!(serde_json::to_value(RunCancelReason::Unknown).is_err());
+        assert!(serde_json::to_value(LivenessPolicy::Unknown).is_err());
+        assert!(serde_json::to_value(ObserverKind::Unknown).is_err());
+        assert!(serde_json::to_value(DetachCause::Unknown).is_err());
+
+        let event = envelope(
+            7,
+            Some(run_id()),
+            SessionEventPayload::Lifecycle(LifecycleEvent::Unknown),
+        );
+        assert!(serde_json::to_value(&event).is_err());
+    }
+
+    /// The payload's `kind` is the one tag with no fallback.
+    #[test]
+    fn an_unknown_payload_kind_is_refused() {
+        let parsed = serde_json::from_value::<SessionEvent>(json!({
+            "session_id": "sess_1",
+            "seq": 1,
+            "at": 0,
+            "payload": { "kind": "telemetry", "event": {} }
+        }));
+        assert!(parsed.is_err());
     }
 }
