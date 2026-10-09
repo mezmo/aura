@@ -235,6 +235,16 @@ fn queue_answer(ingress: &Arc<SlackIngress>, inbound: Inbound, earlier: Option<V
         );
         return;
     };
+    // The answer runs inside this span, so its log lines, the agent's
+    // included, carry the run's id and the message it answers.
+    let run_id = aura::RunId::mint();
+    let span = tracing::info_span!(
+        parent: None,
+        "agent.stream",
+        run.id = %run_id,
+        slack.channel = %inbound.channel,
+        slack.ts = %inbound.ts,
+    );
     let ingress = Arc::clone(ingress);
     let tracker = Arc::clone(&ingress.state.active_requests);
     let active = ActiveRequestGuard::new(Arc::clone(&tracker));
@@ -247,12 +257,10 @@ fn queue_answer(ingress: &Arc<SlackIngress>, inbound: Inbound, earlier: Option<V
         };
         drop(waiting);
         if slot.is_ok() {
-            ingress.answer(inbound, earlier).await;
+            ingress.answer(inbound, earlier, run_id).await;
         }
     };
-    tracker.track_task(tokio::spawn(
-        task.instrument(tracing::info_span!(parent: None, "agent.stream")),
-    ));
+    tracker.track_task(tokio::spawn(task.instrument(span)));
 }
 
 impl SlackIngress {
@@ -263,17 +271,15 @@ impl SlackIngress {
     /// participation verdict stands, since the trimmed read may no longer
     /// hold the bot turn that earned it. A conversation read here is
     /// checked here.
-    async fn answer(&self, inbound: Inbound, prefetched: Option<Vec<SlackMessage>>) {
-        // The run's id, and in string form the request id everything
-        // request-keyed reads. The message it answers is logged beside it.
-        let run_id = aura::RunId::mint();
+    async fn answer(
+        &self,
+        inbound: Inbound,
+        prefetched: Option<Vec<SlackMessage>>,
+        run_id: aura::RunId,
+    ) {
+        // In string form, the run's id is the request id everything
+        // request-keyed reads.
         let request_id = run_id.to_string();
-        debug!(
-            request_id,
-            channel = %inbound.channel,
-            ts = %inbound.ts,
-            "slack message starts its run"
-        );
         let earlier = match prefetched {
             Some(earlier) => earlier,
             None => {

@@ -769,9 +769,10 @@ async fn handle_non_streaming_completion(
 
     let (result_tx, result_rx) = oneshot::channel();
 
+    let agent_span = tracing::info_span!(parent: None, "agent.stream", run.id = %config.request_id);
     let handle = tokio::spawn(
         execute_completion(setup, config, DeliveryMode::Collect { result_tx })
-            .instrument(tracing::info_span!(parent: None, "agent.stream")),
+            .instrument(agent_span),
     );
     data.active_requests.track_task(handle);
 
@@ -814,6 +815,7 @@ async fn handle_streaming_completion(
 
     let heartbeat_interval = std::time::Duration::from_secs(15);
 
+    let agent_span = tracing::info_span!(parent: None, "agent.stream", run.id = %config.request_id);
     let handle = tokio::spawn(
         execute_completion(
             setup,
@@ -823,7 +825,7 @@ async fn handle_streaming_completion(
                 heartbeat_interval,
             },
         )
-        .instrument(tracing::info_span!(parent: None, "agent.stream")),
+        .instrument(agent_span),
     );
     data.active_requests.track_task(handle);
 
