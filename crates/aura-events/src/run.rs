@@ -21,8 +21,7 @@
 //! Every event names its session. An event names a run when it belongs to
 //! one; an observer attaching to an idle session belongs to none.
 //!
-//! A run has one id, a [`RunId`] minted once when the run starts. The envelope
-//! never carries a second id for the same run.
+//! A run has one id, a [`RunId`] minted once when the run starts.
 //!
 //! # Sequence numbers are dense
 //!
