@@ -966,7 +966,7 @@ impl Orchestrator {
                 let p = self.persistence.lock().await;
                 (p.run_id().to_string(), p.session_id().map(String::from))
             };
-            let run_id = run_id_str.parse::<super::RunId>().map_err(
+            let run_id = run_id_str.parse::<super::PersistenceRunId>().map_err(
                 |e| -> Box<dyn std::error::Error + Send + Sync> {
                     format!("HITL: orchestration run id '{run_id_str}' is not a valid UUID: {e}")
                         .into()
@@ -1213,7 +1213,7 @@ impl Orchestrator {
             (p.run_id().to_string(), p.session_id().map(String::from))
         };
         run_id
-            .parse::<super::RunId>()
+            .parse::<super::PersistenceRunId>()
             .ok()
             .map(|run_id| crate::hitl::AgentScope::Worker {
                 run_id,

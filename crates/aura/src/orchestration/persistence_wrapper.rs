@@ -1426,7 +1426,7 @@ mod tests {
             AgentScope, ApprovalDecision, DecisionId, DecisionRoute, HitlApprovalWrapper,
             PendingApprovals,
         };
-        use crate::orchestration::{RunId, TaskIdentity};
+        use crate::orchestration::{PersistenceRunId, TaskIdentity};
         use crate::session_store::{
             ApprovalStore, EventBus, InMemoryApprovalStore, InMemoryEventBus,
         };
@@ -1442,7 +1442,7 @@ mod tests {
             timeout: std::time::Duration::from_secs(60),
         });
 
-        let run_id: RunId = "0191e8c0-1111-7000-8000-000000000000".parse().unwrap();
+        let run_id: PersistenceRunId = "0191e8c0-1111-7000-8000-000000000000".parse().unwrap();
         let scope = AgentScope::Worker {
             run_id,
             task: TaskIdentity::new(2, Some("k8s-agent".to_string())),

@@ -18,7 +18,7 @@ use crate::hitl::{
     AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
     ParkedApproval, Timestamp,
 };
-use crate::orchestration::{RunId, TaskIdentity};
+use crate::orchestration::{PersistenceRunId, TaskIdentity};
 
 /// Round-trippable storage form of a [`ParkedApproval`]. Field and tag names
 /// are a persisted contract shared by every instance reading the store — rename
@@ -233,7 +233,7 @@ impl From<OriginRecord> for ApprovalOrigin {
     }
 }
 
-fn parse_run_id(raw: &str) -> Result<RunId, InvalidRecord> {
+fn parse_run_id(raw: &str) -> Result<PersistenceRunId, InvalidRecord> {
     raw.parse().map_err(|e| InvalidRecord {
         reason: format!("run_id '{raw}': {e}"),
     })

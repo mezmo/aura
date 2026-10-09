@@ -296,12 +296,12 @@ fn outcome_to_wire(outcome: &ApprovalOutcome) -> ApprovalOutcomeWire {
 mod tests {
     use super::*;
     use crate::hitl::decision::{AgentScope, CancelReason, DecisionId};
-    use crate::orchestration::{RunId, TaskIdentity};
+    use crate::orchestration::{PersistenceRunId, TaskIdentity};
 
     #[test]
     fn sender_dropped_outcome_serializes_as_sender_dropped() {
         let id = DecisionId::generate();
-        let run_id: RunId = "0191e8c0-1111-7000-8000-000000000000".parse().unwrap();
+        let run_id: PersistenceRunId = "0191e8c0-1111-7000-8000-000000000000".parse().unwrap();
         let scope = AgentScope::Worker {
             run_id,
             task: TaskIdentity::new(0, Some("ops".to_string())),

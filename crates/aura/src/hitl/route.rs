@@ -857,7 +857,7 @@ mod tests {
 
     #[test]
     fn worker_request_wire_shape_flattens_task_and_keeps_session() {
-        let run_id: crate::orchestration::RunId =
+        let run_id: crate::orchestration::PersistenceRunId =
             "0191e8c0-1111-7000-8000-000000000000".parse().unwrap();
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
