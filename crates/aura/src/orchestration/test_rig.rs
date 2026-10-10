@@ -697,6 +697,7 @@ pub(crate) fn worker_definition(
             preamble: preamble.to_string(),
             mcp_filter: Some(vec![]),
             vector_stores: vec![],
+            remotes: Vec::new(),
             turn_depth: None,
             llm: None,
             scratchpad: None,

@@ -419,6 +419,13 @@ impl PreparedAgent {
             config_owned.hitl_request_approval_tool = Some(approval_tool);
         }
 
+        config_owned.remote_agent_tool = config_owned
+            .a2a
+            .as_ref()
+            .filter(|a2a| !a2a.remote.is_empty())
+            .map(|a2a| crate::a2a::RemoteAgentTool::from_config(a2a, Arc::clone(&run)))
+            .transpose()?;
+
         // Scratchpad bonus only applies when scratchpad was actually wired up
         // (enabled + context_window + a matching MCP tool).
         let base_depth = config_owned.agent.turn_depth.unwrap_or(DEFAULT_MAX_DEPTH);
@@ -1204,10 +1211,10 @@ impl PreparedAgent {
                     );
 
                     // Wrap with tool_wrapper if configured
-                    builder_state = Self::add_mcp_tool(
+                    builder_state = Self::add_wrapped_tool(
                         builder_state,
                         tool_adaptor,
-                        mcp_tool.namespace().clone(),
+                        Some(mcp_tool.namespace().clone()),
                         config,
                     );
                 }
@@ -1256,6 +1263,37 @@ impl PreparedAgent {
             }
 
             tracing::info!("All vector stores configured successfully");
+        }
+
+        // Remote agents over A2A, all behind the one `ask_agent` tool. A
+        // single agent's carries every `[a2a.remote]` entry; an orchestration
+        // worker's carries the subset its `remotes` names, or is absent (see
+        // `Orchestrator::create_worker`). `mcp_filter` does not apply: it
+        // governs MCP tools only.
+        if let Some(tool) = &config.remote_agent_tool {
+            // Rig keys tools by name and silently overwrites on a
+            // collision, so an MCP tool named `ask_agent` would shadow
+            // this one (or vice versa) depending on registration order.
+            // Only an MCP tool that passes the effective filter is
+            // registered, so only that one collides.
+            if let Some(mcp_manager) = mcp_manager.as_deref()
+                && mcp_manager.all_tools().iter().any(|tool| {
+                    tool.name().as_str() == crate::a2a::ASK_AGENT_TOOL_NAME
+                        && config.tool_matches_filter(tool)
+                })
+            {
+                return Err(format!(
+                    "an MCP server exposes a tool named {:?}, which collides with the remote-agent tool; filter it out with mcp_filter or drop [a2a.remote]",
+                    crate::a2a::ASK_AGENT_TOOL_NAME
+                )
+                .into());
+            }
+            tracing::info!(
+                "Adding {} tool for remote agent(s): {:?}",
+                crate::a2a::ASK_AGENT_TOOL_NAME,
+                tool.remote_names()
+            );
+            builder_state = Self::add_wrapped_tool(builder_state, tool.clone(), None, config);
         }
 
         if let Some(ref scratchpad) = config.scratchpad_tools_config {
@@ -1361,17 +1399,19 @@ impl PreparedAgent {
         Ok(builder_state)
     }
 
-    /// Helper to add an MCP tool, optionally wrapping with config.tool_wrapper.
+    /// Helper to add an externally-executing tool (MCP or remote agent),
+    /// optionally wrapping with config.tool_wrapper.
     ///
     /// If `config.tool_wrapper` is set, the tool is wrapped and a context is
     /// created using `config.tool_context_factory` (or a default context),
-    /// always stamped with `namespace` so wrapper-layer consumers (HITL
-    /// approval requests, in particular) can attribute the call to its MCP
-    /// server without it ever touching the tool's model-facing name.
-    fn add_mcp_tool<M, T>(
+    /// stamped with `namespace` so wrapper-layer consumers (HITL approval
+    /// requests, in particular) can attribute the call to its MCP server
+    /// without it ever touching the tool's model-facing name. A tool no MCP
+    /// server exposes passes `None` and is left unattributed.
+    fn add_wrapped_tool<M, T>(
         builder_state: BuilderState<M>,
         tool: T,
-        namespace: crate::mcp::ToolNamespace,
+        namespace: Option<crate::mcp::ToolNamespace>,
         config: &AgentRuntimeConfig,
     ) -> BuilderState<M>
     where
@@ -1392,7 +1432,9 @@ impl PreparedAgent {
                             .as_ref()
                             .map(|f| f(&tool_name))
                             .unwrap_or_else(|| ToolCallContext::new(&tool_name));
-                        ctx.tool_namespace = Some(namespace.to_string());
+                        if let Some(namespace) = &namespace {
+                            ctx.tool_namespace = Some(namespace.to_string());
+                        }
                         ctx
                     });
                 builder_state.add_tool(wrapped)
@@ -2514,7 +2556,7 @@ mod tests {
         }
     }
 
-    /// `add_mcp_tool` is the only place a tool's namespace is stamped onto the
+    /// `add_wrapped_tool` is the only place a tool's namespace is stamped onto the
     /// `ToolCallContext` the approval gate reads. The matcher is unit-tested
     /// against a hand-supplied namespace, so only a composed agent shows that
     /// the value the gate matches on is the one the server was keyed by — and
@@ -2610,7 +2652,7 @@ mod tests {
 
         /// Asserting on the raised approval rather than merely on "the call was
         /// gated" is what spans the chain: the namespace in the event is the
-        /// one `add_mcp_tool` stamped, carried through `pre_call`.
+        /// one `add_wrapped_tool` stamped, carried through `pre_call`.
         #[tokio::test]
         async fn a_namespace_scoped_pattern_gates_a_tool_from_that_server() {
             let request_id = "req_ns_gating_match";
