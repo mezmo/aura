@@ -231,7 +231,7 @@ pub struct RequestSetup {
 pub async fn prepare_request(
     data: &AppState,
     req: &mut ChatCompletionRequest,
-    chat_session_id: &str,
+    chat_session_id: &aura::SessionId,
     req_headers_map: &HashMap<String, String>,
 ) -> Result<RequestSetup, PrepareError> {
     // Client-side tools are gated per-agent by `[agent].enable_client_tools`
@@ -298,10 +298,8 @@ pub async fn prepare_request(
     // server-generated session id is echoed back via `X-Chat-Session-Id`, so
     // the client may adopt it on its next request, and an id that is never
     // reused just leaves TTL-bounded orphan records.
-    let skill_log = aura::session_store::SkillLogKey::new(
-        aura::SessionId::new(chat_session_id),
-        config.agent_id(),
-    );
+    let skill_log =
+        aura::session_store::SkillLogKey::new(chat_session_id.clone(), config.agent_id());
     let skill_recorder = (!config.agent.skills.local.is_empty()).then(|| {
         Arc::new(aura::skill_tool::SkillInvocationRecorder::new(
             data.session_store.skills(),
@@ -1341,8 +1339,15 @@ pub async fn resolve_approval(
 /// A blank value counts as none given. Taken as given, every client that sends
 /// one would share a single session, and with it each other's recorded skill
 /// invocations; orchestration persistence would refuse it outright.
-fn chat_session_id(metadata: Option<&HashMap<String, String>>, headers: &HeaderMap) -> String {
-    let given = |value: &str| (!value.trim().is_empty()).then(|| value.to_owned());
+fn chat_session_id(
+    metadata: Option<&HashMap<String, String>>,
+    headers: &HeaderMap,
+) -> aura::SessionId {
+    let given = |value: &str| {
+        (!value.trim().is_empty())
+            .then(|| value.to_owned())
+            .and_then(aura::SessionId::non_empty)
+    };
     let header = |name: &str| {
         headers
             .get(name)
@@ -1358,8 +1363,9 @@ fn chat_session_id(metadata: Option<&HashMap<String, String>>, headers: &HeaderM
 }
 
 /// Generate a chat session ID (simple GUID)
-fn generate_chat_session_id() -> String {
-    format!("cs_{}", Uuid::new_v4().simple())
+fn generate_chat_session_id() -> aura::SessionId {
+    aura::SessionId::new(format!("cs_{}", Uuid::new_v4().simple()))
+        .expect("a generated id carries its prefix, so it is never empty")
 }
 
 /// The HMAC-ON ingress path for `resolve_approval`: buffer the raw bytes
@@ -1526,7 +1532,7 @@ mod tests {
             let first = chat_session_id(Some(&metadata("")), &blank);
             let second = chat_session_id(Some(&metadata("")), &blank);
 
-            assert!(first.starts_with("cs_"), "got: {first}");
+            assert!(first.as_str().starts_with("cs_"), "got: {first}");
             assert_ne!(first, second);
         }
     }
@@ -3141,13 +3147,13 @@ source = '{}'
                 skill_agent(dir.path(), "agent-a", "# Agent A instructions"),
                 skill_agent(dir.path(), "agent-b", "# Agent B instructions"),
             ]);
-            let session = "sess-switch";
+            let session = aura::SessionId::new("sess-switch").unwrap();
             // Agent A loaded `shared` during the session's first turn.
             state
                 .session_store
                 .skills()
                 .record(
-                    &SkillLogKey::new(aura::SessionId::new(session), "agent-a"),
+                    &SkillLogKey::new(session.clone(), "agent-a"),
                     SkillInvocationRecord {
                         version: SKILL_INVOCATION_RECORD_VERSION,
                         invocation: SkillInvocation::LoadSkill {
@@ -3165,7 +3171,7 @@ source = '{}'
             // The client keeps the session id and switches to agent B, which
             // configures a skill of the same name it never loaded.
             let setup =
-                prepare_request(&state, &mut follow_up("agent-b"), session, &HashMap::new())
+                prepare_request(&state, &mut follow_up("agent-b"), &session, &HashMap::new())
                     .await
                     .unwrap();
             assert!(
@@ -3177,7 +3183,7 @@ source = '{}'
 
             // Agent A, back on the same session, still gets its own.
             let setup =
-                prepare_request(&state, &mut follow_up("agent-a"), session, &HashMap::new())
+                prepare_request(&state, &mut follow_up("agent-a"), &session, &HashMap::new())
                     .await
                     .unwrap();
             assert_eq!(setup.rehydrated_skills, ["shared"]);

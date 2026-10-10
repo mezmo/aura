@@ -346,7 +346,7 @@ mod tests {
 
     fn envelope(seq: u64, run: Option<RunId>, payload: SessionEventPayload) -> SessionEvent {
         SessionEvent {
-            session_id: SessionId::new("sess_1"),
+            session_id: SessionId::new("sess_1").unwrap(),
             run_id: run,
             seq: SequenceNumber::try_from(seq).expect("a sequence starts at 1"),
             at: Timestamp::from_unix_millis(1_700_000_000_000),
@@ -785,7 +785,7 @@ mod tests {
     fn ids_serialize_as_bare_strings() {
         assert_eq!(serde_json::to_value(run_id()).unwrap(), json!(RUN));
         assert_eq!(
-            serde_json::to_value(SessionId::new("sess_1")).unwrap(),
+            serde_json::to_value(SessionId::new("sess_1").unwrap()).unwrap(),
             json!("sess_1")
         );
         assert_eq!(
@@ -840,6 +840,36 @@ mod tests {
             serde_json::from_value::<ObserverId>(json!("obs_1")).unwrap(),
             "obs_1"
         );
+    }
+
+    /// A session named by the empty string names nothing, like an observer
+    /// or a checkpoint, so neither the constructor nor deserialization will
+    /// build one, and a stream keyed by it cannot exist.
+    #[test]
+    fn an_empty_session_id_is_refused() {
+        let err = SessionId::new("").unwrap_err();
+        assert_eq!(err.to_string(), "SessionId cannot be empty");
+        assert!(SessionId::try_from(String::new()).is_err());
+        assert!(serde_json::from_value::<SessionId>(json!("")).is_err());
+        assert_eq!(
+            serde_json::from_value::<SessionId>(json!("sess_1")).unwrap(),
+            "sess_1"
+        );
+    }
+
+    #[test]
+    fn a_blank_names_no_session() {
+        assert_eq!(SessionId::non_empty(""), None);
+        assert_eq!(SessionId::non_empty(String::new()), None);
+        assert_eq!(
+            SessionId::non_empty("sess_1"),
+            Some(SessionId::new("sess_1").unwrap())
+        );
+        assert_eq!(
+            Some("sess_1".to_string()).and_then(SessionId::non_empty),
+            Some(SessionId::new("sess_1").unwrap())
+        );
+        assert_eq!(Some(String::new()).and_then(SessionId::non_empty), None);
     }
 
     /// The refusal reaches the envelope: an attach naming an empty observer
