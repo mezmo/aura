@@ -223,11 +223,8 @@ string_newtype! {
 }
 
 /// Identifier for one run: a unit of work within a session, from a prompt to
-/// a terminal state.
-///
-/// This is the epic's "unique agent id for that run". It is not
-/// [`AgentContext::agent_id`], which is [`CONVERSATION_AGENT_ID`] or a worker
-/// name and attributes an event *within* a run.
+/// a terminal state. It is not [`AgentContext::agent_id`], which attributes an
+/// event *within* a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "uuid::Uuid", into = "uuid::Uuid")]
 pub struct RunId(uuid::Uuid);

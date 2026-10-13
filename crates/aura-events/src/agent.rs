@@ -14,6 +14,10 @@
 //!   [`CorrelationContext`](crate::CorrelationContext) (session id, trace id)
 //!   into every payload. That is ambient request state, not something an agent
 //!   knows, so it is applied by the observer rather than carried here.
+//!
+//! A `type` this version does not know reads as
+//! [`AgentEventPayload::Unknown`], which cannot be written back; the session
+//! envelope ([`crate::run`]) states the rule and why.
 
 use serde::{Deserialize, Serialize};
 
@@ -230,8 +234,7 @@ pub enum AgentEventPayload {
         iteration: usize,
     },
 
-    /// Any other value on the wire, read by a version of this crate that does
-    /// not know it. It cannot be written back.
+    /// A value this version of the crate does not know.
     #[serde(other, skip_serializing)]
     Unknown,
 }

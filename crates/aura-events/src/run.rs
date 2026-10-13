@@ -95,8 +95,7 @@ pub enum ObserverKind {
     Collecting,
     /// Holds the live run's right to continue.
     Claiming,
-    /// Any other value on the wire, read by a version of this crate that does
-    /// not know it. It cannot be written back.
+    /// A value this version of the crate does not know.
     #[serde(other, skip_serializing)]
     Unknown,
 }
@@ -121,8 +120,7 @@ pub enum DetachCause {
     Expired,
     /// Another claimant took over.
     Displaced,
-    /// Any other value on the wire, read by a version of this crate that does
-    /// not know it. It cannot be written back.
+    /// A value this version of the crate does not know.
     #[serde(other, skip_serializing)]
     Unknown,
 }
@@ -138,8 +136,7 @@ pub enum LivenessPolicy {
     Continue,
     /// Checkpoint and end the run resumable.
     Park,
-    /// Any other value on the wire, read by a version of this crate that does
-    /// not know it. It cannot be written back.
+    /// A value this version of the crate does not know.
     #[serde(other, skip_serializing)]
     Unknown,
 }
@@ -181,8 +178,7 @@ pub enum RunCancelReason {
     Unclaimed,
     /// The process stopped serving runs.
     Shutdown,
-    /// Any other value on the wire, read by a version of this crate that does
-    /// not know it. It cannot be written back.
+    /// A value this version of the crate does not know.
     #[serde(other, skip_serializing)]
     Unknown,
 }
@@ -266,8 +262,7 @@ pub enum LifecycleEvent {
         usage: TokenUsage,
     },
 
-    /// Any other value on the wire, read by a version of this crate that does
-    /// not know it. It cannot be written back.
+    /// A value this version of the crate does not know.
     #[serde(other, skip_serializing)]
     Unknown,
 }
