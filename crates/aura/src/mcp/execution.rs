@@ -55,8 +55,8 @@ fn record_applied_headers(
 
 /// Record tool call result attributes on the current span.
 ///
-/// On success: result length, status OK, and (when content recording is
-/// enabled) the truncated result body.
+/// On `Ok`: result length, (when content recording is enabled) the truncated
+/// result body, and status OK, or ERROR when the response is a tool error.
 /// On cancellation: error status "cancelled" + `tool.cancelled = true`.
 /// On other errors: error status with truncated message.
 fn record_tool_call_result(span: &tracing::Span, result: &Result<String, anyhow::Error>) {
@@ -69,12 +69,8 @@ fn record_tool_call_result(span: &tracing::Span, result: &Result<String, anyhow:
             );
             // MCP errors arrive as Ok("Tool returned an error: ...") —
             // detect these so the span shows ERROR in Phoenix / Jaeger.
-            let status = crate::tool_error_detection::detect_tool_error(response);
-            if let Some(err) = status.error() {
-                crate::logging::set_span_error(
-                    span,
-                    crate::logging::truncate_for_otel(&err.full_message()),
-                );
+            if crate::tool_error_detection::is_tool_error(response) {
+                crate::logging::set_span_error(span, crate::logging::truncate_for_otel(response));
             } else {
                 crate::logging::set_span_ok(span);
             }

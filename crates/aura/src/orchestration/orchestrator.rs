@@ -378,10 +378,7 @@ async fn forward_internal_tool_completed(
         return;
     };
     let Some(tx) = event_tx else { return };
-    let success = matches!(
-        crate::tool_error_detection::detect_tool_error(result),
-        crate::tool_error_detection::ToolResultStatus::Success
-    );
+    let success = !crate::tool_error_detection::is_tool_error(result);
     let _ = tx
         .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
             &start.worker_id,

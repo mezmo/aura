@@ -24,10 +24,11 @@ use tokio_util::sync::CancellationToken;
 use super::types::{
     CHUNK_OBJECT, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionChunkDelta,
     FINISH_REASON_LENGTH, FINISH_REASON_STOP, FINISH_REASON_TOOL_CALLS, FUNCTION_TYPE,
-    FunctionCallChunk, MessageRole, StreamConfig, ToolCallChunk, ToolResultMode, ToolResultStatus,
-    TurnContext, TurnState, detect_tool_error, format_sse_chunk, truncate_result,
+    FunctionCallChunk, MessageRole, StreamConfig, ToolCallChunk, ToolResultMode, TurnContext,
+    TurnState, format_sse_chunk, truncate_result,
 };
 use aura::stream_events::{AuraStreamEvent, CorrelationContext};
+use aura::tool_error_detection::is_tool_error;
 use aura::{
     EventContext, OrchestrationStreamEvent, PASSTHROUGH_MARKER, ResponseContent, StreamError,
     StreamItem, StreamedAssistantContent, StreamedUserContent, StreamingAgent, ToolCall,
@@ -1101,46 +1102,37 @@ fn handle_tool_result(
             .map(|(name, _)| name.clone())
             .unwrap_or_else(|| "unknown".to_string());
 
-        // Aura's ToolResult has result as a plain String
-        // Try to unescape JSON-quoted strings for error detection
-        let result_text = serde_json::from_str::<String>(&tool_result.result)
-            .unwrap_or_else(|_| tool_result.result.clone());
-
         tracing::debug!(
-            "Tool '{}' result_text (first 200 chars): {}",
+            "Tool '{}' result (first 200 chars): {}",
             tool_name,
-            truncate_result(&result_text, 200)
+            truncate_result(&tool_result.result, 200)
         );
 
-        let status = detect_tool_error(&result_text);
-        let event = match status {
-            ToolResultStatus::Error(ref err) => {
-                tracing::warn!(
-                    "Tool '{}' returned error: {} - {}",
-                    tool_name,
-                    err.error_type(),
-                    err.message()
-                );
-                AuraStreamEvent::tool_complete_failure(
-                    &tool_result.id,
-                    &tool_name,
-                    duration_ms,
-                    err.full_message(),
-                    ctx.agent_context.clone(),
-                    ctx.correlation.clone(),
-                )
-            }
-            ToolResultStatus::Success => {
-                let truncated_result = truncate_result(&result_text, config.tool_result_max_length);
-                AuraStreamEvent::tool_complete_success(
-                    &tool_result.id,
-                    &tool_name,
-                    duration_ms,
-                    &truncated_result,
-                    ctx.agent_context.clone(),
-                    ctx.correlation.clone(),
-                )
-            }
+        let event = if is_tool_error(&tool_result.result) {
+            tracing::warn!(
+                "Tool '{}' returned error: {}",
+                tool_name,
+                tool_result.result
+            );
+            AuraStreamEvent::tool_complete_failure(
+                &tool_result.id,
+                &tool_name,
+                duration_ms,
+                &tool_result.result,
+                ctx.agent_context.clone(),
+                ctx.correlation.clone(),
+            )
+        } else {
+            let truncated_result =
+                truncate_result(&tool_result.result, config.tool_result_max_length);
+            AuraStreamEvent::tool_complete_success(
+                &tool_result.id,
+                &tool_name,
+                duration_ms,
+                &truncated_result,
+                ctx.agent_context.clone(),
+                ctx.correlation.clone(),
+            )
         };
 
         output.push(Bytes::from(event.format_sse()));
@@ -1162,8 +1154,13 @@ fn handle_tool_result(
                 original_index
             );
 
-            // Truncate the result string directly
-            let content_str = truncate_result(&tool_result.result, config.tool_result_max_length);
+            // OpenWebUI appends this to the call's empty arguments and reads
+            // the whole as JSON, so the result goes out as a JSON string.
+            let content_str = serde_json::Value::String(truncate_result(
+                &tool_result.result,
+                config.tool_result_max_length,
+            ))
+            .to_string();
 
             let chunk = ChatCompletionChunk {
                 id: ctx.completion_id.clone(),
@@ -1905,6 +1902,65 @@ mod tests {
                 frame.contains(r#""worker_id":"log-analyst""#),
                 "the {label} frame must name the worker, got: {frame}"
             );
+        }
+    }
+
+    /// The `arguments` of the result delta OpenWebUI mode sends for `result`.
+    fn openwebui_result_arguments(result: &str, max_length: usize) -> String {
+        let config = StreamConfig::new(false, false, ToolResultMode::OpenWebUI, max_length);
+        let ctx = TurnContext {
+            completion_id: "test-123".to_string(),
+            model_str: "gpt-4".to_string(),
+            created_timestamp: 1234567890,
+            max_tokens: None,
+            agent_context: aura::stream_events::AgentContext::single_agent(),
+            correlation: CorrelationContext::new("test-session", None),
+        };
+        let mut state = TurnState::new();
+        state
+            .tool_call_map
+            .insert("call_1".to_string(), ("mock_tool".to_string(), 0));
+        let tool_result = ToolResult {
+            id: "call_1".to_string(),
+            call_id: None,
+            result: result.to_string(),
+        };
+
+        let output: String = handle_tool_result(&config, &ctx, &mut state, &tool_result)
+            .iter()
+            .filter_map(|b| std::str::from_utf8(b).ok())
+            .collect();
+        let data = output
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("a tool_calls chunk");
+        let chunk: serde_json::Value = serde_json::from_str(data).unwrap();
+        chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("string arguments")
+            .to_string()
+    }
+
+    #[test]
+    fn openwebui_result_arguments_are_a_json_string_of_the_result() {
+        let long = "x".repeat(1500);
+        let cases = [
+            ("a short result", "Mock tool executed successfully: hi", 0),
+            (
+                "a result with quotes and newlines",
+                "line \"one\"\nline two",
+                0,
+            ),
+            ("a truncated result", long.as_str(), 1000),
+            ("a tool error", "Toolset error: ToolCallError: boom", 0),
+        ];
+
+        for (label, result, max_length) in cases {
+            let arguments = openwebui_result_arguments(result, max_length);
+            let decoded: String = serde_json::from_str(&arguments).unwrap_or_else(|e| {
+                panic!("{label}: arguments must be a JSON string ({e}): {arguments}")
+            });
+            assert_eq!(decoded, truncate_result(result, max_length), "{label}");
         }
     }
 
@@ -3119,11 +3175,23 @@ mod tests {
             assert_eq!(complete.len(), 1, "expected one aura.tool_complete");
             let json = payload(complete[0]);
             assert_eq!(json["success"], false);
-            assert_eq!(json["error"], "ExecutionError: Connection refused");
+            assert_eq!(json["error"], "Tool execution failed: Connection refused");
             assert!(
                 json.get("result").is_none(),
                 "failed tool_complete must not carry a result"
             );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn tool_complete_reports_a_rig_wrapped_tool_err_as_a_failure() {
+            let error = "Toolset error: ToolCallError: ToolCallError: Connection refused";
+            let events = run_with(|s| tool_turn(s, items::tool_result(TOOL_ID, error))).await;
+
+            let complete = events_by_type(&events, event_names::TOOL_COMPLETE);
+            assert_eq!(complete.len(), 1, "expected one aura.tool_complete");
+            let json = payload(complete[0]);
+            assert_eq!(json["success"], false);
+            assert_eq!(json["error"], error);
         }
 
         #[tokio::test(start_paused = true)]

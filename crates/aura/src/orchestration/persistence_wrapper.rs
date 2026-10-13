@@ -26,9 +26,12 @@ use tokio::sync::{Mutex, Notify};
 
 use super::persistence::{ExecutionPersistence, ToolOutcome, ToolTraceEntry};
 use crate::mcp::CallOutcome;
+use crate::tool_error_detection::is_tool_error;
 use crate::tool_wrapper::{
     ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult, non_blank,
 };
+
+const TRACE_ERROR_MAX_CHARS: usize = 200;
 
 /// The namespaced field name for reasoning (signals framework/internal field).
 const REASONING_FIELD: &str = "_aura_reasoning";
@@ -200,14 +203,15 @@ impl ToolWrapper for PersistenceWrapper {
     /// wrapper that rewrites the output, e.g. `ScratchpadWrapper`), then
     /// appends an artifact footer when size-based promotion qualifies.
     ///
-    /// Suppressed when persistence is disabled (no backing file will exist).
+    /// Suppressed when persistence is disabled (no backing file will exist)
+    /// and for a tool error, which is never promoted.
     /// Duration-based promotion is handled in `on_complete` — those artifacts
     /// are written for observability but lack an inline footer because the
     /// output has already been returned to the LLM by that point.
     async fn transform_output(
         &self,
         output: String,
-        _outcome: &CallOutcome,
+        outcome: &CallOutcome,
         ctx: &ToolCallContext,
         extracted: Option<&Value>,
     ) -> TransformOutputResult {
@@ -220,7 +224,7 @@ impl ToolWrapper for PersistenceWrapper {
         }
 
         // 2. Artifact footer (only if persistence enabled + size qualifies)
-        if !self.persistence_enabled {
+        if !self.persistence_enabled || outcome.is_error() {
             return TransformOutputResult::new(output);
         }
 
@@ -285,6 +289,9 @@ impl ToolWrapper for PersistenceWrapper {
         // Strip any artifact footer appended by transform_output so we write
         // clean output and compute thresholds on the original size.
         let output_clean = strip_artifact_footer(output_text);
+        let error = error
+            .as_deref()
+            .or_else(|| is_tool_error(output_clean).then_some(output_clean));
         let should_promote = match (
             output_clean.len(),
             self.size_threshold,
@@ -300,8 +307,8 @@ impl ToolWrapper for PersistenceWrapper {
         // Single lock acquisition for both artifact write and tool call append
         let persistence_guard = self.persistence.lock().await;
 
-        // Write artifact file if promoted
-        let artifact_filename = if should_promote && result.is_ok() {
+        // Write artifact file if promoted. A tool error is never promoted.
+        let artifact_filename = if should_promote && error.is_none() {
             match persistence_guard
                 .write_tool_output_artifact(
                     task_id,
@@ -330,7 +337,9 @@ impl ToolWrapper for PersistenceWrapper {
         // Record the condensed trace (continuation prompts + run manifest).
         // Full outputs live in promoted artifacts and OTel spans, not here.
         let outcome = match error {
-            Some(message) => ToolOutcome::Error { message },
+            Some(message) => ToolOutcome::Error {
+                message: trace_error_message(message),
+            },
             None => ToolOutcome::Success {
                 output_bytes: output_clean.len() as u64,
             },
@@ -346,6 +355,14 @@ impl ToolWrapper for PersistenceWrapper {
             },
         );
     }
+}
+
+/// A traced error's message: its first line, capped at
+/// [`TRACE_ERROR_MAX_CHARS`]. Traces render one line per call into later
+/// coordinator prompts.
+fn trace_error_message(message: &str) -> String {
+    let first_line = message.lines().next().unwrap_or_default();
+    super::types::truncate_chars(first_line, TRACE_ERROR_MAX_CHARS)
 }
 
 /// Fetch a top-level string field from the `extracted` value. Handles both
@@ -1333,6 +1350,130 @@ mod tests {
             traces[0].outcome,
             ToolOutcome::Success { output_bytes: 50 }
         ));
+    }
+
+    #[tokio::test]
+    async fn an_mcp_error_result_is_never_promoted() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let persistence = Arc::new(Mutex::new(
+            ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+                .await
+                .unwrap(),
+        ));
+        let wrapper = enabled_wrapper(persistence.clone(), Some("sre".to_string()), 0, 0).await;
+        let ctx = ToolCallContext::new("list_pods").with_task_context(0, "sre".to_string(), 1);
+        let extracted = wrapper
+            .transform_args(serde_json::json!({}), &ctx)
+            .extracted
+            .unwrap();
+        let error = "Tool returned an error: 401 Unauthorized";
+
+        let output = wrapper
+            .transform_output(
+                error.to_string(),
+                &CallOutcome::classify_from_output(error),
+                &ctx,
+                Some(&extracted),
+            )
+            .await
+            .output;
+        assert_eq!(output, error, "an error gets no artifact footer");
+
+        wrapper
+            .on_complete(&ctx, Some(&extracted), Ok(&output), 100)
+            .await;
+
+        let p = persistence.lock().await;
+        let traces = p.tool_traces_for_task(0);
+        assert_eq!(traces.len(), 1);
+        assert!(matches!(traces[0].outcome, ToolOutcome::Error { .. }));
+        assert!(
+            traces[0].artifact_filename.is_none(),
+            "no artifact is written"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_traced_error_is_one_bounded_line() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let persistence = Arc::new(Mutex::new(
+            ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+                .await
+                .unwrap(),
+        ));
+        let wrapper =
+            enabled_wrapper(persistence.clone(), Some("sre".to_string()), 500, 5000).await;
+        let ctx = ToolCallContext::new("list_pods").with_task_context(0, "sre".to_string(), 1);
+        let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
+        let body = format!("401 Unauthorized {}\n<html>\n</html>", "x".repeat(6000));
+
+        wrapper
+            .on_complete(
+                &ctx,
+                Some(&extracted),
+                Ok(&format!("Tool returned an error: {body}")),
+                100,
+            )
+            .await;
+        wrapper
+            .on_complete(
+                &ctx,
+                Some(&extracted),
+                Err(&format!("ToolCallError: {body}")),
+                100,
+            )
+            .await;
+
+        let p = persistence.lock().await;
+        let traces = p.tool_traces_for_task(0);
+        assert_eq!(traces.len(), 2);
+        for trace in traces {
+            let ToolOutcome::Error { message } = &trace.outcome else {
+                panic!("expected an error trace, got {:?}", trace.outcome);
+            };
+            assert!(!message.contains('\n'), "{message}");
+            assert!(
+                message.chars().count() <= TRACE_ERROR_MAX_CHARS + 1,
+                "{message}"
+            );
+            assert!(message.contains("401 Unauthorized"), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_mcp_error_result_is_traced_as_an_error() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let persistence = Arc::new(Mutex::new(
+            ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+                .await
+                .unwrap(),
+        ));
+        let wrapper =
+            enabled_wrapper(persistence.clone(), Some("sre".to_string()), 500, 5000).await;
+
+        let ctx = ToolCallContext::new("list_pods").with_task_context(0, "sre".to_string(), 1);
+        let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
+
+        wrapper
+            .on_complete(
+                &ctx,
+                Some(&extracted),
+                Ok("Tool returned an error: 401 Unauthorized"),
+                100,
+            )
+            .await;
+
+        let p = persistence.lock().await;
+        let traces = p.tool_traces_for_task(0);
+        assert_eq!(traces.len(), 1);
+        assert!(
+            matches!(
+                &traces[0].outcome,
+                ToolOutcome::Error { message } if message == "Tool returned an error: 401 Unauthorized"
+            ),
+            "{:?}",
+            traces[0].outcome
+        );
     }
 
     // --------------------------------------------------------------------

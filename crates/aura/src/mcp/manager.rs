@@ -1054,8 +1054,8 @@ impl McpManager {
         filter: Option<&[GlobPattern]>,
     ) -> Result<String, String> {
         // Parse arguments as JSON
-        let args: Value = serde_json::from_str(arguments)
-            .map_err(|e| format!("Failed to parse arguments: {}", e))?;
+        let args: Value =
+            serde_json::from_str(arguments).map_err(|e| format!("Invalid tool arguments: {e}"))?;
 
         let args_map = match args {
             Value::Object(map) => map.into_iter().collect::<HashMap<String, Value>>(),
@@ -1072,7 +1072,7 @@ impl McpManager {
             })
             .remove(tool_name)
         else {
-            return Err(format!("Tool '{}' not found", tool_name));
+            return Err(format!("Tool not found: {tool_name}"));
         };
 
         info!(
