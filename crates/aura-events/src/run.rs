@@ -172,8 +172,6 @@ pub enum RunCancelReason {
     },
     /// Something outside the run cancelled it.
     External,
-    /// The model called a tool the caller executes.
-    ClientTool,
     /// Nothing claimed the run, and its liveness policy ended it.
     Unclaimed,
     /// The process stopped serving runs.
@@ -514,11 +512,6 @@ mod tests {
             LifecycleEvent::Cancelled {
                 reason: RunCancelReason::External,
                 message: Some("operator stopped it".to_string()),
-                usage: usage(),
-            },
-            LifecycleEvent::Cancelled {
-                reason: RunCancelReason::ClientTool,
-                message: None,
                 usage: usage(),
             },
             LifecycleEvent::Cancelled {

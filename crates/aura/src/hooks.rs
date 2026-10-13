@@ -11,6 +11,30 @@ use async_trait::async_trait;
 
 pub use aura_events::run::RunCancelReason;
 
+/// Why a hook ends a run before its next turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// The run outlived the bound it was started with.
+    Deadline { after: std::time::Duration },
+    /// Something outside the run cancelled it.
+    External,
+    /// The model called a tool the caller executes.
+    ClientTool,
+}
+
+impl StopReason {
+    /// The cancel reason this stop puts on the wire. A client-tool stop puts
+    /// none: that run ends as a finish, with `finish_reason: "tool_calls"`,
+    /// not as a cancel.
+    pub fn cancel_reason(self) -> Option<RunCancelReason> {
+        match self {
+            Self::Deadline { after } => Some(RunCancelReason::Deadline { after }),
+            Self::External => Some(RunCancelReason::External),
+            Self::ClientTool => None,
+        }
+    }
+}
+
 pub struct ToolCall<'a> {
     pub name: &'a str,
 }
@@ -24,14 +48,14 @@ pub struct ToolCall<'a> {
 pub trait AgentHook: Send + Sync {
     /// `false` ends the run rather than taking another LLM turn.
     /// `Some` ends the run before the next turn, carrying why.
-    async fn before_turn(&self) -> Option<RunCancelReason> {
+    async fn before_turn(&self) -> Option<StopReason> {
         None
     }
 
     async fn on_tool_call(&self, _tool_name: &str) {}
 
     /// Ends the run at the next point the agent checks.
-    fn should_cancel(&self) -> Option<RunCancelReason> {
+    fn should_cancel(&self) -> Option<StopReason> {
         None
     }
 }
@@ -55,7 +79,7 @@ impl Hooks {
 impl AgentHook for Hooks {
     /// One hook declining ends the run; the rest are still asked, so none
     /// silently skips the turn it was told about.
-    async fn before_turn(&self) -> Option<RunCancelReason> {
+    async fn before_turn(&self) -> Option<StopReason> {
         let mut stop = None;
         for hook in &self.0 {
             stop = hook.before_turn().await.or(stop);
@@ -69,7 +93,7 @@ impl AgentHook for Hooks {
         }
     }
 
-    fn should_cancel(&self) -> Option<RunCancelReason> {
+    fn should_cancel(&self) -> Option<StopReason> {
         self.0.iter().find_map(|hook| hook.should_cancel())
     }
 }
@@ -96,13 +120,13 @@ impl Deadline {
 
 #[async_trait]
 impl AgentHook for Deadline {
-    fn should_cancel(&self) -> Option<RunCancelReason> {
+    fn should_cancel(&self) -> Option<StopReason> {
         if self.cancelled.is_cancelled() {
-            Some(RunCancelReason::External)
+            Some(StopReason::External)
         } else {
             self.timeout
                 .filter(|timeout| self.start.elapsed() > *timeout)
-                .map(|after| RunCancelReason::Deadline { after })
+                .map(|after| StopReason::Deadline { after })
         }
     }
 }
@@ -129,8 +153,8 @@ impl ClientTools {
 
 #[async_trait]
 impl AgentHook for ClientTools {
-    async fn before_turn(&self) -> Option<RunCancelReason> {
-        self.was_called().then_some(RunCancelReason::ClientTool)
+    async fn before_turn(&self) -> Option<StopReason> {
+        self.was_called().then_some(StopReason::ClientTool)
     }
 
     async fn on_tool_call(&self, tool_name: &str) {
@@ -159,13 +183,13 @@ mod tests {
 
     #[async_trait]
     impl AgentHook for Counting {
-        async fn before_turn(&self) -> Option<RunCancelReason> {
+        async fn before_turn(&self) -> Option<StopReason> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            (!self.proceed).then_some(RunCancelReason::External)
+            (!self.proceed).then_some(StopReason::External)
         }
 
-        fn should_cancel(&self) -> Option<RunCancelReason> {
-            self.cancel.then_some(RunCancelReason::External)
+        fn should_cancel(&self) -> Option<StopReason> {
+            self.cancel.then_some(StopReason::External)
         }
     }
 
@@ -231,7 +255,7 @@ mod tests {
         assert!(tools.was_called());
         assert_eq!(
             tools.before_turn().await,
-            Some(RunCancelReason::ClientTool),
+            Some(StopReason::ClientTool),
             "the caller must run the tool, and the reason says so"
         );
     }
@@ -254,5 +278,21 @@ mod tests {
 
         token.cancel();
         assert!(deadline.should_cancel().is_some());
+    }
+
+    /// A deadline or an external cancel is a cancel on the wire; a client-tool
+    /// stop is not, since that run finished with its tool calls.
+    #[test]
+    fn a_client_tool_stop_is_not_a_cancel_on_the_wire() {
+        let after = std::time::Duration::from_secs(30);
+        assert_eq!(
+            StopReason::Deadline { after }.cancel_reason(),
+            Some(RunCancelReason::Deadline { after })
+        );
+        assert_eq!(
+            StopReason::External.cancel_reason(),
+            Some(RunCancelReason::External)
+        );
+        assert_eq!(StopReason::ClientTool.cancel_reason(), None);
     }
 }

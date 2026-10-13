@@ -38,7 +38,7 @@
 //! let (prompt, completion, total) = usage_state.get_final_usage();
 //! ```
 
-use crate::hooks::{AgentHook, ClientTools, Deadline, Hooks, RunCancelReason};
+use crate::hooks::{AgentHook, ClientTools, Deadline, Hooks, StopReason};
 use aura_events::agent::{AgentEvent, AgentEventPayload};
 use rig::agent::{CancelSignal, StreamingPromptHook};
 use rig::completion::{CompletionModel, GetTokenUsage, Message};
@@ -430,7 +430,7 @@ impl StreamingRequestHook {
         self
     }
 
-    fn should_cancel(&self) -> Option<RunCancelReason> {
+    fn should_cancel(&self) -> Option<StopReason> {
         AgentHook::should_cancel(&self.hooks)
     }
 
@@ -463,20 +463,19 @@ impl StreamingRequestHook {
         };
         // A blown deadline is an operator's problem; the rest are routine.
         match reason {
-            RunCancelReason::Deadline { after } => tracing::warn!(
+            StopReason::Deadline { after } => tracing::warn!(
                 "Request timeout ({:?}) exceeded during {} - cancelling",
                 after,
                 context
             ),
-            RunCancelReason::External => {
+            StopReason::External => {
                 tracing::info!("Request cancelled externally during {}", context)
             }
             // Raised by `before_turn`, which logs it and ends the run itself, so
             // reaching the cancel path means a hook also reports it here.
-            RunCancelReason::ClientTool => {
+            StopReason::ClientTool => {
                 tracing::info!("Run yielding to a client tool during {}", context)
             }
-            other => tracing::info!("Run cancelled ({:?}) during {}", other, context),
         }
         cancel_sig.cancel();
     }
@@ -835,8 +834,8 @@ mod tests {
 
         #[async_trait::async_trait]
         impl AgentHook for AlwaysCancel {
-            fn should_cancel(&self) -> Option<RunCancelReason> {
-                Some(RunCancelReason::External)
+            fn should_cancel(&self) -> Option<StopReason> {
+                Some(StopReason::External)
             }
         }
 
