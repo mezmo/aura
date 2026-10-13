@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use aura::streaming::AgentRun;
 use aura::{Message, StreamError, StreamItem, StreamingAgent, UsageState};
-use aura::{StreamedAssistantContent, StreamedUserContent, ToolCall, ToolResult};
+use aura::{StreamedAssistantContent, StreamedUserContent, ToolCall, ToolResult, ToolResultKind};
 use futures::stream::{self, BoxStream, StreamExt};
 
 type StartHook = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
@@ -66,11 +66,24 @@ pub mod items {
     }
 
     pub fn tool_result(id: &str, result: &str) -> Result<StreamItem, StreamError> {
+        tool_result_of(id, result, ToolResultKind::Text)
+    }
+
+    pub fn tool_error(id: &str, error: &str) -> Result<StreamItem, StreamError> {
+        tool_result_of(id, error, ToolResultKind::Error)
+    }
+
+    fn tool_result_of(
+        id: &str,
+        result: &str,
+        kind: ToolResultKind,
+    ) -> Result<StreamItem, StreamError> {
         Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(
             ToolResult {
                 id: id.to_string(),
                 call_id: None,
                 result: result.to_string(),
+                kind,
             },
         )))
     }

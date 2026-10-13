@@ -11,6 +11,7 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent};
+use crate::tool_error_detection::{is_reported_error, tool_error_message};
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper, TransformArgsResult};
 use rig::tool::ToolError;
 
@@ -111,14 +112,15 @@ impl ToolWrapper for ObserverWrapper {
 
         // Emit CallCompleted event (full output — truncation happens at SSE handler layer)
         let event = match result {
-            Ok(output) => ToolEvent::call_completed_success(
+            Ok(output) if !is_reported_error(output) => ToolEvent::call_completed_success(
                 tool_call_id,
                 &ctx.tool_name,
                 &ctx.tool_initiator_id,
                 output,
                 duration_ms,
             ),
-            Err(err) => {
+            Ok(err) | Err(err) => {
+                let err = tool_error_message(err);
                 let retry_hint = RetryHint::from_error_message(err);
                 ToolEvent::call_completed_error(
                     tool_call_id,
@@ -265,7 +267,7 @@ mod tests {
             .on_complete(
                 &ctx,
                 result.extracted.as_ref(),
-                Err("rate limit exceeded"),
+                Err("ToolCallError: ToolCallError: rate limit exceeded"),
                 50,
             )
             .await;
@@ -275,6 +277,36 @@ mod tests {
             ToolEvent::CallCompleted { result, .. } => {
                 assert!(!result.is_success());
                 assert_eq!(result.error_message(), Some("rate limit exceeded"));
+            }
+            _ => panic!("Expected CallCompleted event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_error_results_complete_as_failures() {
+        let (observer, mut rx) = ToolCallObserver::new(8);
+        let wrapper = ObserverWrapper::new(observer, 0);
+
+        let ctx = ToolCallContext::new("mcp_tool");
+        let result = wrapper.transform_args(serde_json::json!({}), &ctx);
+        let _ = rx.recv().await.unwrap();
+
+        wrapper
+            .on_complete(
+                &ctx,
+                result.extracted.as_ref(),
+                Ok("Tool returned an error: 401 Unauthorized"),
+                50,
+            )
+            .await;
+
+        match rx.recv().await.unwrap() {
+            ToolEvent::CallCompleted { result, .. } => {
+                assert!(!result.is_success());
+                assert_eq!(
+                    result.error_message(),
+                    Some("Tool returned an error: 401 Unauthorized")
+                );
             }
             _ => panic!("Expected CallCompleted event"),
         }
