@@ -245,8 +245,8 @@ pub async fn prepare_request(
 
     // The run's id, minted before the agent build (single-agent or
     // orchestration) so the build and the completion stream share one value.
-    // Its string form is the request id every request-keyed registry reads:
-    // the HITL gate's approvals, their sweep, and MCP cancellation.
+    // Its string form is the request id; `RunContext::has_id` says how it is
+    // spelled.
     let run_id = aura::RunId::mint();
     let request_id = run_id.to_string();
 

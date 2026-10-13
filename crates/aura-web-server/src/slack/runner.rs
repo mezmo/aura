@@ -277,8 +277,8 @@ impl SlackIngress {
         prefetched: Option<Vec<SlackMessage>>,
         run_id: aura::RunId,
     ) {
-        // In string form, the run's id is the request id everything
-        // request-keyed reads.
+        // Its string form is the request id; `RunContext::has_id` says how it
+        // is spelled.
         let request_id = run_id.to_string();
         let earlier = match prefetched {
             Some(earlier) => earlier,

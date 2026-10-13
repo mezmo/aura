@@ -280,8 +280,8 @@ impl AgentExecutor for AuraAgentExecutor {
                 metadata: None,
             }));
 
-            // In string form, the run's id is the request id everything
-            // request-keyed reads: MCP cancellation, approvals, the cancel map.
+            // Its string form is the request id; `RunContext::has_id` says how
+            // it is spelled.
             let request_id = run_id.to_string();
 
             // Registered before the agent build and history fetch, both of which
