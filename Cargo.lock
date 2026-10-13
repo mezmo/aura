@@ -397,6 +397,7 @@ dependencies = [
  "http-body-util",
  "loom",
  "opentelemetry",
+ "pin-project-lite",
  "redis",
  "reqwest",
  "rig-core",

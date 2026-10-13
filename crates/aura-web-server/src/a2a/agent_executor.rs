@@ -17,9 +17,11 @@ use a2a::{
 use a2a_server::{AgentExecutor, ExecutorContext, TaskStore};
 use aura::RigBuilder;
 use aura::{StreamItem, StreamedAssistantContent, StreamingAgent};
-use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
+use futures_util::{Stream, StreamExt};
 use serde_json::Value;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, event};
 
@@ -244,17 +246,20 @@ impl AgentExecutor for AuraAgentExecutor {
         let mut append_tracker: HashMap<(String, String, String), bool> = HashMap::new();
 
         // The run is polled inside this span, so its log lines, the agent's
-        // included, carry the run's id and the task it executes.
+        // included, carry the run's id and the task it executes. It is the
+        // task's span, not an `agent.stream`: the exporter reads that name as
+        // an LLM span, and nothing records a model, input, or output here.
         let run_id = aura::RunId::mint();
         let span = tracing::info_span!(
             parent: None,
-            "agent.stream",
+            "a2a.task",
             run.id = %run_id,
             a2a.task_id = %ctx.task_id,
             a2a.context_id = %ctx.context_id,
         );
 
         let execution = async_stream::stream! {
+            event!(Level::DEBUG, "a2a task starts its run");
             let task_id = ctx.task_id.clone();
             let context_id = ctx.context_id.clone();
 
@@ -572,7 +577,7 @@ impl AgentExecutor for AuraAgentExecutor {
                 }));
             }
         };
-        in_span(span, Box::pin(execution))
+        in_span(span, execution)
     }
 
     fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
@@ -635,16 +640,31 @@ fn extract_text(parts: Vec<Part>) -> Result<String, A2AError> {
     Ok(strings.join("\n"))
 }
 
-/// `stream`, polled inside `span`, so its log lines carry the span's fields.
-fn in_span<T: 'static>(
+pin_project_lite::pin_project! {
+    /// A stream polled inside a span, so its log lines carry the span's
+    /// fields.
+    struct InSpan<S> {
+        span: tracing::Span,
+        #[pin]
+        stream: S,
+    }
+}
+
+impl<S: Stream> Stream for InSpan<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<S::Item>> {
+        let this = self.project();
+        let _entered = this.span.enter();
+        this.stream.poll_next(cx)
+    }
+}
+
+fn in_span<S: Stream + Send + 'static>(
     span: tracing::Span,
-    mut stream: BoxStream<'static, T>,
-) -> BoxStream<'static, T> {
-    futures_util::stream::poll_fn(move |cx| {
-        let _entered = span.enter();
-        stream.poll_next_unpin(cx)
-    })
-    .boxed()
+    stream: S,
+) -> BoxStream<'static, S::Item> {
+    Box::pin(InSpan { span, stream })
 }
 
 pub(super) fn fail_status(task_id: &str, context_id: &str, error_msg: &str) -> StreamResponse {
@@ -1072,35 +1092,47 @@ mod tests {
         assert!(claim_agent(&state, &task_id, &agent) == CancelRaced::Yes);
     }
 
-    /// A line the run logs carries its span's fields, which is what ties a
-    /// run's id to the task it executes.
+    /// A line the run logs, from its first, names the task and the run on
+    /// its span, so an operator can tie the run's id back to the task.
     #[tokio::test]
-    async fn a_line_logged_inside_the_span_carries_its_fields() {
+    async fn a_run_logs_inside_the_span_that_names_its_task() {
         let written = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let writer = {
             let written = Arc::clone(&written);
             move || SharedWriter(Arc::clone(&written))
         };
         let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
             .with_writer(writer)
             .with_ansi(false)
             .finish();
         let _default = tracing::subscriber::set_default(subscriber);
 
-        let span = tracing::info_span!("agent.stream", a2a.task_id = %"t_1");
-        let run = futures_util::stream::once(async {
-            tracing::warn!("inside the run");
-            1
-        })
-        .boxed();
-        assert_eq!(in_span(span, run).collect::<Vec<_>>().await, vec![1]);
+        let executor = make_executor(vec![make_config("agent", None)], None);
+        let ctx = ExecutorContext {
+            message: None,
+            task_id: "t_1".to_string(),
+            stored_task: None,
+            context_id: "ctx_1".to_string(),
+            metadata: None,
+            user: None,
+            service_params: HashMap::new(),
+            tenant: None,
+        };
+        let mut run = executor.execute(ctx);
+        while let Some(item) = run.next().await {
+            drop(item);
+        }
 
         let written = String::from_utf8(written.lock().unwrap().clone()).unwrap();
         let line = written
             .lines()
-            .find(|line| line.contains("inside the run"))
-            .expect("the line is written");
-        assert!(line.contains("agent.stream{a2a.task_id=t_1}"), "{line}");
+            .find(|line| line.contains("a2a task starts its run"))
+            .expect("the start line is written");
+        assert!(line.contains("a2a.task{"), "{line}");
+        assert!(line.contains("a2a.task_id=t_1"), "{line}");
+        assert!(line.contains("a2a.context_id=ctx_1"), "{line}");
+        assert!(line.contains("run.id="), "{line}");
     }
 
     struct SharedWriter(Arc<std::sync::Mutex<Vec<u8>>>);
