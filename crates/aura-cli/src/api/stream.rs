@@ -254,15 +254,14 @@ where
                     {
                         let elapsed = Duration::from_millis(duration_ms);
                         tool_timers.remove(&tool_id);
-                        handler.on_tool_complete(&tool_id, &tool_name, elapsed, result.as_deref());
 
-                        // Cache server-side result by tool_call_id for hybrid mode.
-                        // For failures, cache the error message so the model sees the
-                        // real failure instead of a bogus "executed successfully" fallback.
-                        if let Some(res) = result {
-                            server_results.insert(tool_id, res);
-                        } else if let Some(err) = error {
-                            server_results.insert(tool_id, format!("Error: {err}"));
+                        // A failure is shown, and cached for hybrid mode, as
+                        // "Error: ..." so neither the user nor the model takes
+                        // it for output or falls back to "executed successfully".
+                        let text = result.or_else(|| error.map(|err| format!("Error: {err}")));
+                        handler.on_tool_complete(&tool_id, &tool_name, elapsed, text.as_deref());
+                        if let Some(text) = text {
+                            server_results.insert(tool_id, text);
                         }
                     }
                 }
@@ -827,7 +826,12 @@ mod tests {
             ),
             sse("", "[DONE]"),
         ];
-        let (result, _) = run_stream(events).await;
+        let (result, caps) = run_stream(events).await;
+        assert_eq!(
+            caps.tools_completed[0].2.as_deref(),
+            Some("Error: command not found"),
+            "the handler is shown the error"
+        );
         match result.unwrap() {
             StreamResult::ToolCalls { server_results, .. } => {
                 assert_eq!(

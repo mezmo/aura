@@ -11,7 +11,7 @@ use base64::Engine;
 use rmcp::model::CallToolResult;
 use tracing::{debug, info, warn};
 
-const MCP_ERROR_PREFIX: &str = "Tool returned an error: ";
+pub(crate) const MCP_ERROR_PREFIX: &str = "Tool returned an error: ";
 
 /// JSON-RPC 2.0 error codes that indicate input/schema validation failures.
 const SCHEMA_ERROR_CODES: [i32; 3] = [
