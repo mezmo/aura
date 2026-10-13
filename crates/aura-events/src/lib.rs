@@ -72,38 +72,17 @@ pub fn format_named_sse(event_name: &str, data: &impl Serialize) -> String {
 // and the wire schema below. Opaque newtypes reached through canonical
 // conversion traits; each serializes as its inner value.
 
-/// Generates the shared surface of a string newtype: construction, borrowing,
-/// display, and comparison against the string types.
-macro_rules! string_newtype {
-    ($(#[$meta:meta])* $name:ident) => {
-        $(#[$meta])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-        #[serde(transparent)]
-        pub struct $name(String);
-
+/// Generates the surface every string newtype shares: borrowing, display, and
+/// comparison against the string types.
+macro_rules! string_newtype_surface {
+    ($name:ident) => {
         impl $name {
-            pub fn new(value: impl Into<String>) -> Self {
-                Self(value.into())
-            }
-
             pub fn as_str(&self) -> &str {
                 &self.0
             }
 
             pub fn into_string(self) -> String {
                 self.0
-            }
-        }
-
-        impl From<String> for $name {
-            fn from(value: String) -> Self {
-                Self(value)
-            }
-        }
-
-        impl From<&str> for $name {
-            fn from(value: &str) -> Self {
-                Self(value.to_owned())
             }
         }
 
@@ -139,6 +118,37 @@ macro_rules! string_newtype {
     };
 }
 
+/// Generates the shared surface of a string newtype: construction, borrowing,
+/// display, and comparison against the string types.
+macro_rules! string_newtype {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Self {
+                Self(value.into())
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(value: String) -> Self {
+                Self(value)
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(value: &str) -> Self {
+                Self(value.to_owned())
+            }
+        }
+
+        $crate::string_newtype_surface!($name);
+    };
+}
+
 /// Generates a string newtype that cannot hold a blank string: a fallible
 /// constructor, `TryFrom` the string types, and deserialization that refuse
 /// `""` and whitespace alike.
@@ -159,14 +169,6 @@ macro_rules! nonempty_string_newtype {
                 } else {
                     Ok(Self(value))
                 }
-            }
-
-            pub fn as_str(&self) -> &str {
-                &self.0
-            }
-
-            pub fn into_string(self) -> String {
-                self.0
             }
         }
 
@@ -192,36 +194,14 @@ macro_rules! nonempty_string_newtype {
             }
         }
 
-        impl std::fmt::Display for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(&self.0)
-            }
-        }
-
-        impl AsRef<str> for $name {
-            fn as_ref(&self) -> &str {
-                &self.0
-            }
-        }
-
-        impl PartialEq<str> for $name {
-            fn eq(&self, other: &str) -> bool {
-                self.0 == other
-            }
-        }
-
-        impl PartialEq<&str> for $name {
-            fn eq(&self, other: &&str) -> bool {
-                self.0 == *other
-            }
-        }
+        $crate::string_newtype_surface!($name);
     };
 }
 
-// Path-based so submodules can invoke it regardless of declaration order.
-pub(crate) use nonempty_string_newtype;
+// Path-based so submodules can invoke them regardless of declaration order.
+pub(crate) use {nonempty_string_newtype, string_newtype_surface};
 
-/// An identifier given as the empty string.
+/// An identifier given as a blank string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmptyId {
     /// The identifier's type name.
@@ -446,7 +426,7 @@ impl Timestamp {
         let since_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        Self(u64::try_from(since_epoch.as_millis()).unwrap_or(u64::MAX))
+        Self(duration_ms::whole_millis(since_epoch))
     }
 }
 
@@ -1735,6 +1715,20 @@ mod tests {
             now > at,
             "now ({now}) should be after November 2023 ({at}) on any sane clock"
         );
+    }
+
+    /// Both string newtype macros share one surface, so a non-empty id
+    /// compares against every string type a plain one does.
+    #[test]
+    fn a_nonempty_id_has_the_same_surface_as_a_plain_one() {
+        let plain = SessionId::new("s");
+        let nonempty = run::ObserverId::new("s").unwrap();
+        assert_eq!(plain, "s");
+        assert_eq!(nonempty, "s");
+        assert_eq!(plain, String::from("s"));
+        assert_eq!(nonempty, String::from("s"));
+        assert_eq!(nonempty.as_str(), plain.as_str());
+        assert_eq!(nonempty.to_string(), plain.into_string());
     }
 }
 

@@ -7,10 +7,13 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// `duration` as whole milliseconds, saturating at `u64::MAX`.
+pub fn whole_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 pub fn serialize<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
-    u64::try_from(duration.as_millis())
-        .unwrap_or(u64::MAX)
-        .serialize(serializer)
+    whole_millis(*duration).serialize(serializer)
 }
 
 pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
@@ -26,9 +29,7 @@ pub mod option {
         duration: &Option<Duration>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        duration
-            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-            .serialize(serializer)
+        duration.map(super::whole_millis).serialize(serializer)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(
