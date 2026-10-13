@@ -249,6 +249,23 @@ where
         let level = *event.metadata().level();
         write!(&mut buf, "{level:5} ")?;
 
+        // The spans the event is in, root first, each with its fields, so a
+        // line reads as the run and request it belongs to.
+        if let Some(scope) = ctx.event_scope() {
+            for span in scope.from_root() {
+                write!(&mut buf, "{}", span.name())?;
+                let extensions = span.extensions();
+                if let Some(fields) = extensions
+                    .get::<tracing_subscriber::fmt::FormattedFields<N>>()
+                    .filter(|fields| !fields.is_empty())
+                {
+                    write!(&mut buf, "{{{fields}}}")?;
+                }
+                buf.push(':');
+            }
+            buf.push(' ');
+        }
+
         // Add target
         write!(&mut buf, "{}: ", event.metadata().target())?;
 
@@ -505,7 +522,10 @@ pub fn init_logging(debug: bool, verbose: bool, binary_name: &str) {
         // Create a custom formatting layer that truncates very long lines (e.g., API payloads)
         // Block execute_tool spans (and their events) from rig to avoid duplication
         // Our aura::mcp::dynamic logs provide better tool execution visibility with truncation
+        // Plain text throughout: the formatter writes no colour, so the
+        // span fields it prints must carry none either.
         let fmt_layer = fmt::layer()
+            .with_ansi(false)
             .event_format(TruncatingFormatter { max_length: 500 })
             .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
                 // Block execute_tool spans from rig::agent::prompt_request to prevent duplicate logs
@@ -950,6 +970,34 @@ mod tests {
                 shown.len()
             );
         }
+    }
+
+    /// A verbose console line names the spans it was logged in, with their
+    /// fields, so a run's lines read as the request they belong to.
+    #[test]
+    fn truncating_formatter_prints_the_spans_an_event_is_in() {
+        use std::sync::Arc;
+
+        let buf = Arc::new(CapturedLog(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .event_format(TruncatingFormatter { max_length: 500 })
+            .with_writer(buf.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let outer = tracing::info_span!("agent.stream", run.id = %"run_1");
+            let _outer = outer.enter();
+            let inner = tracing::info_span!("agent.turn");
+            let _inner = inner.enter();
+            tracing::info!(target: "aura::logging", "inside the run");
+        });
+
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("agent.stream{run.id=run_1}:agent.turn: aura::logging: inside the run"),
+            "got: {log}"
+        );
     }
 
     /// A prompt longer than `OTEL_CONTENT_MAX_LENGTH` must still serialize to
