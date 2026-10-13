@@ -139,9 +139,9 @@ macro_rules! string_newtype {
     };
 }
 
-/// Generates a string newtype that cannot hold the empty string: a fallible
-/// constructor, `TryFrom` the string types, and deserialization that refuses
-/// `""`.
+/// Generates a string newtype that cannot hold a blank string: a fallible
+/// constructor, `TryFrom` the string types, and deserialization that refuse
+/// `""` and whitespace alike.
 macro_rules! nonempty_string_newtype {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
@@ -152,7 +152,7 @@ macro_rules! nonempty_string_newtype {
         impl $name {
             pub fn new(value: impl Into<String>) -> Result<Self, $crate::EmptyId> {
                 let value = value.into();
-                if value.is_empty() {
+                if value.trim().is_empty() {
                     Err($crate::EmptyId {
                         id: stringify!($name),
                     })
@@ -230,7 +230,7 @@ pub struct EmptyId {
 
 impl std::fmt::Display for EmptyId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} cannot be empty", self.id)
+        write!(f, "{} cannot be blank", self.id)
     }
 }
 

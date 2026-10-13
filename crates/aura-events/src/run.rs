@@ -825,17 +825,21 @@ mod tests {
         assert!(err.to_string().contains("nil UUID"), "got: {err}");
     }
 
-    /// An observer or checkpoint named by the empty string names nothing, so
-    /// neither the constructor nor deserialization will build one.
+    /// An observer or checkpoint named by a blank string names nothing, so
+    /// neither the constructor nor deserialization will build one. Whitespace
+    /// is blank too, as it is for a chat session id.
     #[test]
-    fn an_empty_observer_or_checkpoint_id_is_refused() {
+    fn a_blank_observer_or_checkpoint_id_is_refused() {
         let err = ObserverId::new("").unwrap_err();
-        assert_eq!(err.to_string(), "ObserverId cannot be empty");
+        assert_eq!(err.to_string(), "ObserverId cannot be blank");
         assert!(CheckpointRef::new(String::new()).is_err());
         assert!(ObserverId::try_from("").is_err());
+        assert!(ObserverId::new("   ").is_err());
+        assert!(CheckpointRef::try_from(" \t").is_err());
 
         assert!(serde_json::from_value::<ObserverId>(json!("")).is_err());
         assert!(serde_json::from_value::<CheckpointRef>(json!("")).is_err());
+        assert!(serde_json::from_value::<ObserverId>(json!("  ")).is_err());
         assert_eq!(
             serde_json::from_value::<ObserverId>(json!("obs_1")).unwrap(),
             "obs_1"
