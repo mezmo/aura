@@ -452,6 +452,8 @@ pub struct Orchestrator {
 
     /// The run the orchestration serves.
     run_id: crate::config::RunId,
+    /// The run served outside any run scope.
+    unscoped_run: std::sync::OnceLock<Arc<RunContext>>,
 
     /// Tool call observer for coordinator visibility into worker tool execution.
     /// Wired to emit AgentEventPayload for real-time SSE streaming via spawn_tool_event_forwarder.
@@ -675,6 +677,7 @@ impl Orchestrator {
         Ok(Self {
             orchestrator_id,
             run_id,
+            unscoped_run: std::sync::OnceLock::new(),
             config: orchestration_config,
             agent_config,
             tool_call_observer,
@@ -1169,10 +1172,16 @@ impl Orchestrator {
 
     /// The run the orchestration serves, for its workers and coordinator to
     /// begin theirs within. That is the run in scope; a test driving the
-    /// orchestrator outside one gets a run nobody observes, under the id the
-    /// orchestrator was created with.
+    /// orchestrator outside one gets one run nobody observes, shared by every
+    /// agent of the orchestration so a cancel reaches them all, under the id
+    /// the orchestrator was created with.
     fn orchestration_run(&self) -> Arc<RunContext> {
-        crate::run_context::current_run().unwrap_or_else(|| RunContext::channel(self.run_id).0)
+        crate::run_context::current_run().unwrap_or_else(|| {
+            Arc::clone(
+                self.unscoped_run
+                    .get_or_init(|| RunContext::channel(self.run_id).0),
+            )
+        })
     }
 
     /// Park-mode wiring for one worker attempt: `Some` only when this run
@@ -7520,6 +7529,10 @@ mod tests {
             .unwrap();
         let first = orchestrator.orchestration_run();
         let second = orchestrator.orchestration_run();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "one run, not two that share an id"
+        );
         assert_eq!(first.id(), second.id());
         assert_eq!(
             orchestrator.agent_config.run_id,
