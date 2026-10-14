@@ -27,7 +27,8 @@ use tokio::sync::{Mutex, Notify};
 use super::persistence::{ExecutionPersistence, ToolOutcome, ToolTraceEntry};
 use crate::tool_error_detection::is_tool_error;
 use crate::tool_wrapper::{
-    ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult, non_blank,
+    ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult, extracted_field,
+    non_blank,
 };
 
 const TRACE_ERROR_MAX_CHARS: usize = 200;
@@ -167,18 +168,7 @@ impl ToolWrapper for PersistenceWrapper {
         extracted: Option<&Value>,
         ctx: &ToolCallContext,
     ) -> Result<(), ToolError> {
-        let reasoning = extracted
-            .and_then(|v| {
-                // Handle both direct object and array from ComposedWrapper
-                if let Some(arr) = v.as_array() {
-                    arr.iter()
-                        .find_map(|item| item.get("reasoning"))
-                        .and_then(|v| v.as_str())
-                } else {
-                    v.get("reasoning").and_then(|v| v.as_str())
-                }
-            })
-            .unwrap_or("");
+        let reasoning = find_field(extracted, "reasoning").unwrap_or("");
 
         if reasoning.trim().is_empty() {
             tracing::debug!(
@@ -364,19 +354,8 @@ fn trace_error_message(message: &str) -> String {
     super::types::truncate_chars(first_line, TRACE_ERROR_MAX_CHARS)
 }
 
-/// Fetch a top-level string field from the `extracted` value. Handles both
-/// direct objects and the array form that `ComposedWrapper` produces when
-/// multiple wrappers each contribute extracted data.
 fn find_field<'a>(extracted: Option<&'a Value>, field: &str) -> Option<&'a str> {
-    extracted.and_then(|v| {
-        if let Some(arr) = v.as_array() {
-            arr.iter()
-                .find_map(|item| item.get(field))
-                .and_then(|v| v.as_str())
-        } else {
-            v.get(field).and_then(|v| v.as_str())
-        }
-    })
+    extracted_field(extracted, field).and_then(Value::as_str)
 }
 
 // ============================================================================
@@ -410,16 +389,8 @@ pub fn add_reasoning_to_schema(schema: &mut Value) {
 
 /// Extract the call_idx from the extracted metadata (set during transform_args).
 fn extract_call_idx(extracted: Option<&Value>) -> usize {
-    extracted
-        .and_then(|v| {
-            if let Some(arr) = v.as_array() {
-                arr.iter()
-                    .find_map(|item| item.get("call_idx"))
-                    .and_then(|v| v.as_u64())
-            } else {
-                v.get("call_idx").and_then(|v| v.as_u64())
-            }
-        })
+    extracted_field(extracted, "call_idx")
+        .and_then(Value::as_u64)
         .unwrap_or(0) as usize
 }
 

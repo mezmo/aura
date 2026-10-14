@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::tool_wrapper::{
-    ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult,
+    ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult, extracted_field,
 };
 
 const GUIDANCE_TEMPLATE: &str = include_str!("../prompts/duplicate_call_guidance.md");
@@ -171,25 +171,11 @@ impl ToolWrapper for DuplicateCallGuard {
     }
 }
 
-/// Extract guard data from the extracted value, handling both direct and ComposedWrapper array formats.
+/// The guard's tool name and args hash from its `transform_args` data.
 fn extract_guard_data(extracted: Option<&Value>) -> Option<(String, u64)> {
-    extracted.and_then(|v| {
-        // Handle ComposedWrapper array format
-        let obj = if let Some(arr) = v.as_array() {
-            arr.iter()
-                .find(|item| item.get("dup_guard_tool_name").is_some())
-        } else if v.get("dup_guard_tool_name").is_some() {
-            Some(v)
-        } else {
-            None
-        };
-
-        obj.and_then(|o| {
-            let tool_name = o.get("dup_guard_tool_name")?.as_str()?.to_string();
-            let args_hash = o.get("dup_guard_args_hash")?.as_u64()?;
-            Some((tool_name, args_hash))
-        })
-    })
+    let tool_name = extracted_field(extracted, "dup_guard_tool_name")?.as_str()?;
+    let args_hash = extracted_field(extracted, "dup_guard_args_hash")?.as_u64()?;
+    Some((tool_name.to_string(), args_hash))
 }
 
 #[cfg(test)]

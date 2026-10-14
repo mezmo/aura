@@ -683,6 +683,19 @@ where
     }
 }
 
+/// The value a wrapper stored under `key` in its `transform_args` extracted
+/// data. That data is one wrapper's object, or a [`ComposedWrapper`]'s array
+/// of them, where a nested composite contributes an array of its own.
+pub(crate) fn extracted_field<'a>(extracted: Option<&'a Value>, key: &str) -> Option<&'a Value> {
+    let extracted = extracted?;
+    match extracted.as_array() {
+        Some(items) => items
+            .iter()
+            .find_map(|item| extracted_field(Some(item), key)),
+        None => extracted.get(key),
+    }
+}
+
 /// Compose multiple wrappers into a single wrapper.
 ///
 /// Wrappers are applied in order:
@@ -839,6 +852,39 @@ impl ToolWrapper for ComposedWrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StoresKey(&'static str);
+
+    #[async_trait]
+    impl ToolWrapper for StoresKey {
+        fn transform_args(&self, args: Value, _ctx: &ToolCallContext) -> TransformArgsResult {
+            TransformArgsResult::with_extracted(args, serde_json::json!({ self.0: self.0 }))
+        }
+    }
+
+    #[test]
+    fn extracted_field_finds_keys_under_nested_composites() {
+        let inner = Arc::new(ComposedWrapper::new(vec![
+            Arc::new(StoresKey("inner_a")) as Arc<dyn ToolWrapper>,
+            Arc::new(StoresKey("inner_b")),
+        ]));
+        let outer = ComposedWrapper::new(vec![
+            Arc::new(StoresKey("outer")) as Arc<dyn ToolWrapper>,
+            inner,
+        ]);
+        let extracted = outer
+            .transform_args(serde_json::json!({}), &ToolCallContext::new("t"))
+            .extracted;
+
+        for key in ["outer", "inner_a", "inner_b"] {
+            assert_eq!(
+                extracted_field(extracted.as_ref(), key),
+                Some(&Value::from(key)),
+                "{key}"
+            );
+        }
+        assert_eq!(extracted_field(extracted.as_ref(), "missing"), None);
+    }
 
     struct NoOpWrapper;
 
