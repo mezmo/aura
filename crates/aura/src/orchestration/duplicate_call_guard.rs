@@ -170,15 +170,6 @@ impl ToolWrapper for DuplicateCallGuard {
 
         TransformOutputResult::new(output)
     }
-
-    fn handle_error(
-        &self,
-        error: rig::tool::ToolError,
-        _ctx: &ToolCallContext,
-        _extracted: Option<&Value>,
-    ) -> rig::tool::ToolError {
-        error
-    }
 }
 
 /// Extract guard data from the extracted value, handling both direct and ComposedWrapper array formats.

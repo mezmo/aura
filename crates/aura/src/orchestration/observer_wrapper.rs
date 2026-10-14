@@ -10,10 +10,9 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent};
+use crate::tool_call_observer::{ToolCallObserver, ToolEvent};
 use crate::tool_error_detection::{is_reported_error, tool_error_message};
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper, TransformArgsResult};
-use rig::tool::ToolError;
 
 /// Counter for generating unique tool call IDs within a process.
 static CALL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -71,16 +70,6 @@ impl ToolWrapper for ObserverWrapper {
         }
     }
 
-    fn handle_error(
-        &self,
-        error: ToolError,
-        _ctx: &ToolCallContext,
-        _extracted: Option<&Value>,
-    ) -> ToolError {
-        // Error passes through unchanged
-        error
-    }
-
     async fn on_complete(
         &self,
         ctx: &ToolCallContext,
@@ -119,18 +108,13 @@ impl ToolWrapper for ObserverWrapper {
                 output,
                 duration_ms,
             ),
-            Ok(err) | Err(err) => {
-                let err = tool_error_message(err);
-                let retry_hint = RetryHint::from_error_message(err);
-                ToolEvent::call_completed_error(
-                    tool_call_id,
-                    &ctx.tool_name,
-                    &ctx.tool_initiator_id,
-                    err,
-                    Some(retry_hint),
-                    duration_ms,
-                )
-            }
+            Ok(err) | Err(err) => ToolEvent::call_completed_error(
+                tool_call_id,
+                &ctx.tool_name,
+                &ctx.tool_initiator_id,
+                tool_error_message(err),
+                duration_ms,
+            ),
         };
 
         self.observer.emit(event);
@@ -140,6 +124,7 @@ impl ToolWrapper for ObserverWrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aura_events::agent::ToolOutcome;
 
     #[test]
     fn test_generate_tool_call_id() {
@@ -199,7 +184,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(duration_ms, 100);
-                assert!(result.is_success());
+                assert!(matches!(result, ToolOutcome::Success { .. }), "{result:?}");
             }
             _ => panic!("Expected CallCompleted event"),
         }
@@ -245,7 +230,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(duration_ms, 100);
-                assert!(result.is_success());
+                assert!(matches!(result, ToolOutcome::Success { .. }), "{result:?}");
             }
             _ => panic!("Expected CallCompleted event"),
         }
@@ -275,8 +260,10 @@ mod tests {
         let event = rx.recv().await.unwrap();
         match event {
             ToolEvent::CallCompleted { result, .. } => {
-                assert!(!result.is_success());
-                assert_eq!(result.error_message(), Some("rate limit exceeded"));
+                assert!(
+                    matches!(&result, ToolOutcome::Failure { error } if error == "rate limit exceeded"),
+                    "{result:?}"
+                );
             }
             _ => panic!("Expected CallCompleted event"),
         }
@@ -302,10 +289,9 @@ mod tests {
 
         match rx.recv().await.unwrap() {
             ToolEvent::CallCompleted { result, .. } => {
-                assert!(!result.is_success());
-                assert_eq!(
-                    result.error_message(),
-                    Some("Tool returned an error: 401 Unauthorized")
+                assert!(
+                    matches!(&result, ToolOutcome::Failure { error } if error == "Tool returned an error: 401 Unauthorized"),
+                    "{result:?}"
                 );
             }
             _ => panic!("Expected CallCompleted event"),
