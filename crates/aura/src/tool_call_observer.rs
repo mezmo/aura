@@ -12,7 +12,6 @@
 //! execution boundaries, providing:
 //!
 //! - Real-time visibility into tool calls (name, arguments)
-//! - Error classification with retry hints
 //! - Duration tracking for performance analysis
 //!
 //! # Usage
@@ -35,7 +34,6 @@
 //! }
 //! ```
 
-use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use tokio::sync::broadcast;
 
@@ -65,7 +63,7 @@ pub enum ToolEvent {
         /// The ID of the orchestrator or worker that initiated the tool call
         tool_initiator_id: String,
         /// The outcome of the tool call
-        result: ToolOutcome,
+        result: aura_events::agent::ToolOutcome,
         /// How long the call took in milliseconds
         duration_ms: u64,
     },
@@ -100,7 +98,9 @@ impl ToolEvent {
             tool_call_id: tool_call_id.into(),
             tool_name: tool_name.into(),
             tool_initiator_id: tool_initiator_id.into(),
-            result: ToolOutcome::Success(result.into()),
+            result: aura_events::agent::ToolOutcome::Success {
+                result: result.into(),
+            },
             duration_ms,
         }
     }
@@ -111,117 +111,17 @@ impl ToolEvent {
         tool_name: impl Into<String>,
         tool_initiator_id: impl Into<String>,
         message: impl Into<String>,
-        retry_hint: Option<RetryHint>,
         duration_ms: u64,
     ) -> Self {
         Self::CallCompleted {
             tool_call_id: tool_call_id.into(),
             tool_name: tool_name.into(),
             tool_initiator_id: tool_initiator_id.into(),
-            result: ToolOutcome::Error {
-                message: message.into(),
-                retry_hint,
+            result: aura_events::agent::ToolOutcome::Failure {
+                error: message.into(),
             },
             duration_ms,
         }
-    }
-}
-
-/// Outcome of a tool execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ToolOutcome {
-    /// Tool executed successfully with the given result.
-    Success(String),
-    /// Tool execution failed.
-    Error {
-        /// Error message describing what went wrong.
-        message: String,
-        /// Hint for whether/how to retry.
-        retry_hint: Option<RetryHint>,
-    },
-}
-
-impl ToolOutcome {
-    /// Returns true if this outcome represents success.
-    pub fn is_success(&self) -> bool {
-        matches!(self, Self::Success(_))
-    }
-
-    /// Returns the error message if this is an error outcome.
-    pub fn error_message(&self) -> Option<&str> {
-        match self {
-            Self::Error { message, .. } => Some(message),
-            Self::Success(_) => None,
-        }
-    }
-}
-
-/// Hint for whether and how to retry a failed tool call.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum RetryHint {
-    /// Retry immediately - transient error.
-    Immediate,
-    /// Retry after a backoff period.
-    Backoff {
-        /// Suggested wait time in milliseconds.
-        suggested_ms: u64,
-    },
-    /// Do not retry - permanent error.
-    NoRetry,
-}
-
-impl RetryHint {
-    /// Classify an error message into a retry hint.
-    ///
-    /// This heuristic examines error messages to determine if the error
-    /// is transient (retry), rate-limited (backoff), or permanent (no retry).
-    pub fn from_error_message(message: &str) -> Self {
-        let lower = message.to_lowercase();
-
-        // Rate limiting - suggest backoff
-        if lower.contains("rate limit")
-            || lower.contains("too many requests")
-            || lower.contains("429")
-        {
-            return Self::Backoff { suggested_ms: 5000 };
-        }
-
-        // Transient network errors - retry immediately
-        if lower.contains("timeout")
-            || lower.contains("connection reset")
-            || lower.contains("connection refused")
-            || lower.contains("network")
-            || lower.contains("temporary")
-        {
-            return Self::Immediate;
-        }
-
-        // Server errors (5xx) - retry with backoff
-        if lower.contains("500")
-            || lower.contains("502")
-            || lower.contains("503")
-            || lower.contains("504")
-            || lower.contains("internal server error")
-            || lower.contains("service unavailable")
-        {
-            return Self::Backoff { suggested_ms: 1000 };
-        }
-
-        // Client errors (4xx except 429) - don't retry
-        if lower.contains("400")
-            || lower.contains("401")
-            || lower.contains("403")
-            || lower.contains("404")
-            || lower.contains("not found")
-            || lower.contains("unauthorized")
-            || lower.contains("forbidden")
-            || lower.contains("invalid")
-        {
-            return Self::NoRetry;
-        }
-
-        // Default: suggest single retry with short backoff
-        Self::Backoff { suggested_ms: 500 }
     }
 }
 
@@ -290,47 +190,6 @@ impl Default for ToolCallObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_tool_outcome_success() {
-        let outcome = ToolOutcome::Success("result".to_string());
-        assert!(outcome.is_success());
-        assert!(outcome.error_message().is_none());
-    }
-
-    #[test]
-    fn test_tool_outcome_error() {
-        let outcome = ToolOutcome::Error {
-            message: "failed".to_string(),
-            retry_hint: Some(RetryHint::Immediate),
-        };
-        assert!(!outcome.is_success());
-        assert_eq!(outcome.error_message(), Some("failed"));
-    }
-
-    #[test]
-    fn test_retry_hint_rate_limit() {
-        let hint = RetryHint::from_error_message("Error: rate limit exceeded");
-        assert!(matches!(hint, RetryHint::Backoff { suggested_ms: 5000 }));
-    }
-
-    #[test]
-    fn test_retry_hint_timeout() {
-        let hint = RetryHint::from_error_message("Connection timeout");
-        assert_eq!(hint, RetryHint::Immediate);
-    }
-
-    #[test]
-    fn test_retry_hint_not_found() {
-        let hint = RetryHint::from_error_message("Tool not found: invalid_tool");
-        assert_eq!(hint, RetryHint::NoRetry);
-    }
-
-    #[test]
-    fn test_retry_hint_server_error() {
-        let hint = RetryHint::from_error_message("Internal server error (500)");
-        assert!(matches!(hint, RetryHint::Backoff { suggested_ms: 1000 }));
-    }
 
     #[tokio::test]
     async fn test_observer_emit_and_receive() {

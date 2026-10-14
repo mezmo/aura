@@ -111,7 +111,7 @@ pub use stream_events::{
     format_named_sse,
 };
 pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};
-pub use tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent, ToolOutcome};
+pub use tool_call_observer::{ToolCallObserver, ToolEvent};
 pub use tool_middleware::{
     CallFailure, MiddlewareStack, MiddlewareTool, Next, ToolMiddleware, ToolReply, ToolRequest,
     WrapperLayer,
