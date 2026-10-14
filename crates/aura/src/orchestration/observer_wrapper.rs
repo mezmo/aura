@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::tool_call_observer::{ToolCallObserver, ToolEvent};
 use crate::tool_error_detection::tool_error_message;
-use crate::tool_wrapper::{ToolCallContext, ToolWrapper, TransformArgsResult};
+use crate::tool_wrapper::{ToolCallContext, ToolWrapper, TransformArgsResult, extracted_field};
 
 /// Counter for generating unique tool call IDs within a process.
 static CALL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -78,18 +78,8 @@ impl ToolWrapper for ObserverWrapper {
         duration_ms: u64,
     ) {
         // Extract tool_call_id from the extracted data
-        let tool_call_id = extracted
-            .and_then(|v| {
-                // Handle both direct object and array from ComposedWrapper
-                if let Some(arr) = v.as_array() {
-                    // Find the object with observer_tool_call_id
-                    arr.iter()
-                        .find_map(|item| item.get("observer_tool_call_id"))
-                        .and_then(|v| v.as_str())
-                } else {
-                    v.get("observer_tool_call_id").and_then(|v| v.as_str())
-                }
-            })
+        let tool_call_id = extracted_field(extracted, "observer_tool_call_id")
+            .and_then(Value::as_str)
             .unwrap_or_else(|| {
                 // Fallback: generate a new ID (shouldn't happen in normal flow)
                 tracing::warn!(
