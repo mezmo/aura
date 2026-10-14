@@ -691,7 +691,7 @@ impl McpClient {
         match handle.await_response().await {
             Ok(rmcp::model::ServerResult::CallToolResult(result)) => {
                 debug!("Tool '{}' executed successfully", tool_name);
-                extract_tool_result(result, tool_name).map(|outcome| outcome.into_prefixed_string())
+                Ok(extract_tool_result(result, tool_name))
             }
             Ok(_) => Err(anyhow::anyhow!("Unexpected response type for tool call")),
             Err(err) => {
@@ -779,7 +779,7 @@ impl McpClient {
         match response {
             rmcp::model::ServerResult::CallToolResult(result) => {
                 debug!("Tool '{}' completed with progress tracking", tool_name);
-                let extracted = extract_tool_result(result, tool_name)?.into_prefixed_string();
+                let extracted = extract_tool_result(result, tool_name);
                 Ok((extracted, progress_rx))
             }
             _ => Err(anyhow::anyhow!("Unexpected response type for tool call")),
@@ -835,8 +835,7 @@ impl McpClient {
                 match result {
                     Ok(rmcp::model::ServerResult::CallToolResult(call_result)) => {
                         debug!("Tool '{}' completed successfully", tool_name);
-                        extract_tool_result(call_result, tool_name)
-                            .map(|outcome| outcome.into_prefixed_string())
+                        Ok(extract_tool_result(call_result, tool_name))
                     }
                     Ok(_) => Err(anyhow::anyhow!("Unexpected response type for tool call")),
                     Err(err) => {
@@ -977,8 +976,7 @@ impl McpClient {
         match result {
             Ok(rmcp::model::ServerResult::CallToolResult(call_result)) => {
                 debug!("Tool '{}' completed successfully", tool_name);
-                extract_tool_result(call_result, tool_name)
-                    .map(|outcome| outcome.into_prefixed_string())
+                Ok(extract_tool_result(call_result, tool_name))
             }
             Ok(_) => Err(anyhow::anyhow!("Unexpected response type for tool call")),
             Err(err) => {

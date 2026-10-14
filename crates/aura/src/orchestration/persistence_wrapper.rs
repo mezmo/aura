@@ -25,7 +25,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, Notify};
 
 use super::persistence::{ExecutionPersistence, ToolOutcome, ToolTraceEntry};
-use crate::mcp::CallOutcome;
 use crate::tool_error_detection::is_tool_error;
 use crate::tool_wrapper::{
     ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult, non_blank,
@@ -211,7 +210,7 @@ impl ToolWrapper for PersistenceWrapper {
     async fn transform_output(
         &self,
         output: String,
-        outcome: &CallOutcome,
+        is_error: bool,
         ctx: &ToolCallContext,
         extracted: Option<&Value>,
     ) -> TransformOutputResult {
@@ -224,7 +223,7 @@ impl ToolWrapper for PersistenceWrapper {
         }
 
         // 2. Artifact footer (only if persistence enabled + size qualifies)
-        if !self.persistence_enabled || outcome.is_error() {
+        if !self.persistence_enabled || is_error {
             return TransformOutputResult::new(output);
         }
 
@@ -858,9 +857,8 @@ mod tests {
             .to_string();
 
         let raw = "gigantic raw tool output that scratchpad would rewrite to a pointer";
-        let outcome = crate::mcp::CallOutcome::Success(raw.to_string());
         let _ = wrapper
-            .transform_output(raw.to_string(), &outcome, &ctx, Some(&extracted))
+            .transform_output(raw.to_string(), false, &ctx, Some(&extracted))
             .await;
 
         // Cached under the call id until on_complete consumes it.
@@ -942,9 +940,8 @@ mod tests {
 
         // Use varied content to avoid tokenizer compression masking the threshold.
         let raw: String = (0..500).map(|i| format!("entry_{} ", i)).collect();
-        let outcome = crate::mcp::CallOutcome::Success(raw.clone());
         let result = composed
-            .transform_output(raw.clone(), &outcome, &ctx, Some(&extracted))
+            .transform_output(raw.clone(), false, &ctx, Some(&extracted))
             .await;
 
         assert!(
@@ -1084,11 +1081,10 @@ mod tests {
 
         let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
-        let outcome = CallOutcome::Success(String::new());
         let long_output = "x".repeat(20);
 
         let result = wrapper
-            .transform_output(long_output.clone(), &outcome, &ctx, Some(&extracted))
+            .transform_output(long_output.clone(), false, &ctx, Some(&extracted))
             .await;
         assert!(result.output.contains(
             "[Tool output saved to artifact: task-0-sre-iter-2-log-search-0-output.txt]"
@@ -1102,10 +1098,9 @@ mod tests {
 
         let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
-        let outcome = CallOutcome::Success(String::new());
 
         let result = wrapper
-            .transform_output("short output".to_string(), &outcome, &ctx, Some(&extracted))
+            .transform_output("short output".to_string(), false, &ctx, Some(&extracted))
             .await;
         assert_eq!(result.output, "short output");
         assert!(!result.output.contains("[Tool output saved to artifact"));
@@ -1117,10 +1112,9 @@ mod tests {
 
         let ctx = ToolCallContext::new("my_tool").with_task_context(3, "w".to_string(), 1);
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
-        let outcome = CallOutcome::Success(String::new());
 
         let result = wrapper
-            .transform_output("tiny".to_string(), &outcome, &ctx, Some(&extracted))
+            .transform_output("tiny".to_string(), false, &ctx, Some(&extracted))
             .await;
         assert!(result.output.contains(
             "[Tool output saved to artifact: task-3-default-iter-1-my-tool-0-output.txt]"
@@ -1265,10 +1259,9 @@ mod tests {
 
         let ctx = ToolCallContext::new("my_search tool").with_task_context(0, "sre".to_string(), 1);
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
-        let outcome = CallOutcome::Success(String::new());
 
         let result = wrapper
-            .transform_output("output".to_string(), &outcome, &ctx, Some(&extracted))
+            .transform_output("output".to_string(), false, &ctx, Some(&extracted))
             .await;
         assert!(
             result
@@ -1283,15 +1276,9 @@ mod tests {
 
         let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
-        let outcome = CallOutcome::Success(String::new());
 
         let result = wrapper
-            .transform_output(
-                "big output here".to_string(),
-                &outcome,
-                &ctx,
-                Some(&extracted),
-            )
+            .transform_output("big output here".to_string(), false, &ctx, Some(&extracted))
             .await;
         assert_eq!(result.output, "big output here");
         assert!(!result.output.contains("[Tool output saved to artifact"));
@@ -1369,12 +1356,7 @@ mod tests {
         let error = "Tool returned an error: 401 Unauthorized";
 
         let output = wrapper
-            .transform_output(
-                error.to_string(),
-                &CallOutcome::classify_from_output(error),
-                &ctx,
-                Some(&extracted),
-            )
+            .transform_output(error.to_string(), true, &ctx, Some(&extracted))
             .await
             .output;
         assert_eq!(output, error, "an error gets no artifact footer");

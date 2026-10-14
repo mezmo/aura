@@ -39,11 +39,11 @@ mod tests {
 
     #[test]
     fn mcp_error_results_are_errors() {
-        let outcome = crate::mcp::CallOutcome::GeneralToolError {
-            content: "401 Unauthorized".into(),
-            code: None,
-        };
-        assert!(is_tool_error(&outcome.into_prefixed_string()));
+        let result = rmcp::model::CallToolResult::error(vec![rmcp::model::Content::text(
+            "401 Unauthorized",
+        )]);
+        let text = crate::mcp::extract_tool_result(result, "auth_tool");
+        assert!(is_tool_error(&text), "{text}");
     }
 
     /// A tool's `Err` reaches the model through rig's tool server, which
