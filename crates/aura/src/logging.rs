@@ -250,18 +250,27 @@ where
         write!(&mut buf, "{level:5} ")?;
 
         // The spans the event is in, root first, each with its fields, so a
-        // line reads as the run and request it belongs to.
+        // line reads as the run and request it belongs to. The prefix gets
+        // half the line at most: span fields such as a planning goal or a
+        // worker task run to hundreds of characters, and the message, which
+        // says what happened, must keep the other half.
         if let Some(scope) = ctx.event_scope() {
+            let mut prefix = String::new();
             for span in scope.from_root() {
-                write!(&mut buf, "{}", span.name())?;
+                write!(&mut prefix, "{}", span.name())?;
                 let extensions = span.extensions();
                 if let Some(fields) = extensions
                     .get::<tracing_subscriber::fmt::FormattedFields<N>>()
                     .filter(|fields| !fields.is_empty())
                 {
-                    write!(&mut buf, "{{{fields}}}")?;
+                    write!(&mut prefix, "{{{fields}}}")?;
                 }
-                buf.push(':');
+                prefix.push(':');
+            }
+            let (shown, cut) = crate::string_utils::truncate_for_log(&prefix, self.max_length / 2);
+            buf.push_str(shown);
+            if cut {
+                buf.push('…');
             }
             buf.push(' ');
         }
@@ -997,6 +1006,38 @@ mod tests {
         assert!(
             log.contains("agent.stream{run.id=run_1}:agent.turn: aura::logging: inside the run"),
             "got: {log}"
+        );
+    }
+
+    /// A span prefix never crowds out the message: a long span field is cut
+    /// to half the line, and the message that says what happened survives.
+    #[test]
+    fn truncating_formatter_keeps_the_message_past_a_long_span_prefix() {
+        use std::sync::Arc;
+
+        let buf = Arc::new(CapturedLog(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .event_format(TruncatingFormatter { max_length: 200 })
+            .with_writer(buf.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let goal = "g".repeat(400);
+            let span = tracing::info_span!("orchestration.planning", orchestration.goal = %goal);
+            let _span = span.enter();
+            tracing::error!(target: "aura::logging", "provider returned 500");
+        });
+
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("orchestration.planning{"), "got: {log}");
+        assert!(log.contains("…"), "the prefix is cut, got: {log}");
+        assert!(log.contains("provider returned 500"), "got: {log}");
+        let (shown, _) = log.split_once("\n").unwrap_or((&log, ""));
+        assert!(
+            shown.len() <= 200 + "... (9999 chars)".len(),
+            "{} bytes: {shown}",
+            shown.len()
         );
     }
 
