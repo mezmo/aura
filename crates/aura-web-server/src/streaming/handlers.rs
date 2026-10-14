@@ -1965,6 +1965,42 @@ mod tests {
     }
 
     #[test]
+    fn a_hitl_denial_reports_success_false() {
+        let config = StreamConfig::new(true, false, ToolResultMode::Aura, 0);
+        let ctx = TurnContext {
+            completion_id: "test-123".to_string(),
+            model_str: "gpt-4".to_string(),
+            created_timestamp: 1234567890,
+            max_tokens: None,
+            agent_context: aura::stream_events::AgentContext::single_agent(),
+            correlation: CorrelationContext::new("test-session", None),
+        };
+        let mut state = TurnState::new();
+        state
+            .tool_call_map
+            .insert("call_2".to_string(), ("echo".to_string(), 0));
+        let denial = "Tool call blocked by human approval denial: scripted denial. Do not execute this action.";
+        let tool_result = ToolResult {
+            id: "call_2".to_string(),
+            call_id: None,
+            result: denial.to_string(),
+        };
+
+        let output: String = handle_tool_result(&config, &ctx, &mut state, &tool_result)
+            .iter()
+            .filter_map(|b| std::str::from_utf8(b).ok())
+            .collect();
+        let data = output
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("an aura.tool_complete frame");
+        let frame: serde_json::Value = serde_json::from_str(data).unwrap();
+
+        assert_eq!(frame["success"], false, "{frame}");
+        assert_eq!(frame["error"], denial, "{frame}");
+    }
+
+    #[test]
     fn test_handle_tool_result_reports_mcp_error_as_failure() {
         let config = StreamConfig::new(true, false, ToolResultMode::Aura, 0);
         let ctx = TurnContext {

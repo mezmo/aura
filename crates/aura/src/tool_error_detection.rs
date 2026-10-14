@@ -1,6 +1,7 @@
 //! Decides whether a tool result's text reports a failure. Tool failures
 //! reach the model as result text, not as an `Err`.
 
+use crate::hitl::DENIAL_PREFIX;
 use crate::mcp::MCP_ERROR_PREFIX;
 
 const ERROR_PREFIXES: &[&str] = &[
@@ -10,6 +11,7 @@ const ERROR_PREFIXES: &[&str] = &[
     "Error while sending message: ",
     "An invalid message type was returned",
     MCP_ERROR_PREFIX,
+    DENIAL_PREFIX,
     // `McpManager::execute_fallback_tool`
     "Tool execution failed: ",
     "Tool not found: ",

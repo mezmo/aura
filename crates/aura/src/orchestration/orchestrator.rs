@@ -8627,7 +8627,8 @@ mod tests {
     /// denial arm in `gate.rs` verbatim.
     fn denial_feedback_wire(reason: &str) -> String {
         serde_json::to_string(&format!(
-            "Tool call blocked by human approval denial: {reason}. Do not execute this action."
+            "{}{reason}. Do not execute this action.",
+            crate::hitl::DENIAL_PREFIX
         ))
         .expect("a plain string serializes")
     }
