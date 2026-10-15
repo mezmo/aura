@@ -384,10 +384,7 @@ impl PreparedAgent {
             && let Some(hitl) = build_context_owned.hitl.clone()
         {
             let scope = crate::hitl::AgentScope::Single {
-                session_id: build_context_owned
-                    .session_id
-                    .clone()
-                    .and_then(crate::config::SessionId::non_empty),
+                session_id: build_context_owned.session_id.clone(),
             };
             let wrapper = Arc::new(crate::hitl::HitlApprovalWrapper::new(
                 hitl.patterns.clone(),

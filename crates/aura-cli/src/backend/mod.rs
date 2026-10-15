@@ -55,7 +55,7 @@ impl Backend {
         &self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
-        session_id: &str,
+        session_id: &aura_events::SessionId,
         cancel: Arc<AtomicBool>,
         handler: &mut impl StreamHandler,
     ) -> Result<StreamResult> {
@@ -83,7 +83,7 @@ impl Backend {
     pub async fn summarize(
         &self,
         text: &str,
-        session_id: &str,
+        session_id: &aura_events::SessionId,
     ) -> Result<(String, Option<(u64, u64)>)> {
         match self {
             Self::Http(http) => http.summarize(text, session_id).await,

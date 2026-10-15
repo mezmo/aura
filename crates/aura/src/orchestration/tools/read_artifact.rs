@@ -493,7 +493,7 @@ mod tests {
     async fn test_read_cross_run_artifact() {
         let temp_dir = TempDir::new().unwrap();
         let memory_dir = temp_dir.path().join("memory");
-        let session_id = "session_cross_run".to_string();
+        let session_id = crate::config::SessionId::new("session_cross_run").unwrap();
 
         // Create run A and write an artifact
         let run_a = ExecutionPersistence::new(&memory_dir, Some(session_id.clone()))
@@ -757,7 +757,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let memory_dir = temp_dir.path().join("memory");
-        let session_id = "session-xrun-large".to_string();
+        let session_id = crate::config::SessionId::new("session-xrun-large").unwrap();
 
         // Run A writes a large artifact.
         let big: String = (0..2_000).map(|i| format!("xrun line {i}\n")).collect();
@@ -1049,7 +1049,7 @@ mod tests {
     async fn test_budgeted_read_applies_to_cross_run_reads() {
         let temp_dir = TempDir::new().unwrap();
         let memory_dir = temp_dir.path().join("memory");
-        let session_id = "session_cap".to_string();
+        let session_id = crate::config::SessionId::new("session_cap").unwrap();
         let big: String = (0..2_000).map(|i| format!("xrun line {i}\n")).collect();
 
         let run_a = ExecutionPersistence::new(&memory_dir, Some(session_id.clone()))

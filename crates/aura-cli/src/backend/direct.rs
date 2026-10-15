@@ -333,17 +333,15 @@ impl DirectBackend {
         &self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
-        session_id: &str,
+        session_id: &aura::SessionId,
         cancel: Arc<AtomicBool>,
         handler: &mut impl StreamHandler,
     ) -> Result<StreamResult> {
         let selected = get_selected_model();
         let mut req = Self::build_chat_request(messages, tools, selected);
 
-        let session =
-            aura::SessionId::new(session_id).map_err(|e| anyhow::anyhow!("session id: {e}"))?;
         let setup =
-            handlers::prepare_request(&self.app_state, &mut req, &session, &self.extra_headers)
+            handlers::prepare_request(&self.app_state, &mut req, session_id, &self.extra_headers)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -381,7 +379,7 @@ impl DirectBackend {
     pub async fn summarize(
         &self,
         text: &str,
-        session_id: &str,
+        session_id: &aura::SessionId,
     ) -> Result<(String, Option<(u64, u64)>)> {
         let selected = get_selected_model();
 
@@ -408,10 +406,8 @@ impl DirectBackend {
             tools: None,
         };
 
-        let session =
-            aura::SessionId::new(session_id).map_err(|e| anyhow::anyhow!("session id: {e}"))?;
         let setup =
-            handlers::prepare_request(&self.app_state, &mut req, &session, &self.extra_headers)
+            handlers::prepare_request(&self.app_state, &mut req, session_id, &self.extra_headers)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 

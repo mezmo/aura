@@ -165,7 +165,7 @@ struct ResponseContext {
     completion_id: String,
     model_str: String,
     created_timestamp: u64,
-    chat_session_id: String,
+    chat_session_id: aura::SessionId,
 }
 
 /// Build a fresh agent for a request, applying headers_from_request mappings
@@ -177,7 +177,7 @@ async fn build_agent_for_request(
     additional_tools: Vec<Box<dyn aura::ToolDyn>>,
     client_tools: Option<&[ClientToolDefinition]>,
     run_id: aura::RunId,
-    session_id: String,
+    session_id: aura::SessionId,
 ) -> Result<Arc<aura::Agent>, PrepareError> {
     let client_tool_defs =
         client_tools.map(|tools| tools.iter().map(aura::builder::ClientTool::from).collect());
@@ -207,7 +207,7 @@ pub struct RequestSetup {
     pub completion_id: String,
     pub model_str: String,
     pub created_timestamp: u64,
-    pub chat_session_id: String,
+    pub chat_session_id: aura::SessionId,
     /// Whether the request includes client-side tool definitions and the
     /// server is configured to honor them. The streaming layer uses this to
     /// emit `finish_reason: "tool_calls"` instead of `"stop"` when the LLM
@@ -320,7 +320,7 @@ pub async fn prepare_request(
             let agent = builder
                 .build_streaming_agent_with_tools(
                     Some(req_headers_map),
-                    Some(chat_session_id.to_string()),
+                    Some(chat_session_id.clone()),
                     client_tools_vec.clone(),
                     Some(run_id),
                     run_tools,
@@ -351,7 +351,7 @@ pub async fn prepare_request(
                 additional_tools,
                 client_tools,
                 run_id,
-                chat_session_id.to_string(),
+                chat_session_id.clone(),
             )
             .await?;
             let tools_json = agent.otel_llm_tools();
@@ -401,7 +401,7 @@ pub async fn prepare_request(
         completion_id,
         model_str,
         created_timestamp,
-        chat_session_id: chat_session_id.to_string(),
+        chat_session_id: chat_session_id.clone(),
         has_client_tools,
         request_id,
         user_id,
@@ -504,7 +504,7 @@ pub fn build_completion_config(
             setup.model_str.clone(),
             setup.created_timestamp,
             max_tokens,
-            &setup.chat_session_id,
+            setup.chat_session_id.as_str(),
         );
         if setup.config.orchestration_enabled() {
             ctx.with_orchestration()
@@ -605,7 +605,7 @@ pub async fn execute_completion(
         provider: config.provider,
         model: config.model,
         request_id: config.request_id.clone(),
-        session_id: chat_session_id.clone(),
+        session_id: chat_session_id.to_string(),
         query: config.query_for_otel,
         user_id,
         metadata_json,
@@ -715,7 +715,7 @@ fn build_json_response(
     let mut response_metadata = HashMap::new();
     response_metadata.insert(
         "chat_session_id".to_string(),
-        response_ctx.chat_session_id.clone(),
+        response_ctx.chat_session_id.to_string(),
     );
 
     let chat_response = ChatCompletionResponse {
@@ -1335,13 +1335,9 @@ pub async fn resolve_approval(
     }
 }
 
-/// The chat session a request belongs to: the id the client gave in its
-/// metadata, then `X-Chat-Session-Id`, then `x-openwebui-chat-id`, else a
-/// fresh one.
-///
-/// A blank value counts as none given. Taken as given, every client that sends
-/// one would share a single session, and with it each other's recorded skill
-/// invocations; orchestration persistence would refuse it outright.
+/// The chat session a request belongs to. Uses the first non-blank value of
+/// the `chat_session_id` metadata field, the `X-Chat-Session-Id` header, or
+/// the `x-openwebui-chat-id` header, and generates a new id if none is set.
 fn chat_session_id(
     metadata: Option<&HashMap<String, String>>,
     headers: &HeaderMap,
@@ -2540,7 +2536,7 @@ url = "http://127.0.0.1:9"
             completion_id: "chatcmpl-test-123".to_string(),
             model_str: "openai/gpt-4".to_string(),
             created_timestamp: 1700000000,
-            chat_session_id: "cs_test".to_string(),
+            chat_session_id: aura::SessionId::new("cs_test").unwrap(),
         }
     }
 

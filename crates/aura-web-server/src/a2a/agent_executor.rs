@@ -306,7 +306,9 @@ impl AgentExecutor for AuraAgentExecutor {
                 },
             );
 
-            let session_id = Some(context_id.clone());
+            // Run a blank contextId without a session. Using it as-is would put
+            // every client that sends a blank contextId in the same session.
+            let session_id = aura::SessionId::non_empty(context_id.clone());
             let builder = RigBuilder::new(config, pending_approvals).with_hitl_hmac(hitl_hmac);
             let agent = match builder
                 .build_streaming_agent_with_tools(

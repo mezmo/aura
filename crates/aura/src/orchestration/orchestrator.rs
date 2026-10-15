@@ -1095,9 +1095,9 @@ impl Orchestrator {
         // `pre_call`, so placing it outside leaves the documented
         // `transform_output` ordering above untouched.
         if let Some(hitl) = worker_build_context.hitl.clone() {
-            let (run_id_str, session_id_owned) = {
+            let (run_id_str, session_id) = {
                 let p = self.persistence.lock().await;
-                (p.run_id().to_string(), p.session_id().map(String::from))
+                (p.run_id().to_string(), p.session_id().cloned())
             };
             let run_id = run_id_str.parse::<super::PersistenceRunId>().map_err(
                 |e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -1108,7 +1108,7 @@ impl Orchestrator {
             let scope = crate::hitl::AgentScope::Worker {
                 run_id,
                 task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
-                session_id: session_id_owned.and_then(crate::config::SessionId::non_empty),
+                session_id,
             };
             let mut gate = crate::hitl::HitlApprovalWrapper::new(
                 hitl.patterns.clone(),
@@ -1357,7 +1357,7 @@ impl Orchestrator {
     ) -> Option<crate::hitl::AgentScope> {
         let (run_id, session_id) = {
             let p = self.persistence.lock().await;
-            (p.run_id().to_string(), p.session_id().map(String::from))
+            (p.run_id().to_string(), p.session_id().cloned())
         };
         run_id
             .parse::<super::PersistenceRunId>()
@@ -1365,7 +1365,7 @@ impl Orchestrator {
             .map(|run_id| crate::hitl::AgentScope::Worker {
                 run_id,
                 task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
-                session_id: session_id.and_then(crate::config::SessionId::non_empty),
+                session_id,
             })
     }
 
@@ -5669,7 +5669,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         };
         let (run_id, session_id) = {
             let p = self.persistence.lock().await;
-            (p.run_id().to_string(), p.session_id().map(String::from))
+            (p.run_id().to_string(), p.session_id().cloned())
         };
 
         let Some(memory_dir) = self
@@ -5694,7 +5694,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let inputs = super::park::ParkCommitInputs {
             state: super::park::RunStateForPark {
                 run_id: &run_id,
-                session_id: session_id.as_deref(),
+                session_id: session_id.as_ref().map(crate::config::SessionId::as_str),
                 query,
                 chat_history,
                 coordinator_conversation,
@@ -8264,7 +8264,7 @@ mod tests {
                 park_enabled: true,
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
-            session_id: Some("park-sess".to_string()),
+            session_id: Some(crate::config::SessionId::new("park-sess").unwrap()),
             run_id: Some(aura_events::RunId::mint()),
             ..AgentBuildContext::default()
         };
@@ -8837,7 +8837,7 @@ mod tests {
                 park_enabled: true,
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
-            session_id: Some("orphan-sess".to_string()),
+            session_id: Some(crate::config::SessionId::new("orphan-sess").unwrap()),
             run_id: Some(run_id),
             orchestration: Some(OrchestrationConfig {
                 enabled: true,
@@ -9130,7 +9130,7 @@ mod tests {
                 park_enabled: true,
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
-            session_id: Some(session_id.to_string()),
+            session_id: Some(crate::config::SessionId::new(session_id).unwrap()),
             run_id: Some(aura_events::RunId::mint()),
             orchestration: Some(OrchestrationConfig {
                 enabled: true,
@@ -9668,7 +9668,7 @@ mod coordinator_artifact_tests {
     ) -> Orchestrator {
         let mut build_context = AgentBuildContext {
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
-            session_id: Some(SESSION.to_string()),
+            session_id: Some(crate::config::SessionId::new(SESSION).unwrap()),
             ..AgentBuildContext::default()
         };
         if let Some(window) = window {
@@ -9690,9 +9690,12 @@ mod coordinator_artifact_tests {
 
     /// A prior run in the same session holding one result artifact.
     async fn prior_run_with_artifact(memory_dir: &std::path::Path, content: &str) -> String {
-        let run = ExecutionPersistence::new(memory_dir, Some(SESSION.to_string()))
-            .await
-            .unwrap();
+        let run = ExecutionPersistence::new(
+            memory_dir,
+            Some(crate::config::SessionId::new(SESSION).unwrap()),
+        )
+        .await
+        .unwrap();
         run.write_result_artifact(0, Some("files"), 1, content)
             .await
             .unwrap();
