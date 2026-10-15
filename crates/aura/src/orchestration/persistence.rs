@@ -29,6 +29,7 @@
 //!     └── iteration-{n}/
 //! ```
 
+use crate::config::SessionId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
@@ -291,7 +292,7 @@ pub const MAX_LISTED_ARTIFACTS: usize = 40;
 pub struct ExecutionPersistence {
     base_path: PathBuf,
     run_id: String,
-    session_id: Option<String>,
+    session_id: Option<SessionId>,
     current_iteration: usize,
     enabled: bool,
     in_flight: Arc<AtomicUsize>,
@@ -308,12 +309,15 @@ impl ExecutionPersistence {
     /// When `session_id` is provided, the directory structure becomes
     /// `{base_path}/{session_id}/{run_id}/...`, grouping runs by session.
     /// Without a session_id, the flat `{base_path}/{run_id}/...` layout is used.
-    pub async fn new<P: AsRef<Path>>(base_path: P, session_id: Option<String>) -> io::Result<Self> {
+    pub async fn new<P: AsRef<Path>>(
+        base_path: P,
+        session_id: Option<SessionId>,
+    ) -> io::Result<Self> {
         let base_path = base_path.as_ref().to_path_buf();
 
         // Validate session_id to prevent path traversal
-        if let Some(ref sid) = session_id
-            && (sid.is_empty() || sid.contains('/') || sid.contains('\\') || sid.contains(".."))
+        if let Some(sid) = session_id.as_ref().map(SessionId::as_str)
+            && (sid.contains('/') || sid.contains('\\') || sid.contains(".."))
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -323,7 +327,7 @@ impl ExecutionPersistence {
 
         // Compute effective base: with session namespace or flat
         let effective_base = if let Some(ref sid) = session_id {
-            base_path.join(sid)
+            base_path.join(sid.as_str())
         } else {
             base_path.clone()
         };
@@ -909,8 +913,8 @@ impl ExecutionPersistence {
     // ========================================================================
 
     /// Get the session ID (if set).
-    pub fn session_id(&self) -> Option<&str> {
-        self.session_id.as_deref()
+    pub fn session_id(&self) -> Option<&SessionId> {
+        self.session_id.as_ref()
     }
 
     /// Write a typed run manifest to `{run_path}/manifest.json`.
@@ -969,11 +973,11 @@ const SESSION_HISTORY_TEMPLATE: &str = include_str!("../prompts/session_history.
 /// reading every manifest and selecting by completion timestamp.
 pub async fn load_session_manifests(
     base_path: &Path,
-    session_id: &str,
+    session_id: &SessionId,
     exclude_run_id: &str,
     limit: usize,
 ) -> io::Result<Vec<RunManifest>> {
-    let session_dir = base_path.join(session_id);
+    let session_dir = base_path.join(session_id.as_str());
     let mut entries = match fs::read_dir(&session_dir).await {
         Ok(e) => e,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1205,7 +1209,7 @@ mod tests {
     /// refused instead of explorable in place. Covers both layouts.
     #[tokio::test]
     async fn test_artifacts_under_read_root_invariant() {
-        for session in [None, Some("session-1".to_string())] {
+        for session in [None, Some(SessionId::new("session-1").unwrap())] {
             let temp_dir = TempDir::new().unwrap();
             let mut persistence =
                 ExecutionPersistence::new(temp_dir.path().join("memory"), session.clone())
@@ -1582,7 +1586,7 @@ mod tests {
     async fn test_read_artifact_cross_run_basic() {
         let temp_dir = TempDir::new().unwrap();
         let memory_dir = temp_dir.path().join("memory");
-        let session_id = "session_xrun".to_string();
+        let session_id = SessionId::new("session_xrun").unwrap();
 
         // Create run A and write an artifact
         let run_a = ExecutionPersistence::new(&memory_dir, Some(session_id.clone()))
@@ -1652,19 +1656,19 @@ mod tests {
     #[tokio::test]
     async fn test_session_id_creates_namespaced_directory() {
         let temp_dir = TempDir::new().unwrap();
-        let session_id = "cs_test123".to_string();
+        let session_id = SessionId::new("cs_test123").unwrap();
         let persistence =
             ExecutionPersistence::new(temp_dir.path().join("memory"), Some(session_id.clone()))
                 .await
                 .unwrap();
 
-        assert_eq!(persistence.session_id(), Some("cs_test123"));
+        assert_eq!(persistence.session_id(), Some(&session_id));
 
         // Verify the run directory is under the session namespace
         let expected_prefix = temp_dir
             .path()
             .join("memory")
-            .join(&session_id)
+            .join(session_id.as_str())
             .join(persistence.run_id());
         assert_eq!(persistence.base_path, expected_prefix);
         assert!(expected_prefix.exists());
@@ -1673,10 +1677,10 @@ mod tests {
     #[tokio::test]
     async fn test_session_id_path_traversal_rejected() {
         let temp_dir = TempDir::new().unwrap();
-        for bad_id in &["../escape", "foo/bar", "..\\win", ""] {
+        for bad_id in ["../escape", "foo/bar", "..\\win"] {
+            let session = SessionId::new(bad_id).unwrap();
             let result =
-                ExecutionPersistence::new(temp_dir.path().join("memory"), Some(bad_id.to_string()))
-                    .await;
+                ExecutionPersistence::new(temp_dir.path().join("memory"), Some(session)).await;
             assert!(result.is_err(), "Should reject session_id: {:?}", bad_id);
             let err = result.err().unwrap();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
@@ -1863,9 +1867,14 @@ mod tests {
     #[tokio::test]
     async fn test_load_session_manifests_empty_dir() {
         let temp_dir = TempDir::new().unwrap();
-        let result = load_session_manifests(temp_dir.path(), "cs_nonexistent", "exclude-me", 3)
-            .await
-            .unwrap();
+        let result = load_session_manifests(
+            temp_dir.path(),
+            &SessionId::new("cs_nonexistent").unwrap(),
+            "exclude-me",
+            3,
+        )
+        .await
+        .unwrap();
         assert!(result.is_empty());
     }
 
@@ -1897,9 +1906,14 @@ mod tests {
         .unwrap();
 
         // Exclude run-2 (current run)
-        let result = load_session_manifests(temp_dir.path(), "cs_test", "run-2", 3)
-            .await
-            .unwrap();
+        let result = load_session_manifests(
+            temp_dir.path(),
+            &SessionId::new("cs_test").unwrap(),
+            "run-2",
+            3,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].run_id, "run-1");
@@ -1927,9 +1941,14 @@ mod tests {
             .unwrap();
         }
 
-        let result = load_session_manifests(temp_dir.path(), "cs_test", "exclude-none", 10)
-            .await
-            .unwrap();
+        let result = load_session_manifests(
+            temp_dir.path(),
+            &SessionId::new("cs_test").unwrap(),
+            "exclude-none",
+            10,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.len(), 3);
         // Most recent first
@@ -1957,9 +1976,14 @@ mod tests {
             .unwrap();
         }
 
-        let result = load_session_manifests(temp_dir.path(), "cs_test", "exclude-none", 2)
-            .await
-            .unwrap();
+        let result = load_session_manifests(
+            temp_dir.path(),
+            &SessionId::new("cs_test").unwrap(),
+            "exclude-none",
+            2,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].run_id, "run-0");
@@ -1994,9 +2018,14 @@ mod tests {
             .unwrap();
         }
 
-        let result = load_session_manifests(temp_dir.path(), "cs_test", "exclude-none", 2)
-            .await
-            .unwrap();
+        let result = load_session_manifests(
+            temp_dir.path(),
+            &SessionId::new("cs_test").unwrap(),
+            "exclude-none",
+            2,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.len(), 2);
         // Output is timestamp-sorted.
@@ -2026,9 +2055,14 @@ mod tests {
             symlink("run-1", session_dir.join("latest")).unwrap();
         }
 
-        let result = load_session_manifests(temp_dir.path(), "cs_test", "exclude-none", 10)
-            .await
-            .unwrap();
+        let result = load_session_manifests(
+            temp_dir.path(),
+            &SessionId::new("cs_test").unwrap(),
+            "exclude-none",
+            10,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].run_id, "run-1");
@@ -2752,10 +2786,12 @@ mod tests {
     #[tokio::test]
     async fn test_prune_skips_parked_directory_and_parked_runs() {
         let temp_dir = TempDir::new().unwrap();
-        let persistence =
-            ExecutionPersistence::new(temp_dir.path().join("memory"), Some("cs_prune".to_string()))
-                .await
-                .unwrap();
+        let persistence = ExecutionPersistence::new(
+            temp_dir.path().join("memory"),
+            Some(SessionId::new("cs_prune").unwrap()),
+        )
+        .await
+        .unwrap();
         let session_dir = temp_dir.path().join("memory").join("cs_prune");
         let oldest = "0191e8c0-0000-7000-8000-000000000001";
         let second = "0191e8c0-0aaa-7000-8000-000000000005";

@@ -12,7 +12,7 @@ use crate::builder::{
     Agent, ClientTool, PreparedAgent, RunToolFactory, build_streaming_agent_with_tools,
     no_run_tools,
 };
-use crate::config::{AgentRuntimeConfig, RunId, WorkerSkills};
+use crate::config::{AgentRuntimeConfig, RunId, SessionId, WorkerSkills};
 use crate::error::BuilderError;
 use crate::forwarded_headers::ForwardedHeaders;
 use crate::hitl::PendingApprovals;
@@ -166,7 +166,7 @@ impl RigBuilder {
         req_headers: Option<&HashMap<String, String>>,
         additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
         client_tools: Option<Vec<ClientTool>>,
-        session_id: Option<String>,
+        session_id: Option<SessionId>,
     ) -> Result<Arc<PreparedAgent>, BuilderError> {
         let mut agent_config = self.discovered_agent_config(req_headers)?;
         resolve_mcp_headers(&mut agent_config, req_headers);
@@ -189,7 +189,7 @@ impl RigBuilder {
         additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
         client_tools: Option<Vec<ClientTool>>,
         run_id: Option<RunId>,
-        session_id: Option<String>,
+        session_id: Option<SessionId>,
     ) -> Result<Agent, BuilderError> {
         let prepared = self
             .prepare_agent(req_headers, additional_tools, client_tools, session_id)
@@ -216,7 +216,7 @@ impl RigBuilder {
     pub async fn build_streaming_agent_with_headers(
         &self,
         req_headers: Option<&HashMap<String, String>>,
-        session_id: Option<String>,
+        session_id: Option<SessionId>,
         client_tools: Option<Vec<ClientTool>>,
         run_id: Option<RunId>,
     ) -> Result<Arc<dyn StreamingAgent>, BuilderError> {
@@ -237,7 +237,7 @@ impl RigBuilder {
     pub async fn build_streaming_agent_with_tools(
         &self,
         req_headers: Option<&HashMap<String, String>>,
-        session_id: Option<String>,
+        session_id: Option<SessionId>,
         client_tools: Option<Vec<ClientTool>>,
         run_id: Option<RunId>,
         run_tools: RunToolFactory,

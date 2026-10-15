@@ -1,3 +1,5 @@
+use aura_events::SessionId;
+
 /// Header name used to communicate the chat session identifier.
 pub const CHAT_SESSION_HEADER: &str = "x-chat-session-id";
 
@@ -61,6 +63,10 @@ pub fn find_header_value<'a>(extra_headers: &'a [(String, String)], name: &str) 
 /// Precedence:
 /// 1. If `extra_headers` (from `AURA_EXTRA_HEADERS`) sets `x-chat-session-id`, use it as the base.
 /// 2. Otherwise, use `conversation_uuid` as the base.
+/// 3. Otherwise, generate a new id.
+///
+/// Blank values are skipped, so an empty `x-chat-session-id:` in
+/// `AURA_EXTRA_HEADERS` falls back to the conversation id.
 ///
 /// For `SessionKind::Summary`, append `-summary` to the resolved base so that
 /// title-generation calls correlate with their parent chat session but don't
@@ -69,14 +75,18 @@ pub fn resolve_chat_session_id(
     extra_headers: &[(String, String)],
     conversation_uuid: &str,
     kind: SessionKind,
-) -> String {
+) -> SessionId {
     let base = find_header_value(extra_headers, CHAT_SESSION_HEADER)
-        .map(str::to_string)
-        .unwrap_or_else(|| conversation_uuid.to_string());
+        .and_then(SessionId::non_empty)
+        .or_else(|| SessionId::non_empty(conversation_uuid))
+        .unwrap_or_else(|| {
+            SessionId::new(uuid::Uuid::new_v4().to_string()).expect("a UUID is never blank")
+        });
 
     match kind {
         SessionKind::Chat => base,
-        SessionKind::Summary => format!("{base}{SUMMARY_SUFFIX}"),
+        SessionKind::Summary => SessionId::new(format!("{base}{SUMMARY_SUFFIX}"))
+            .expect("the id ends with \"-summary\", so it is not blank"),
     }
 }
 
@@ -116,6 +126,29 @@ mod tests {
             resolve_chat_session_id(&h, "conv-123", SessionKind::Chat),
             "override-abc"
         );
+    }
+
+    #[test]
+    fn blank_header_falls_back_to_conversation_uuid() {
+        for blank in ["", "  "] {
+            let h = headers(&[("x-chat-session-id", blank)]);
+            assert_eq!(
+                resolve_chat_session_id(&h, "conv-123", SessionKind::Chat),
+                "conv-123"
+            );
+            assert_eq!(
+                resolve_chat_session_id(&h, "conv-123", SessionKind::Summary),
+                "conv-123-summary"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_header_and_conversation_get_a_fresh_id() {
+        let h = headers(&[("x-chat-session-id", "")]);
+        let first = resolve_chat_session_id(&h, "", SessionKind::Chat);
+        let second = resolve_chat_session_id(&h, "", SessionKind::Chat);
+        assert_ne!(first, second);
     }
 
     #[test]

@@ -364,10 +364,11 @@ impl SlackIngress {
         let request_id = run_id.to_string();
         let request_id = request_id.as_str();
         let history = thread_history(earlier, &self.identity, &inbound.ts);
-        let session_id = match inbound.reply_thread() {
+        let session_id = aura::SessionId::new(match inbound.reply_thread() {
             Some(thread) => format!("slack:{}:{thread}", inbound.channel),
             None => format!("slack:{}", inbound.channel),
-        };
+        })
+        .expect("the id starts with \"slack:\", so it is not blank");
         let (config, tools) = run_setup(&self.config, &self.api, inbound);
         debug!(
             request_id,

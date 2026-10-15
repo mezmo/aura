@@ -27,13 +27,13 @@ impl HttpBackend {
         &self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
-        session_id: &str,
+        session_id: &aura_events::SessionId,
         cancel: Arc<AtomicBool>,
         handler: &mut impl StreamHandler,
     ) -> Result<StreamResult> {
         let response = self
             .client
-            .send_streaming(messages, tools, session_id)
+            .send_streaming(messages, tools, session_id.as_str())
             .await?;
         process_stream(response, cancel, handler).await
     }
@@ -41,9 +41,9 @@ impl HttpBackend {
     pub async fn summarize(
         &self,
         text: &str,
-        session_id: &str,
+        session_id: &aura_events::SessionId,
     ) -> Result<(String, Option<(u64, u64)>)> {
-        self.client.summarize(text, session_id).await
+        self.client.summarize(text, session_id.as_str()).await
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>> {
