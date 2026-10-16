@@ -19,6 +19,7 @@ pub mod hitl;
 pub mod hooks;
 pub mod inactivity;
 pub mod instance_id;
+pub mod journal;
 pub mod logging;
 pub mod mcp;
 #[cfg(feature = "otel")]
