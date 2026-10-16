@@ -2931,7 +2931,6 @@ mod tests {
     /// `transform_args` will all surface here.
     #[tokio::test]
     async fn test_composed_scratchpad_then_existing_observes_raw_output() {
-        use crate::mcp::CallOutcome;
         use crate::scratchpad::{ScratchpadStorage, ScratchpadWrapper};
         use crate::tool_wrapper::{
             ComposedWrapper, ToolCallContext, ToolWrapper, TransformArgsResult,
@@ -2967,7 +2966,7 @@ mod tests {
             async fn transform_output(
                 &self,
                 output: String,
-                _outcome: &CallOutcome,
+                _is_error: bool,
                 _ctx: &ToolCallContext,
                 _extracted: Option<&Value>,
             ) -> TransformOutputResult {
@@ -3027,9 +3026,8 @@ mod tests {
         // then scratchpad runs on recording's pass-through output and rewrites
         // it to a pointer.
         let raw: String = (0..500).map(|i| format!("entry_{} ", i)).collect();
-        let outcome = CallOutcome::Success(raw.clone());
         let result = composed
-            .transform_output(raw.clone(), &outcome, &ctx, None)
+            .transform_output(raw.clone(), false, &ctx, None)
             .await;
 
         assert_eq!(

@@ -196,12 +196,11 @@ impl FallbackToolExecutor {
                                     Err(e) => {
                                         warn!(tool = %parsed_call.name, error = %e, "Fallback tool execution failed");
 
-                                        // Emit error as tool result
                                         yield Ok(StreamItem::StreamUserItem(
                                             StreamedUserContent::ToolResult(ToolResult {
                                                 id: tool_call_id.clone(),
                                                 call_id: Some(tool_call_id),
-                                                result: format!("Error: {}", e),
+                                                result: e,
                                             })
                                         ));
                                     }
@@ -281,6 +280,44 @@ impl StreamState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_failed_fallback_call_yields_a_tool_error() {
+        let executor = FallbackToolExecutor::new(
+            Arc::new(McpManager::new()),
+            vec!["does_not_exist".to_string()],
+            None,
+        );
+        let model_output = futures::stream::iter([
+            Ok(StreamItem::StreamAssistantItem(
+                StreamedAssistantContent::Text(
+                    r#"{"name": "does_not_exist", "parameters": {}}"#.to_string(),
+                ),
+            )),
+            Ok(StreamItem::FinalMarker),
+        ])
+        .boxed();
+
+        let results: Vec<String> = executor
+            .wrap_stream(model_output)
+            .filter_map(|item| async move {
+                match item {
+                    Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(r))) => {
+                        Some(r.result)
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+            .await;
+
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert!(
+            crate::tool_error_detection::is_tool_error(&results[0]),
+            "{}",
+            results[0]
+        );
+    }
 
     #[test]
     fn test_might_contain_tool_call_json() {

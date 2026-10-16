@@ -10,9 +10,9 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent};
-use crate::tool_wrapper::{ToolCallContext, ToolWrapper, TransformArgsResult};
-use rig::tool::ToolError;
+use crate::tool_call_observer::{ToolCallObserver, ToolEvent};
+use crate::tool_error_detection::is_tool_error;
+use crate::tool_wrapper::{ToolCallContext, ToolWrapper, TransformArgsResult, extracted_field};
 
 /// Counter for generating unique tool call IDs within a process.
 static CALL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -70,16 +70,6 @@ impl ToolWrapper for ObserverWrapper {
         }
     }
 
-    fn handle_error(
-        &self,
-        error: ToolError,
-        _ctx: &ToolCallContext,
-        _extracted: Option<&Value>,
-    ) -> ToolError {
-        // Error passes through unchanged
-        error
-    }
-
     async fn on_complete(
         &self,
         ctx: &ToolCallContext,
@@ -88,18 +78,8 @@ impl ToolWrapper for ObserverWrapper {
         duration_ms: u64,
     ) {
         // Extract tool_call_id from the extracted data
-        let tool_call_id = extracted
-            .and_then(|v| {
-                // Handle both direct object and array from ComposedWrapper
-                if let Some(arr) = v.as_array() {
-                    // Find the object with observer_tool_call_id
-                    arr.iter()
-                        .find_map(|item| item.get("observer_tool_call_id"))
-                        .and_then(|v| v.as_str())
-                } else {
-                    v.get("observer_tool_call_id").and_then(|v| v.as_str())
-                }
-            })
+        let tool_call_id = extracted_field(extracted, "observer_tool_call_id")
+            .and_then(Value::as_str)
             .unwrap_or_else(|| {
                 // Fallback: generate a new ID (shouldn't happen in normal flow)
                 tracing::warn!(
@@ -111,24 +91,20 @@ impl ToolWrapper for ObserverWrapper {
 
         // Emit CallCompleted event (full output — truncation happens at SSE handler layer)
         let event = match result {
-            Ok(output) => ToolEvent::call_completed_success(
+            Ok(output) if !is_tool_error(output) => ToolEvent::call_completed_success(
                 tool_call_id,
                 &ctx.tool_name,
                 &ctx.tool_initiator_id,
                 output,
                 duration_ms,
             ),
-            Err(err) => {
-                let retry_hint = RetryHint::from_error_message(err);
-                ToolEvent::call_completed_error(
-                    tool_call_id,
-                    &ctx.tool_name,
-                    &ctx.tool_initiator_id,
-                    err,
-                    Some(retry_hint),
-                    duration_ms,
-                )
-            }
+            Ok(err) | Err(err) => ToolEvent::call_completed_error(
+                tool_call_id,
+                &ctx.tool_name,
+                &ctx.tool_initiator_id,
+                err,
+                duration_ms,
+            ),
         };
 
         self.observer.emit(event);
@@ -138,6 +114,7 @@ impl ToolWrapper for ObserverWrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aura_events::agent::ToolOutcome;
 
     #[test]
     fn test_generate_tool_call_id() {
@@ -197,7 +174,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(duration_ms, 100);
-                assert!(result.is_success());
+                assert!(matches!(result, ToolOutcome::Success { .. }), "{result:?}");
             }
             _ => panic!("Expected CallCompleted event"),
         }
@@ -243,7 +220,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(duration_ms, 100);
-                assert!(result.is_success());
+                assert!(matches!(result, ToolOutcome::Success { .. }), "{result:?}");
             }
             _ => panic!("Expected CallCompleted event"),
         }
@@ -273,8 +250,39 @@ mod tests {
         let event = rx.recv().await.unwrap();
         match event {
             ToolEvent::CallCompleted { result, .. } => {
-                assert!(!result.is_success());
-                assert_eq!(result.error_message(), Some("rate limit exceeded"));
+                assert!(
+                    matches!(&result, ToolOutcome::Failure { error } if error == "rate limit exceeded"),
+                    "{result:?}"
+                );
+            }
+            _ => panic!("Expected CallCompleted event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_error_results_complete_as_failures() {
+        let (observer, mut rx) = ToolCallObserver::new(8);
+        let wrapper = ObserverWrapper::new(observer, 0);
+
+        let ctx = ToolCallContext::new("mcp_tool");
+        let result = wrapper.transform_args(serde_json::json!({}), &ctx);
+        let _ = rx.recv().await.unwrap();
+
+        wrapper
+            .on_complete(
+                &ctx,
+                result.extracted.as_ref(),
+                Ok("Tool returned an error: 401 Unauthorized"),
+                50,
+            )
+            .await;
+
+        match rx.recv().await.unwrap() {
+            ToolEvent::CallCompleted { result, .. } => {
+                assert!(
+                    matches!(&result, ToolOutcome::Failure { error } if error == "Tool returned an error: 401 Unauthorized"),
+                    "{result:?}"
+                );
             }
             _ => panic!("Expected CallCompleted event"),
         }

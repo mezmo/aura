@@ -26,7 +26,6 @@
 //! ```ignore
 //! use std::sync::Arc;
 //!
-//! use aura::mcp::CallOutcome;
 //! use aura::tool_wrapper::{
 //!     ToolCallContext, ToolWrapper, TransformOutputResult, WrappedTool,
 //! };
@@ -41,7 +40,7 @@
 //!     async fn transform_output(
 //!         &self,
 //!         output: String,
-//!         _outcome: &CallOutcome,
+//!         _is_error: bool,
 //!         _ctx: &ToolCallContext,
 //!         _extracted: Option<&Value>,
 //!     ) -> TransformOutputResult {
@@ -61,7 +60,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::config::ToolContextFactory;
-use crate::mcp::CallOutcome;
+use crate::tool_error_detection::is_tool_error;
 
 /// Context passed to wrapper methods during tool execution.
 ///
@@ -248,13 +247,15 @@ pub trait ToolWrapper: Send + Sync {
 
     /// Transform output after tool execution.
     ///
-    /// Called after each successful tool invocation. Use this to:
+    /// Called whenever the inner tool returns `Ok`, including output that
+    /// reports a failure (see `is_error`). Use this to:
     /// - Convert field formats in the response
     /// - Add metadata to the response
     /// - Trigger side effects (logging, metrics)
     ///
     /// # Arguments
     /// * `output` - Output from the inner tool
+    /// * `is_error` - Whether `output` reports a tool failure
     /// * `ctx` - Context about the current tool call
     /// * `extracted` - Data extracted during `transform_args`
     ///
@@ -263,7 +264,7 @@ pub trait ToolWrapper: Send + Sync {
     async fn transform_output(
         &self,
         output: String,
-        _outcome: &CallOutcome,
+        _is_error: bool,
         _ctx: &ToolCallContext,
         _extracted: Option<&Value>,
     ) -> TransformOutputResult {
@@ -600,11 +601,11 @@ where
                     let span = tracing::Span::current();
                     let transform_handle = tokio::spawn(tracing::Instrument::instrument(
                         async move {
-                            let outcome = CallOutcome::classify_from_output(&output);
+                            let is_error = is_tool_error(&output);
                             let transformed = wrapper_clone
                                 .transform_output(
                                     output,
-                                    &outcome,
+                                    is_error,
                                     &ctx_clone,
                                     extracted_clone.as_ref(),
                                 )
@@ -679,6 +680,19 @@ where
                 }
             }
         })
+    }
+}
+
+/// The value a wrapper stored under `key` in its `transform_args` extracted
+/// data. That data is one wrapper's object, or a [`ComposedWrapper`]'s array
+/// of them, where a nested composite contributes an array of its own.
+pub(crate) fn extracted_field<'a>(extracted: Option<&'a Value>, key: &str) -> Option<&'a Value> {
+    let extracted = extracted?;
+    match extracted.as_array() {
+        Some(items) => items
+            .iter()
+            .find_map(|item| extracted_field(Some(item), key)),
+        None => extracted.get(key),
     }
 }
 
@@ -793,13 +807,13 @@ impl ToolWrapper for ComposedWrapper {
     async fn transform_output(
         &self,
         mut output: String,
-        outcome: &CallOutcome,
+        is_error: bool,
         ctx: &ToolCallContext,
         extracted: Option<&Value>,
     ) -> TransformOutputResult {
         for wrapper in self.wrappers.iter().rev() {
             let result = wrapper
-                .transform_output(output, outcome, ctx, extracted)
+                .transform_output(output, is_error, ctx, extracted)
                 .await;
             output = result.output;
         }
@@ -838,6 +852,39 @@ impl ToolWrapper for ComposedWrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StoresKey(&'static str);
+
+    #[async_trait]
+    impl ToolWrapper for StoresKey {
+        fn transform_args(&self, args: Value, _ctx: &ToolCallContext) -> TransformArgsResult {
+            TransformArgsResult::with_extracted(args, serde_json::json!({ self.0: self.0 }))
+        }
+    }
+
+    #[test]
+    fn extracted_field_finds_keys_under_nested_composites() {
+        let inner = Arc::new(ComposedWrapper::new(vec![
+            Arc::new(StoresKey("inner_a")) as Arc<dyn ToolWrapper>,
+            Arc::new(StoresKey("inner_b")),
+        ]));
+        let outer = ComposedWrapper::new(vec![
+            Arc::new(StoresKey("outer")) as Arc<dyn ToolWrapper>,
+            inner,
+        ]);
+        let extracted = outer
+            .transform_args(serde_json::json!({}), &ToolCallContext::new("t"))
+            .extracted;
+
+        for key in ["outer", "inner_a", "inner_b"] {
+            assert_eq!(
+                extracted_field(extracted.as_ref(), key),
+                Some(&Value::from(key)),
+                "{key}"
+            );
+        }
+        assert_eq!(extracted_field(extracted.as_ref(), "missing"), None);
+    }
 
     struct NoOpWrapper;
 
@@ -901,9 +948,8 @@ mod tests {
 
         // Output unchanged
         let output = "test output".to_string();
-        let outcome = CallOutcome::Success(output.clone());
         let result = wrapper
-            .transform_output(output.clone(), &outcome, &ctx, None)
+            .transform_output(output.clone(), false, &ctx, None)
             .await;
         assert_eq!(result.output, output);
     }

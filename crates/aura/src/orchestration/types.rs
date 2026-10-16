@@ -1258,7 +1258,7 @@ fn render_tool_chain_lines(
                     if t.reasoning.is_empty() {
                         format!("{} ({})", t.tool, duration)
                     } else {
-                        let r = truncate_reasoning(&t.reasoning, 100);
+                        let r = truncate_chars(&t.reasoning, 100);
                         format!("{} ({}, \"{}\")", t.tool, duration, r)
                     }
                 }
@@ -1272,7 +1272,7 @@ fn render_tool_chain_lines(
     vec![format!("Tool chain: {}", parts.join(" → "))]
 }
 
-fn truncate_reasoning(s: &str, max_chars: usize) -> String {
+pub(super) fn truncate_chars(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
     } else {

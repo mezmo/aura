@@ -2,7 +2,6 @@
 //! to the scratchpad directory, returning a summary pointer to the LLM.
 
 use super::storage::ScratchpadStorage;
-use crate::mcp::CallOutcome;
 use crate::orchestration::persistence_wrapper::strip_artifact_footer;
 use crate::run_context::BoundRun;
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper, TransformOutputResult};
@@ -72,7 +71,7 @@ impl ToolWrapper for ScratchpadWrapper {
     async fn transform_output(
         &self,
         output: String,
-        outcome: &CallOutcome,
+        is_error: bool,
         ctx: &ToolCallContext,
         _extracted: Option<&serde_json::Value>,
     ) -> TransformOutputResult {
@@ -81,9 +80,9 @@ impl ToolWrapper for ScratchpadWrapper {
         // tool outputs that exceed the per-tool token threshold.
         //
         // Oversized errors are bounded upstream at the tool-result source
-        // (`mcp_response::bound_error_content`), so passing the
+        // (`crate::mcp::response::bound_error_content`), so passing the
         // error through here does not risk flooding a worker's context.
-        if outcome.is_error() {
+        if is_error {
             return TransformOutputResult::new(output);
         }
 
@@ -252,12 +251,6 @@ mod tests {
     use crate::tool_wrapper::ToolCallContext;
     use tempfile::TempDir;
 
-    /// Build a `CallOutcome::Success` for tests that don't care about the
-    /// content (the wrapper only reads `is_error()`, not the inner string).
-    fn ok() -> CallOutcome {
-        CallOutcome::Success(String::new())
-    }
-
     // Glob pattern matching + per-server tie-break semantics now live in
     // `scratchpad::scratchpad_tool_map`, which runs once per request when the
     // agent (or orchestration worker) is constructed. See the
@@ -299,7 +292,7 @@ mod tests {
         ctx.attempt = Some(0);
 
         let result = wrapper
-            .transform_output(large_output, &ok(), &ctx, None)
+            .transform_output(large_output, false, &ctx, None)
             .await;
         assert!(
             result.output.contains("[scratchpad:"),
@@ -340,10 +333,10 @@ mod tests {
         ctx.attempt = Some(0);
 
         let r1 = wrapper
-            .transform_output(large_output.clone(), &ok(), &ctx, None)
+            .transform_output(large_output.clone(), false, &ctx, None)
             .await;
         let r2 = wrapper
-            .transform_output(large_output, &ok(), &ctx, None)
+            .transform_output(large_output, false, &ctx, None)
             .await;
         assert_eq!(
             r1.output, r2.output,
@@ -378,7 +371,7 @@ mod tests {
         ctx.attempt = Some(0);
 
         let result = wrapper
-            .transform_output(large_output, &ok(), &ctx, None)
+            .transform_output(large_output, false, &ctx, None)
             .await;
         let output = result.output;
 
@@ -441,7 +434,7 @@ mod tests {
         ctx.attempt = Some(0);
 
         let result = wrapper
-            .transform_output(with_footer, &ok(), &ctx, None)
+            .transform_output(with_footer, false, &ctx, None)
             .await;
         assert!(result.output.contains("[scratchpad:"), "must intercept");
 
@@ -487,7 +480,7 @@ mod tests {
         let ctx = ToolCallContext::new("search_knowledge_base");
 
         let result = wrapper
-            .transform_output(small_output.clone(), &ok(), &ctx, None)
+            .transform_output(small_output.clone(), false, &ctx, None)
             .await;
         assert_eq!(
             result.output, small_output,
@@ -526,7 +519,7 @@ mod tests {
         let ctx = ToolCallContext::new("other_tool");
 
         let result = wrapper
-            .transform_output(large_output.clone(), &ok(), &ctx, None)
+            .transform_output(large_output.clone(), false, &ctx, None)
             .await;
         assert_eq!(result.output, large_output);
     }
@@ -558,7 +551,7 @@ mod tests {
         for tool_name in ["load_skill", "read_skill_file"] {
             let ctx = ToolCallContext::new(tool_name);
             let result = wrapper
-                .transform_output(large_output.clone(), &ok(), &ctx, None)
+                .transform_output(large_output.clone(), false, &ctx, None)
                 .await;
             assert_eq!(
                 result.output, large_output,
@@ -602,7 +595,7 @@ mod tests {
         ctx.attempt = Some(0);
 
         let result = wrapper
-            .transform_output(content.clone(), &ok(), &ctx, None)
+            .transform_output(content.clone(), false, &ctx, None)
             .await;
         assert!(
             result.output.contains("[scratchpad:"),
@@ -621,7 +614,7 @@ mod tests {
         );
 
         let result2 = wrapper2
-            .transform_output(content.clone(), &ok(), &ctx, None)
+            .transform_output(content.clone(), false, &ctx, None)
             .await;
         assert_eq!(
             result2.output, content,
@@ -659,7 +652,7 @@ mod tests {
 
         assert_eq!(budget.scratchpad_usage(), (0, 0));
 
-        let result = wrapper.transform_output(content, &ok(), &ctx, None).await;
+        let result = wrapper.transform_output(content, false, &ctx, None).await;
         assert!(result.output.contains("[scratchpad:"));
 
         let (intercepted, _) = budget.scratchpad_usage();
@@ -699,7 +692,7 @@ mod tests {
         ctx.attempt = Some(0);
 
         let result = wrapper
-            .transform_output(large_output.clone(), &ok(), &ctx, None)
+            .transform_output(large_output.clone(), false, &ctx, None)
             .await;
 
         // Returning the raw payload would re-introduce the overflow scratchpad
@@ -765,7 +758,7 @@ mod tests {
         ctx.attempt = Some(0);
 
         let result = wrapper
-            .transform_output(outer.to_string(), &ok(), &ctx, None)
+            .transform_output(outer.to_string(), false, &ctx, None)
             .await;
         let output = result.output;
 
@@ -832,7 +825,7 @@ mod tests {
         ctx.attempt = Some(0);
 
         let result = wrapper
-            .transform_output(large_output, &ok(), &ctx, None)
+            .transform_output(large_output, false, &ctx, None)
             .await;
         let output = result.output;
 

@@ -267,28 +267,19 @@ fn tool_event_to_orchestrator_event(event: crate::tool_call_observer::ToolEvent)
             tool_initiator_id,
             result,
             duration_ms,
-        } => {
-            let success = result.is_success();
-            let result_str = match result {
-                crate::tool_call_observer::ToolOutcome::Success(content) => content,
-                crate::tool_call_observer::ToolOutcome::Error { message, .. } => message,
-            };
-            by_worker(
-                &tool_initiator_id,
-                AgentEventPayload::ToolComplete {
-                    task_id: extract_task_id(&tool_call_id),
-                    tool_call_id: tool_call_id.into(),
-                    tool_name: tool_name.into(),
-                    duration_ms,
-                    outcome: outcome_of(success, result_str),
-                },
-            )
-        }
+        } => by_worker(
+            &tool_initiator_id,
+            AgentEventPayload::ToolComplete {
+                task_id: extract_task_id(&tool_call_id),
+                tool_call_id: tool_call_id.into(),
+                tool_name: tool_name.into(),
+                duration_ms,
+                outcome: result,
+            },
+        ),
     }
 }
 
-/// The schema distinguishes success from failure by variant; the observer
-/// reports one string either way.
 fn outcome_of(success: bool, message: String) -> aura_events::agent::ToolOutcome {
     if success {
         aura_events::agent::ToolOutcome::Success { result: message }
@@ -378,10 +369,7 @@ async fn forward_internal_tool_completed(
         return;
     };
     let Some(tx) = event_tx else { return };
-    let success = matches!(
-        crate::tool_error_detection::detect_tool_error(result),
-        crate::tool_error_detection::ToolResultStatus::Success
-    );
+    let success = !crate::tool_error_detection::is_tool_error(result);
     let _ = tx
         .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
             &start.worker_id,
@@ -8693,7 +8681,8 @@ mod tests {
     /// denial arm in `gate.rs` verbatim.
     fn denial_feedback_wire(reason: &str) -> String {
         serde_json::to_string(&format!(
-            "Tool call blocked by human approval denial: {reason}. Do not execute this action."
+            "{}{reason}. Do not execute this action.",
+            crate::hitl::DENIAL_PREFIX
         ))
         .expect("a plain string serializes")
     }
