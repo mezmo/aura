@@ -715,6 +715,31 @@ impl Orchestrator {
         (self.run_tools)().iter().map(|tool| tool.name()).collect()
     }
 
+    /// Tokens every call of a worker carries before its task prompt: the
+    /// worker preamble and the schemas of the MCP tools its filter admits.
+    fn worker_fixed_overhead(
+        &self,
+        worker_cfg: Option<&super::config::WorkerConfig>,
+        counter: &dyn scratchpad::TokenCounter,
+    ) -> usize {
+        let worker_preamble = worker_cfg.map(|w| w.preamble.as_str()).unwrap_or("");
+        let worker_filter = worker_cfg.and_then(|w| w.mcp_filter.as_deref());
+        let mcp_tool_tokens = self
+            .mcp_manager
+            .as_ref()
+            .map(|m| {
+                scratchpad::count_mcp_tool_schema_tokens(
+                    counter,
+                    m.tool_definitions_iter(),
+                    worker_filter,
+                )
+            })
+            .unwrap_or(0);
+        counter.count_tokens(super::config::WORKER_PREAMBLE_TEMPLATE)
+            + counter.count_tokens(worker_preamble)
+            + mcp_tool_tokens
+    }
+
     /// Create a worker agent for task execution.
     ///
     /// Workers are regular agents that execute individual tasks.
@@ -857,23 +882,8 @@ impl Orchestrator {
                 )? as usize;
                 let (provider, model) = worker_config.llm.model_info();
                 let token_counter = scratchpad::token_counter_for_provider(provider, model);
-                let worker_preamble = worker_cfg.map(|w| w.preamble.as_str()).unwrap_or("");
-
-                let mcp_tool_tokens = self
-                    .mcp_manager
-                    .as_ref()
-                    .map(|m| {
-                        scratchpad::count_mcp_tool_schema_tokens(
-                            &*token_counter,
-                            m.tool_definitions_iter(),
-                            worker_filter,
-                        )
-                    })
-                    .unwrap_or(0);
-                let initial_used = scratchpad::estimate_scratchpad_overhead(
-                    &*token_counter,
-                    &[super::config::WORKER_PREAMBLE_TEMPLATE, worker_preamble],
-                ) + mcp_tool_tokens;
+                let initial_used = scratchpad::estimate_scratchpad_overhead(&*token_counter, &[])
+                    + self.worker_fixed_overhead(worker_cfg, &*token_counter);
 
                 let (iter_dir, read_root) = {
                     let persistence = self.persistence.lock().await;
@@ -898,6 +908,26 @@ impl Orchestrator {
                 scratchpad_budget = Some(build.budget);
                 worker_config.scratchpad_tools_config = Some(build.tools_config);
             }
+        }
+
+        // Without a scratchpad, a known context window still bounds what
+        // `read_artifact` inlines: a plain budget the reads add up in, capped
+        // per read at a quarter of the window.
+        if scratchpad_budget.is_none()
+            && let Some(window) = worker_config.llm.context_window()
+        {
+            let (provider, model) = worker_config.llm.model_info();
+            let token_counter = scratchpad::token_counter_for_provider(provider, model);
+            let initial_used = self.worker_fixed_overhead(worker_cfg, &*token_counter);
+            scratchpad_budget = Some(
+                scratchpad::ContextBudget::new(
+                    window as usize,
+                    scratchpad::ScratchpadConfig::default().context_safety_margin,
+                    initial_used,
+                    token_counter,
+                )
+                .with_max_extraction_tokens(super::tools::inline_cap_tokens(window)),
+            );
         }
 
         // Resolution order: worker turn_depth → [agent].turn_depth → DEFAULT_MAX_DEPTH.
@@ -5784,6 +5814,45 @@ fn context_overflow_suggestion(phase: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Set the context window on whichever provider `llm` is.
+    pub(super) fn set_context_window(llm: &mut crate::config::LlmConfig, window: u64) {
+        use crate::config::LlmConfig;
+        match llm {
+            LlmConfig::OpenAI { context_window, .. }
+            | LlmConfig::Anthropic { context_window, .. }
+            | LlmConfig::Bedrock { context_window, .. }
+            | LlmConfig::Gemini { context_window, .. }
+            | LlmConfig::Ollama { context_window, .. }
+            | LlmConfig::OpenRouter { context_window, .. } => *context_window = Some(window),
+        }
+    }
+
+    /// A worker with a context window and no scratchpad counts its reads
+    /// against a budget that already holds its preamble and tool schemas,
+    /// so `read_artifact` cannot inline what the next request has no room
+    /// for.
+    #[tokio::test]
+    async fn a_plain_worker_budget_starts_from_the_fixed_overhead() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut config = crate::config::AgentRuntimeConfig {
+            memory_dir: Some(temp.path().join("memory").to_string_lossy().into_owned()),
+            ..crate::config::AgentRuntimeConfig::default()
+        };
+        set_context_window(&mut config.llm, 128_000);
+        let orchestrator = Orchestrator::new(config).await.unwrap();
+
+        let worker = orchestrator
+            .create_worker(0, 1, None, None, None)
+            .await
+            .unwrap();
+        let budget = worker.agent.scratchpad_budget().expect("a plain budget");
+        let (provider, model) = orchestrator.agent_config.llm.model_info();
+        let counter = crate::scratchpad::token_counter_for_provider(provider, model);
+        let overhead = orchestrator.worker_fixed_overhead(None, &*counter);
+        assert!(overhead > 0);
+        assert_eq!(budget.remaining(), budget.usable_budget() - overhead);
+    }
 
     fn assistant_text(msg: &rig::completion::Message) -> String {
         match msg {

@@ -1320,6 +1320,19 @@ impl PreparedAgent {
                 }
                 read_artifact = read_artifact
                     .with_scratchpad(scratchpad.run.clone(), scratchpad.storage.clone());
+            } else if config.llm.context_window().is_some() {
+                // Without a scratchpad the run's budget still bounds what the
+                // tool inlines; `create_worker` builds that budget from the
+                // context window.
+                read_artifact = read_artifact.with_budget(Arc::clone(run));
+            } else {
+                tracing::warn!(
+                    "Agent {}: [agent.llm].context_window is unset, so read_artifact returns \
+                     artifacts over {} bytes as a preview of their start; set context_window \
+                     to the model's window so artifacts that fit come back whole",
+                    config.agent.name,
+                    crate::orchestration::tools::PREVIEW_BYTES,
+                );
             }
             builder_state = builder_state.add_tool(read_artifact);
         }

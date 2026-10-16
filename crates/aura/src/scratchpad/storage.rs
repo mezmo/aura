@@ -28,6 +28,24 @@ impl ContentFormat {
         (ContentFormat::Text, None)
     }
 
+    /// The format `content` looks like, from its shape alone: a JSON
+    /// object or array by its first and last bytes, markdown by its
+    /// headers, text otherwise. Nothing is parsed, so a malformed JSON body
+    /// is still called json here; the read tools report that when it is
+    /// opened.
+    pub fn detect(content: &str) -> Self {
+        let trimmed = content.trim();
+        if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+            || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+        {
+            return ContentFormat::Json;
+        }
+        if Self::is_markdown(trimmed) {
+            return ContentFormat::Markdown;
+        }
+        ContentFormat::Text
+    }
+
     /// Detect whether content is structured markdown.
     ///
     /// Heuristic: returns true when any of the first 50 lines is a valid
