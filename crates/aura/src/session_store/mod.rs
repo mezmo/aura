@@ -1,6 +1,6 @@
 //! Pluggable cross-instance session-state capabilities: a durable store for parked
-//! HITL approvals, a per-session, per-agent skill-invocation store, and a pub/sub
-//! event bus.
+//! HITL approvals, a per-session, per-agent skill-invocation store, a per-session
+//! event journal, and a pub/sub event bus.
 //!
 //! The in-memory implementations are the default; file-backed approval and
 //! skill-invocation stores survive a process restart on a single host, and a
@@ -18,9 +18,12 @@ mod record;
 mod skill_record;
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use aura_events::run::{SessionEvent, SessionEventPayload};
+use aura_events::{RunId, SequenceNumber};
 use bytes::Bytes;
 use futures::Stream;
 
@@ -30,7 +33,10 @@ use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 #[cfg(test)]
 pub(crate) use fault_store::FaultInjectingStore;
 pub use file::{FileApprovalStore, FileSkillInvocationStore};
-pub use memory::{InMemoryApprovalStore, InMemoryEventBus, InMemorySkillInvocationStore};
+pub use memory::{
+    DEFAULT_MAX_JOURNAL_ENTRIES_PER_SESSION, DEFAULT_MAX_JOURNAL_SESSIONS, InMemoryApprovalStore,
+    InMemoryEventBus, InMemoryJournalStore, InMemorySkillInvocationStore,
+};
 pub use record::{DecisionRecord, InvalidRecord, OriginRecord, ParkedApprovalRecord, ScopeRecord};
 pub use skill_record::{
     SKILL_INVOCATION_RECORD_VERSION, SkillInvocation, SkillInvocationRecord, SkillRecordDecodeError,
@@ -58,6 +64,21 @@ pub enum SessionStoreError {
     /// A stored record failed to decode.
     #[error("session store record failed to decode: {reason}")]
     Decode { reason: String },
+    /// A journal append expected the session at one sequence number and the
+    /// store holds it at another; `None` is a session with nothing yet.
+    #[error(
+        "journal append expected the session at {}, but it is at {}",
+        sequence_label(expected),
+        sequence_label(actual)
+    )]
+    Conflict {
+        expected: Option<SequenceNumber>,
+        actual: Option<SequenceNumber>,
+    },
+}
+
+fn sequence_label(seq: &Option<SequenceNumber>) -> String {
+    seq.map_or_else(|| "nothing".to_owned(), |seq| format!("seq {seq}"))
 }
 
 /// Durable storage for parked conversational HITL approvals, over the
@@ -144,6 +165,81 @@ pub trait SkillInvocationStore: Send + Sync {
         &self,
         log: &SkillLogKey,
     ) -> Result<Vec<SkillInvocationRecord>, SessionStoreError>;
+}
+
+/// One stored entry of a session's journal, as the store hands it back.
+#[derive(Debug, Clone)]
+pub enum JournalEntry {
+    Event(Arc<SessionEvent>),
+    /// An entry at `seq` this binary cannot decode into a [`SessionEvent`].
+    Undecodable {
+        seq: SequenceNumber,
+        raw: Bytes,
+    },
+}
+
+impl JournalEntry {
+    pub fn seq(&self) -> SequenceNumber {
+        match self {
+            Self::Event(event) => event.seq,
+            Self::Undecodable { seq, .. } => *seq,
+        }
+    }
+}
+
+/// Append-only storage of each session's [`SessionEvent`]s, keyed by session.
+#[async_trait]
+pub trait JournalStore: Send + Sync {
+    /// Stores an event under `session` at the session's next sequence number,
+    /// which the store mints, and returns the event as stored. Returns once the
+    /// event is kept to this store's standard: at once in memory, on commit
+    /// elsewhere. A failed append mints nothing.
+    ///
+    /// `expected` is the newest number the writer has seen for the session,
+    /// `None` for a session it has seen nothing of. The store appends only
+    /// when that is the newest it holds, and otherwise refuses with
+    /// [`SessionStoreError::Conflict`]: someone else appended since, so there
+    /// are two writers, and the second is stopped rather than interleaved. A
+    /// store that remembers nothing of the session may take `expected` as
+    /// where the session stands. The number minted is one past it, so a
+    /// session's numbers are dense and none is handed out twice.
+    ///
+    /// A store bounds what it keeps on its own, by count or by TTL, and lets a
+    /// session's oldest entries go first, so what it holds of a session is
+    /// always a suffix of its stream.
+    async fn append(
+        &self,
+        session: &SessionId,
+        expected: Option<SequenceNumber>,
+        run_id: Option<RunId>,
+        at: aura_events::Timestamp,
+        payload: SessionEventPayload,
+    ) -> Result<Arc<SessionEvent>, SessionStoreError>;
+
+    /// The first `limit` entries of the session with `seq` in `from..=to`
+    /// that the store still holds, in sequence order. Entries the store no
+    /// longer holds take no part in the count, so a read starting before what
+    /// is retained returns the retained entries rather than nothing. An entry
+    /// the store holds but cannot decode is returned as
+    /// [`JournalEntry::Undecodable`] in its place rather than dropped, so a
+    /// reader sees the position and not a hole.
+    async fn read(
+        &self,
+        session: &SessionId,
+        from: SequenceNumber,
+        to: SequenceNumber,
+        limit: usize,
+    ) -> Result<Vec<JournalEntry>, SessionStoreError>;
+
+    /// The highest sequence number minted for the session, or `None` for a
+    /// session the store remembers nothing of. A store remembers it at least as
+    /// long as any of the session's entries and may remember it longer, and
+    /// mints from it, so a session whose entries are gone goes on numbering
+    /// past the numbers it already handed out.
+    async fn latest(
+        &self,
+        session: &SessionId,
+    ) -> Result<Option<SequenceNumber>, SessionStoreError>;
 }
 
 /// The payload stream returned by [`EventBus::subscribe`].
