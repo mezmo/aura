@@ -60,8 +60,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::config::ToolContextFactory;
 use crate::mcp::CallOutcome;
+use crate::tool_middleware::{MiddlewareStack, MiddlewareTool};
 
 /// Context passed to wrapper methods during tool execution.
 ///
@@ -214,6 +214,13 @@ impl TransformOutputResult {
 /// so you only need to implement the methods relevant to your use case.
 #[async_trait]
 pub trait ToolWrapper: Send + Sync {
+    /// The wrappers this one composes, outermost first; `None` for a
+    /// wrapper that is not a composition.
+    #[doc(hidden)]
+    fn composed_layers(&self) -> Option<&[Arc<dyn ToolWrapper>]> {
+        None
+    }
+
     /// Modify the tool's JSON schema definition.
     ///
     /// Called once when the tool definition is requested.
@@ -379,30 +386,24 @@ pub trait ToolWrapper: Send + Sync {
 }
 
 /// A tool wrapped with a `ToolWrapper` implementation.
-///
-/// This struct implements Rig's `Tool` trait, delegating to the inner
-/// tool while applying transformations from the wrapper.
 #[derive(Clone)]
 pub struct WrappedTool<T>
 where
     T: RigTool + Send + Sync + Clone,
 {
-    inner: T,
-    wrapper: Arc<dyn ToolWrapper>,
-    /// Optional context factory for creating per-call context
-    context_factory: Option<ToolContextFactory>,
+    tool: MiddlewareTool<T>,
 }
 
 impl<T> WrappedTool<T>
 where
     T: RigTool + Send + Sync + Clone,
 {
-    /// Create a new wrapped tool.
+    /// Create a new wrapped tool, run through a [`MiddlewareStack`] with one
+    /// layer per composed wrapper; `crate::tool_middleware` describes the
+    /// phases of a call.
     pub fn new(inner: T, wrapper: Arc<dyn ToolWrapper>) -> Self {
         Self {
-            inner,
-            wrapper,
-            context_factory: None,
+            tool: MiddlewareTool::new(inner, MiddlewareStack::from_wrapper(wrapper)),
         }
     }
 
@@ -413,7 +414,7 @@ where
     where
         F: Fn(&str) -> ToolCallContext + Send + Sync + 'static,
     {
-        self.context_factory = Some(Arc::new(factory));
+        self.tool = self.tool.with_context_factory(factory);
         self
     }
 }
@@ -429,7 +430,7 @@ where
     const NAME: &'static str = "wrapped_tool";
 
     fn name(&self) -> String {
-        self.inner.name()
+        self.tool.name()
     }
 
     #[allow(refining_impl_trait)]
@@ -437,14 +438,7 @@ where
         &self,
         prompt: String,
     ) -> Pin<Box<dyn Future<Output = rig::completion::ToolDefinition> + Send + Sync + '_>> {
-        let inner = self.inner.clone();
-        let wrapper = self.wrapper.clone();
-
-        Box::pin(async move {
-            let mut def = inner.definition(prompt).await;
-            def.parameters = wrapper.wrap_schema(def.parameters);
-            def
-        })
+        self.tool.definition(prompt)
     }
 
     #[allow(refining_impl_trait)]
@@ -452,233 +446,7 @@ where
         &self,
         args: Self::Args,
     ) -> Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send + '_>> {
-        let inner = self.inner.clone();
-        let wrapper = self.wrapper.clone();
-        let tool_name = self.inner.name();
-        let context_factory = self.context_factory.clone();
-
-        Box::pin(async move {
-            let start = std::time::Instant::now();
-
-            // Create context
-            let mut ctx = context_factory
-                .as_ref()
-                .map(|f| f(&tool_name))
-                .unwrap_or_else(|| ToolCallContext::new(&tool_name));
-
-            // Transform args
-            let transform_result = wrapper.transform_args(args, &ctx);
-            let clean_args = transform_result.args;
-            let extracted = transform_result.extracted;
-
-            // Store clean args on context so on_complete can persist them
-            ctx.metadata = Some(clean_args.clone());
-
-            // Let wrappers surface advisory fields from extracted data onto
-            // the context (e.g. PersistenceWrapper publishes the pre-strip
-            // reasoning as `tool_call_intent` for the HITL gate). Runs after
-            // transform_args (which produces `extracted`) and before pre_call
-            // (which reads it).
-            wrapper.write_context(extracted.as_ref(), &mut ctx);
-
-            // Validate args (wrappers can reject tool calls here)
-            if let Err(validation_error) =
-                wrapper.validate_args(&clean_args, extracted.as_ref(), &ctx)
-            {
-                let duration_ms = start.elapsed().as_millis() as u64;
-                let error_msg = validation_error.to_string();
-
-                // Still call on_complete so wrappers can clean up
-                // (e.g., observer emits CallCompleted for the orphaned CallStarted)
-                let wrapper_clone = wrapper.clone();
-                let ctx_clone = ctx.clone();
-                let extracted_clone = extracted.clone();
-                tokio::spawn(async move {
-                    wrapper_clone
-                        .on_complete(
-                            &ctx_clone,
-                            extracted_clone.as_ref(),
-                            Err(&error_msg),
-                            duration_ms,
-                        )
-                        .await;
-                });
-
-                return Err(validation_error);
-            }
-
-            // Async pre-call gate (e.g. HITL approval): may call an external
-            // service or park for a human decision before the tool runs.
-            // Spawned so the gate survives caller cancellation.
-            let pre_wrapper = wrapper.clone();
-            let pre_args = clean_args.clone();
-            let pre_ctx = ctx.clone();
-            let pre_span = tracing::Span::current();
-            let pre_handle = tokio::spawn(tracing::Instrument::instrument(
-                async move { pre_wrapper.pre_call(&pre_args, &pre_ctx).await },
-                pre_span,
-            ));
-            let pre_call_result = match pre_handle.await {
-                Ok(r) => r,
-                Err(join_error) => Err(ToolError::ToolCallError(join_error.into())),
-            };
-            let approver_overrides = match pre_call_result {
-                // Approver overrides are scoped into the task-local inside
-                // the inner-call spawn below — task-locals do not cross a
-                // spawn, the value is known here after pre_call, and a
-                // demanded override silently degrading to None would
-                // proceed under cached identity, which is fail-open.
-                Ok(PreCallOutcome::Proceed { overrides }) => overrides,
-                Ok(PreCallOutcome::ShortCircuit { output }) => {
-                    let duration_ms = start.elapsed().as_millis() as u64;
-
-                    let wrapper_clone = wrapper.clone();
-                    let ctx_clone = ctx.clone();
-                    let extracted_clone = extracted.clone();
-                    let output_clone = output.clone();
-                    tokio::spawn(async move {
-                        wrapper_clone
-                            .on_complete(
-                                &ctx_clone,
-                                extracted_clone.as_ref(),
-                                Ok(&output_clone),
-                                duration_ms,
-                            )
-                            .await;
-                    });
-
-                    return Ok(output);
-                }
-                Err(pre_call_error) => {
-                    let duration_ms = start.elapsed().as_millis() as u64;
-                    let error_msg = pre_call_error.to_string();
-
-                    let wrapper_clone = wrapper.clone();
-                    let ctx_clone = ctx.clone();
-                    let extracted_clone = extracted.clone();
-                    tokio::spawn(async move {
-                        wrapper_clone
-                            .on_complete(
-                                &ctx_clone,
-                                extracted_clone.as_ref(),
-                                Err(&error_msg),
-                                duration_ms,
-                            )
-                            .await;
-                    });
-
-                    return Err(pre_call_error);
-                }
-            };
-
-            // Call inner tool in a spawned task to isolate panics.
-            // Propagate the current span so mcp.tool_call nests under execute_tool.
-            let inner_clone = inner.clone();
-            let args_clone = clean_args.clone();
-            let tool_span = tracing::Span::current();
-            let result_handle = tokio::spawn(tracing::Instrument::instrument(
-                crate::approver_headers::APPROVER_OVERRIDES.scope(approver_overrides, async move {
-                    inner_clone.call(args_clone).await
-                }),
-                tool_span,
-            ));
-            let result = match result_handle.await {
-                Ok(r) => r,
-                Err(join_error) => Err(ToolError::ToolCallError(join_error.into())),
-            };
-
-            let duration_ms = start.elapsed().as_millis() as u64;
-
-            // Transform result
-            match result {
-                Ok(output) => {
-                    // Supervise the transform + completion hook in a spawned task
-                    // so it runs to completion even if the request is cancelled.
-                    let wrapper_clone = wrapper.clone();
-                    let ctx_clone = ctx.clone();
-                    let extracted_clone = extracted.clone();
-                    let span = tracing::Span::current();
-                    let transform_handle = tokio::spawn(tracing::Instrument::instrument(
-                        async move {
-                            let outcome = CallOutcome::classify_from_output(&output);
-                            let transformed = wrapper_clone
-                                .transform_output(
-                                    output,
-                                    &outcome,
-                                    &ctx_clone,
-                                    extracted_clone.as_ref(),
-                                )
-                                .await;
-
-                            // Fire-and-forget completion hook.
-                            let output_clone = transformed.output.clone();
-                            tokio::spawn(async move {
-                                wrapper_clone
-                                    .on_complete(
-                                        &ctx_clone,
-                                        extracted_clone.as_ref(),
-                                        Ok(&output_clone),
-                                        duration_ms,
-                                    )
-                                    .await;
-                            });
-
-                            transformed
-                        },
-                        span,
-                    ));
-                    let transformed = match transform_handle.await {
-                        Ok(t) => t,
-                        Err(join_error) => {
-                            // Emit failure completion on transform panic to close state.
-                            let error = ToolError::ToolCallError(join_error.into());
-                            let error_msg = error.to_string();
-                            let wrapper_clone = wrapper.clone();
-                            let ctx_clone = ctx.clone();
-                            let extracted_clone = extracted.clone();
-                            tokio::spawn(async move {
-                                wrapper_clone
-                                    .on_complete(
-                                        &ctx_clone,
-                                        extracted_clone.as_ref(),
-                                        Err(&error_msg),
-                                        duration_ms,
-                                    )
-                                    .await;
-                            });
-                            return Err(error);
-                        }
-                    };
-
-                    if let Some(warning) = &transformed.warning {
-                        tracing::warn!("Tool wrapper warning for {}: {}", tool_name, warning);
-                    }
-
-                    Ok(transformed.output)
-                }
-                Err(error) => {
-                    let transformed_error = wrapper.handle_error(error, &ctx, extracted.as_ref());
-                    let error_msg = transformed_error.to_string();
-
-                    // Spawn async completion hook (fire-and-forget, don't block the response)
-                    let wrapper_clone = wrapper.clone();
-                    let ctx_clone = ctx.clone();
-                    let extracted_clone = extracted.clone();
-                    tokio::spawn(async move {
-                        wrapper_clone
-                            .on_complete(
-                                &ctx_clone,
-                                extracted_clone.as_ref(),
-                                Err(&error_msg),
-                                duration_ms,
-                            )
-                            .await;
-                    });
-
-                    Err(transformed_error)
-                }
-            }
-        })
+        self.tool.call(args)
     }
 }
 
@@ -712,6 +480,10 @@ impl ComposedWrapper {
 
 #[async_trait]
 impl ToolWrapper for ComposedWrapper {
+    fn composed_layers(&self) -> Option<&[Arc<dyn ToolWrapper>]> {
+        Some(&self.wrappers)
+    }
+
     fn wrap_schema(&self, mut schema: Value) -> Value {
         for wrapper in &self.wrappers {
             schema = wrapper.wrap_schema(schema);

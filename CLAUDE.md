@@ -163,6 +163,7 @@ export AWS_REGION="your-region"       # For Knowledge Base
 - `provider_agent.rs` - Type-erased streaming across providers
 - `stream_events.rs` - Custom aura SSE events
 - `request_cancellation.rs` - The signal that stops a run, as awaiting work sees it
+- `tool_middleware.rs` - `MiddlewareStack`, the layers a tool call passes through: a forward pass that prepares arguments and context, then an onion of `ToolMiddleware::call` layers around the tool; `WrappedTool` runs a `ToolWrapper` through it as `WrapperLayer`s, and the parity suite there records the hook order every layer can rely on
 - `run_context.rs` - `RunContext`, the run a task is working on: its event channel, the FIFO queue for tool_call_id correlation (see critical assumption below), and the scratchpad budget, turn-nudge counters and skill-invocation recorder an agent keeps for it; `BoundRun` is the slot through which prepare-time tools and wrappers (turn nudge, scratchpad, skills, HITL) reach it, and `RunLease` is what `begin_run` counts to serve one run at a time
 - `orchestration/` - Multi-agent coordinator, workers, DAG execution, orchestration SSE events
 
