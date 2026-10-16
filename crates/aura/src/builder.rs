@@ -417,7 +417,8 @@ impl PreparedAgent {
                 scope,
                 config_owned.agent.name.clone(),
                 config_owned.instance_id.clone(),
-            );
+            )
+            .with_gated_patterns(hitl.patterns.clone());
             hitl_approval_tool = Some(approval_tool.clone());
             config_owned.hitl_request_approval_tool = Some(approval_tool);
         }
@@ -1108,6 +1109,9 @@ impl PreparedAgent {
         if config.tool_wrapper.is_some() {
             tracing::info!("Tool wrapper configured");
         }
+        // `(namespace, name)` of each tool registered behind the wrapper, the
+        // only tools the HITL config gate can stop.
+        let mut wrapped_tools: Vec<(String, String)> = Vec::new();
         let effective_filter = config
             .mcp_filter
             .as_ref()
@@ -1206,6 +1210,11 @@ impl PreparedAgent {
                         Arc::clone(&client_arc),
                         transport_kind,
                     );
+
+                    if config.tool_wrapper.is_some() {
+                        wrapped_tools
+                            .push((mcp_tool.namespace().to_string(), tool_name.to_owned()));
+                    }
 
                     // Wrap with tool_wrapper if configured
                     builder_state = Self::add_mcp_tool(
@@ -1343,7 +1352,12 @@ impl PreparedAgent {
         // for this build (orchestration workers set it in `create_worker`; the
         // single-agent path leaves it unset until that surface is wired).
         if let Some(ref approval_tool) = config.hitl_request_approval_tool {
-            builder_state = builder_state.add_tool(approval_tool.clone());
+            let approval_tool = approval_tool.clone().with_gated_tools(
+                wrapped_tools
+                    .iter()
+                    .map(|(namespace, name)| (namespace.as_str(), name.as_str())),
+            );
+            builder_state = builder_state.add_tool(approval_tool);
         }
 
         // Add additional custom tools (e.g., CLI local tools in standalone mode)

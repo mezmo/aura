@@ -1001,12 +1001,15 @@ impl Orchestrator {
                 gate = gate.with_recorded_decisions(Arc::clone(recorded));
             }
             wrappers.insert(0, Arc::new(gate));
-            worker_config.hitl_request_approval_tool = Some(crate::hitl::RequestApprovalTool::new(
-                hitl.route.clone(),
-                scope,
-                worker_config.agent.name.clone(),
-                worker_config.instance_id.clone(),
-            ));
+            worker_config.hitl_request_approval_tool = Some(
+                crate::hitl::RequestApprovalTool::new(
+                    hitl.route.clone(),
+                    scope,
+                    worker_config.agent.name.clone(),
+                    worker_config.instance_id.clone(),
+                )
+                .with_gated_patterns(hitl.patterns.clone()),
+            );
         }
 
         let wrapper: Arc<dyn ToolWrapper> = Arc::new(ComposedWrapper::new(wrappers));
