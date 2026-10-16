@@ -3,7 +3,7 @@
 //! Tools that let the LLM selectively explore large tool outputs stored on disk, rather
 //! than loading everything into context.
 
-use super::context_budget::ContextBudget;
+use super::context_budget::{ContextBudget, Fit};
 use super::schema::{
     MAX_SCHEMA_DEPTH, analyze_json_structure, analyze_markdown_structure, format_markdown_schema,
     format_schema,
@@ -163,31 +163,52 @@ pub(crate) enum BudgetCheckError {
     BudgetExceeded(super::context_budget::BudgetExceeded),
 }
 
-/// Check budget and record usage. Returns `Ok(())` if within budget,
-/// or `Err` with details for the caller to format.
+impl BudgetCheckError {
+    /// The token count the check decided on.
+    pub(crate) fn tokens(&self) -> usize {
+        match self {
+            Self::ExtractionLimit(e) => e.estimated_tokens,
+            Self::BudgetExceeded(e) => e.requested_tokens,
+        }
+    }
+}
+
+/// Check budget and record usage as an extraction from the scratchpad.
+/// Returns `Ok(())` if within budget, or `Err` with details for the caller
+/// to format.
 pub(crate) fn check_and_record_budget(
     budget: &ContextBudget,
     content: &str,
 ) -> Result<(), BudgetCheckError> {
-    // Per-call extraction limit check first
-    if let Some(limit) = budget.max_extraction_tokens() {
-        let tokens = budget.count_tokens(content);
-        if tokens > limit {
-            return Err(BudgetCheckError::ExtractionLimit(
+    let tokens = check_budget(budget, content)?;
+    budget.record_extracted(tokens);
+    Ok(())
+}
+
+/// Check `content` against the per-call limit and the remaining budget,
+/// recording it as used when it fits. Returns its token count.
+pub(crate) fn check_budget(
+    budget: &ContextBudget,
+    content: &str,
+) -> Result<usize, BudgetCheckError> {
+    let limit = budget.max_extraction_tokens();
+    let allowed = limit.map_or(budget.remaining(), |limit| limit.min(budget.remaining()));
+    match budget.fit(content, allowed) {
+        // Recording is atomic against concurrent tool calls, so a fit by
+        // count can still lose the race for the remaining budget.
+        Fit::Fits { tokens } => match budget.try_record_tokens(tokens) {
+            Ok(()) => Ok(tokens),
+            Err(e) => Err(BudgetCheckError::BudgetExceeded(e)),
+        },
+        Fit::Exceeds { tokens, .. } => match limit {
+            Some(limit) if tokens > limit => Err(BudgetCheckError::ExtractionLimit(
                 super::context_budget::ExtractionLimitExceeded {
                     estimated_tokens: tokens,
                     limit,
                 },
-            ));
-        }
-    }
-    // Atomic cumulative budget check + record (no TOCTOU race)
-    match budget.try_record_usage(content) {
-        Ok(tokens) => {
-            budget.record_extracted(tokens);
-            Ok(())
-        }
-        Err(e) => Err(BudgetCheckError::BudgetExceeded(e)),
+            )),
+            _ => Err(BudgetCheckError::BudgetExceeded(budget.exceeded_by(tokens))),
+        },
     }
 }
 

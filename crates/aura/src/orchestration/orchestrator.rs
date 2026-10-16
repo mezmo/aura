@@ -150,6 +150,8 @@ struct CoordinatorState {
     preamble: String,
     conversation: Vec<rig::completion::Message>,
     routing_decision: super::tools::routing_tools::RoutingDecision,
+    /// Tokens of the request's chat history.
+    chat_history_tokens: Option<usize>,
 }
 
 /// Bundled coordinator tools for `build_agent_with_tools`.
@@ -162,6 +164,75 @@ struct CoordinatorTools {
     write_artifact: Option<WriteArtifactTool>,
     list_prior_runs: Option<super::tools::ListPriorRunsTool>,
     skill_tools: Option<crate::skill_tool::SkillToolset>,
+    scratchpad: Option<scratchpad::ScratchpadToolsConfig>,
+}
+
+impl CoordinatorTools {
+    /// Tokens the tool definitions add to every coordinator call, counted
+    /// the way `scratchpad_tool_schema_tokens` counts the read tools.
+    async fn schema_tokens(&self, counter: &dyn scratchpad::TokenCounter) -> usize {
+        use rig::tool::Tool;
+        let count = |def: rig::completion::ToolDefinition| {
+            counter.count_tokens(&def.name)
+                + counter.count_tokens(&def.description)
+                + counter.count_tokens(&def.parameters.to_string())
+        };
+        let mut defs = Vec::new();
+        if let Some(t) = &self.list_tools {
+            defs.push(t.definition(String::new()).await);
+        }
+        if let Some(t) = &self.inspect_tool_params {
+            defs.push(t.definition(String::new()).await);
+        }
+        for t in &self.vector_tools {
+            defs.push(t.definition(String::new()).await);
+        }
+        defs.push(
+            self.routing_tools
+                .respond_directly
+                .definition(String::new())
+                .await,
+        );
+        defs.push(
+            self.routing_tools
+                .create_plan
+                .definition(String::new())
+                .await,
+        );
+        defs.push(
+            self.routing_tools
+                .request_clarification
+                .definition(String::new())
+                .await,
+        );
+        if let Some(t) = &self.read_artifact {
+            defs.push(t.definition(String::new()).await);
+        }
+        if let Some(t) = &self.write_artifact {
+            defs.push(t.definition(String::new()).await);
+        }
+        if let Some(t) = &self.list_prior_runs {
+            defs.push(t.definition(String::new()).await);
+        }
+        if let Some(t) = &self.skill_tools {
+            defs.push(t.load.definition(String::new()).await);
+            defs.push(t.read_file.definition(String::new()).await);
+        }
+        let read_tools = self
+            .scratchpad
+            .as_ref()
+            .map_or(0, |_| scratchpad::scratchpad_tool_schema_tokens(counter));
+        defs.into_iter().map(count).sum::<usize>() + read_tools
+    }
+}
+
+/// The coordinator's `read_artifact` and the budget, read tools and depth
+/// bonus that go with it.
+struct CoordinatorArtifacts {
+    read_artifact: ReadArtifactTool,
+    scratchpad: Option<scratchpad::ScratchpadToolsConfig>,
+    budget: Option<scratchpad::ContextBudget>,
+    depth_bonus: usize,
 }
 
 // ============================================================================
@@ -503,6 +574,8 @@ struct StreamCallParams<'a> {
     phase: &'a str,
     event_tx: Option<&'a tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
     context_agent: Option<&'a str>,
+    /// Tokens of the call's whole input: prompt and history.
+    input_tokens: Option<usize>,
 }
 
 /// Every exit path of a stream loop must route its turns through
@@ -715,6 +788,31 @@ impl Orchestrator {
         (self.run_tools)().iter().map(|tool| tool.name()).collect()
     }
 
+    /// Tokens every call of a worker carries before its task prompt: the
+    /// worker preamble and the schemas of the MCP tools its filter admits.
+    fn worker_fixed_overhead(
+        &self,
+        worker_cfg: Option<&super::config::WorkerConfig>,
+        counter: &dyn scratchpad::TokenCounter,
+    ) -> usize {
+        let worker_preamble = worker_cfg.map(|w| w.preamble.as_str()).unwrap_or("");
+        let worker_filter = worker_cfg.and_then(|w| w.mcp_filter.as_deref());
+        let mcp_tool_tokens = self
+            .mcp_manager
+            .as_ref()
+            .map(|m| {
+                scratchpad::count_mcp_tool_schema_tokens(
+                    counter,
+                    m.tool_definitions_iter(),
+                    worker_filter,
+                )
+            })
+            .unwrap_or(0);
+        counter.count_tokens(super::config::WORKER_PREAMBLE_TEMPLATE)
+            + counter.count_tokens(worker_preamble)
+            + mcp_tool_tokens
+    }
+
     /// Create a worker agent for task execution.
     ///
     /// Workers are regular agents that execute individual tasks.
@@ -740,7 +838,8 @@ impl Orchestrator {
         use super::duplicate_call_guard::DuplicateCallGuard;
         use super::observer_wrapper::ObserverWrapper;
         use super::persistence_wrapper::PersistenceWrapper;
-        use crate::tool_wrapper::{ComposedWrapper, ToolCallContext, ToolWrapper};
+        use crate::tool_middleware::{MiddlewareStack, ToolMiddleware, WrapperLayer};
+        use crate::tool_wrapper::ToolCallContext;
 
         // Build base tool wrappers: observer + duplicate guard + persistence
         let (in_flight, drain_notify, iteration, persistence_enabled) = {
@@ -807,7 +906,7 @@ impl Orchestrator {
         // run through; `begin_run_within` fills it once the worker is prepared.
         let run = Arc::new(BoundRun::default());
         let mut scratchpad_budget: Option<scratchpad::ContextBudget> = None;
-        let mut scratchpad_tools = Vec::<Arc<dyn ToolWrapper>>::new();
+        let mut scratchpad_tools = Vec::<Arc<dyn ToolMiddleware>>::new();
         if let Some(ref sp_cfg) = effective_scratchpad
             && sp_cfg.enabled
         {
@@ -856,23 +955,8 @@ impl Orchestrator {
                 )? as usize;
                 let (provider, model) = worker_config.llm.model_info();
                 let token_counter = scratchpad::token_counter_for_provider(provider, model);
-                let worker_preamble = worker_cfg.map(|w| w.preamble.as_str()).unwrap_or("");
-
-                let mcp_tool_tokens = self
-                    .mcp_manager
-                    .as_ref()
-                    .map(|m| {
-                        scratchpad::count_mcp_tool_schema_tokens(
-                            &*token_counter,
-                            m.tool_definitions_iter(),
-                            worker_filter,
-                        )
-                    })
-                    .unwrap_or(0);
-                let initial_used = scratchpad::estimate_scratchpad_overhead(
-                    &*token_counter,
-                    &[super::config::WORKER_PREAMBLE_TEMPLATE, worker_preamble],
-                ) + mcp_tool_tokens;
+                let initial_used = scratchpad::estimate_scratchpad_overhead(&*token_counter, &[])
+                    + self.worker_fixed_overhead(worker_cfg, &*token_counter);
 
                 let (iter_dir, read_root) = {
                     let persistence = self.persistence.lock().await;
@@ -893,10 +977,30 @@ impl Orchestrator {
                 })
                 .await?;
 
-                scratchpad_tools.push(build.wrapper);
+                scratchpad_tools.push(build.layer);
                 scratchpad_budget = Some(build.budget);
                 worker_config.scratchpad_tools_config = Some(build.tools_config);
             }
+        }
+
+        // Without a scratchpad, a known context window still bounds what
+        // `read_artifact` inlines: a plain budget the reads add up in, capped
+        // per read at a quarter of the window.
+        if scratchpad_budget.is_none()
+            && let Some(window) = worker_config.llm.context_window()
+        {
+            let (provider, model) = worker_config.llm.model_info();
+            let token_counter = scratchpad::token_counter_for_provider(provider, model);
+            let initial_used = self.worker_fixed_overhead(worker_cfg, &*token_counter);
+            scratchpad_budget = Some(
+                scratchpad::ContextBudget::new(
+                    window as usize,
+                    scratchpad::ScratchpadConfig::default().context_safety_margin,
+                    initial_used,
+                    token_counter,
+                )
+                .with_max_extraction_tokens(super::tools::inline_cap_tokens(window)),
+            );
         }
 
         // Resolution order: worker turn_depth → [agent].turn_depth → DEFAULT_MAX_DEPTH.
@@ -932,21 +1036,26 @@ impl Orchestrator {
             resolved_depth,
         );
 
-        // ComposedWrapper applies transform_output in reverse-list order, so
-        // the LAST entry runs FIRST on the raw tool output. Persistence must
-        // see raw output (for debugging/retry), so it goes last. Scratchpad
-        // also needs raw output — persistence's transform_output is a
-        // passthrough that just caches the raw — and rewrites to the pointer.
-        // Duplicate-guard and observer then see the pointer, which is what
-        // should surface to the LLM/UI. The turn-limit nudge goes first so
-        // it runs after everything else, on the text the LLM sees.
-        let mut wrappers: Vec<Arc<dyn ToolWrapper>> = vec![observer_wrapper, duplicate_guard];
-        wrappers.extend(scratchpad_tools);
-        wrappers.push(persistence_wrapper);
+        // Outermost first. A reply climbs the stack from the tool, so the
+        // innermost layer sees the raw output: persistence goes last, since
+        // it must see the raw output (for debugging/retry); its
+        // transform_output is a passthrough that just caches the raw.
+        // Scratchpad also needs the raw output and rewrites it to the
+        // pointer. Duplicate-guard and observer then see the pointer, which
+        // is what should surface to the LLM/UI. The turn-limit nudge goes
+        // first so it runs after everything else, on the text the LLM sees.
+        let mut layers: Vec<Arc<dyn ToolMiddleware>> = vec![
+            Arc::new(WrapperLayer(observer_wrapper)),
+            Arc::new(WrapperLayer(duplicate_guard)),
+        ];
+        layers.extend(scratchpad_tools);
+        layers.push(Arc::new(WrapperLayer(persistence_wrapper)));
         if turn_nudge.is_some() {
-            wrappers.insert(
+            layers.insert(
                 0,
-                Arc::new(crate::turn_nudge::TurnNudgeWrapper::new(Arc::clone(&run))),
+                Arc::new(WrapperLayer(Arc::new(
+                    crate::turn_nudge::TurnNudgeWrapper::new(Arc::clone(&run)),
+                ))),
             );
             tracing::info!(
                 "Worker {} turn-limit nudging enabled (last_turn={}, wrap_up_threshold={:?})",
@@ -959,11 +1068,11 @@ impl Orchestrator {
         // HITL config gate. When `[hitl]` is configured, gate matching worker
         // tool calls behind the decision route, and pre-build the agent-callable
         // `request_approval` tool with the same scope/route (attached by
-        // `add_all_tools` via `hitl_request_approval_tool`). The gate is composed
-        // FIRST so its `pre_call` runs before every other wrapper and a denial
-        // short-circuits the call — `ComposedWrapper::pre_call` iterates the vec
-        // front-to-back. The gate only implements `pre_call`, so prepending it
-        // leaves the documented `transform_output` ordering above untouched.
+        // `add_all_tools` via `hitl_request_approval_tool`). The gate is the
+        // outermost layer so its `pre_call` runs before every other layer and
+        // a denial short-circuits the call. The gate only implements
+        // `pre_call`, so placing it outside leaves the documented
+        // `transform_output` ordering above untouched.
         if let Some(hitl) = worker_config.hitl.clone() {
             let (run_id_str, session_id_owned) = {
                 let p = self.persistence.lock().await;
@@ -1000,7 +1109,7 @@ impl Orchestrator {
             if let Some(recorded) = recorded {
                 gate = gate.with_recorded_decisions(Arc::clone(recorded));
             }
-            wrappers.insert(0, Arc::new(gate));
+            layers.insert(0, Arc::new(WrapperLayer(Arc::new(gate))));
             worker_config.hitl_request_approval_tool = Some(
                 crate::hitl::RequestApprovalTool::new(
                     hitl.route.clone(),
@@ -1012,7 +1121,7 @@ impl Orchestrator {
             );
         }
 
-        let wrapper: Arc<dyn ToolWrapper> = Arc::new(ComposedWrapper::new(wrappers));
+        let stack = MiddlewareStack::new(layers);
 
         // Configure worker based on assignment
         if let Some(name) = worker_name {
@@ -1081,8 +1190,10 @@ impl Orchestrator {
             }));
         }
 
-        // Orchestrator owns tool wrapping decision
-        worker_config.tool_wrapper = Some(wrapper);
+        // Orchestrator owns tool wrapping decision: the worker stack is the
+        // whole stack, in place of any wrapper the agent config carries.
+        worker_config.tool_middleware = Some(stack);
+        worker_config.tool_wrapper = None;
 
         // Give workers access to result artifacts
         worker_config.orchestration_persistence = Some(self.persistence.clone());
@@ -1597,10 +1708,18 @@ impl Orchestrator {
             phase,
             event_tx,
             context_agent,
+            input_tokens,
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let inactivity_secs = self.config.stream_inactivity_timeout_secs();
         let emit_scratchpad_events = scratchpad::emit_scratchpad_tool_events_enabled();
+        // Each call starts from its own input: the coordinator's calls do
+        // not carry earlier calls' tool results, so what they recorded is
+        // dropped rather than kept as a floor.
+        let budget = agent.scratchpad_budget().cloned();
+        if let (Some(budget), Some(tokens)) = (&budget, input_tokens) {
+            budget.reset_request_input(tokens);
+        }
         let stream_future = async {
             let mut stream = agent
                 .stream_chat_with_depth(prompt, history, agent.max_depth)
@@ -1703,6 +1822,12 @@ impl Orchestrator {
                                     stream.next().await
                                 {
                                     tally.record(&turn, cache, &self.usage_state);
+                                    if let Some(budget) = &budget {
+                                        budget.set_estimated_used(
+                                            turn.input_tokens,
+                                            turn.output_tokens,
+                                        );
+                                    }
                                 }
                                 return Ok(LoopStep::End);
                             }
@@ -1729,6 +1854,9 @@ impl Orchestrator {
                         }
                         Ok(StreamItem::TurnUsage(turn, cache)) => {
                             tally.record(&turn, cache, &self.usage_state);
+                            if let Some(budget) = &budget {
+                                budget.set_estimated_used(turn.input_tokens, turn.output_tokens);
+                            }
                         }
                         Ok(StreamItem::FinalMarker) => return Ok(LoopStep::End),
                         // MaxDepthError: success if decision was captured, error otherwise
@@ -1890,6 +2018,7 @@ impl Orchestrator {
                         phase: params.phase,
                         event_tx: params.event_tx,
                         context_agent: params.context_agent,
+                        input_tokens: params.input_tokens,
                     },
                     || {
                         let rd = rd.clone();
@@ -2021,6 +2150,22 @@ impl Orchestrator {
             let mut full_history = chat_history.to_vec();
             full_history.extend(coordinator_state.conversation.iter().cloned());
 
+            // The chat history is the same on every call of the request, so
+            // it is counted once; the prompt and the coordinator's own
+            // conversation change from call to call.
+            let input_tokens = match coordinator_state.agent.scratchpad_budget().cloned() {
+                Some(budget) => {
+                    let history = *coordinator_state
+                        .chat_history_tokens
+                        .get_or_insert_with(|| budget.request_input_tokens("", chat_history));
+                    Some(
+                        history
+                            + budget.request_input_tokens(&prompt, &coordinator_state.conversation),
+                    )
+                }
+                None => None,
+            };
+
             let response = match self
                 .planning_stream_with_transient_retry(
                     &coordinator_state.agent,
@@ -2041,6 +2186,7 @@ impl Orchestrator {
                         // the correction), so neither reports.
                         context_agent: (previous.is_none() && attempt == 1)
                             .then_some(CONVERSATION_AGENT_ID),
+                        input_tokens,
                     },
                     &coordinator_state.routing_decision,
                 )
@@ -2625,7 +2771,108 @@ Assign tasks to the worker whose tools best match the required operations."#,
             state = state.add_tool(toolset.load);
             state = state.add_tool(toolset.read_file);
         }
+        if let Some(sp) = tools.scratchpad {
+            use crate::scratchpad::{
+                GetInTool, GrepTool, HeadTool, ItemSchemaTool, IterateOverTool, ReadTool,
+                SchemaTool, SliceTool,
+            };
+            let (s, r) = (&sp.storage, &sp.run);
+            state = state
+                .add_tool(HeadTool::new(s.clone(), r.clone()))
+                .add_tool(SliceTool::new(s.clone(), r.clone()))
+                .add_tool(GrepTool::new(s.clone(), r.clone()))
+                .add_tool(SchemaTool::new(s.clone(), r.clone()))
+                .add_tool(ItemSchemaTool::new(s.clone(), r.clone()))
+                .add_tool(GetInTool::new(s.clone(), r.clone()))
+                .add_tool(IterateOverTool::new(s.clone(), r.clone()))
+                .add_tool(ReadTool::new(s.clone(), r.clone()));
+        }
         state.build()
+    }
+
+    /// The coordinator's `read_artifact` and what backs it, by what the
+    /// configuration allows:
+    /// - `[agent.scratchpad]` enabled with `coordinator` on and a context
+    ///   window: a scratchpad in the run directory that can read any run of
+    ///   the session, its read tools and preamble, and the depth bonus, so a
+    ///   large artifact from a prior run comes back as a pointer to explore;
+    /// - a context window alone: a plain budget the reads add up in, capped
+    ///   per read at a quarter of the window, with previews past it;
+    /// - neither: previews past `PREVIEW_BYTES`, with a warning naming the
+    ///   setting that would let artifacts that fit come back whole.
+    async fn coordinator_artifact_tools(
+        &self,
+        preamble: &mut String,
+        run: &Arc<BoundRun>,
+    ) -> Result<CoordinatorArtifacts, Box<dyn std::error::Error + Send + Sync>> {
+        let llm = &self.agent_config.llm;
+        let read_artifact = ReadArtifactTool::new(self.persistence.clone());
+        let Some(window) = llm.context_window() else {
+            tracing::warn!(
+                "Coordinator: [agent.llm].context_window is unset, so read_artifact returns \
+                 artifacts over {} bytes as a preview of their start; set context_window to \
+                 the model's window so artifacts that fit come back whole",
+                super::tools::PREVIEW_BYTES,
+            );
+            return Ok(CoordinatorArtifacts {
+                read_artifact,
+                scratchpad: None,
+                budget: None,
+                depth_bonus: 0,
+            });
+        };
+        let (provider, model) = llm.model_info();
+        let token_counter = scratchpad::token_counter_for_provider(provider, model);
+
+        let sp_cfg = self
+            .agent_config
+            .agent
+            .scratchpad
+            .as_ref()
+            .filter(|sp| sp.enabled && sp.coordinator);
+        let Some(sp_cfg) = sp_cfg else {
+            let budget = scratchpad::ContextBudget::new(
+                window as usize,
+                scratchpad::ScratchpadConfig::default().context_safety_margin,
+                0,
+                token_counter,
+            )
+            .with_max_extraction_tokens(super::tools::inline_cap_tokens(window));
+            return Ok(CoordinatorArtifacts {
+                read_artifact: read_artifact.with_budget(Arc::clone(run)),
+                scratchpad: None,
+                budget: Some(budget),
+                depth_bonus: 0,
+            });
+        };
+
+        let (run_dir, read_root) = {
+            let persistence = self.persistence.lock().await;
+            let run_dir = persistence.run_path().to_path_buf();
+            let read_root = run_dir
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| run_dir.clone());
+            (run_dir, read_root)
+        };
+        let build = scratchpad::build_scratchpad(scratchpad::ScratchpadBuildInputs {
+            sp_cfg,
+            storage_dir: &run_dir,
+            read_root: Some(&read_root),
+            scratchpad_tool_map: std::collections::HashMap::new(),
+            context_window: window as usize,
+            initial_used: 0,
+            token_counter,
+            run: Arc::clone(run),
+        })
+        .await?;
+        preamble.push_str(scratchpad::SCRATCHPAD_PREAMBLE);
+        Ok(CoordinatorArtifacts {
+            read_artifact: read_artifact.with_scratchpad(Arc::clone(run), build.storage),
+            scratchpad: Some(build.tools_config),
+            budget: Some(build.budget),
+            depth_bonus: sp_cfg.turn_depth_bonus,
+        })
     }
 
     /// Create a coordinator agent for planning tasks.
@@ -2747,6 +2994,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // `begin_run_within` fills it once the coordinator is prepared.
         let run = Arc::new(BoundRun::default());
 
+        let artifacts = self.coordinator_artifact_tools(&mut preamble, &run).await?;
+
         // Bundle all coordinator tools
         let coordinator_tools = CoordinatorTools {
             list_tools: if include_recon_tools {
@@ -2761,7 +3010,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             },
             vector_tools,
             routing_tools,
-            read_artifact: Some(ReadArtifactTool::new(self.persistence.clone())),
+            read_artifact: Some(artifacts.read_artifact),
             write_artifact: Some(WriteArtifactTool::new(self.persistence.clone())),
             list_prior_runs: if include_history_tools {
                 Some(super::tools::ListPriorRunsTool::new(
@@ -2775,6 +3024,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 &self.agent_config.agent.skills,
                 Some(Arc::clone(&run)),
             ),
+            scratchpad: artifacts.scratchpad,
+        };
+
+        // The budget's fixed overhead is everything each call carries
+        // before its prompt: the preamble and every tool definition.
+        let scratchpad_budget = match artifacts.budget {
+            Some(budget) => {
+                let (provider, model) = self.agent_config.llm.model_info();
+                let counter = scratchpad::token_counter_for_provider(provider, model);
+                let overhead = counter.count_tokens(&preamble)
+                    + coordinator_tools.schema_tokens(&*counter).await;
+                Some(budget.with_initial_used(overhead))
+            }
+            None => None,
         };
 
         let provider_agent = self
@@ -2797,7 +3060,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .agent_config
             .agent
             .turn_depth
-            .unwrap_or(crate::builder::DEFAULT_MAX_DEPTH);
+            .unwrap_or(crate::builder::DEFAULT_MAX_DEPTH)
+            + artifacts.depth_bonus;
 
         // The coordinator is one run of one prepared agent, under the request
         // that owns the orchestration.
@@ -2810,7 +3074,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             fallback_tool_names: vec![],
             fallback_mcp_filter: None,
             context_window: self.agent_config.llm.context_window(),
-            scratchpad_budget: None,
+            scratchpad_budget,
             client_tool_names: Default::default(),
             turn_nudge: None,
             system_prompt: preamble.clone(),
@@ -3055,8 +3319,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Test-only model injection (park/reify rig): a queued override builds
         // this worker from a scripted model. The override's extra tools go
-        // through the worker's own wrapper chain — `worker_config.tool_wrapper`
-        // carries the composed chain (observer, duplicate guard, persistence,
+        // through the worker's own layers — `worker_config.tool_middleware`
+        // carries the stack (observer, duplicate guard, persistence,
         // HITL gate) create_worker assembled — so a scripted worker's gated
         // calls park exactly like live ones. No override queued: unchanged
         // behavior.
@@ -3065,7 +3329,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             use rig::tool::Tool as _;
 
             use crate::orchestration::test_rig::DynToolAsTool;
-            use crate::tool_wrapper::WrappedTool;
+            use crate::tool_middleware::MiddlewareTool;
 
             let mut builder = rig::agent::AgentBuilder::new(worker_override.model);
             builder = builder.name(&worker_config.agent.name);
@@ -3075,19 +3339,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
             for tool in worker_override.extra_tools {
                 let shim = DynToolAsTool::new(tool);
                 match (
-                    &worker_config.tool_wrapper,
+                    worker_config.tool_middleware_stack(),
                     &worker_config.tool_context_factory,
                 ) {
-                    (Some(wrapper), Some(factory)) => {
+                    (Some(stack), Some(factory)) => {
                         let factory = factory.clone();
                         let tool_name = shim.name();
                         state = state.add_tool(
-                            WrappedTool::new(shim, wrapper.clone())
+                            MiddlewareTool::new(shim, stack)
                                 .with_context_factory(move |_| factory(&tool_name)),
                         );
                     }
-                    (Some(wrapper), None) => {
-                        state = state.add_tool(WrappedTool::new(shim, wrapper.clone()));
+                    (Some(stack), None) => {
+                        state = state.add_tool(MiddlewareTool::new(shim, stack));
                     }
                     (None, _) => state = state.add_tool(shim),
                 }
@@ -3871,6 +4135,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         phase: "Worker task",
                         event_tx,
                         context_agent: None,
+                        input_tokens: None,
                     },
                     worker_name.map(|name| StreamContext {
                         task_id,
@@ -4580,6 +4845,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             preamble: coordinator_preamble,
             conversation: Vec::new(),
             routing_decision,
+            chat_history_tokens: None,
         };
 
         // Planning latency: prompt → plan created (includes correction retries).
@@ -4597,6 +4863,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             )
             .await?;
         let initial_planning_ms = planning_start.elapsed().as_millis() as u64;
+        let usage_tx = event_tx.clone();
 
         let result = match response {
             PlanningResponse::Direct {
@@ -4664,6 +4931,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .await
             }
         };
+
+        // The coordinator's scratchpad activity is reported once, for the
+        // conversation, like each worker's is for its task.
+        if let Some(event) = coordinator_state
+            .agent
+            .scratchpad_budget()
+            .and_then(|budget| {
+                crate::builder::scratchpad_usage_event(budget, CONVERSATION_AGENT_ID)
+            })
+        {
+            let _ = usage_tx.send(Ok(event)).await;
+        }
 
         match &result {
             Ok(_) => crate::logging::set_span_ok(&span),
@@ -5776,6 +6055,45 @@ fn context_overflow_suggestion(phase: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Set the context window on whichever provider `llm` is.
+    pub(super) fn set_context_window(llm: &mut crate::config::LlmConfig, window: u64) {
+        use crate::config::LlmConfig;
+        match llm {
+            LlmConfig::OpenAI { context_window, .. }
+            | LlmConfig::Anthropic { context_window, .. }
+            | LlmConfig::Bedrock { context_window, .. }
+            | LlmConfig::Gemini { context_window, .. }
+            | LlmConfig::Ollama { context_window, .. }
+            | LlmConfig::OpenRouter { context_window, .. } => *context_window = Some(window),
+        }
+    }
+
+    /// A worker with a context window and no scratchpad counts its reads
+    /// against a budget that already holds its preamble and tool schemas,
+    /// so `read_artifact` cannot inline what the next request has no room
+    /// for.
+    #[tokio::test]
+    async fn a_plain_worker_budget_starts_from_the_fixed_overhead() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut config = crate::config::AgentRuntimeConfig {
+            memory_dir: Some(temp.path().join("memory").to_string_lossy().into_owned()),
+            ..crate::config::AgentRuntimeConfig::default()
+        };
+        set_context_window(&mut config.llm, 128_000);
+        let orchestrator = Orchestrator::new(config).await.unwrap();
+
+        let worker = orchestrator
+            .create_worker(0, 1, None, None, None)
+            .await
+            .unwrap();
+        let budget = worker.agent.scratchpad_budget().expect("a plain budget");
+        let (provider, model) = orchestrator.agent_config.llm.model_info();
+        let counter = crate::scratchpad::token_counter_for_provider(provider, model);
+        let overhead = orchestrator.worker_fixed_overhead(None, &*counter);
+        assert!(overhead > 0);
+        assert_eq!(budget.remaining(), budget.usable_budget() - overhead);
+    }
 
     fn assistant_text(msg: &rig::completion::Message) -> String {
         match msg {
@@ -9269,5 +9587,240 @@ mod tests {
         );
         assert!(resume_invocations.lock().unwrap().is_empty());
         assert!(park_invocations.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod coordinator_artifact_tests {
+    use super::tests::set_context_window;
+    use super::*;
+    use crate::config::AgentRuntimeConfig;
+    use crate::orchestration::persistence::ExecutionPersistence;
+    use crate::orchestration::tools::read_artifact::ReadArtifactArgs;
+    use crate::run_context::RunContext;
+    use crate::scratchpad::{HeadTool, ScratchpadConfig};
+    use rig::tool::Tool;
+
+    const SESSION: &str = "coord-artifact-sess";
+
+    async fn orchestrator(
+        memory_dir: &std::path::Path,
+        window: Option<u64>,
+        scratchpad: Option<ScratchpadConfig>,
+    ) -> Orchestrator {
+        let mut config = AgentRuntimeConfig {
+            memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
+            session_id: Some(SESSION.to_string()),
+            ..AgentRuntimeConfig::default()
+        };
+        if let Some(window) = window {
+            set_context_window(&mut config.llm, window);
+        }
+        config.agent.scratchpad = scratchpad;
+        Orchestrator::new(config).await.unwrap()
+    }
+
+    fn scratchpad_cfg(coordinator: bool) -> Option<ScratchpadConfig> {
+        Some(ScratchpadConfig {
+            enabled: true,
+            max_extraction_tokens: 1_000,
+            turn_depth_bonus: 4,
+            coordinator,
+            ..ScratchpadConfig::default()
+        })
+    }
+
+    /// A prior run in the same session holding one result artifact.
+    async fn prior_run_with_artifact(memory_dir: &std::path::Path, content: &str) -> String {
+        let run = ExecutionPersistence::new(memory_dir, Some(SESSION.to_string()))
+            .await
+            .unwrap();
+        run.write_result_artifact(0, Some("files"), 1, content)
+            .await
+            .unwrap();
+        run.run_id().to_string()
+    }
+
+    fn big_artifact() -> String {
+        (0..20_000).map(|i| format!("log line {i}\n")).collect()
+    }
+
+    /// The coordinator's artifact tools with their run bound, as
+    /// `begin_run_within` binds it.
+    async fn artifact_tools(
+        orchestrator: &Orchestrator,
+        preamble: &mut String,
+    ) -> (CoordinatorArtifacts, Arc<BoundRun>) {
+        let run = Arc::new(BoundRun::default());
+        let artifacts = orchestrator
+            .coordinator_artifact_tools(preamble, &run)
+            .await
+            .unwrap();
+        run.bind(RunContext::detached_with(
+            crate::config::RunId::mint(),
+            artifacts.budget.clone(),
+            None,
+        ));
+        (artifacts, run)
+    }
+
+    async fn read_prior(tool: &ReadArtifactTool, run_id: &str) -> String {
+        tool.call(ReadArtifactArgs {
+            filename: "task-0-files-iter-1-result.txt".to_string(),
+            run_id: Some(run_id.to_string()),
+        })
+        .await
+        .unwrap()
+        .content
+    }
+
+    fn file_ref_from_pointer(pointer: &str) -> String {
+        let marker = "head file=\"";
+        let start = pointer.find(marker).expect("pointer should list head") + marker.len();
+        let len = pointer[start..].find('"').unwrap();
+        pointer[start..start + len].to_string()
+    }
+
+    #[tokio::test]
+    async fn with_scratchpad_a_large_prior_artifact_is_an_explorable_pointer() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let memory_dir = temp.path().join("memory");
+        let big = big_artifact();
+        let prior = prior_run_with_artifact(&memory_dir, &big).await;
+        let orchestrator = orchestrator(&memory_dir, Some(128_000), scratchpad_cfg(true)).await;
+
+        let mut preamble = String::from("coordinator preamble");
+        let (artifacts, run) = artifact_tools(&orchestrator, &mut preamble).await;
+        let scratchpad = artifacts.scratchpad.expect("coordinator scratchpad wired");
+        assert!(preamble.contains("Scratchpad Tools"));
+        assert_eq!(artifacts.depth_bonus, 4);
+
+        let content = read_prior(&artifacts.read_artifact, &prior).await;
+        assert!(content.len() < big.len() / 10, "artifact was inlined");
+        assert!(content.contains("is too large"), "got: {content}");
+
+        let out = HeadTool::new(scratchpad.storage.clone(), run)
+            .call(crate::scratchpad::tools::HeadArgs {
+                file: file_ref_from_pointer(&content),
+                lines: 2,
+            })
+            .await
+            .unwrap();
+        assert!(out.contains("log line 0") && out.contains("log line 1"));
+    }
+
+    #[tokio::test]
+    async fn with_scratchpad_a_small_artifact_is_inlined_and_recorded() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let memory_dir = temp.path().join("memory");
+        let prior = prior_run_with_artifact(&memory_dir, "short summary").await;
+        let orchestrator = orchestrator(&memory_dir, Some(128_000), scratchpad_cfg(true)).await;
+
+        let (artifacts, run) = artifact_tools(&orchestrator, &mut String::new()).await;
+        assert_eq!(
+            read_prior(&artifacts.read_artifact, &prior).await,
+            "short summary"
+        );
+        assert!(run.scratchpad_budget().unwrap().scratchpad_usage().1 > 0);
+    }
+
+    /// Seeding from a history full of escaped tool output counts the content
+    /// sent, not its `Debug` form, so an artifact that fits is still inlined.
+    #[tokio::test]
+    async fn a_seed_from_escaped_history_still_inlines_a_fitting_artifact() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let memory_dir = temp.path().join("memory");
+        let artifact: String = (0..60).map(|i| format!("summary line {i}\n")).collect();
+        let prior = prior_run_with_artifact(&memory_dir, &artifact).await;
+        let orchestrator = orchestrator(&memory_dir, Some(128_000), scratchpad_cfg(true)).await;
+
+        let (artifacts, run) = artifact_tools(&orchestrator, &mut String::new()).await;
+        let budget = run.scratchpad_budget().unwrap();
+        let history = [
+            rig::completion::Message::user("verify the prior run"),
+            rig::completion::Message::tool_result("call_1", "{\"k\":\"v\"}\n".repeat(16_000)),
+        ];
+        let debug_tokens: usize = history
+            .iter()
+            .map(|m| budget.count_tokens(&format!("{m:?}")))
+            .sum();
+        assert!(
+            debug_tokens > budget.remaining(),
+            "fixture must overflow the budget when counted by Debug ({debug_tokens} tokens)"
+        );
+
+        budget.reset_request_input(budget.request_input_tokens("plan this", &history));
+        assert_eq!(read_prior(&artifacts.read_artifact, &prior).await, artifact);
+    }
+
+    #[tokio::test]
+    async fn with_the_coordinator_opted_out_reads_are_budgeted_previews() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let memory_dir = temp.path().join("memory");
+        let big = big_artifact();
+        let prior = prior_run_with_artifact(&memory_dir, &big).await;
+        let orchestrator = orchestrator(&memory_dir, Some(128_000), scratchpad_cfg(false)).await;
+
+        let mut preamble = String::from("coordinator preamble");
+        let (artifacts, _run) = artifact_tools(&orchestrator, &mut preamble).await;
+        assert!(artifacts.scratchpad.is_none());
+        assert!(artifacts.budget.is_some());
+        assert_eq!(artifacts.depth_bonus, 0);
+        assert_eq!(preamble, "coordinator preamble");
+
+        let content = read_prior(&artifacts.read_artifact, &prior).await;
+        assert!(content.starts_with("log line 0\n"));
+        assert!(content.contains("too large to return inline"));
+    }
+
+    #[tokio::test]
+    async fn without_a_context_window_reads_are_previews() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let memory_dir = temp.path().join("memory");
+        let big = big_artifact();
+        let prior = prior_run_with_artifact(&memory_dir, &big).await;
+        let orchestrator = orchestrator(&memory_dir, None, scratchpad_cfg(true)).await;
+
+        let (artifacts, _run) = artifact_tools(&orchestrator, &mut String::new()).await;
+        assert!(artifacts.budget.is_none() && artifacts.scratchpad.is_none());
+        let content = read_prior(&artifacts.read_artifact, &prior).await;
+        assert!(content.contains("too large to return inline"));
+        assert!(content.len() < crate::orchestration::tools::PREVIEW_BYTES + 512);
+    }
+
+    #[tokio::test]
+    async fn the_coordinator_gets_the_depth_bonus_only_with_its_scratchpad() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let memory_dir = temp.path().join("memory");
+
+        let on = orchestrator(&memory_dir, Some(128_000), scratchpad_cfg(true)).await;
+        let base = on
+            .agent_config
+            .agent
+            .turn_depth
+            .unwrap_or(crate::builder::DEFAULT_MAX_DEPTH);
+        let coordinator = on
+            .create_coordinator(RoutingToolSet::new(), true)
+            .await
+            .unwrap();
+        let budget = coordinator
+            .agent
+            .scratchpad_budget()
+            .expect("coordinator budget");
+        assert!(
+            budget.remaining() < budget.usable_budget(),
+            "the preamble and tool schemas count as fixed overhead"
+        );
+        assert_eq!(coordinator.agent.max_depth(), base + 4);
+        assert!(coordinator.preamble.contains("Scratchpad Tools"));
+
+        let off = orchestrator(&memory_dir, Some(128_000), scratchpad_cfg(false)).await;
+        let coordinator = off
+            .create_coordinator(RoutingToolSet::new(), true)
+            .await
+            .unwrap();
+        assert!(coordinator.agent.scratchpad_budget().is_some());
+        assert_eq!(coordinator.agent.max_depth(), base);
+        assert!(!coordinator.preamble.contains("Scratchpad Tools"));
     }
 }

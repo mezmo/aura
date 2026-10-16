@@ -70,7 +70,7 @@ impl Drop for DrainGuard {
 /// 1. Adds an optional `_aura_reasoning` field to tool schemas
 /// 2. Extracts reasoning from args before calling the inner tool
 /// 3. Captures RAW tool output in `transform_output` (runs before any wrapper
-///    that rewrites the output, e.g. `ScratchpadWrapper`)
+///    that rewrites the output, e.g. `ScratchpadMiddleware`)
 /// 4. Records a condensed `ToolTraceEntry` in `on_complete` using the captured
 ///    raw output plus the `duration_ms` that only the completion hook receives
 /// 5. Promotes qualifying tool outputs to artifact files (size/duration threshold)
@@ -197,7 +197,7 @@ impl ToolWrapper for PersistenceWrapper {
     }
 
     /// Captures the RAW tool output into `raw_outputs` (must run BEFORE any
-    /// wrapper that rewrites the output, e.g. `ScratchpadWrapper`), then
+    /// wrapper that rewrites the output, e.g. `ScratchpadMiddleware`), then
     /// appends an artifact footer when size-based promotion qualifies.
     ///
     /// Suppressed when persistence is disabled (no backing file will exist).
@@ -866,18 +866,39 @@ mod tests {
         );
     }
 
-    /// End-to-end ordering test through `ComposedWrapper`. Locks down the
-    /// load-bearing convention from `orchestrator.rs::create_worker` that
-    /// `PersistenceWrapper` is placed AFTER `ScratchpadWrapper` in the vec
-    /// so its `transform_output` runs FIRST under reverse iteration and sees
-    /// the RAW payload, while the LLM-facing output is the scratchpad
-    /// pointer. A future reorder of the wrapper vec — or a change to
-    /// `ComposedWrapper`'s reverse iteration — will fail this test.
+    /// `PersistenceWrapper` sits inside `ScratchpadMiddleware` in the worker
+    /// stack `create_worker` builds, so on the way up it sees the raw output
+    /// before the scratchpad rewrites it: the promoted artifact holds the
+    /// raw payload while the LLM gets the pointer.
     #[tokio::test]
-    async fn test_composed_persistence_after_scratchpad_captures_raw() {
+    async fn test_persistence_inside_scratchpad_persists_raw_output() {
         use crate::scratchpad::context_budget::TiktokenCounter;
-        use crate::scratchpad::{ContextBudget, ScratchpadStorage, ScratchpadWrapper};
-        use crate::tool_wrapper::ComposedWrapper;
+        use crate::scratchpad::{ContextBudget, ScratchpadMiddleware, ScratchpadStorage};
+        use crate::tool_middleware::{MiddlewareStack, MiddlewareTool, WrapperLayer};
+        use rig::tool::Tool as _;
+
+        /// The tool under the stack, with a fixed output.
+        #[derive(Clone)]
+        struct Echo(String);
+
+        impl rig::tool::Tool for Echo {
+            const NAME: &'static str = "big_tool";
+            type Error = ToolError;
+            type Args = Value;
+            type Output = String;
+
+            async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+                rig::completion::ToolDefinition {
+                    name: Self::NAME.to_string(),
+                    description: String::new(),
+                    parameters: serde_json::json!({ "type": "object" }),
+                }
+            }
+
+            async fn call(&self, _args: Value) -> Result<String, ToolError> {
+                Ok(self.0.clone())
+            }
+        }
 
         let tmp = tempfile::TempDir::new().unwrap();
         let storage = Arc::new(
@@ -887,18 +908,24 @@ mod tests {
         );
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
-
-        let scratchpad_tools = HashMap::from([("big_tool".to_string(), 10_usize)]);
-        let scratchpad: Arc<dyn ToolWrapper> = Arc::new(ScratchpadWrapper::new(
-            scratchpad_tools,
-            storage.clone(),
+        let scratchpad = ScratchpadMiddleware::new(
+            HashMap::from([("big_tool".to_string(), 10_usize)]),
+            storage,
             Arc::new(crate::run_context::BoundRun::pinned_budget(budget)),
-        ));
+        );
 
-        let persistence_inner = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
-        let (in_flight, drain_notify) = {
+        let persistence_inner = Arc::new(Mutex::new(
+            ExecutionPersistence::new(tmp.path().join("memory"), None)
+                .await
+                .unwrap(),
+        ));
+        let (in_flight, drain_notify, artifacts) = {
             let p = persistence_inner.lock().await;
-            (p.in_flight_counter(), p.drain_notify())
+            (
+                p.in_flight_counter(),
+                p.drain_notify(),
+                p.run_path().join("artifacts"),
+            )
         };
         let persistence = Arc::new(PersistenceWrapper::new(PersistenceWrapperParams {
             persistence: persistence_inner,
@@ -906,48 +933,49 @@ mod tests {
             drain_notify,
             worker_name: None,
             iteration: 1,
-            persistence_enabled: false,
+            persistence_enabled: true,
             size_threshold: 0,
             duration_threshold_ms: 0,
         }));
-        let persistence_dyn: Arc<dyn ToolWrapper> = persistence.clone();
 
-        // Same ordering as `orchestrator.rs::create_worker`: scratchpad
-        // before persistence in the vec → persistence's `transform_output`
-        // runs first under reverse iteration → sees raw → caches → then
-        // scratchpad rewrites to the pointer.
-        let composed = ComposedWrapper::new(vec![scratchpad, persistence_dyn]);
-
-        let ctx = ToolCallContext::new("big_tool").with_task_context(7, "worker_xyz".into(), 0);
-        let TransformArgsResult { extracted, .. } =
-            composed.transform_args(serde_json::json!({}), &ctx);
-        let extracted = extracted.expect("composed transform_args produces extracted");
-
+        let stack = MiddlewareStack::new(vec![
+            Arc::new(scratchpad),
+            Arc::new(WrapperLayer(persistence)),
+        ]);
         // Use varied content to avoid tokenizer compression masking the threshold.
         let raw: String = (0..500).map(|i| format!("entry_{} ", i)).collect();
-        let outcome = crate::mcp::CallOutcome::Success(raw.clone());
-        let result = composed
-            .transform_output(raw.clone(), &outcome, &ctx, Some(&extracted))
-            .await;
+        let tool = MiddlewareTool::new(Echo(raw.clone()), stack).with_context_factory(|_| {
+            ToolCallContext::new("big_tool").with_task_context(7, "worker_xyz".into(), 0)
+        });
 
+        let output = tool.call(serde_json::json!({})).await.unwrap();
         assert!(
-            result.output.contains("[scratchpad:"),
+            output.contains("[scratchpad:"),
             "scratchpad must rewrite output to a pointer for the LLM, got: {}",
-            &result.output[..result.output.len().min(120)]
+            &output[..output.len().min(120)]
         );
 
-        let call_id = find_field(Some(&extracted), CALL_ID_FIELD)
-            .expect("composed extracted must carry _persistence_call_id");
-        let cached = persistence
-            .raw_outputs
-            .lock()
-            .unwrap()
-            .get(call_id)
-            .cloned();
+        // The promoted artifact is written by the completion hook, which the
+        // call does not wait for.
+        let mut artifact = None;
+        for _ in 0..200 {
+            if let Ok(mut entries) = tokio::fs::read_dir(&artifacts).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    if entry.file_name().to_string_lossy().ends_with("-output.txt") {
+                        artifact = Some(entry.path());
+                    }
+                }
+            }
+            if artifact.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let artifact = artifact.expect("persistence must promote the tool output to an artifact");
+        let persisted = tokio::fs::read_to_string(&artifact).await.unwrap();
         assert_eq!(
-            cached.as_deref(),
-            Some(raw.as_str()),
-            "persistence must cache the RAW payload, not the scratchpad pointer"
+            persisted, raw,
+            "persistence must persist the RAW payload, not the scratchpad pointer"
         );
     }
 

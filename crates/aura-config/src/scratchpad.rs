@@ -29,6 +29,9 @@ pub struct ScratchpadConfig {
     /// Extra turns added when scratchpad is active (to account for exploration).
     #[serde(default = "default_turn_depth_bonus")]
     pub turn_depth_bonus: usize,
+    /// Whether the orchestration coordinator gets a scratchpad of its own.
+    #[serde(default = "default_coordinator")]
+    pub coordinator: bool,
 }
 
 impl Default for ScratchpadConfig {
@@ -38,6 +41,7 @@ impl Default for ScratchpadConfig {
             context_safety_margin: default_context_safety_margin(),
             max_extraction_tokens: default_max_extraction_tokens(),
             turn_depth_bonus: default_turn_depth_bonus(),
+            coordinator: default_coordinator(),
         }
     }
 }
@@ -157,6 +161,10 @@ fn default_max_extraction_tokens() -> usize {
 
 fn default_turn_depth_bonus() -> usize {
     6
+}
+
+fn default_coordinator() -> bool {
+    true
 }
 
 fn default_scratchpad_min_tokens() -> usize {

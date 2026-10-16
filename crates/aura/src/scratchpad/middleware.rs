@@ -1,21 +1,25 @@
-//! ScratchpadWrapper — intercepts large MCP tool outputs and writes them
-//! to the scratchpad directory, returning a summary pointer to the LLM.
+//! `ScratchpadMiddleware`: the layer that keeps large tool output out of
+//! the context window by writing it to the scratchpad and handing the model
+//! a pointer to explore instead.
 
-use super::storage::ScratchpadStorage;
-use crate::mcp::CallOutcome;
-use crate::orchestration::persistence_wrapper::strip_artifact_footer;
-use crate::run_context::BoundRun;
-use crate::tool_wrapper::{ToolCallContext, ToolWrapper, TransformOutputResult};
-use async_trait::async_trait;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
+use super::context_budget::Fit;
+use super::storage::{ContentFormat, ScratchpadStorage};
+use crate::orchestration::persistence_wrapper::strip_artifact_footer;
+use crate::run_context::BoundRun;
+use crate::tool_middleware::{CallFailure, Next, ToolMiddleware, ToolReply, ToolRequest};
+use crate::tool_wrapper::ToolCallContext;
+
 /// Build the primary "this lives in a file, explore it with these tools"
-/// pointer. Shared by [`ScratchpadWrapper`] (for intercepted MCP output) and
-/// the orchestration `read_artifact` tool (for large artifacts read in place),
-/// so both surfaces give the LLM identical exploration guidance.
+/// pointer. Shared by [`ScratchpadMiddleware`] (for intercepted MCP output)
+/// and the orchestration `read_artifact` tool (for large artifacts read in
+/// place), so both surfaces give the LLM identical exploration guidance.
 ///
 /// `headline` is the caller-specific first line (e.g. "[scratchpad: output
 /// saved to 'foo.json' (...)]" vs "[artifact 'result.txt' is large (...)]").
@@ -38,9 +42,10 @@ pub(crate) fn build_file_pointer(headline: &str, file_ref: &str) -> String {
     )
 }
 
-/// ToolWrapper that intercepts large outputs from flagged tools and writes
-/// them to scratchpad files, replacing the output with a compact pointer.
-pub struct ScratchpadWrapper {
+/// The scratchpad's [`ToolMiddleware`] layer: the flagged tools, their
+/// thresholds, and the storage their output goes to.
+#[derive(Clone)]
+pub struct ScratchpadMiddleware {
     /// Map of bare tool name → `min_tokens` threshold.
     scratchpad_tools: HashMap<String, usize>,
     /// Storage backend for writing scratchpad files.
@@ -49,7 +54,7 @@ pub struct ScratchpadWrapper {
     run: Arc<BoundRun>,
 }
 
-impl ScratchpadWrapper {
+impl ScratchpadMiddleware {
     pub fn new(
         scratchpad_tools: HashMap<String, usize>,
         storage: Arc<ScratchpadStorage>,
@@ -61,44 +66,18 @@ impl ScratchpadWrapper {
             run,
         }
     }
-}
 
-#[async_trait]
-impl ToolWrapper for ScratchpadWrapper {
+    /// Replace `output` with a pointer when it reaches `min_tokens`.
+    ///
     /// Counts and records against the budget of the run bound when the call
-    /// happens. Exact-name lookup against `scratchpad_tools`, which
-    /// `scratchpad::scratchpad_tool_map` resolves from the per-server glob
-    /// patterns when the agent is prepared.
-    async fn transform_output(
-        &self,
-        output: String,
-        outcome: &CallOutcome,
-        ctx: &ToolCallContext,
-        _extracted: Option<&serde_json::Value>,
-    ) -> TransformOutputResult {
-        // Tool errors should never be diverted to scratchpad — the LLM needs
-        // to see the error inline so it can react. Only intercept successful
-        // tool outputs that exceed the per-tool token threshold.
-        //
-        // Oversized errors are bounded upstream at the tool-result source
-        // (`mcp_response::bound_error_content`), so passing the
-        // error through here does not risk flooding a worker's context.
-        if outcome.is_error() {
-            return TransformOutputResult::new(output);
-        }
-
-        let min_tokens = match self.scratchpad_tools.get(&ctx.tool_name) {
-            Some(&mt) => mt,
-            None => return TransformOutputResult::new(output),
-        };
-
-        // The output may arrive with a trailing artifact footer already
-        // appended. The pointer built below replaces the whole output, and
-        // the scratchpad file must hold only the raw tool output — a
-        // trailing non-JSON footer breaks get_in, schema, and iterate_over
-        // on otherwise-valid JSON. Strip it before counting, hashing, and
-        // writing. Passthrough returns hand back `output` untouched, footer
-        // and all.
+    /// happens. Output under the threshold passes through untouched, footer
+    /// and all; the scratchpad file holds only the raw tool output, since a
+    /// trailing non-JSON footer breaks `get_in`, `schema` and `iterate_over`
+    /// on otherwise-valid JSON. The file name carries a hash of that content
+    /// rather than a UUID so identical output yields an identical pointer:
+    /// the orchestration `DuplicateCallGuard` compares pointer strings, and a
+    /// fresh name every call would defeat it on intercepted tools.
+    async fn intercept(&self, ctx: &ToolCallContext, output: String, min_tokens: usize) -> String {
         let content = strip_artifact_footer(&output);
 
         // With no run bound there is no budget to count against, and a
@@ -111,28 +90,26 @@ impl ToolWrapper for ScratchpadWrapper {
                 "Scratchpad: {} output withheld — no run is bound",
                 ctx.tool_name
             );
-            return TransformOutputResult::new(format!(
+            return format!(
                 "[scratchpad: {} output withheld: no run is bound to count it against. \
                  Retry the tool call.]",
                 ctx.tool_name
-            ));
+            );
         };
 
-        let output_tokens = budget.count_tokens(content);
-        if output_tokens < min_tokens {
-            tracing::debug!(
-                "Scratchpad: {} output (~{} tokens) below threshold ({}), passing through",
-                ctx.tool_name,
-                output_tokens,
-                min_tokens
-            );
-            return TransformOutputResult::new(output);
-        }
+        let output_tokens = match budget.fit(content, min_tokens.saturating_sub(1)) {
+            Fit::Fits { tokens } => {
+                tracing::debug!(
+                    "Scratchpad: {} output (~{} tokens) below threshold ({}), passing through",
+                    ctx.tool_name,
+                    tokens,
+                    min_tokens
+                );
+                return output;
+            }
+            Fit::Exceeds { tokens, .. } => tokens,
+        };
 
-        // Suffix is a content hash (not a UUID) so identical raw output yields
-        // an identical pointer string. The orchestration `DuplicateCallGuard`
-        // runs after this wrapper and compares pointer strings; a fresh UUID
-        // every call would defeat duplicate detection on intercepted tools.
         let mut hasher = DefaultHasher::new();
         content.hash(&mut hasher);
         let content_hash = format!("{:016x}", hasher.finish());
@@ -148,8 +125,7 @@ impl ToolWrapper for ScratchpadWrapper {
         .replace(['/', '\\', ':', ' '], "_");
 
         // The write is awaited before returning the pointer.
-        let write = self.storage.write_output(&file_id, content).await;
-        match write {
+        match self.storage.write_output(&file_id, content).await {
             Ok(result) => {
                 let filename = result
                     .path
@@ -186,7 +162,6 @@ impl ToolWrapper for ScratchpadWrapper {
                     // JSON tree — get_in / item_schema / iterate_over apply.
                     // Markdown companions are a flat string — line-based
                     // tools (slice) only.
-                    use super::storage::ContentFormat;
                     let tool_list = match companion.format {
                         ContentFormat::Json => format!(
                             "\n\
@@ -220,7 +195,7 @@ impl ToolWrapper for ScratchpadWrapper {
                     result.companions.len(),
                 );
 
-                TransformOutputResult::new(pointer)
+                pointer
             }
             Err(e) => {
                 tracing::warn!(
@@ -232,14 +207,39 @@ impl ToolWrapper for ScratchpadWrapper {
                 // overflow scratchpad exists to prevent — the output already
                 // exceeded the per-tool threshold by token count. Surface a
                 // compact error pointer instead so the LLM can react and retry.
-                let error_pointer = format!(
+                format!(
                     "[scratchpad: failed to save {} output (~{} tokens): {}. \
                      The output was too large for the context window and could not be \
                      persisted. Retry the tool call, narrow the query, or proceed without it.]",
                     ctx.tool_name, output_tokens, e
-                );
-                TransformOutputResult::new(error_pointer)
+                )
             }
+        }
+    }
+}
+
+#[async_trait]
+impl ToolMiddleware for ScratchpadMiddleware {
+    /// A successful reply from a flagged tool that reaches its threshold is
+    /// written to a scratchpad file and replaced with a compact pointer to
+    /// it (see `intercept`). Tool
+    /// errors must reach the LLM inline so it can react, and oversized
+    /// errors are bounded upstream at the tool-result source
+    /// (`mcp_response::bound_error_content`), so passing them through here
+    /// cannot flood the context. Exact-name lookup against
+    /// `scratchpad_tools`, which `scratchpad::scratchpad_tool_map` resolves
+    /// from the per-server glob patterns when the agent is prepared.
+    async fn call(&self, req: ToolRequest, next: Next<'_>) -> Result<ToolReply, CallFailure> {
+        let ctx = Arc::clone(&req.ctx);
+        match next.run(req).await? {
+            ToolReply::Tool { output, outcome } if !outcome.is_error() => {
+                let output = match self.scratchpad_tools.get(&ctx.tool_name) {
+                    Some(&min_tokens) => self.intercept(&ctx, output, min_tokens).await,
+                    None => output,
+                };
+                Ok(ToolReply::Tool { output, outcome })
+            }
+            reply => Ok(reply),
         }
     }
 }
@@ -249,13 +249,50 @@ mod tests {
     use super::*;
     use crate::scratchpad::ContextBudget;
     use crate::scratchpad::context_budget::{TiktokenCounter, TokenCounter};
+    use crate::tool_middleware::{MiddlewareStack, MiddlewareTool};
     use crate::tool_wrapper::ToolCallContext;
+    use rig::tool::{Tool as _, ToolError};
     use tempfile::TempDir;
 
-    /// Build a `CallOutcome::Success` for tests that don't care about the
-    /// content (the wrapper only reads `is_error()`, not the inner string).
-    fn ok() -> CallOutcome {
-        CallOutcome::Success(String::new())
+    /// A tool with a fixed output, so a test can push any payload through
+    /// the layer.
+    #[derive(Clone)]
+    struct Echo(String);
+
+    impl rig::tool::Tool for Echo {
+        const NAME: &'static str = "echo";
+        type Error = ToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+
+        async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+            rig::completion::ToolDefinition {
+                name: Self::NAME.to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({ "type": "object" }),
+            }
+        }
+
+        async fn call(&self, _args: serde_json::Value) -> Result<String, ToolError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// Run `output` from the tool `ctx` names up through `layer` alone.
+    async fn run(
+        layer: &ScratchpadMiddleware,
+        ctx: &ToolCallContext,
+        output: impl Into<String>,
+    ) -> String {
+        let ctx = ctx.clone();
+        MiddlewareTool::new(
+            Echo(output.into()),
+            MiddlewareStack::new(vec![Arc::new(layer.clone())]),
+        )
+        .with_context_factory(move |_| ctx.clone())
+        .call(serde_json::json!({}))
+        .await
+        .unwrap()
     }
 
     // Glob pattern matching + per-server tie-break semantics now live in
@@ -284,7 +321,7 @@ mod tests {
 
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(
+        let wrapper = ScratchpadMiddleware::new(
             tools,
             storage.clone(),
             Arc::new(BoundRun::pinned_budget(budget)),
@@ -298,13 +335,11 @@ mod tests {
         ctx.tool_initiator_id = "incident".to_string();
         ctx.attempt = Some(0);
 
-        let result = wrapper
-            .transform_output(large_output, &ok(), &ctx, None)
-            .await;
+        let result = run(&wrapper, &ctx, large_output).await;
         assert!(
-            result.output.contains("[scratchpad:"),
+            result.contains("[scratchpad:"),
             "exact-name lookup must intercept; got: {}",
-            &result.output[..result.output.len().min(200)]
+            &result[..result.len().min(200)]
         );
 
         let files = storage.list_files().await.unwrap();
@@ -331,7 +366,7 @@ mod tests {
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
         let wrapper =
-            ScratchpadWrapper::new(tools, storage, Arc::new(BoundRun::pinned_budget(budget)));
+            ScratchpadMiddleware::new(tools, storage, Arc::new(BoundRun::pinned_budget(budget)));
 
         let large_output = (0..200).map(|i| format!("entry_{i} ")).collect::<String>();
         let mut ctx = ToolCallContext::new("echo_large");
@@ -339,14 +374,10 @@ mod tests {
         ctx.tool_initiator_id = "worker_loop".to_string();
         ctx.attempt = Some(0);
 
-        let r1 = wrapper
-            .transform_output(large_output.clone(), &ok(), &ctx, None)
-            .await;
-        let r2 = wrapper
-            .transform_output(large_output, &ok(), &ctx, None)
-            .await;
+        let r1 = run(&wrapper, &ctx, large_output.clone()).await;
+        let r2 = run(&wrapper, &ctx, large_output).await;
         assert_eq!(
-            r1.output, r2.output,
+            r1, r2,
             "identical raw output must produce identical pointer strings so DuplicateCallGuard can detect loops"
         );
     }
@@ -364,7 +395,7 @@ mod tests {
 
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(
+        let wrapper = ScratchpadMiddleware::new(
             tools,
             storage.clone(),
             Arc::new(BoundRun::pinned_budget(budget)),
@@ -377,10 +408,8 @@ mod tests {
         ctx.tool_initiator_id = "worker_abc".to_string();
         ctx.attempt = Some(0);
 
-        let result = wrapper
-            .transform_output(large_output, &ok(), &ctx, None)
-            .await;
-        let output = result.output;
+        let result = run(&wrapper, &ctx, large_output).await;
+        let output = result;
 
         assert!(output.contains("[scratchpad:"));
         assert!(output.contains("schema"));
@@ -418,7 +447,7 @@ mod tests {
         let tools = HashMap::from([("execute_range_query".to_string(), 10)]);
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(
+        let wrapper = ScratchpadMiddleware::new(
             tools,
             storage.clone(),
             Arc::new(BoundRun::pinned_budget(budget)),
@@ -440,10 +469,8 @@ mod tests {
         ctx.tool_initiator_id = "metrics".to_string();
         ctx.attempt = Some(0);
 
-        let result = wrapper
-            .transform_output(with_footer, &ok(), &ctx, None)
-            .await;
-        assert!(result.output.contains("[scratchpad:"), "must intercept");
+        let result = run(&wrapper, &ctx, with_footer).await;
+        assert!(result.contains("[scratchpad:"), "must intercept");
 
         let files = storage.list_files().await.unwrap();
         let name = files.first().expect("a scratchpad file must be written");
@@ -477,7 +504,7 @@ mod tests {
 
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(
+        let wrapper = ScratchpadMiddleware::new(
             tools,
             storage.clone(),
             Arc::new(BoundRun::pinned_budget(budget.clone())),
@@ -486,11 +513,9 @@ mod tests {
         let small_output = "small result".to_string();
         let ctx = ToolCallContext::new("search_knowledge_base");
 
-        let result = wrapper
-            .transform_output(small_output.clone(), &ok(), &ctx, None)
-            .await;
+        let result = run(&wrapper, &ctx, small_output.clone()).await;
         assert_eq!(
-            result.output, small_output,
+            result, small_output,
             "small output should pass through unchanged"
         );
         // Verify no interception occurred: budget should show zero intercepted tokens
@@ -520,15 +545,13 @@ mod tests {
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
         let wrapper =
-            ScratchpadWrapper::new(tools, storage, Arc::new(BoundRun::pinned_budget(budget)));
+            ScratchpadMiddleware::new(tools, storage, Arc::new(BoundRun::pinned_budget(budget)));
 
         let large_output = "x".repeat(500);
         let ctx = ToolCallContext::new("other_tool");
 
-        let result = wrapper
-            .transform_output(large_output.clone(), &ok(), &ctx, None)
-            .await;
-        assert_eq!(result.output, large_output);
+        let result = run(&wrapper, &ctx, large_output.clone()).await;
+        assert_eq!(result, large_output);
     }
 
     /// Skill tool outputs must never be diverted to scratchpad: skills are
@@ -548,7 +571,7 @@ mod tests {
 
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(
+        let wrapper = ScratchpadMiddleware::new(
             tools,
             storage.clone(),
             Arc::new(BoundRun::pinned_budget(budget)),
@@ -557,11 +580,9 @@ mod tests {
         let large_output = (0..500).map(|i| format!("line_{} ", i)).collect::<String>();
         for tool_name in ["load_skill", "read_skill_file"] {
             let ctx = ToolCallContext::new(tool_name);
-            let result = wrapper
-                .transform_output(large_output.clone(), &ok(), &ctx, None)
-                .await;
+            let result = run(&wrapper, &ctx, large_output.clone()).await;
             assert_eq!(
-                result.output, large_output,
+                result, large_output,
                 "{tool_name} output must pass through unintercepted"
             );
         }
@@ -590,7 +611,7 @@ mod tests {
         // Set threshold to exactly the token count — should be intercepted (>=)
         let tools = HashMap::from([("tool_at_boundary".to_string(), exact_tokens)]);
         let budget = ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(
+        let wrapper = ScratchpadMiddleware::new(
             tools,
             storage.clone(),
             Arc::new(BoundRun::pinned_budget(budget)),
@@ -601,30 +622,26 @@ mod tests {
         ctx.tool_initiator_id = "worker".to_string();
         ctx.attempt = Some(0);
 
-        let result = wrapper
-            .transform_output(content.clone(), &ok(), &ctx, None)
-            .await;
+        let result = run(&wrapper, &ctx, content.clone()).await;
         assert!(
-            result.output.contains("[scratchpad:"),
+            result.contains("[scratchpad:"),
             "Output at exact threshold should be intercepted, got: {}",
-            &result.output[..result.output.len().min(200)]
+            &result[..result.len().min(200)]
         );
 
         // Now test one token below threshold — should pass through
         let tools_above = HashMap::from([("tool_at_boundary".to_string(), exact_tokens + 1)]);
         let counter2 = TiktokenCounter::default_counter();
         let budget2 = ContextBudget::new(128_000, 0.20, 0, Arc::new(counter2));
-        let wrapper2 = ScratchpadWrapper::new(
+        let wrapper2 = ScratchpadMiddleware::new(
             tools_above,
             storage,
             Arc::new(BoundRun::pinned_budget(budget2)),
         );
 
-        let result2 = wrapper2
-            .transform_output(content.clone(), &ok(), &ctx, None)
-            .await;
+        let result2 = run(&wrapper2, &ctx, content.clone()).await;
         assert_eq!(
-            result2.output, content,
+            result2, content,
             "Output below threshold should pass through unchanged"
         );
     }
@@ -638,7 +655,7 @@ mod tests {
                 .unwrap(),
         );
 
-        let tools = HashMap::from([("counted_tool".to_string(), 10)]);
+        let tools = HashMap::from([("counted_tool".to_string(), 100)]);
         let counter = TiktokenCounter::default_counter();
         let content = (0..200)
             .map(|i| format!("entry_{} ", i))
@@ -646,7 +663,7 @@ mod tests {
         let expected_tokens = counter.count_tokens(&content);
 
         let budget = ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(
+        let wrapper = ScratchpadMiddleware::new(
             tools,
             storage,
             Arc::new(BoundRun::pinned_budget(budget.clone())),
@@ -659,8 +676,8 @@ mod tests {
 
         assert_eq!(budget.scratchpad_usage(), (0, 0));
 
-        let result = wrapper.transform_output(content, &ok(), &ctx, None).await;
-        assert!(result.output.contains("[scratchpad:"));
+        let result = run(&wrapper, &ctx, content).await;
+        assert!(result.contains("[scratchpad:"));
 
         let (intercepted, _) = budget.scratchpad_usage();
         assert_eq!(
@@ -686,7 +703,7 @@ mod tests {
         let tools = HashMap::from([("failing_tool".to_string(), 10)]);
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(
+        let wrapper = ScratchpadMiddleware::new(
             tools,
             storage,
             Arc::new(BoundRun::pinned_budget(budget.clone())),
@@ -698,24 +715,22 @@ mod tests {
         ctx.tool_initiator_id = "worker".to_string();
         ctx.attempt = Some(0);
 
-        let result = wrapper
-            .transform_output(large_output.clone(), &ok(), &ctx, None)
-            .await;
+        let result = run(&wrapper, &ctx, large_output.clone()).await;
 
         // Returning the raw payload would re-introduce the overflow scratchpad
         // exists to prevent. The wrapper must instead surface a compact error
         // pointer so the LLM sees something small and actionable.
         assert!(
-            result.output.contains("[scratchpad: failed"),
+            result.contains("[scratchpad: failed"),
             "On write failure, output should be a compact error pointer; got: {}",
-            &result.output[..result.output.len().min(200)]
+            &result[..result.len().min(200)]
         );
         assert!(
-            result.output.len() < large_output.len(),
+            result.len() < large_output.len(),
             "Error pointer must be smaller than the raw payload it replaces"
         );
         assert!(
-            result.output.contains("failing_tool"),
+            result.contains("failing_tool"),
             "Error pointer should name the tool"
         );
 
@@ -744,7 +759,7 @@ mod tests {
         let tools = HashMap::from([("nested_call".to_string(), 10)]);
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(
+        let wrapper = ScratchpadMiddleware::new(
             tools,
             storage.clone(),
             Arc::new(BoundRun::pinned_budget(budget)),
@@ -764,10 +779,8 @@ mod tests {
         ctx.tool_initiator_id = "worker_a".to_string();
         ctx.attempt = Some(0);
 
-        let result = wrapper
-            .transform_output(outer.to_string(), &ok(), &ctx, None)
-            .await;
-        let output = result.output;
+        let result = run(&wrapper, &ctx, outer.to_string()).await;
+        let output = result;
 
         // The companion was a JSON tree, so the pointer must list JSON-aware
         // tools alongside the line-based ones.
@@ -812,7 +825,7 @@ mod tests {
 
         let counter = TiktokenCounter::default_counter();
         let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
-        let wrapper = ScratchpadWrapper::new(
+        let wrapper = ScratchpadMiddleware::new(
             tools,
             storage.clone(),
             Arc::new(BoundRun::pinned_budget(budget)),
@@ -831,10 +844,8 @@ mod tests {
         ctx.tool_initiator_id = "worker_rca".to_string();
         ctx.attempt = Some(0);
 
-        let result = wrapper
-            .transform_output(large_output, &ok(), &ctx, None)
-            .await;
-        let output = result.output;
+        let result = run(&wrapper, &ctx, large_output).await;
+        let output = result;
 
         // Primary file pointer
         assert!(output.contains("[scratchpad:"));

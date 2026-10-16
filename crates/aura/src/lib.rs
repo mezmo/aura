@@ -44,6 +44,7 @@ pub(crate) mod string_utils;
 pub(crate) mod test_span_capture;
 pub mod tool_call_observer;
 pub mod tool_error_detection;
+pub mod tool_middleware;
 pub mod tool_wrapper;
 pub mod tools;
 pub mod turn_nudge;
@@ -111,6 +112,10 @@ pub use stream_events::{
 pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};
 pub use tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent, ToolOutcome};
 pub use tool_error_detection::{DetectedToolError, ToolResultStatus, detect_tool_error};
+pub use tool_middleware::{
+    CallFailure, MiddlewareStack, MiddlewareTool, Next, ToolMiddleware, ToolReply, ToolRequest,
+    WrapperLayer,
+};
 pub use tool_wrapper::{
     ComposedWrapper, ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult,
     WrappedTool,

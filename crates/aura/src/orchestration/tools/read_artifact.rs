@@ -9,16 +9,42 @@ use tokio::sync::Mutex;
 
 use crate::orchestration::persistence::ExecutionPersistence;
 use crate::run_context::BoundRun;
-use crate::scratchpad::ScratchpadStorage;
+use crate::scratchpad::middleware::build_file_pointer;
 use crate::scratchpad::storage::{ContentFormat, ScratchpadPathError};
-use crate::scratchpad::tools::check_and_record_budget;
-use crate::scratchpad::wrapper::build_file_pointer;
+use crate::scratchpad::tools::{check_and_record_budget, check_budget};
+use crate::scratchpad::{ContextBudget, ScratchpadStorage};
 
+/// Fraction of the context window one read may fill.
+const INLINE_CAP_WINDOW_FRACTION: f64 = 0.25;
+
+/// Bytes of an artifact an unbudgeted read shows.
+pub const PREVIEW_BYTES: usize = 8 * 1024;
+
+/// The per-read cap, in tokens, for a run with `context_window` and no
+/// scratchpad.
+pub fn inline_cap_tokens(context_window: u64) -> usize {
+    ((context_window as f64) * INLINE_CAP_WINDOW_FRACTION) as usize
+}
+
+/// What bounds the content a read returns inline.
 #[derive(Clone)]
-struct ReadArtifactScratchpad {
-    /// The prepared agent's run slot.
-    run: Arc<BoundRun>,
-    storage: Arc<ScratchpadStorage>,
+enum Surfacing {
+    /// No budget.
+    Preview,
+    /// The bound run's budget, and what stands in for content past it.
+    Budgeted {
+        run: Arc<BoundRun>,
+        fallback: Fallback,
+    },
+}
+
+/// What stands in for artifact content past the budget.
+#[derive(Clone)]
+enum Fallback {
+    /// An in-place pointer, built against this storage's read root.
+    Pointer(Arc<ScratchpadStorage>),
+    /// A preview of the artifact's head.
+    Preview,
 }
 
 /// Reads full content of a result artifact file.
@@ -28,39 +54,83 @@ struct ReadArtifactScratchpad {
 #[derive(Clone)]
 pub struct ReadArtifactTool {
     persistence: Arc<Mutex<ExecutionPersistence>>,
-    scratchpad: Option<ReadArtifactScratchpad>,
+    surfacing: Surfacing,
 }
 
 impl ReadArtifactTool {
+    /// A tool with no budget: content under [`PREVIEW_BYTES`] comes back
+    /// inline, anything larger as a preview of its head.
     pub fn new(persistence: Arc<Mutex<ExecutionPersistence>>) -> Self {
         Self {
             persistence,
-            scratchpad: None,
+            surfacing: Surfacing::Preview,
         }
     }
 
-    /// With scratchpad, oversized artifacts are returned as a pointer.
+    /// Count reads against the bound run's budget; an artifact that does
+    /// not fit comes back as a pointer to explore with the scratchpad read
+    /// tools.
     pub fn with_scratchpad(mut self, run: Arc<BoundRun>, storage: Arc<ScratchpadStorage>) -> Self {
-        self.scratchpad = Some(ReadArtifactScratchpad { run, storage });
+        self.surfacing = Surfacing::Budgeted {
+            run,
+            fallback: Fallback::Pointer(storage),
+        };
         self
     }
 
+    /// Count reads against the bound run's budget; an artifact that does
+    /// not fit comes back as a preview of its head.
+    pub fn with_budget(mut self, run: Arc<BoundRun>) -> Self {
+        self.surfacing = Surfacing::Budgeted {
+            run,
+            fallback: Fallback::Preview,
+        };
+        self
+    }
+
+    /// The budget of the run a budgeted tool is bound to.
+    #[cfg(test)]
+    fn run_budget(&self) -> Option<crate::scratchpad::ContextBudget> {
+        match &self.surfacing {
+            Surfacing::Budgeted { run, .. } => run.scratchpad_budget(),
+            Surfacing::Preview => None,
+        }
+    }
+
+    fn points_at_scratchpad(&self) -> bool {
+        matches!(
+            self.surfacing,
+            Surfacing::Budgeted {
+                fallback: Fallback::Pointer(_),
+                ..
+            }
+        )
+    }
+
     /// Decide how to surface artifact `content`:
-    /// - scratchpad inactive → inline;
+    /// - no budget → inline up to [`PREVIEW_BYTES`], else a preview;
     /// - fits the budget → inline, recorded against the budget;
     /// - too large → a pointer to the artifact in place (or, if the artifact
-    ///   can't be referenced in place, a compact "too large" notice).
+    ///   can't be referenced in place, a compact "too large" notice), or a
+    ///   preview sized to the room the budget has left and recorded against it.
     ///
     /// `abs_path` is the artifact's absolute path (already resolved & validated
     /// by the caller); it's used to build the in-place `file=` reference.
     async fn surface_content(&self, filename: &str, abs_path: &Path, content: String) -> String {
-        let Some(sp) = &self.scratchpad else {
-            return content;
+        let (run, fallback) = match &self.surfacing {
+            Surfacing::Preview => {
+                return if content.len() <= PREVIEW_BYTES {
+                    content
+                } else {
+                    capped_preview(filename, &content, PREVIEW_BYTES)
+                };
+            }
+            Surfacing::Budgeted { run, fallback } => (run, fallback),
         };
         // No run bound means no budget to check the artifact against;
         // withhold it rather than inline an unbounded read, as the
         // scratchpad read tools do with `ScratchpadToolError::NoRun`.
-        let Some(budget) = sp.run.scratchpad_budget() else {
+        let Some(budget) = run.scratchpad_budget() else {
             tracing::warn!(
                 "read_artifact: artifact {} withheld — no run is bound",
                 filename
@@ -71,14 +141,23 @@ impl ReadArtifactTool {
             );
         };
 
-        if check_and_record_budget(&budget, &content).is_ok() {
-            return content;
-        }
+        let storage = match fallback {
+            Fallback::Pointer(storage) => storage,
+            Fallback::Preview => {
+                return match check_budget(&budget, &content) {
+                    Ok(_) => content,
+                    Err(_) => budgeted_preview(filename, &content, &budget),
+                };
+            }
+        };
 
-        let tokens = budget.count_tokens(&content);
+        let tokens = match check_and_record_budget(&budget, &content) {
+            Ok(()) => return content,
+            Err(check) => check.tokens(),
+        };
         let line_count = content.lines().count();
-        let (format, _) = ContentFormat::detect_and_parse(&content);
-        match sp.storage.relative_ref(abs_path).await {
+        let format = ContentFormat::detect(&content);
+        match storage.relative_ref(abs_path).await {
             Ok(file_ref) => {
                 let headline = format!(
                     "[artifact '{filename}' is too large for the context window \
@@ -119,6 +198,65 @@ impl ReadArtifactTool {
             }
         }
     }
+}
+
+/// A preview that fits the room the budget has left, notice included,
+/// recorded against the budget.
+///
+/// The notice is part of what the read returns, so it comes out of the
+/// same room as the head; it is sized for a head of the whole room, which
+/// can only overstate its length. The complete preview is counted before it
+/// is returned. With no room for it, the read returns a one-line note that
+/// nothing was shown, which is not recorded, so reads past an exhausted
+/// budget do not keep adding to it.
+fn budgeted_preview(filename: &str, content: &str, budget: &ContextBudget) -> String {
+    let room = budget
+        .max_extraction_tokens()
+        .unwrap_or(usize::MAX)
+        .min(budget.remaining());
+    let notice = budget.count_tokens(&preview_notice(filename, content, room));
+    let preview = capped_preview(filename, content, room.saturating_sub(notice));
+    let tokens = budget.count_tokens(&preview);
+    if tokens <= room && budget.try_record_tokens(tokens).is_ok() {
+        return preview;
+    }
+    format!(
+        "[artifact '{filename}' not shown: the context window has no room left for it \
+         ({bytes} bytes). Narrow the task or have a worker process it.]",
+        bytes = content.len(),
+    )
+}
+
+/// The first `limit` bytes of `content` plus a notice that the rest was
+/// left out.
+///
+/// The cut is by bytes, not lines, since a minified JSON artifact can be a
+/// single line; a token is at least one byte, so the head is at most
+/// `limit` tokens, and the notice comes on top of it. The head ends at the
+/// last newline when that keeps more than half the window, so a long line
+/// that follows a short first one is not trimmed back to that first line.
+fn capped_preview(filename: &str, content: &str, limit: usize) -> String {
+    let mut end = limit.min(content.len());
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = &content[..end];
+    let head = match head.rfind('\n') {
+        Some(nl) if nl > end / 2 => &head[..=nl],
+        _ => head,
+    };
+    format!("{head}{}", preview_notice(filename, content, head.len()))
+}
+
+/// The line that follows a preview showing the first `shown` bytes.
+fn preview_notice(filename: &str, content: &str, shown: usize) -> String {
+    format!(
+        "\n[artifact '{filename}' is too large to return inline ({bytes} bytes, \
+         {lines} lines); showing the first {shown} bytes. If more is needed, process it in \
+         a narrower task.]",
+        bytes = content.len(),
+        lines = content.lines().count(),
+    )
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -163,16 +301,27 @@ impl Tool for ReadArtifactTool {
     type Args = ReadArtifactArgs;
     type Output = ReadArtifactOutput;
 
+    /// The description tells the model what a large artifact comes back
+    /// as, since a pointer is only worth following where the scratchpad
+    /// read tools exist.
     async fn definition(&self, _prompt: String) -> ToolDefinition {
+        let large = if self.points_at_scratchpad() {
+            "A large artifact is returned as a scratchpad pointer to explore in place \
+             (with head, grep, slice, etc.) rather than inlined."
+        } else {
+            "A large artifact is returned as a preview of its start rather than whole; \
+             there is no tool to read further, so narrow the task or have a worker \
+             process it."
+        };
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Read the content of a result artifact. By default reads from \
-                the current run. Supply an optional run_id to read artifacts from a prior run \
-                in this session (see session history for available run_id values). A large \
-                artifact is returned as a scratchpad pointer to explore in place (with head, \
-                grep, slice, etc.) rather than inlined. A filename that is not found returns \
-                found=false with the run's artifact filenames in `available`."
-                .to_string(),
+            description: format!(
+                "Read the content of a result artifact. By default reads from the current \
+                 run. Supply an optional run_id to read artifacts from a prior run in this \
+                 session (see session history for available run_id values). {large} A \
+                 filename that is not found returns found=false with the run's artifact \
+                 filenames in `available`."
+            ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -438,7 +587,7 @@ mod tests {
     // Budget-aware behavior (scratchpad active)
     // ------------------------------------------------------------------
 
-    use crate::scratchpad::{ContextBudget, TiktokenCounter};
+    use crate::scratchpad::{ContextBudget, TiktokenCounter, TokenCounter};
 
     /// A standard 128k-window budget with the given per-call extraction limit.
     fn test_budget(max_extraction_tokens: usize) -> ContextBudget {
@@ -500,15 +649,7 @@ mod tests {
     #[tokio::test]
     async fn test_small_artifact_inlines_and_records_budget() {
         let (tool, storage, _dir) = setup_scratchpad_tool("a short result", 10_000).await;
-        let extracted_before = tool
-            .scratchpad
-            .as_ref()
-            .unwrap()
-            .run
-            .scratchpad_budget()
-            .unwrap()
-            .scratchpad_usage()
-            .1;
+        let extracted_before = tool.run_budget().unwrap().scratchpad_usage().1;
         assert_eq!(extracted_before, 0);
 
         let result = tool
@@ -522,15 +663,7 @@ mod tests {
         assert!(result.found);
         assert_eq!(result.content, "a short result");
         // Budget recorded the extraction.
-        let extracted = tool
-            .scratchpad
-            .as_ref()
-            .unwrap()
-            .run
-            .scratchpad_budget()
-            .unwrap()
-            .scratchpad_usage()
-            .1;
+        let extracted = tool.run_budget().unwrap().scratchpad_usage().1;
         assert!(
             extracted > 0,
             "small inline read must record extracted tokens"
@@ -700,10 +833,10 @@ mod tests {
         assert!(head_out.contains("xrun line 2"));
     }
 
-    /// With no scratchpad attached, a large artifact is returned inline in full.
     #[tokio::test]
-    async fn test_no_scratchpad_inlines_large_artifact() {
-        let big: String = (0..2_000).map(|i| format!("line {i}\n")).collect();
+    async fn test_unbudgeted_read_previews_past_preview_bytes() {
+        let big: String = (0..3_000).map(|i| format!("line number {i}\n")).collect();
+        assert!(big.len() > PREVIEW_BYTES);
         let temp_dir = TempDir::new().unwrap();
         let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
             .await
@@ -714,18 +847,294 @@ mod tests {
             .unwrap();
         let tool = ReadArtifactTool::new(Arc::new(Mutex::new(persistence)));
 
-        let result = tool
-            .call(ReadArtifactArgs {
-                filename: "task-0-research-iter-1-result.txt".to_string(),
-                run_id: None,
-            })
+        let result = read_result(&tool).await;
+        assert!(result.found);
+        assert!(result.content.starts_with("line number 0\n"));
+        assert!(
+            result.content.contains("too large to return inline"),
+            "expected a preview notice, got: {}",
+            &result.content[result.content.len().saturating_sub(200)..]
+        );
+        assert!(bytes_shown(&result.content) <= PREVIEW_BYTES);
+    }
+
+    // ------------------------------------------------------------------
+    // Budgeted reads without a scratchpad
+    // ------------------------------------------------------------------
+
+    /// Counter that refuses to tokenize anything larger than `max_len` bytes,
+    /// proving oversized content is rejected without a full tokenizer pass.
+    struct BoundedCounter {
+        max_len: usize,
+    }
+
+    impl crate::scratchpad::TokenCounter for BoundedCounter {
+        fn count_tokens(&self, text: &str) -> usize {
+            assert!(
+                text.len() <= self.max_len,
+                "tokenizer called on {} bytes",
+                text.len()
+            );
+            TiktokenCounter::default_counter().count_tokens(text)
+        }
+    }
+
+    async fn setup_budgeted_tool(
+        content: &str,
+        budget: ContextBudget,
+    ) -> (ReadArtifactTool, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+        persistence
+            .write_result_artifact(0, Some("research"), 1, content)
+            .await
+            .unwrap();
+        let tool = ReadArtifactTool::new(Arc::new(Mutex::new(persistence)))
+            .with_budget(Arc::new(BoundRun::pinned_budget(budget)));
+        (tool, temp_dir)
+    }
+
+    async fn read_result(tool: &ReadArtifactTool) -> ReadArtifactOutput {
+        tool.call(ReadArtifactArgs {
+            filename: "task-0-research-iter-1-result.txt".to_string(),
+            run_id: None,
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The byte count a preview notice reports.
+    fn bytes_shown(content: &str) -> usize {
+        let tail = content.rsplit("showing the first ").next().unwrap();
+        tail.split(' ').next().unwrap().parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_budgeted_read_inlines_content_that_fits() {
+        let (tool, _dir) = setup_budgeted_tool("a short result", test_budget(1_000)).await;
+        assert_eq!(read_result(&tool).await.content, "a short result");
+    }
+
+    #[tokio::test]
+    async fn test_budgeted_read_previews_content_over_the_cap() {
+        let big: String = (0..2_000).map(|i| format!("line number {i}\n")).collect();
+        let (tool, _dir) = setup_budgeted_tool(&big, test_budget(500)).await;
+        let result = read_result(&tool).await;
+
+        assert!(result.found);
+        assert!(result.content.starts_with("line number 0\n"));
+        assert!(
+            result.content.contains("too large to return inline"),
+            "expected a preview notice, got: {}",
+            result.content
+        );
+        assert!(bytes_shown(&result.content) <= 500);
+        let tokens = TiktokenCounter::default_counter().count_tokens(&result.content);
+        assert!(tokens < 500, "preview is {tokens} tokens");
+    }
+
+    #[tokio::test]
+    async fn test_budgeted_preview_bounds_a_single_line() {
+        let big = format!("[{}]", "{\"k\":\"value\"},".repeat(5_000));
+        let (tool, _dir) = setup_budgeted_tool(&big, test_budget(500)).await;
+        let result = read_result(&tool).await;
+
+        assert!(result.content.starts_with("[{\"k\":"));
+        assert!(result.content.contains("too large to return inline"));
+        let tokens = TiktokenCounter::default_counter().count_tokens(&result.content);
+        assert!(tokens < 500, "preview is {tokens} tokens");
+    }
+
+    #[tokio::test]
+    async fn test_budgeted_preview_keeps_the_window_after_a_short_first_line() {
+        let big = format!("Result:\n{}", "{\"k\":\"value\"},".repeat(5_000));
+        let (tool, _dir) = setup_budgeted_tool(&big, test_budget(500)).await;
+        let result = read_result(&tool).await;
+
+        assert!(result.content.starts_with("Result:\n{\"k\""));
+        let shown = bytes_shown(&result.content);
+        assert!(shown > 250, "preview collapsed to {shown} bytes");
+    }
+
+    #[tokio::test]
+    async fn test_budgeted_reads_add_up_across_calls() {
+        let content: String = (0..60).map(|i| format!("entry number {i}\n")).collect();
+        let counter = TiktokenCounter::default_counter();
+        let tokens = counter.count_tokens(&content);
+        let budget = ContextBudget::new(tokens * 5 / 2, 0.0, 0, Arc::new(counter))
+            .with_max_extraction_tokens(tokens + 1);
+        let (tool, _dir) = setup_budgeted_tool(&content, budget.clone()).await;
+
+        assert_eq!(read_result(&tool).await.content, content);
+        assert_eq!(read_result(&tool).await.content, content);
+        let third = read_result(&tool).await.content;
+        assert!(
+            third.contains("too large to return inline"),
+            "the third read must be a preview, got: {third}"
+        );
+        assert!(
+            bytes_shown(&third) <= tokens / 2,
+            "the preview is bounded by the room left"
+        );
+        assert!(
+            budget.remaining() < tokens / 2,
+            "the preview is counted too"
+        );
+    }
+
+    /// A budget with `room` tokens left and no per-read cap.
+    fn budget_with_room(room: usize) -> ContextBudget {
+        ContextBudget::new(
+            100_000,
+            0.0,
+            100_000 - room,
+            Arc::new(TiktokenCounter::default_counter()),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_budgeted_preview_fits_its_room_notice_included() {
+        let big: String = (0..2_000).map(|i| format!("line number {i}\n")).collect();
+        let budget = budget_with_room(200);
+        let (tool, _dir) = setup_budgeted_tool(&big, budget.clone()).await;
+
+        let content = read_result(&tool).await.content;
+        assert!(content.contains("too large to return inline"), "{content}");
+        let tokens = TiktokenCounter::default_counter().count_tokens(&content);
+        assert!(tokens <= 200, "the preview is {tokens} tokens");
+        assert_eq!(
+            budget.remaining(),
+            200 - tokens,
+            "the whole preview is recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_exhausted_budget_stops_growing() {
+        let big: String = (0..2_000).map(|i| format!("line number {i}\n")).collect();
+        let budget = budget_with_room(10);
+        let (tool, _dir) = setup_budgeted_tool(&big, budget.clone()).await;
+
+        for _ in 0..3 {
+            let content = read_result(&tool).await.content;
+            assert!(content.contains("not shown"), "{content}");
+        }
+        assert_eq!(
+            budget.remaining(),
+            10,
+            "notes past the budget are not recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_budgeted_read_rejects_huge_content_without_tokenizing() {
+        let big = "x".repeat(2_000_000);
+        let budget = ContextBudget::new(
+            128_000,
+            0.20,
+            0,
+            Arc::new(BoundedCounter { max_len: 100_000 }),
+        )
+        .with_max_extraction_tokens(1_000);
+        let (tool, _dir) = setup_budgeted_tool(&big, budget).await;
+
+        let result = read_result(&tool).await;
+        assert!(result.content.contains("too large to return inline"));
+        assert!(result.content.len() < 10_000);
+    }
+
+    #[tokio::test]
+    async fn test_budgeted_read_applies_to_cross_run_reads() {
+        let temp_dir = TempDir::new().unwrap();
+        let memory_dir = temp_dir.path().join("memory");
+        let session_id = "session_cap".to_string();
+        let big: String = (0..2_000).map(|i| format!("xrun line {i}\n")).collect();
+
+        let run_a = ExecutionPersistence::new(&memory_dir, Some(session_id.clone()))
+            .await
+            .unwrap();
+        let run_a_id = run_a.run_id().to_string();
+        run_a
+            .write_result_artifact(0, Some("sre"), 1, &big)
             .await
             .unwrap();
 
-        assert!(result.found);
-        assert_eq!(
-            result.content, big,
-            "no-scratchpad path must inline verbatim"
+        let run_b = ExecutionPersistence::new(&memory_dir, Some(session_id))
+            .await
+            .unwrap();
+        let tool = ReadArtifactTool::new(Arc::new(Mutex::new(run_b)))
+            .with_budget(Arc::new(BoundRun::pinned_budget(test_budget(500))));
+
+        let result = tool
+            .call(ReadArtifactArgs {
+                filename: "task-0-sre-iter-1-result.txt".to_string(),
+                run_id: Some(run_a_id),
+            })
+            .await
+            .unwrap();
+        assert!(result.content.starts_with("xrun line 0\n"));
+        assert!(result.content.contains("too large to return inline"));
+    }
+
+    #[tokio::test]
+    async fn test_scratchpad_rejects_huge_content_without_tokenizing() {
+        let big = "y\n".repeat(1_000_000);
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+        let run_dir = persistence.run_path().to_path_buf();
+        let storage = Arc::new(
+            ScratchpadStorage::in_dir(&persistence.iteration_path())
+                .await
+                .unwrap()
+                .with_read_root(run_dir),
         );
+        persistence
+            .write_result_artifact(0, Some("research"), 1, &big)
+            .await
+            .unwrap();
+        let budget = ContextBudget::new(
+            128_000,
+            0.20,
+            0,
+            Arc::new(BoundedCounter { max_len: 100_000 }),
+        )
+        .with_max_extraction_tokens(1_000);
+        let tool = ReadArtifactTool::new(Arc::new(Mutex::new(persistence)))
+            .with_scratchpad(Arc::new(BoundRun::pinned_budget(budget)), storage);
+
+        let result = read_result(&tool).await;
+        assert!(result.content.contains("head file="));
+    }
+
+    #[tokio::test]
+    async fn test_definition_describes_the_fallback() {
+        let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
+        let plain = ReadArtifactTool::new(persistence.clone());
+        let description = plain.definition(String::new()).await.description;
+        assert!(
+            description.contains("preview of its start"),
+            "{description}"
+        );
+        assert!(!description.contains("scratchpad pointer"), "{description}");
+
+        let tmp = TempDir::new().unwrap();
+        let storage = Arc::new(
+            ScratchpadStorage::with_base_dir(tmp.path(), "req-def")
+                .await
+                .unwrap(),
+        );
+        let with_scratchpad = ReadArtifactTool::new(persistence)
+            .with_scratchpad(Arc::new(BoundRun::pinned_budget(test_budget(10))), storage);
+        let description = with_scratchpad.definition(String::new()).await.description;
+        assert!(description.contains("scratchpad pointer"), "{description}");
+    }
+
+    #[test]
+    fn test_inline_cap_tokens_scales_with_context_window() {
+        assert_eq!(inline_cap_tokens(200_000), 50_000);
     }
 }
