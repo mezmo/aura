@@ -149,7 +149,7 @@ impl ScratchpadStorage {
     ///
     /// Creates `{parent}/scratchpad/` for storing intercepted tool outputs.
     pub async fn in_dir(parent: &Path) -> std::io::Result<Self> {
-        let dir = parent.join("scratchpad");
+        let dir = resolve_path(&parent.join("scratchpad"))?;
         fs::create_dir_all(&dir).await?;
         info!("Scratchpad directory created: {}", dir.display());
         Ok(Self {
@@ -160,7 +160,7 @@ impl ScratchpadStorage {
 
     /// Create storage with a specific base directory (for testing).
     pub async fn with_base_dir(base: &Path, request_id: &str) -> std::io::Result<Self> {
-        let dir = base.join(request_id);
+        let dir = resolve_path(&base.join(request_id))?;
         fs::create_dir_all(&dir).await?;
         Ok(Self {
             read_root: dir.clone(),
@@ -176,7 +176,7 @@ impl ScratchpadStorage {
     /// boundary stays at `dir`) — this keeps the invariant that the scratchpad
     /// write dir is always readable.
     pub fn with_read_root(mut self, read_root: PathBuf) -> Self {
-        let normalized = normalize_path(&read_root);
+        let normalized = resolve_path(&read_root).unwrap_or_else(|_| normalize_path(&read_root));
         if self.dir.starts_with(&normalized) {
             self.read_root = normalized;
         } else {
@@ -209,7 +209,12 @@ impl ScratchpadStorage {
     /// The result is validated through [`validate_path`](Self::validate_path),
     /// so a path outside the read root is rejected.
     pub async fn relative_ref(&self, abs: &Path) -> Result<String, ScratchpadPathError> {
-        let abs_norm = normalize_path(abs);
+        // Resolved like the read root, since persistence hands over paths
+        // under `memory_dir` exactly as configured, relative ones included.
+        let abs_norm = resolve_path(abs).map_err(|source| ScratchpadPathError::Io {
+            path: abs.display().to_string(),
+            source,
+        })?;
         let dir_norm = normalize_path(&self.dir);
 
         // Both the target and the scratchpad dir must live under the read root.
@@ -605,6 +610,13 @@ fn slugify_component(key: &str) -> String {
 }
 
 /// Normalize a path by resolving `.` and `..` components lexically.
+/// `path` made absolute against the working directory and normalized, so
+/// a relative `memory_dir` (`./memory`, `../memory`) and the absolute
+/// paths built from it compare component by component.
+fn resolve_path(path: &Path) -> std::io::Result<PathBuf> {
+    Ok(normalize_path(&std::path::absolute(path)?))
+}
+
 fn normalize_path(path: &Path) -> PathBuf {
     let mut components = Vec::new();
     for component in path.components() {
@@ -950,6 +962,49 @@ mod tests {
         let storage = storage.with_read_root(unrelated);
         // read_root falls back to the write dir.
         assert_eq!(storage.read_root(), dir.as_path());
+    }
+
+    /// A relative `memory_dir` resolves the write dir, the read root and the
+    /// artifact paths the same way, so the root is kept rather than ignored
+    /// as a non-ancestor and pointers can be built.
+    #[tokio::test]
+    async fn test_with_read_root_accepts_relative_paths() {
+        let tmp = TempDir::new().unwrap();
+        let artifacts = tmp.path().join("memory/run/artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(artifacts.join("a.txt"), "artifact").unwrap();
+
+        // The temp dir as a path relative to the cwd, so nothing is written
+        // into the source tree, which may be read-only.
+        let cwd = std::env::current_dir().unwrap();
+        let up: PathBuf = cwd
+            .components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+            .map(|_| "..")
+            .collect();
+        let tmp_abs = std::path::absolute(tmp.path()).unwrap();
+        let rel = up.join(tmp_abs.strip_prefix("/").unwrap());
+        let last = tmp_abs.file_name().unwrap();
+
+        for base in [PathBuf::from(".").join(&rel), rel.join("..").join(last)] {
+            let run = base.join("memory/run");
+            let storage = ScratchpadStorage::in_dir(&run.join("iteration-1"))
+                .await
+                .unwrap()
+                .with_read_root(run.clone());
+            assert!(
+                storage.dir().starts_with(storage.read_root())
+                    && storage.read_root() != storage.dir(),
+                "read root {} was ignored",
+                run.display()
+            );
+            // Persistence hands over the artifact path relative, as configured.
+            let token = storage
+                .relative_ref(&run.join("artifacts/a.txt"))
+                .await
+                .unwrap();
+            assert!(storage.validate_path(&token).await.is_ok());
+        }
     }
 
     #[tokio::test]

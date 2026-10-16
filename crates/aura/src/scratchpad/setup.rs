@@ -279,6 +279,7 @@ mod tests {
             context_safety_margin: 0.20,
             max_extraction_tokens: 5_000,
             turn_depth_bonus: 6,
+            coordinator: true,
         };
         let mut tool_map = HashMap::new();
         tool_map.insert("search_*".into(), 512);

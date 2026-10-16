@@ -1855,6 +1855,23 @@ turn_depth_bonus = 12
     }
 
     #[test]
+    fn scratchpad_coordinator_defaults_on_and_parses_off() {
+        let on = single_agent_config(
+            r#"memory_dir = "/tmp/aura-test""#,
+            "\n[agent.scratchpad]\nenabled = true\n",
+        );
+        let loaded = load_config_from_str(&on).expect("config should parse");
+        assert!(loaded.agent.scratchpad.as_ref().unwrap().coordinator);
+
+        let off = single_agent_config(
+            r#"memory_dir = "/tmp/aura-test""#,
+            "\n[agent.scratchpad]\nenabled = true\ncoordinator = false\n",
+        );
+        let loaded = load_config_from_str(&off).expect("config should parse");
+        assert!(!loaded.agent.scratchpad.as_ref().unwrap().coordinator);
+    }
+
+    #[test]
     fn scratchpad_worker_override_parses() {
         let config = r#"
 memory_dir = "/tmp/aura"

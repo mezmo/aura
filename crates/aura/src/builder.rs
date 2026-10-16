@@ -1545,6 +1545,12 @@ impl PreparedAgent {
 }
 
 impl Agent {
+    /// The turn depth the run is prepared with.
+    #[cfg(test)]
+    pub(crate) fn max_depth(&self) -> usize {
+        self.prepared.max_depth
+    }
+
     /// Prepare an agent from configuration and begin its single run.
     ///
     /// The run is for the request `config` was resolved for: its id is
@@ -1899,10 +1905,9 @@ impl Agent {
     /// Seed the scratchpad budget's running estimate with the user query +
     /// chat history at stream-start so early extraction budget checks see
     /// the request shape before turn-1 LLM-reported `input_tokens` arrives.
-    /// No-op when scratchpad isn't wired up. `Debug` formatting on history
-    /// over-counts vs. per-provider serialization — conservative direction
-    /// for budget gating, and `set_estimated_used` corrects from LLM ground
-    /// truth after each turn anyway.
+    /// No-op when scratchpad isn't wired up. History is counted by the
+    /// content each message sends, since an over-count would refuse reads
+    /// that fit until the first provider usage arrives.
     fn seed_scratchpad_request_input(
         &self,
         query: &str,
@@ -1911,12 +1916,7 @@ impl Agent {
         let Some(budget) = self.scratchpad_budget() else {
             return;
         };
-        let query_tokens = budget.count_tokens(query);
-        let history_tokens: usize = chat_history
-            .iter()
-            .map(|m| budget.count_tokens(&format!("{m:?}")))
-            .sum();
-        budget.record_usage(query_tokens + history_tokens);
+        budget.record_usage(budget.request_input_tokens(query, chat_history));
     }
 }
 
