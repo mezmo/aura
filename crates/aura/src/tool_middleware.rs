@@ -281,6 +281,21 @@ impl MiddlewareStack {
         &self.layers
     }
 
+    /// The stack with `inner`'s layers inside every layer it has.
+    pub fn around(self, inner: MiddlewareStack) -> Self {
+        let mut layers = self.layers.to_vec();
+        layers.extend(inner.layers.iter().cloned());
+        Self::new(layers)
+    }
+
+    /// The stack with `layer` outside every layer it has.
+    pub fn wrapped_by(self, layer: Arc<dyn ToolMiddleware>) -> Self {
+        let mut layers = Vec::with_capacity(self.layers.len() + 1);
+        layers.push(layer);
+        layers.extend(self.layers.iter().cloned());
+        Self::new(layers)
+    }
+
     /// Every layer's schema change, outermost first.
     fn wrap_schema(&self, mut schema: Value) -> Value {
         for layer in self.layers.iter() {

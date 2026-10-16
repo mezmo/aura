@@ -740,7 +740,8 @@ impl Orchestrator {
         use super::duplicate_call_guard::DuplicateCallGuard;
         use super::observer_wrapper::ObserverWrapper;
         use super::persistence_wrapper::PersistenceWrapper;
-        use crate::tool_wrapper::{ComposedWrapper, ToolCallContext, ToolWrapper};
+        use crate::tool_middleware::{MiddlewareStack, ToolMiddleware, WrapperLayer};
+        use crate::tool_wrapper::ToolCallContext;
 
         // Build base tool wrappers: observer + duplicate guard + persistence
         let (in_flight, drain_notify, iteration, persistence_enabled) = {
@@ -807,7 +808,7 @@ impl Orchestrator {
         // run through; `begin_run_within` fills it once the worker is prepared.
         let run = Arc::new(BoundRun::default());
         let mut scratchpad_budget: Option<scratchpad::ContextBudget> = None;
-        let mut scratchpad_tools = Vec::<Arc<dyn ToolWrapper>>::new();
+        let mut scratchpad_tools = Vec::<Arc<dyn ToolMiddleware>>::new();
         if let Some(ref sp_cfg) = effective_scratchpad
             && sp_cfg.enabled
         {
@@ -893,7 +894,7 @@ impl Orchestrator {
                 })
                 .await?;
 
-                scratchpad_tools.push(build.wrapper);
+                scratchpad_tools.push(build.layer);
                 scratchpad_budget = Some(build.budget);
                 worker_config.scratchpad_tools_config = Some(build.tools_config);
             }
@@ -932,21 +933,26 @@ impl Orchestrator {
             resolved_depth,
         );
 
-        // ComposedWrapper applies transform_output in reverse-list order, so
-        // the LAST entry runs FIRST on the raw tool output. Persistence must
-        // see raw output (for debugging/retry), so it goes last. Scratchpad
-        // also needs raw output — persistence's transform_output is a
-        // passthrough that just caches the raw — and rewrites to the pointer.
-        // Duplicate-guard and observer then see the pointer, which is what
-        // should surface to the LLM/UI. The turn-limit nudge goes first so
-        // it runs after everything else, on the text the LLM sees.
-        let mut wrappers: Vec<Arc<dyn ToolWrapper>> = vec![observer_wrapper, duplicate_guard];
-        wrappers.extend(scratchpad_tools);
-        wrappers.push(persistence_wrapper);
+        // Outermost first. A reply climbs the stack from the tool, so the
+        // innermost layer sees the raw output: persistence goes last, since
+        // it must see the raw output (for debugging/retry); its
+        // transform_output is a passthrough that just caches the raw.
+        // Scratchpad also needs the raw output and rewrites it to the
+        // pointer. Duplicate-guard and observer then see the pointer, which
+        // is what should surface to the LLM/UI. The turn-limit nudge goes
+        // first so it runs after everything else, on the text the LLM sees.
+        let mut layers: Vec<Arc<dyn ToolMiddleware>> = vec![
+            Arc::new(WrapperLayer(observer_wrapper)),
+            Arc::new(WrapperLayer(duplicate_guard)),
+        ];
+        layers.extend(scratchpad_tools);
+        layers.push(Arc::new(WrapperLayer(persistence_wrapper)));
         if turn_nudge.is_some() {
-            wrappers.insert(
+            layers.insert(
                 0,
-                Arc::new(crate::turn_nudge::TurnNudgeWrapper::new(Arc::clone(&run))),
+                Arc::new(WrapperLayer(Arc::new(
+                    crate::turn_nudge::TurnNudgeWrapper::new(Arc::clone(&run)),
+                ))),
             );
             tracing::info!(
                 "Worker {} turn-limit nudging enabled (last_turn={}, wrap_up_threshold={:?})",
@@ -959,11 +965,11 @@ impl Orchestrator {
         // HITL config gate. When `[hitl]` is configured, gate matching worker
         // tool calls behind the decision route, and pre-build the agent-callable
         // `request_approval` tool with the same scope/route (attached by
-        // `add_all_tools` via `hitl_request_approval_tool`). The gate is composed
-        // FIRST so its `pre_call` runs before every other wrapper and a denial
-        // short-circuits the call — `ComposedWrapper::pre_call` iterates the vec
-        // front-to-back. The gate only implements `pre_call`, so prepending it
-        // leaves the documented `transform_output` ordering above untouched.
+        // `add_all_tools` via `hitl_request_approval_tool`). The gate is the
+        // outermost layer so its `pre_call` runs before every other layer and
+        // a denial short-circuits the call. The gate only implements
+        // `pre_call`, so placing it outside leaves the documented
+        // `transform_output` ordering above untouched.
         if let Some(hitl) = worker_config.hitl.clone() {
             let (run_id_str, session_id_owned) = {
                 let p = self.persistence.lock().await;
@@ -1000,7 +1006,7 @@ impl Orchestrator {
             if let Some(recorded) = recorded {
                 gate = gate.with_recorded_decisions(Arc::clone(recorded));
             }
-            wrappers.insert(0, Arc::new(gate));
+            layers.insert(0, Arc::new(WrapperLayer(Arc::new(gate))));
             worker_config.hitl_request_approval_tool = Some(
                 crate::hitl::RequestApprovalTool::new(
                     hitl.route.clone(),
@@ -1012,7 +1018,7 @@ impl Orchestrator {
             );
         }
 
-        let wrapper: Arc<dyn ToolWrapper> = Arc::new(ComposedWrapper::new(wrappers));
+        let stack = MiddlewareStack::new(layers);
 
         // Configure worker based on assignment
         if let Some(name) = worker_name {
@@ -1081,8 +1087,10 @@ impl Orchestrator {
             }));
         }
 
-        // Orchestrator owns tool wrapping decision
-        worker_config.tool_wrapper = Some(wrapper);
+        // Orchestrator owns tool wrapping decision: the worker stack is the
+        // whole stack, in place of any wrapper the agent config carries.
+        worker_config.tool_middleware = Some(stack);
+        worker_config.tool_wrapper = None;
 
         // Give workers access to result artifacts
         worker_config.orchestration_persistence = Some(self.persistence.clone());
@@ -3055,8 +3063,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Test-only model injection (park/reify rig): a queued override builds
         // this worker from a scripted model. The override's extra tools go
-        // through the worker's own wrapper chain — `worker_config.tool_wrapper`
-        // carries the composed chain (observer, duplicate guard, persistence,
+        // through the worker's own layers — `worker_config.tool_middleware`
+        // carries the stack (observer, duplicate guard, persistence,
         // HITL gate) create_worker assembled — so a scripted worker's gated
         // calls park exactly like live ones. No override queued: unchanged
         // behavior.
@@ -3065,7 +3073,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             use rig::tool::Tool as _;
 
             use crate::orchestration::test_rig::DynToolAsTool;
-            use crate::tool_wrapper::WrappedTool;
+            use crate::tool_middleware::MiddlewareTool;
 
             let mut builder = rig::agent::AgentBuilder::new(worker_override.model);
             builder = builder.name(&worker_config.agent.name);
@@ -3075,19 +3083,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
             for tool in worker_override.extra_tools {
                 let shim = DynToolAsTool::new(tool);
                 match (
-                    &worker_config.tool_wrapper,
+                    worker_config.tool_middleware_stack(),
                     &worker_config.tool_context_factory,
                 ) {
-                    (Some(wrapper), Some(factory)) => {
+                    (Some(stack), Some(factory)) => {
                         let factory = factory.clone();
                         let tool_name = shim.name();
                         state = state.add_tool(
-                            WrappedTool::new(shim, wrapper.clone())
+                            MiddlewareTool::new(shim, stack)
                                 .with_context_factory(move |_| factory(&tool_name)),
                         );
                     }
-                    (Some(wrapper), None) => {
-                        state = state.add_tool(WrappedTool::new(shim, wrapper.clone()));
+                    (Some(stack), None) => {
+                        state = state.add_tool(MiddlewareTool::new(shim, stack));
                     }
                     (None, _) => state = state.add_tool(shim),
                 }

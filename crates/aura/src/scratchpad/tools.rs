@@ -3,7 +3,7 @@
 //! Tools that let the LLM selectively explore large tool outputs stored on disk, rather
 //! than loading everything into context.
 
-use super::context_budget::ContextBudget;
+use super::context_budget::{ContextBudget, Fit};
 use super::schema::{
     MAX_SCHEMA_DEPTH, analyze_json_structure, analyze_markdown_structure, format_markdown_schema,
     format_schema,
@@ -169,25 +169,27 @@ pub(crate) fn check_and_record_budget(
     budget: &ContextBudget,
     content: &str,
 ) -> Result<(), BudgetCheckError> {
-    // Per-call extraction limit check first
-    if let Some(limit) = budget.max_extraction_tokens() {
-        let tokens = budget.count_tokens(content);
-        if tokens > limit {
-            return Err(BudgetCheckError::ExtractionLimit(
+    let limit = budget.max_extraction_tokens();
+    let allowed = limit.map_or(budget.remaining(), |limit| limit.min(budget.remaining()));
+    match budget.fit(content, allowed) {
+        // Recording is atomic against concurrent tool calls, so a fit by
+        // count can still lose the race for the remaining budget.
+        Fit::Fits { tokens } => match budget.try_record_tokens(tokens) {
+            Ok(()) => {
+                budget.record_extracted(tokens);
+                Ok(())
+            }
+            Err(e) => Err(BudgetCheckError::BudgetExceeded(e)),
+        },
+        Fit::Exceeds { tokens, .. } => match limit {
+            Some(limit) if tokens > limit => Err(BudgetCheckError::ExtractionLimit(
                 super::context_budget::ExtractionLimitExceeded {
                     estimated_tokens: tokens,
                     limit,
                 },
-            ));
-        }
-    }
-    // Atomic cumulative budget check + record (no TOCTOU race)
-    match budget.try_record_usage(content) {
-        Ok(tokens) => {
-            budget.record_extracted(tokens);
-            Ok(())
-        }
-        Err(e) => Err(BudgetCheckError::BudgetExceeded(e)),
+            )),
+            _ => Err(BudgetCheckError::BudgetExceeded(budget.exceeded_by(tokens))),
+        },
     }
 }
 

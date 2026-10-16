@@ -9,6 +9,7 @@
 use crate::forwarded_headers::ForwardedHeaders;
 use crate::hitl::HitlRuntime;
 use crate::scratchpad::ScratchpadToolsConfig;
+use crate::tool_middleware::{MiddlewareStack, ToolMiddleware};
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper};
 use aura_config::GlobPattern;
 use std::sync::Arc;
@@ -76,6 +77,9 @@ pub struct AgentRuntimeConfig {
     /// Optional tool wrapper applied to all MCP tools.
     /// When set, all MCP tools are wrapped with this wrapper.
     pub tool_wrapper: Option<Arc<dyn ToolWrapper + Send + Sync>>,
+
+    /// Layers MCP tools run through, outside `tool_wrapper`.
+    pub tool_middleware: Option<MiddlewareStack>,
 
     /// Factory for creating ToolCallContext per tool.
     /// Allows callers to inject metadata (task_id, attempt) into wrapped tool calls.
@@ -145,6 +149,7 @@ impl Clone for AgentRuntimeConfig {
             worker_skills: self.worker_skills.clone(),
             // Arc fields clone the Arc (shared reference)
             tool_wrapper: self.tool_wrapper.clone(),
+            tool_middleware: self.tool_middleware.clone(),
             tool_context_factory: self.tool_context_factory.clone(),
             preamble_override: self.preamble_override.clone(),
             mcp_filter: self.mcp_filter.clone(),
@@ -175,6 +180,10 @@ impl std::fmt::Debug for AgentRuntimeConfig {
             .field(
                 "tool_wrapper",
                 &self.tool_wrapper.as_ref().map(|_| "<wrapper>"),
+            )
+            .field(
+                "tool_middleware",
+                &self.tool_middleware.as_ref().map(|s| s.layers().len()),
             )
             .field(
                 "tool_context_factory",
@@ -217,6 +226,28 @@ impl std::fmt::Debug for AgentRuntimeConfig {
 }
 
 impl AgentRuntimeConfig {
+    /// The stack MCP tools run through: the placed layers outside the
+    /// caller's `tool_wrapper`, so the wrapper sees the raw tool output and
+    /// every layer still runs when both are set.
+    pub fn tool_middleware_stack(&self) -> Option<MiddlewareStack> {
+        let wrapper = self
+            .tool_wrapper
+            .clone()
+            .map(|wrapper| MiddlewareStack::from_wrapper(wrapper));
+        match (self.tool_middleware.clone(), wrapper) {
+            (Some(layers), Some(inner)) => Some(layers.around(inner)),
+            (layers, inner) => layers.or(inner),
+        }
+    }
+
+    /// Place `layer` outside every layer MCP tools already run through.
+    pub fn add_outer_tool_layer(&mut self, layer: Arc<dyn ToolMiddleware>) {
+        self.tool_middleware = Some(match self.tool_middleware.take() {
+            Some(stack) => stack.wrapped_by(layer),
+            None => MiddlewareStack::new(vec![layer]),
+        });
+    }
+
     /// Check if orchestration mode is enabled.
     ///
     /// Returns true if the `[orchestration]` section exists and `enabled = true`.
@@ -289,6 +320,121 @@ impl AgentRuntimeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod tool_stack {
+        use super::*;
+        use crate::tool_middleware::{
+            CallFailure, MiddlewareTool, Next, ToolMiddleware, ToolReply, ToolRequest,
+        };
+        use crate::tool_wrapper::TransformOutputResult;
+        use async_trait::async_trait;
+        use rig::tool::{Tool as _, ToolError};
+        use serde_json::Value;
+
+        /// Appends its tag to the output, so the result shows which ran and
+        /// in what order on the way up.
+        struct TagWrapper(&'static str);
+
+        #[async_trait]
+        impl ToolWrapper for TagWrapper {
+            async fn transform_output(
+                &self,
+                output: String,
+                _outcome: &crate::mcp::CallOutcome,
+                _ctx: &ToolCallContext,
+                _extracted: Option<&Value>,
+            ) -> TransformOutputResult {
+                TransformOutputResult::new(format!("{output}<{}", self.0))
+            }
+        }
+
+        struct TagLayer(&'static str);
+
+        #[async_trait]
+        impl ToolMiddleware for TagLayer {
+            async fn call(
+                &self,
+                req: ToolRequest,
+                next: Next<'_>,
+            ) -> Result<ToolReply, CallFailure> {
+                match next.run(req).await? {
+                    ToolReply::Tool { output, outcome } => Ok(ToolReply::Tool {
+                        output: format!("{output}<{}", self.0),
+                        outcome,
+                    }),
+                    other => Ok(other),
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct Raw;
+
+        impl rig::tool::Tool for Raw {
+            const NAME: &'static str = "raw";
+            type Error = ToolError;
+            type Args = Value;
+            type Output = String;
+
+            async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+                rig::completion::ToolDefinition {
+                    name: Self::NAME.to_string(),
+                    description: String::new(),
+                    parameters: serde_json::json!({ "type": "object" }),
+                }
+            }
+
+            async fn call(&self, _args: Value) -> Result<String, ToolError> {
+                Ok("raw".to_string())
+            }
+        }
+
+        async fn run(config: &AgentRuntimeConfig) -> String {
+            let stack = config.tool_middleware_stack().expect("a stack");
+            MiddlewareTool::new(Raw, stack)
+                .call(serde_json::json!({}))
+                .await
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn a_placed_layer_runs_outside_the_caller_wrapper() {
+            let mut config = AgentRuntimeConfig {
+                tool_wrapper: Some(Arc::new(TagWrapper("w"))),
+                ..Default::default()
+            };
+            config.add_outer_tool_layer(Arc::new(TagLayer("a")));
+            config.add_outer_tool_layer(Arc::new(TagLayer("b")));
+            assert_eq!(run(&config).await, "raw<w<a<b");
+        }
+
+        #[tokio::test]
+        async fn a_supplied_stack_keeps_the_caller_wrapper() {
+            let config = AgentRuntimeConfig {
+                tool_wrapper: Some(Arc::new(TagWrapper("w"))),
+                tool_middleware: Some(MiddlewareStack::new(vec![Arc::new(TagLayer("a"))])),
+                ..Default::default()
+            };
+            assert_eq!(run(&config).await, "raw<w<a");
+        }
+
+        #[tokio::test]
+        async fn either_alone_is_the_stack() {
+            let wrapper_only = AgentRuntimeConfig {
+                tool_wrapper: Some(Arc::new(TagWrapper("w"))),
+                ..Default::default()
+            };
+            assert_eq!(run(&wrapper_only).await, "raw<w");
+            let mut layers_only = AgentRuntimeConfig::default();
+            layers_only.add_outer_tool_layer(Arc::new(TagLayer("a")));
+            assert_eq!(run(&layers_only).await, "raw<a");
+            assert!(
+                AgentRuntimeConfig::default()
+                    .tool_middleware_stack()
+                    .is_none()
+            );
+        }
+    }
 
     fn aura_tool(namespace: &str, tool_name: &str) -> crate::mcp::AuraTool {
         let tool = rmcp::model::Tool::new(

@@ -1,17 +1,17 @@
 //! Shared scratchpad wire-up used by both the single-agent builder and the
 //! orchestration worker factory. Callers handle their own gating, path
-//! selection, preamble mutation, and wrapper composition; this module owns
-//! the construction of the budget, storage, wrapper, and tools config.
+//! selection, preamble mutation, and layer placement; this module owns
+//! the construction of the budget, storage, layer, and tools config.
 
 use aura_config::GlobPattern;
 
 use super::{
-    ContextBudget, SCRATCHPAD_PREAMBLE, ScratchpadConfig, ScratchpadStorage, ScratchpadToolsConfig,
-    ScratchpadWrapper, TokenCounter, scratchpad_tool_schema_tokens,
+    ContextBudget, SCRATCHPAD_PREAMBLE, ScratchpadConfig, ScratchpadMiddleware, ScratchpadStorage,
+    ScratchpadToolsConfig, TokenCounter, scratchpad_tool_schema_tokens,
 };
 use crate::mcp::AuraTool;
 use crate::run_context::BoundRun;
-use crate::tool_wrapper::ToolWrapper;
+use crate::tool_middleware::ToolMiddleware;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -38,14 +38,14 @@ pub struct ScratchpadBuild {
     /// Seed context budget: the limits, with no usage recorded.
     pub budget: ContextBudget,
     pub storage: Arc<ScratchpadStorage>,
-    pub wrapper: Arc<dyn ToolWrapper>,
+    pub layer: Arc<dyn ToolMiddleware>,
     pub tools_config: ScratchpadToolsConfig,
 }
 
-/// Build the `ContextBudget`, `ScratchpadStorage`, `ScratchpadWrapper`, and
+/// Build the `ContextBudget`, `ScratchpadStorage`, `ScratchpadMiddleware`, and
 /// `ScratchpadToolsConfig`. Caller is responsible for gating (enabled check,
 /// accessibility check, context_window resolution), preamble injection, and
-/// composing the returned wrapper into its tool pipeline.
+/// placing the returned layer in its tool stack.
 pub async fn build_scratchpad(
     inputs: ScratchpadBuildInputs<'_>,
 ) -> std::io::Result<ScratchpadBuild> {
@@ -70,7 +70,7 @@ pub async fn build_scratchpad(
         inputs.scratchpad_tool_map.len(),
     );
 
-    let wrapper: Arc<dyn ToolWrapper> = Arc::new(ScratchpadWrapper::new(
+    let layer: Arc<dyn ToolMiddleware> = Arc::new(ScratchpadMiddleware::new(
         inputs.scratchpad_tool_map.clone(),
         storage.clone(),
         inputs.run.clone(),
@@ -85,7 +85,7 @@ pub async fn build_scratchpad(
     Ok(ScratchpadBuild {
         budget,
         storage,
-        wrapper,
+        layer,
         tools_config,
     })
 }

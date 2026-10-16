@@ -187,6 +187,21 @@ pub fn token_counter_for_provider(provider: &str, model: &str) -> Arc<dyn TokenC
     }
 }
 
+/// The longest token any supported tokenizer emits, in bytes. cl100k and
+/// o200k both top out at 128-byte whitespace runs; the approximate
+/// counters average a few bytes per token.
+pub const MAX_BYTES_PER_TOKEN: usize = 128;
+
+/// Whether content fits a token allowance, with the count that decided it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    /// The tokenizer's count, within the allowance.
+    Fits { tokens: usize },
+    /// Over the allowance; `estimated` marks a count derived from byte
+    /// length rather than the tokenizer.
+    Exceeds { tokens: usize, estimated: bool },
+}
+
 // ============================================================================
 // ContextBudget
 // ============================================================================
@@ -296,29 +311,63 @@ impl ContextBudget {
         }
     }
 
+    /// Whether `content` fits in `allowed` tokens, measured as cheaply as
+    /// the answer permits.
+    ///
+    /// Content longer than `allowed * MAX_BYTES_PER_TOKEN` bytes cannot
+    /// fit, so it is sized by the four-bytes-per-token rule of thumb instead
+    /// of being tokenized, which on multi-megabyte content would stall the
+    /// call for nothing. Anything shorter is tokenized once; callers record
+    /// and report the count from the returned [`Fit`] rather than counting
+    /// again.
+    pub fn fit(&self, content: &str, allowed: usize) -> Fit {
+        if content.len() > allowed.saturating_mul(MAX_BYTES_PER_TOKEN) {
+            return Fit::Exceeds {
+                tokens: content.len() / 4,
+                estimated: true,
+            };
+        }
+        let tokens = self.count_tokens(content);
+        if tokens > allowed {
+            Fit::Exceeds {
+                tokens,
+                estimated: false,
+            }
+        } else {
+            Fit::Fits { tokens }
+        }
+    }
+
+    /// Atomically record `tokens` of usage if there is room for them.
+    pub fn try_record_tokens(&self, tokens: usize) -> Result<(), BudgetExceeded> {
+        let usable = self.usable_budget();
+        self.estimated_used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current + tokens <= usable).then_some(current + tokens)
+            })
+            .map(drop)
+            .map_err(|current| BudgetExceeded {
+                requested_tokens: tokens,
+                remaining_tokens: usable.saturating_sub(current),
+                total_budget: usable,
+            })
+    }
+
+    /// The error for a request of `tokens` against what is left.
+    pub fn exceeded_by(&self, tokens: usize) -> BudgetExceeded {
+        BudgetExceeded {
+            requested_tokens: tokens,
+            remaining_tokens: self.remaining(),
+            total_budget: self.usable_budget(),
+        }
+    }
+
     /// Atomically check if content fits and record usage in one step.
     ///
     /// Returns the token count on success, or `BudgetExceeded` if there isn't room.
     pub fn try_record_usage(&self, content: &str) -> Result<usize, BudgetExceeded> {
         let tokens = self.count_tokens(content);
-        let usable = self.usable_budget();
-
-        match self
-            .estimated_used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                if current + tokens <= usable {
-                    Some(current + tokens)
-                } else {
-                    None
-                }
-            }) {
-            Ok(_prev) => Ok(tokens),
-            Err(current) => Err(BudgetExceeded {
-                requested_tokens: tokens,
-                remaining_tokens: usable.saturating_sub(current),
-                total_budget: usable,
-            }),
-        }
+        self.try_record_tokens(tokens).map(|()| tokens)
     }
 
     /// Record that tokens were consumed (after a successful tool return).
@@ -713,5 +762,71 @@ mod tests {
         let before = budget.remaining();
         budget.set_estimated_used(0, 0);
         assert_eq!(budget.remaining(), before);
+    }
+
+    /// A counter that refuses content past `max_len` bytes, so a test can
+    /// prove the tokenizer was never asked about it.
+    struct BoundedCounter {
+        max_len: usize,
+    }
+
+    impl TokenCounter for BoundedCounter {
+        fn count_tokens(&self, text: &str) -> usize {
+            assert!(
+                text.len() <= self.max_len,
+                "tokenizer called on {} bytes",
+                text.len()
+            );
+            text.len() / 4
+        }
+    }
+
+    #[test]
+    fn fit_reports_the_tokenizer_count_on_both_sides_of_the_allowance() {
+        let budget = ContextBudget::new(1_000, 0.0, 0, test_counter());
+        let text = "word ".repeat(50);
+        let expected = budget.count_tokens(&text);
+        assert_eq!(budget.fit(&text, expected), Fit::Fits { tokens: expected });
+        assert_eq!(
+            budget.fit(&text, expected - 1),
+            Fit::Exceeds {
+                tokens: expected,
+                estimated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn fit_skips_the_tokenizer_past_the_byte_bound() {
+        let bound = 10 * MAX_BYTES_PER_TOKEN;
+        let budget = ContextBudget::new(1_000, 0.0, 0, Arc::new(BoundedCounter { max_len: bound }));
+        let text = "x".repeat(bound + 1);
+        assert_eq!(
+            budget.fit(&text, 10),
+            Fit::Exceeds {
+                tokens: text.len() / 4,
+                estimated: true,
+            }
+        );
+        let text = "x".repeat(bound);
+        assert!(matches!(
+            budget.fit(&text, 10),
+            Fit::Exceeds {
+                estimated: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn try_record_tokens_is_the_atomic_half_of_try_record_usage() {
+        let budget = ContextBudget::new(100, 0.0, 0, test_counter());
+        assert!(budget.try_record_tokens(60).is_ok());
+        let err = budget.try_record_tokens(60).unwrap_err();
+        assert_eq!(
+            (err.requested_tokens, err.remaining_tokens, err.total_budget),
+            (60, 40, 100)
+        );
+        assert_eq!(budget.remaining(), 40);
     }
 }

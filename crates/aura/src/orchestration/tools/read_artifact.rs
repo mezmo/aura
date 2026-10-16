@@ -10,9 +10,9 @@ use tokio::sync::Mutex;
 use crate::orchestration::persistence::ExecutionPersistence;
 use crate::run_context::BoundRun;
 use crate::scratchpad::ScratchpadStorage;
+use crate::scratchpad::middleware::build_file_pointer;
 use crate::scratchpad::storage::{ContentFormat, ScratchpadPathError};
 use crate::scratchpad::tools::check_and_record_budget;
-use crate::scratchpad::wrapper::build_file_pointer;
 
 #[derive(Clone)]
 struct ReadArtifactScratchpad {

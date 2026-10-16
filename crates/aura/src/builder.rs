@@ -11,7 +11,8 @@ use crate::{
     run_context::{BoundRun, RunContext, RunInProgress, RunLease},
     scratchpad::{self, ContextBudget},
     skill_tool::{SkillInvocationRecorder, SkillToolset, render_skill_catalog},
-    tool_wrapper::{ToolCallContext, WrappedTool},
+    tool_middleware::{MiddlewareTool, WrapperLayer},
+    tool_wrapper::ToolCallContext,
     tools::{FilesystemTool, ListDirTool, ReadFileTool, WriteFileTool},
     turn_nudge::TurnNudgeState,
     vector_dynamic::DynamicVectorSearchTool,
@@ -314,27 +315,15 @@ impl PreparedAgent {
         })
         .await?;
 
-        // Order in vec controls reverse-iter `transform_output`: the LAST
-        // entry in the vec runs FIRST on raw output. Place `existing` after
-        // scratchpad so a caller-supplied wrapper observes the raw tool
-        // output (matches the orchestration convention where persistence-
-        // class wrappers go after scratchpad — see `create_worker`).
-        //
-        // Asymmetry callers should know about: `wrap_schema`, `transform_args`,
-        // and `validate_args` walk the vec forward, so `existing` sees a
-        // scratchpad-wrapped schema (extra fields injected) and scratchpad-
-        // stripped args (scratchpad fields removed) — not the raw MCP
-        // versions. Audit / logging wrappers are unaffected; a wrapper that
-        // introspects schema or transforms args needs to account for this.
-        // See `ComposedWrapper` docs and the lockdown test at the bottom of
-        // this module (`test_composed_scratchpad_then_existing_observes_raw_output`).
-        config.tool_wrapper = Some(match config.tool_wrapper.take() {
-            Some(existing) => Arc::new(crate::tool_wrapper::ComposedWrapper::new(vec![
-                build.wrapper,
-                existing,
-            ])),
-            None => build.wrapper,
-        });
+        // The scratchpad layer goes outside any caller-supplied layers, so a
+        // caller's wrapper sees the raw tool output on the way up and the
+        // scratchpad rewrites it to a pointer after that (the worker stack
+        // in `create_worker` is ordered the same way). On the way down the
+        // caller's wrapper sees the schema and arguments as the scratchpad
+        // layer leaves them, which is unchanged, since it adds no fields.
+        // `test_scratchpad_layer_outside_existing_observes_raw_output` at
+        // the bottom of this module pins this.
+        config.add_outer_tool_layer(build.layer);
         config.preamble_override = Some(format!(
             "{}{}",
             config.effective_preamble(),
@@ -389,7 +378,7 @@ impl PreparedAgent {
         let mut hitl_gate = None;
         let mut hitl_approval_tool = None;
         if !config_owned.orchestration_enabled()
-            && let Some(ref hitl) = config_owned.hitl
+            && let Some(hitl) = config_owned.hitl.clone()
         {
             let scope = crate::hitl::AgentScope::Single {
                 session_id: config_owned
@@ -405,13 +394,7 @@ impl PreparedAgent {
                 config_owned.instance_id.clone(),
             ));
             hitl_gate = Some(Arc::clone(&wrapper));
-            let gate: Arc<dyn crate::tool_wrapper::ToolWrapper> = wrapper;
-            config_owned.tool_wrapper = Some(match config_owned.tool_wrapper.take() {
-                Some(existing) => Arc::new(crate::tool_wrapper::ComposedWrapper::new(vec![
-                    gate, existing,
-                ])),
-                None => gate,
-            });
+            config_owned.add_outer_tool_layer(Arc::new(WrapperLayer(wrapper)));
             let approval_tool = crate::hitl::RequestApprovalTool::new(
                 hitl.route.clone(),
                 scope,
@@ -448,16 +431,11 @@ impl PreparedAgent {
             )
         };
         if turn_nudge.is_some() {
-            // First in the vec → transform_output runs last, on the text the
-            // LLM actually sees (after any scratchpad pointer rewrite).
-            let nudge: Arc<dyn crate::tool_wrapper::ToolWrapper> =
-                Arc::new(crate::turn_nudge::TurnNudgeWrapper::new(Arc::clone(&run)));
-            config_owned.tool_wrapper = Some(match config_owned.tool_wrapper.take() {
-                Some(existing) => Arc::new(crate::tool_wrapper::ComposedWrapper::new(vec![
-                    nudge, existing,
-                ])),
-                None => nudge,
-            });
+            // Outermost, so it runs last on the way up, on the text the LLM
+            // actually sees (after any scratchpad pointer rewrite).
+            config_owned.add_outer_tool_layer(Arc::new(WrapperLayer(Arc::new(
+                crate::turn_nudge::TurnNudgeWrapper::new(Arc::clone(&run)),
+            ))));
             tracing::info!(
                 "  Turn-limit nudging: ENABLED (last_turn={}, wrap_up_threshold={:?})",
                 config_owned.agent.nudge_last_turn,
@@ -1106,11 +1084,15 @@ impl PreparedAgent {
     where
         M: rig::completion::CompletionModel + Send + Sync,
     {
-        if config.tool_wrapper.is_some() {
-            tracing::info!("Tool wrapper configured");
+        let tool_stack = config.tool_middleware_stack();
+        if let Some(stack) = &tool_stack {
+            tracing::info!(
+                "Tool middleware configured ({} layers)",
+                stack.layers().len()
+            );
         }
-        // `(namespace, name)` of each tool registered behind the wrapper, the
-        // only tools the HITL config gate can stop.
+        // `(namespace, name)` of each tool registered behind the middleware
+        // stack, the only tools the HITL config gate can stop.
         let mut wrapped_tools: Vec<(String, String)> = Vec::new();
         let effective_filter = config
             .mcp_filter
@@ -1211,7 +1193,7 @@ impl PreparedAgent {
                         transport_kind,
                     );
 
-                    if config.tool_wrapper.is_some() {
+                    if tool_stack.is_some() {
                         wrapped_tools
                             .push((mcp_tool.namespace().to_string(), tool_name.to_owned()));
                     }
@@ -1400,19 +1382,18 @@ impl PreparedAgent {
             + Clone
             + 'static,
     {
-        match &config.tool_wrapper {
-            Some(wrapper) => {
+        match config.tool_middleware_stack() {
+            Some(stack) => {
                 let tool_name = tool.name();
                 let base_ctx_factory = config.tool_context_factory.clone();
-                let wrapped =
-                    WrappedTool::new(tool, wrapper.clone()).with_context_factory(move |_| {
-                        let mut ctx = base_ctx_factory
-                            .as_ref()
-                            .map(|f| f(&tool_name))
-                            .unwrap_or_else(|| ToolCallContext::new(&tool_name));
-                        ctx.tool_namespace = Some(namespace.to_string());
-                        ctx
-                    });
+                let wrapped = MiddlewareTool::new(tool, stack).with_context_factory(move |_| {
+                    let mut ctx = base_ctx_factory
+                        .as_ref()
+                        .map(|f| f(&tool_name))
+                        .unwrap_or_else(|| ToolCallContext::new(&tool_name));
+                    ctx.tool_namespace = Some(namespace.to_string());
+                    ctx
+                });
                 builder_state.add_tool(wrapped)
             }
             None => {
@@ -2623,6 +2604,72 @@ mod tests {
                 .build()
         }
 
+        /// The approval tool names the tools the gate already stops, so the
+        /// model does not ask twice for one action. The gate is a layer of
+        /// the stack, as `prepare` and `create_worker` place it, not the
+        /// config's `tool_wrapper`.
+        #[tokio::test]
+        async fn the_approval_tool_lists_the_tools_a_stack_layer_gates() {
+            use crate::hitl::RequestApprovalTool;
+            use crate::tool_middleware::WrapperLayer;
+
+            let server = RecordingMcpServer::start().await;
+            let (run, _rx) = crate::run_context::RunContext::channel(
+                crate::run_context::named_run_id("req_gated_list"),
+            );
+            let patterns: Arc<[aura_config::GlobPattern]> = Arc::from(["github:*".into()]);
+            let route = Arc::new(DecisionRoute::Conversational {
+                registry: PendingApprovals::new(),
+                timeout: Duration::from_millis(50),
+            });
+            let scope = AgentScope::Single { session_id: None };
+            let gate = HitlApprovalWrapper::new(
+                patterns.clone(),
+                route.clone(),
+                scope.clone(),
+                "test-agent".to_owned(),
+                "test-instance-id".to_owned(),
+            );
+            gate.bind_run(run);
+            let mut config = AgentRuntimeConfig {
+                hitl_request_approval_tool: Some(
+                    RequestApprovalTool::new(
+                        route,
+                        scope,
+                        "test-agent".to_owned(),
+                        "test-instance-id".to_owned(),
+                    )
+                    .with_gated_patterns(patterns),
+                ),
+                ..Default::default()
+            };
+            config.add_outer_tool_layer(Arc::new(WrapperLayer(Arc::new(gate))));
+            let manager = Some(Arc::new(
+                manager_serving(&server, "github", "list_repos").await,
+            ));
+            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
+            let agent =
+                PreparedAgent::add_all_tools(state, &config, &manager, &Arc::default(), Vec::new())
+                    .await
+                    .expect("composition succeeds")
+                    .build();
+
+            let definitions = agent
+                .tool_server_handle
+                .get_tool_defs(None)
+                .await
+                .expect("the tool server lists its definitions");
+            let approval = definitions
+                .iter()
+                .find(|d| d.name == <RequestApprovalTool as rig::tool::Tool>::NAME)
+                .expect("request_approval is registered");
+            assert!(
+                approval.description.contains("list_repos"),
+                "the gated tool must be listed, got: {}",
+                approval.description
+            );
+        }
+
         /// Asserting on the raised approval rather than merely on "the call was
         /// gated" is what spans the chain: the namespace in the event is the
         /// one `add_mcp_tool` stamped, carried through `pre_call`.
@@ -2910,41 +2957,29 @@ mod tests {
         }
     }
 
-    /// End-to-end ordering test for the single-agent wrapper composition at
-    /// `setup_single_agent_scratchpad` (this file). Mirrors the orchestration
-    /// lockdown in `persistence_wrapper.rs::test_composed_persistence_after_scratchpad_captures_raw`.
-    ///
-    /// Locks down two related contracts that builder.rs:230 relies on:
-    /// 1. **Output runs reverse**: a caller-supplied `existing` wrapper placed
-    ///    after `ScratchpadWrapper` in the vec sees the **raw** tool output;
-    ///    scratchpad runs second and rewrites the LLM-facing output to a
-    ///    pointer.
-    /// 2. **Schema/args run forward**: `existing` sees whatever scratchpad
-    ///    emitted from `wrap_schema`/`transform_args`. Today scratchpad is a
-    ///    pass-through there, so this asserts identity. If scratchpad ever
-    ///    starts modifying schema or args, this test fails and forces a
-    ///    review of the asymmetry doc (see `ComposedWrapper` and the comment
-    ///    above the `Some(existing) => ...` arm in `setup_single_agent_scratchpad`).
-    ///
-    /// A reorder of the vec, a flip in `ComposedWrapper`'s iteration
-    /// direction, or a new transform inside `ScratchpadWrapper::wrap_schema`/
-    /// `transform_args` will all surface here.
+    /// Lockdown for the order `setup_single_agent_scratchpad` places layers
+    /// in: the scratchpad layer sits outside a caller-supplied wrapper, so
+    /// that wrapper sees the raw tool output on the way up, and on the way
+    /// down sees the schema and arguments as the scratchpad layer leaves
+    /// them, which is unchanged.
     #[tokio::test]
-    async fn test_composed_scratchpad_then_existing_observes_raw_output() {
+    async fn test_scratchpad_layer_outside_existing_observes_raw_output() {
         use crate::mcp::CallOutcome;
-        use crate::scratchpad::{ScratchpadStorage, ScratchpadWrapper};
+        use crate::scratchpad::context_budget::TiktokenCounter;
+        use crate::scratchpad::{ScratchpadMiddleware, ScratchpadStorage};
+        use crate::tool_middleware::{MiddlewareStack, MiddlewareTool, WrapperLayer};
         use crate::tool_wrapper::{
-            ComposedWrapper, ToolCallContext, ToolWrapper, TransformArgsResult,
-            TransformOutputResult,
+            ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult,
         };
         use async_trait::async_trait;
+        use rig::tool::{Tool as _, ToolError};
         use serde_json::Value;
         use std::collections::HashMap;
         use std::sync::Mutex;
 
-        /// Fake "caller-supplied" wrapper that records what each composition
-        /// step hands it. Lets the test assert exactly what the existing
-        /// wrapper observes under the documented composition order.
+        /// Fake "caller-supplied" wrapper that records what each step hands
+        /// it, so the test can assert exactly what an existing wrapper
+        /// observes in the documented order.
         #[derive(Default)]
         struct RecordingWrapper {
             schema_seen: Mutex<Option<Value>>,
@@ -2976,6 +3011,29 @@ mod tests {
             }
         }
 
+        /// The tool under the stack: a fixed schema and a fixed output.
+        #[derive(Clone)]
+        struct EchoTool(String);
+
+        impl rig::tool::Tool for EchoTool {
+            const NAME: &'static str = "big_tool";
+            type Error = ToolError;
+            type Args = Value;
+            type Output = String;
+
+            async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+                rig::completion::ToolDefinition {
+                    name: Self::NAME.to_string(),
+                    description: String::new(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                }
+            }
+
+            async fn call(&self, _args: Value) -> Result<String, ToolError> {
+                Ok(self.0.clone())
+            }
+        }
+
         let tmp = tempfile::TempDir::new().unwrap();
         let storage = Arc::new(
             ScratchpadStorage::with_base_dir(tmp.path(), "req-single-compose")
@@ -2984,63 +3042,51 @@ mod tests {
         );
         let counter = TiktokenCounter::default_counter();
         let sp_budget = scratchpad::ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
-
-        let scratchpad_tools = HashMap::from([("big_tool".to_string(), 10_usize)]);
-        let scratchpad: Arc<dyn ToolWrapper> = Arc::new(ScratchpadWrapper::new(
-            scratchpad_tools,
+        let scratchpad = ScratchpadMiddleware::new(
+            HashMap::from([("big_tool".to_string(), 10_usize)]),
             storage,
             Arc::new(BoundRun::pinned_budget(sp_budget)),
-        ));
+        );
 
         let recording = Arc::new(RecordingWrapper::default());
         let recording_dyn: Arc<dyn ToolWrapper> = recording.clone();
 
-        // Same ordering as `setup_single_agent_scratchpad`: scratchpad first,
-        // existing (recording) last → reverse iter on transform_output runs
-        // recording first → recording sees raw → scratchpad rewrites to pointer.
-        let composed = ComposedWrapper::new(vec![scratchpad, recording_dyn]);
+        // Use varied content to avoid tokenizer compression of repeated chars.
+        let raw: String = (0..500).map(|i| format!("entry_{} ", i)).collect();
+        let stack = MiddlewareStack::new(vec![
+            Arc::new(scratchpad),
+            Arc::new(WrapperLayer(recording_dyn)),
+        ]);
+        let tool = MiddlewareTool::new(EchoTool(raw.clone()), stack).with_context_factory(|_| {
+            ToolCallContext::new("big_tool").with_task_context(7, "single_agent".into(), 0)
+        });
 
-        // Forward iter: scratchpad's wrap_schema runs first, then recording.
         let original_schema = serde_json::json!({"type": "object", "properties": {}});
-        let _ = composed.wrap_schema(original_schema.clone());
+        let _ = tool.definition(String::new()).await;
         assert_eq!(
             recording.schema_seen.lock().unwrap().as_ref(),
             Some(&original_schema),
-            "ScratchpadWrapper should be a passthrough for wrap_schema; \
-             if this fails, the asymmetry doc on builder.rs:230 + ComposedWrapper \
-             needs a re-read because existing wrappers will now see a modified schema",
+            "the scratchpad layer adds no schema fields, so an existing wrapper \
+             sees the tool's own schema",
         );
 
-        // Forward iter: scratchpad's transform_args runs first, then recording.
-        let ctx = ToolCallContext::new("big_tool").with_task_context(7, "single_agent".into(), 0);
         let original_args = serde_json::json!({"input": "hello"});
-        let _ = composed.transform_args(original_args.clone(), &ctx);
+        let output = tool.call(original_args.clone()).await.unwrap();
         assert_eq!(
             recording.args_seen.lock().unwrap().as_ref(),
             Some(&original_args),
-            "ScratchpadWrapper should be a passthrough for transform_args; \
-             if this fails, the asymmetry doc on builder.rs:230 + ComposedWrapper \
-             needs a re-read because existing wrappers will now see modified args",
+            "the scratchpad layer strips no arguments, so an existing wrapper \
+             sees the tool's own arguments",
         );
-
-        // Reverse iter: recording's transform_output runs first on RAW output,
-        // then scratchpad runs on recording's pass-through output and rewrites
-        // it to a pointer.
-        let raw: String = (0..500).map(|i| format!("entry_{} ", i)).collect();
-        let outcome = CallOutcome::Success(raw.clone());
-        let result = composed
-            .transform_output(raw.clone(), &outcome, &ctx, None)
-            .await;
-
         assert_eq!(
             recording.output_seen.lock().unwrap().as_deref(),
             Some(raw.as_str()),
-            "existing wrapper must see RAW output, not the scratchpad pointer",
+            "an existing wrapper inside the scratchpad layer must see the RAW output",
         );
         assert!(
-            result.output.contains("[scratchpad:"),
-            "scratchpad must rewrite the LLM-facing output to a pointer, got: {}",
-            &result.output[..result.output.len().min(120)]
+            output.contains("[scratchpad:"),
+            "the scratchpad layer rewrites the output the LLM sees to a pointer, got: {}",
+            &output[..output.len().min(120)]
         );
     }
 

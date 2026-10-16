@@ -3,7 +3,7 @@
 //!
 //! # Architecture
 //!
-//! 1. **ScratchpadWrapper** (ToolWrapper) — intercepts flagged tool outputs
+//! 1. **ScratchpadMiddleware** (ToolMiddleware) — intercepts flagged tool outputs
 //!    exceeding a size threshold, writes them to disk, returns a summary pointer.
 //! 2. **Scratchpad tools** — eight Rig native tools that read scratchpad files:
 //!    `head`, `slice`, `grep`, `schema`, `get_in`, `iterate_over`, `item_schema`, `read`.
@@ -13,17 +13,18 @@
 //!    for post-hoc debugging; explicit cleanup is exposed but not auto-called.
 
 pub mod context_budget;
+pub mod middleware;
 pub mod schema;
 pub mod setup;
 pub mod storage;
 pub mod tools;
-pub mod wrapper;
 
 use aura_config::{GlobPattern, ScratchpadRule};
 pub use context_budget::{
-    ContextBudget, ExtractionLimitExceeded, TiktokenCounter, TokenCounter,
-    token_counter_for_provider,
+    ContextBudget, ExtractionLimitExceeded, Fit, MAX_BYTES_PER_TOKEN, TiktokenCounter,
+    TokenCounter, token_counter_for_provider,
 };
+pub use middleware::ScratchpadMiddleware;
 pub use setup::{
     ScratchpadBuild, ScratchpadBuildInputs, build_scratchpad, count_mcp_tool_schema_tokens,
     estimate_scratchpad_overhead,
@@ -34,7 +35,6 @@ pub use tools::{
     SliceTool, all_tool_definitions, emit_scratchpad_tool_events_enabled,
     is_always_visible_internal_tool, is_scratchpad_tool, should_forward_tool_event,
 };
-pub use wrapper::ScratchpadWrapper;
 
 use crate::config::McpConfig;
 use crate::mcp::{AuraTool, ToolName};
@@ -45,7 +45,7 @@ use std::sync::Arc;
 /// `tool_name → min_tokens` map at boot time.
 ///
 /// **Why server-aware resolution?** `[mcp.servers.<name>.scratchpad]`
-/// blocks are scoped to a specific server, but `ScratchpadWrapper` looks a
+/// blocks are scoped to a specific server, but `ScratchpadMiddleware` looks a
 /// call up by bare tool name alone and never consults
 /// `ToolCallContext::tool_namespace`. A server-agnostic pattern map would
 /// silently apply Server A's `"*"` to Server B's tools and vice-versa.
