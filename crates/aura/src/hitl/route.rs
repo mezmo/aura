@@ -867,7 +867,7 @@ mod tests {
             scope: AgentScope::Worker {
                 run_id,
                 task: crate::orchestration::TaskIdentity::new(2, Some("k8s-agent".to_string())),
-                session_id: Some(crate::config::SessionId::new("sess-abc".to_string())),
+                session_id: Some(crate::config::SessionId::new("sess-abc").unwrap()),
             },
             origin: ApprovalOrigin::AgentRequested {
                 reason: "deleting prod ns".to_string(),

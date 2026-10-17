@@ -333,7 +333,7 @@ impl DirectBackend {
         &self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
-        session_id: &str,
+        session_id: &aura::SessionId,
         cancel: Arc<AtomicBool>,
         handler: &mut impl StreamHandler,
     ) -> Result<StreamResult> {
@@ -379,7 +379,7 @@ impl DirectBackend {
     pub async fn summarize(
         &self,
         text: &str,
-        session_id: &str,
+        session_id: &aura::SessionId,
     ) -> Result<(String, Option<(u64, u64)>)> {
         let selected = get_selected_model();
 

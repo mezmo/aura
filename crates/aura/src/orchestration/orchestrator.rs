@@ -965,9 +965,9 @@ impl Orchestrator {
         // front-to-back. The gate only implements `pre_call`, so prepending it
         // leaves the documented `transform_output` ordering above untouched.
         if let Some(hitl) = worker_config.hitl.clone() {
-            let (run_id_str, session_id_owned) = {
+            let (run_id_str, session_id) = {
                 let p = self.persistence.lock().await;
-                (p.run_id().to_string(), p.session_id().map(String::from))
+                (p.run_id().to_string(), p.session_id().cloned())
             };
             let run_id = run_id_str.parse::<super::PersistenceRunId>().map_err(
                 |e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -978,7 +978,7 @@ impl Orchestrator {
             let scope = crate::hitl::AgentScope::Worker {
                 run_id,
                 task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
-                session_id: session_id_owned.map(crate::config::SessionId::new),
+                session_id,
             };
             let mut gate = crate::hitl::HitlApprovalWrapper::new(
                 hitl.patterns.clone(),
@@ -1222,7 +1222,7 @@ impl Orchestrator {
     ) -> Option<crate::hitl::AgentScope> {
         let (run_id, session_id) = {
             let p = self.persistence.lock().await;
-            (p.run_id().to_string(), p.session_id().map(String::from))
+            (p.run_id().to_string(), p.session_id().cloned())
         };
         run_id
             .parse::<super::PersistenceRunId>()
@@ -1230,7 +1230,7 @@ impl Orchestrator {
             .map(|run_id| crate::hitl::AgentScope::Worker {
                 run_id,
                 task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
-                session_id: session_id.map(crate::config::SessionId::new),
+                session_id,
             })
     }
 
@@ -5361,7 +5361,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         };
         let (run_id, session_id) = {
             let p = self.persistence.lock().await;
-            (p.run_id().to_string(), p.session_id().map(String::from))
+            (p.run_id().to_string(), p.session_id().cloned())
         };
 
         let Some(memory_dir) = self.agent_config.effective_memory_dir().map(str::to_string) else {
@@ -5382,7 +5382,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let inputs = super::park::ParkCommitInputs {
             state: super::park::RunStateForPark {
                 run_id: &run_id,
-                session_id: session_id.as_deref(),
+                session_id: session_id.as_ref().map(crate::config::SessionId::as_str),
                 query,
                 chat_history,
                 coordinator_conversation,
@@ -7888,7 +7888,7 @@ mod tests {
                 park_enabled: true,
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
-            session_id: Some("park-sess".to_string()),
+            session_id: Some(crate::config::SessionId::new("park-sess").unwrap()),
             run_id: Some(aura_events::RunId::mint()),
             ..AgentRuntimeConfig::default()
         };
@@ -8461,7 +8461,7 @@ mod tests {
                 park_enabled: true,
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
-            session_id: Some("orphan-sess".to_string()),
+            session_id: Some(crate::config::SessionId::new("orphan-sess").unwrap()),
             run_id: Some(run_id),
             orchestration: Some(OrchestrationConfig {
                 enabled: true,
@@ -8754,7 +8754,7 @@ mod tests {
                 park_enabled: true,
             }),
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
-            session_id: Some(session_id.to_string()),
+            session_id: Some(crate::config::SessionId::new(session_id).unwrap()),
             run_id: Some(aura_events::RunId::mint()),
             orchestration: Some(OrchestrationConfig {
                 enabled: true,

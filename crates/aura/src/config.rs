@@ -93,10 +93,8 @@ pub struct AgentRuntimeConfig {
     pub orchestration_persistence:
         Option<Arc<tokio::sync::Mutex<crate::orchestration::ExecutionPersistence>>>,
 
-    /// Session ID for grouping orchestration runs under a shared namespace.
-    /// When set, persistence paths become `{memory_dir}/{session_id}/{run_id}/...`.
-    /// Threaded from the web server's `chat_session_id`.
-    pub session_id: Option<String>,
+    /// The session this agent runs in.
+    pub session_id: Option<SessionId>,
 
     /// Scratchpad storage/budget handed to the 8 exploration tools.
     /// `Some` when scratchpad is wired up for this agent or worker.

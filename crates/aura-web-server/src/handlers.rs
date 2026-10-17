@@ -165,7 +165,7 @@ struct ResponseContext {
     completion_id: String,
     model_str: String,
     created_timestamp: u64,
-    chat_session_id: String,
+    chat_session_id: aura::SessionId,
 }
 
 /// Build a fresh agent for a request, applying headers_from_request mappings
@@ -177,7 +177,7 @@ async fn build_agent_for_request(
     additional_tools: Vec<Box<dyn aura::ToolDyn>>,
     client_tools: Option<&[ClientToolDefinition]>,
     run_id: aura::RunId,
-    session_id: String,
+    session_id: aura::SessionId,
 ) -> Result<Arc<aura::Agent>, PrepareError> {
     let client_tool_defs =
         client_tools.map(|tools| tools.iter().map(aura::builder::ClientTool::from).collect());
@@ -207,7 +207,7 @@ pub struct RequestSetup {
     pub completion_id: String,
     pub model_str: String,
     pub created_timestamp: u64,
-    pub chat_session_id: String,
+    pub chat_session_id: aura::SessionId,
     /// Whether the request includes client-side tool definitions and the
     /// server is configured to honor them. The streaming layer uses this to
     /// emit `finish_reason: "tool_calls"` instead of `"stop"` when the LLM
@@ -231,7 +231,7 @@ pub struct RequestSetup {
 pub async fn prepare_request(
     data: &AppState,
     req: &mut ChatCompletionRequest,
-    chat_session_id: &str,
+    chat_session_id: &aura::SessionId,
     req_headers_map: &HashMap<String, String>,
 ) -> Result<RequestSetup, PrepareError> {
     // Client-side tools are gated per-agent by `[agent].enable_client_tools`
@@ -299,10 +299,8 @@ pub async fn prepare_request(
     // server-generated session id is echoed back via `X-Chat-Session-Id`, so
     // the client may adopt it on its next request, and an id that is never
     // reused just leaves TTL-bounded orphan records.
-    let skill_log = aura::session_store::SkillLogKey::new(
-        aura::SessionId::new(chat_session_id),
-        config.agent_id(),
-    );
+    let skill_log =
+        aura::session_store::SkillLogKey::new(chat_session_id.clone(), config.agent_id());
     let skill_recorder = (!config.agent.skills.local.is_empty()).then(|| {
         Arc::new(aura::skill_tool::SkillInvocationRecorder::new(
             data.session_store.skills(),
@@ -322,7 +320,7 @@ pub async fn prepare_request(
             let agent = builder
                 .build_streaming_agent_with_tools(
                     Some(req_headers_map),
-                    Some(chat_session_id.to_string()),
+                    Some(chat_session_id.clone()),
                     client_tools_vec.clone(),
                     Some(run_id),
                     run_tools,
@@ -353,7 +351,7 @@ pub async fn prepare_request(
                 additional_tools,
                 client_tools,
                 run_id,
-                chat_session_id.to_string(),
+                chat_session_id.clone(),
             )
             .await?;
             let tools_json = agent.otel_llm_tools();
@@ -403,7 +401,7 @@ pub async fn prepare_request(
         completion_id,
         model_str,
         created_timestamp,
-        chat_session_id: chat_session_id.to_string(),
+        chat_session_id: chat_session_id.clone(),
         has_client_tools,
         request_id,
         user_id,
@@ -506,7 +504,7 @@ pub fn build_completion_config(
             setup.model_str.clone(),
             setup.created_timestamp,
             max_tokens,
-            &setup.chat_session_id,
+            setup.chat_session_id.as_str(),
         );
         if setup.config.orchestration_enabled() {
             ctx.with_orchestration()
@@ -607,7 +605,7 @@ pub async fn execute_completion(
         provider: config.provider,
         model: config.model,
         request_id: config.request_id.clone(),
-        session_id: chat_session_id.clone(),
+        session_id: chat_session_id.to_string(),
         query: config.query_for_otel,
         user_id,
         metadata_json,
@@ -717,7 +715,7 @@ fn build_json_response(
     let mut response_metadata = HashMap::new();
     response_metadata.insert(
         "chat_session_id".to_string(),
-        response_ctx.chat_session_id.clone(),
+        response_ctx.chat_session_id.to_string(),
     );
 
     let chat_response = ChatCompletionResponse {
@@ -1337,32 +1335,31 @@ pub async fn resolve_approval(
     }
 }
 
-/// The chat session a request belongs to: the id the client gave in its
-/// metadata, then `X-Chat-Session-Id`, then `x-openwebui-chat-id`, else a
-/// fresh one.
-///
-/// A blank value counts as none given. Taken as given, every client that sends
-/// one would share a single session, and with it each other's recorded skill
-/// invocations; orchestration persistence would refuse it outright.
-fn chat_session_id(metadata: Option<&HashMap<String, String>>, headers: &HeaderMap) -> String {
-    let given = |value: &str| (!value.trim().is_empty()).then(|| value.to_owned());
+/// The chat session a request belongs to. Uses the first non-blank value of
+/// the `chat_session_id` metadata field, the `X-Chat-Session-Id` header, or
+/// the `x-openwebui-chat-id` header, and generates a new id if none is set.
+fn chat_session_id(
+    metadata: Option<&HashMap<String, String>>,
+    headers: &HeaderMap,
+) -> aura::SessionId {
     let header = |name: &str| {
         headers
             .get(name)
             .and_then(|value| value.to_str().ok())
-            .and_then(given)
+            .and_then(aura::SessionId::non_empty)
     };
     metadata
         .and_then(|m| m.get("chat_session_id"))
-        .and_then(|value| given(value))
+        .and_then(aura::SessionId::non_empty)
         .or_else(|| header("X-Chat-Session-Id"))
         .or_else(|| header("x-openwebui-chat-id"))
         .unwrap_or_else(generate_chat_session_id)
 }
 
 /// Generate a chat session ID (simple GUID)
-fn generate_chat_session_id() -> String {
-    format!("cs_{}", Uuid::new_v4().simple())
+fn generate_chat_session_id() -> aura::SessionId {
+    aura::SessionId::new(format!("cs_{}", Uuid::new_v4().simple()))
+        .expect("the id starts with \"cs_\", so it is not blank")
 }
 
 /// The HMAC-ON ingress path for `resolve_approval`: buffer the raw bytes
@@ -1529,7 +1526,7 @@ mod tests {
             let first = chat_session_id(Some(&metadata("")), &blank);
             let second = chat_session_id(Some(&metadata("")), &blank);
 
-            assert!(first.starts_with("cs_"), "got: {first}");
+            assert!(first.as_str().starts_with("cs_"), "got: {first}");
             assert_ne!(first, second);
         }
     }
@@ -2539,7 +2536,7 @@ url = "http://127.0.0.1:9"
             completion_id: "chatcmpl-test-123".to_string(),
             model_str: "openai/gpt-4".to_string(),
             created_timestamp: 1700000000,
-            chat_session_id: "cs_test".to_string(),
+            chat_session_id: aura::SessionId::new("cs_test").unwrap(),
         }
     }
 
@@ -3144,13 +3141,13 @@ source = '{}'
                 skill_agent(dir.path(), "agent-a", "# Agent A instructions"),
                 skill_agent(dir.path(), "agent-b", "# Agent B instructions"),
             ]);
-            let session = "sess-switch";
+            let session = aura::SessionId::new("sess-switch").unwrap();
             // Agent A loaded `shared` during the session's first turn.
             state
                 .session_store
                 .skills()
                 .record(
-                    &SkillLogKey::new(aura::SessionId::new(session), "agent-a"),
+                    &SkillLogKey::new(session.clone(), "agent-a"),
                     SkillInvocationRecord {
                         version: SKILL_INVOCATION_RECORD_VERSION,
                         invocation: SkillInvocation::LoadSkill {
@@ -3168,7 +3165,7 @@ source = '{}'
             // The client keeps the session id and switches to agent B, which
             // configures a skill of the same name it never loaded.
             let setup =
-                prepare_request(&state, &mut follow_up("agent-b"), session, &HashMap::new())
+                prepare_request(&state, &mut follow_up("agent-b"), &session, &HashMap::new())
                     .await
                     .unwrap();
             assert!(
@@ -3180,7 +3177,7 @@ source = '{}'
 
             // Agent A, back on the same session, still gets its own.
             let setup =
-                prepare_request(&state, &mut follow_up("agent-a"), session, &HashMap::new())
+                prepare_request(&state, &mut follow_up("agent-a"), &session, &HashMap::new())
                     .await
                     .unwrap();
             assert_eq!(setup.rehydrated_skills, ["shared"]);
