@@ -446,6 +446,7 @@ fn run_event_sse(
         | Payload::ToolStart { .. }
         | Payload::ToolProgress { .. }
         | Payload::ToolUsage { .. }
+        | Payload::RemoteAgentAnswer { .. }
             if !custom_events =>
         {
             None
@@ -501,6 +502,20 @@ fn run_event_sse(
             usage.prompt_tokens.get(),
             usage.completion_tokens.get(),
             usage.total_tokens.get(),
+            agent,
+            correlation,
+        )),
+
+        Payload::RemoteAgentAnswer {
+            remote,
+            success,
+            text,
+            elapsed_ms,
+        } => Some(AuraStreamEvent::remote_agent_answer(
+            remote,
+            success,
+            text,
+            elapsed_ms,
             agent,
             correlation,
         )),
