@@ -480,7 +480,8 @@ async fn override_forwarded_to_the_gated_call() {
 }
 
 /// Case 2: an approved decision missing the mapped header fails the gated
-/// call closed; the error names the header, never any value.
+/// call closed; the error names the missing response header and the tool
+/// header it maps to, never any value.
 #[tokio::test]
 async fn missing_mapped_header_fails_the_call_by_name_only() {
     let (approver, server) = gated_server(ApproverReply::ApproveBare).await;
@@ -493,9 +494,12 @@ async fn missing_mapped_header_fails_the_call_by_name_only() {
     .await;
     let text = assistant_text(&response);
 
+    let expected_clause = "webhook response missing header \"x-approver-token\" \
+                           (mapped to tool header \"authorization\")";
     assert!(
-        text.to_lowercase().contains("authorization"),
-        "the error must name the missing header, got: {text}"
+        text.to_lowercase().contains(expected_clause),
+        "the error must name the missing response header and the tool header \
+         it maps to, got: {text}"
     );
     assert!(
         !text.contains("legacy-frozen-identity"),
