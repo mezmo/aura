@@ -3,7 +3,7 @@
 //!
 //! This is the bridge between the pure TOML-facing config types in
 //! `aura-config` and aura's runtime agent construction. Because the config
-//! structs are now shared (no per-field conversion), [`RigBuilder::to_agent_config`]
+//! structs are now shared (no per-field conversion), [`RigBuilder::to_build_context`]
 //! is a straight field copy that layers on the runtime extension fields. It also
 //! handles request-scoped MCP header resolution (`headers_from_request`) so the
 //! web server can inject per-request credentials into MCP calls.
@@ -12,7 +12,7 @@ use crate::builder::{
     Agent, ClientTool, PreparedAgent, RunToolFactory, build_streaming_agent_with_tools,
     no_run_tools,
 };
-use crate::config::{AgentRuntimeConfig, RunId, WorkerSkills};
+use crate::config::{AgentBuildContext, RunId, WorkerSkills};
 use crate::error::BuilderError;
 use crate::forwarded_headers::ForwardedHeaders;
 use crate::hitl::PendingApprovals;
@@ -56,28 +56,28 @@ impl RigBuilder {
         self
     }
 
-    /// Get the runtime [`AgentRuntimeConfig`] (mainly for tests/debugging).
-    /// Skips skill discovery; build methods use [`Self::discovered_agent_config`].
+    /// Get the [`AgentBuildContext`] (mainly for tests/debugging).
+    /// Skips skill discovery; build methods use [`Self::discovered_build_context`].
     /// Passes `None` for request headers — production paths that need
     /// `headers_from_request` resolution use [`Self::build_agent`] or
     /// [`Self::build_streaming_agent_with_headers`].
-    pub fn get_agent_config(&self) -> AgentRuntimeConfig {
-        self.to_agent_config(None)
+    pub fn build_context(&self) -> AgentBuildContext {
+        self.to_build_context(None)
     }
 
-    /// Project the parsed `Config` into the runtime `AgentRuntimeConfig`.
+    /// Project the parsed `Config` into an `AgentBuildContext`.
     ///
-    /// The `[agent]` TOML table is split into `AgentSettings` (the runtime
-    /// subset) plus the top-level `llm`; all other sections are shared types
-    /// and copy across directly. Runtime extension fields start empty and are
-    /// populated by callers (e.g. the orchestrator) as needed. Skills start
-    /// empty here because discovery does filesystem IO and can fail; the
-    /// fallible build paths run it via [`Self::discovered_agent_config`].
+    /// The `[agent]` TOML table is split into `AgentSettings` (the subset an
+    /// agent is built with) plus the top-level `llm`; all other sections are
+    /// shared types and copy across directly. The extension fields start empty
+    /// and are populated by callers (e.g. the orchestrator) as needed. Skills
+    /// start empty here because discovery does filesystem IO and can fail; the
+    /// fallible build paths run it via [`Self::discovered_build_context`].
     ///
     /// `req_headers` threads the inbound client request's HTTP headers through
     /// to [`HitlPolicy::from_config`] for `[hitl.route]` `headers_from_request`
     /// resolution. Pass `None` outside an HTTP request context.
-    fn to_agent_config(&self, req_headers: Option<&HashMap<String, String>>) -> AgentRuntimeConfig {
+    fn to_build_context(&self, req_headers: Option<&HashMap<String, String>>) -> AgentBuildContext {
         let agent = AgentSettings {
             name: self.config.agent.name.clone(),
             system_prompt: self.config.agent.system_prompt.clone(),
@@ -92,7 +92,7 @@ impl RigBuilder {
             nudge_turns_remaining: self.config.agent.nudge_turns_remaining,
         };
 
-        AgentRuntimeConfig {
+        AgentBuildContext {
             llm: self.config.agent.llm.clone(),
             agent,
             vector_stores: self.config.vector_stores.clone(),
@@ -118,14 +118,14 @@ impl RigBuilder {
     ///
     /// Effective skill sources are the explicit `[agent.skills]` config.
     /// Relative sources resolve from the process current working directory.
-    fn discovered_agent_config(
+    fn discovered_build_context(
         &self,
         req_headers: Option<&HashMap<String, String>>,
-    ) -> Result<AgentRuntimeConfig, BuilderError> {
-        let mut agent_config = self.to_agent_config(req_headers);
+    ) -> Result<AgentBuildContext, BuilderError> {
+        let mut build_context = self.to_build_context(req_headers);
 
         let skill_sources = self.config.agent.skills.local.clone();
-        agent_config.agent.skills = aura_config::skills::discover_skills(&skill_sources)?;
+        build_context.agent.skills = aura_config::skills::discover_skills(&skill_sources)?;
 
         // Per-worker skill overrides: discover explicit sources only. A worker
         // without a skills key inherits `[agent.skills]` and stays out of the map.
@@ -138,14 +138,14 @@ impl RigBuilder {
                     } else {
                         WorkerSkills::Override(discovered)
                     };
-                    agent_config
+                    build_context
                         .worker_skills
                         .insert(name.clone(), override_skills);
                 }
             }
         }
 
-        Ok(agent_config)
+        Ok(build_context)
     }
 
     /// Prepare an agent with optional request headers, additional tools, and client-side tools.
@@ -168,10 +168,10 @@ impl RigBuilder {
         client_tools: Option<Vec<ClientTool>>,
         session_id: Option<String>,
     ) -> Result<Arc<PreparedAgent>, BuilderError> {
-        let mut agent_config = self.discovered_agent_config(req_headers)?;
-        resolve_mcp_headers(&mut agent_config, req_headers);
-        agent_config.session_id = session_id;
-        PreparedAgent::prepare(&agent_config, additional_tools, client_tools)
+        let mut build_context = self.discovered_build_context(req_headers)?;
+        resolve_mcp_headers(&mut build_context, req_headers);
+        build_context.session_id = session_id;
+        PreparedAgent::prepare(&build_context, additional_tools, client_tools)
             .await
             .map(Arc::new)
             .map_err(|e| BuilderError::AgentError(format!("Failed to build agent: {e}")))
@@ -242,13 +242,13 @@ impl RigBuilder {
         run_id: Option<RunId>,
         run_tools: RunToolFactory,
     ) -> Result<Arc<dyn StreamingAgent>, BuilderError> {
-        let mut agent_config = self.discovered_agent_config(req_headers)?;
-        resolve_mcp_headers(&mut agent_config, req_headers);
-        agent_config.session_id = session_id;
-        agent_config.run_id = run_id;
-        agent_config.skill_recorder = self.skill_recorder.clone();
+        let mut build_context = self.discovered_build_context(req_headers)?;
+        resolve_mcp_headers(&mut build_context, req_headers);
+        build_context.session_id = session_id;
+        build_context.run_id = run_id;
+        build_context.skill_recorder = self.skill_recorder.clone();
 
-        build_streaming_agent_with_tools(&agent_config, client_tools, run_tools)
+        build_streaming_agent_with_tools(&build_context, client_tools, run_tools)
             .await
             .map_err(|e| BuilderError::AgentError(format!("Failed to build streaming agent: {e}")))
     }
@@ -282,17 +282,17 @@ pub(crate) fn apply_request_header_mappings(
 /// incoming request. Static TOML `headers` are already loaded in `server_headers`
 /// and serve as fallback when request headers are not present.
 fn resolve_mcp_headers(
-    agent_config: &mut AgentRuntimeConfig,
+    build_context: &mut AgentBuildContext,
     req_headers: Option<&HashMap<String, String>>,
 ) {
-    let Some(ref mut mcp_config) = agent_config.mcp else {
+    let Some(ref mut mcp_config) = build_context.mcp else {
         return;
     };
     resolve_mcp_headers_in(mcp_config, req_headers);
 }
 
 /// Resolve `headers_from_request` mappings on an [`McpConfig`] directly, for
-/// callers that hold one without a surrounding [`AgentRuntimeConfig`].
+/// callers that hold one without a surrounding [`AgentBuildContext`].
 ///
 /// Static TOML `headers` are already loaded in each server's header map and
 /// serve as fallback when the mapped request header is absent. STDIO servers
@@ -356,11 +356,11 @@ mod tests {
     use super::*;
     use aura_config::{McpConfig, load_config_from_str};
 
-    /// Build a minimal AgentRuntimeConfig with one HttpStreamable MCP server.
-    fn make_agent_config(
+    /// Build a minimal AgentBuildContext with one HttpStreamable MCP server.
+    fn make_build_context(
         static_headers: HashMap<String, String>,
         headers_from_request: HashMap<String, String>,
-    ) -> AgentRuntimeConfig {
+    ) -> AgentBuildContext {
         let mut servers = HashMap::new();
         servers.insert(
             "test_server".to_string(),
@@ -374,17 +374,17 @@ mod tests {
             },
         );
 
-        AgentRuntimeConfig {
+        AgentBuildContext {
             mcp: Some(McpConfig {
                 servers,
                 ..McpConfig::default()
             }),
-            ..AgentRuntimeConfig::default()
+            ..AgentBuildContext::default()
         }
     }
 
-    fn get_server_headers(config: &AgentRuntimeConfig) -> &HashMap<String, String> {
-        let mcp = config.mcp.as_ref().unwrap();
+    fn get_server_headers(build_context: &AgentBuildContext) -> &HashMap<String, String> {
+        let mcp = build_context.mcp.as_ref().unwrap();
         match mcp.servers.get("test_server").unwrap() {
             McpServerConfig::HttpStreamable { headers, .. } => headers,
             _ => panic!("expected HttpStreamable"),
@@ -399,7 +399,7 @@ mod tests {
             "x-test-mezmo-token".to_string(),
         );
 
-        let mut config = make_agent_config(HashMap::new(), headers_from_request);
+        let mut config = make_build_context(HashMap::new(), headers_from_request);
 
         let mut req_headers = HashMap::new();
         req_headers.insert("x-test-mezmo-token".to_string(), "foobar".to_string());
@@ -418,7 +418,7 @@ mod tests {
         let mut static_headers = HashMap::new();
         static_headers.insert("x-static".to_string(), "original".to_string());
 
-        let mut config = make_agent_config(static_headers, HashMap::new());
+        let mut config = make_build_context(static_headers, HashMap::new());
 
         resolve_mcp_headers(&mut config, None);
 
@@ -434,7 +434,7 @@ mod tests {
         let mut headers_from_request = HashMap::new();
         headers_from_request.insert("authorization".to_string(), "x-incoming-auth".to_string());
 
-        let mut config = make_agent_config(static_headers, headers_from_request);
+        let mut config = make_build_context(static_headers, headers_from_request);
 
         let mut req_headers = HashMap::new();
         req_headers.insert("x-incoming-auth".to_string(), "dynamic-token".to_string());
@@ -457,7 +457,7 @@ mod tests {
         let mut headers_from_request = HashMap::new();
         headers_from_request.insert("authorization".to_string(), "x-incoming-auth".to_string());
 
-        let mut config = make_agent_config(static_headers, headers_from_request);
+        let mut config = make_build_context(static_headers, headers_from_request);
 
         // req_headers does NOT contain "x-incoming-auth"
         let req_headers = HashMap::new();
@@ -474,9 +474,9 @@ mod tests {
 
     #[test]
     fn no_mcp_config_is_noop() {
-        let mut config = AgentRuntimeConfig::default(); // mcp is None
-        resolve_mcp_headers(&mut config, None);
-        assert!(config.mcp.is_none());
+        let mut build_context = AgentBuildContext::default(); // mcp is None
+        resolve_mcp_headers(&mut build_context, None);
+        assert!(build_context.mcp.is_none());
     }
 
     #[test]
@@ -487,7 +487,7 @@ mod tests {
         let mut static_headers = HashMap::new();
         static_headers.insert("x-static".to_string(), "kept".to_string());
 
-        let mut mcp_config = make_agent_config(static_headers, headers_from_request)
+        let mut mcp_config = make_build_context(static_headers, headers_from_request)
             .mcp
             .expect("fixture always sets mcp");
 
@@ -515,7 +515,7 @@ mod tests {
         let mut headers_from_request = HashMap::new();
         headers_from_request.insert("Authorization".to_string(), "Authorization".to_string());
 
-        let mut config = make_agent_config(HashMap::new(), headers_from_request);
+        let mut config = make_build_context(HashMap::new(), headers_from_request);
 
         let mut req_headers = HashMap::new();
         req_headers.insert("authorization".to_string(), "Token my-token".to_string());
@@ -577,7 +577,7 @@ mod tests {
         let mut req_headers = HashMap::new();
         req_headers.insert("x-incoming-auth".to_string(), "dynamic-token".to_string());
 
-        let mut config = make_agent_config(static_headers, headers_from_request);
+        let mut config = make_build_context(static_headers, headers_from_request);
 
         resolve_mcp_headers(&mut config, Some(&req_headers));
 
@@ -601,7 +601,7 @@ mod tests {
     // ------------------------------------------------------------------
     // effective_memory_dir: top-level memory_dir vs legacy
     // [orchestration.artifacts].memory_dir fallback. These exercise the full
-    // load -> RigBuilder -> AgentRuntimeConfig path.
+    // load -> RigBuilder -> AgentBuildContext path.
     // ------------------------------------------------------------------
 
     #[test]
@@ -632,7 +632,7 @@ description = "worker"
 preamble = "alpha"
 "#;
         let loaded = load_config_from_str(config).expect("should parse");
-        let built = RigBuilder::new(loaded, PendingApprovals::new()).get_agent_config();
+        let built = RigBuilder::new(loaded, PendingApprovals::new()).build_context();
         assert_eq!(
             built.effective_memory_dir(),
             Some("/tmp/top-level"),
@@ -665,7 +665,7 @@ description = "worker"
 preamble = "alpha"
 "#;
         let loaded = load_config_from_str(config).expect("should parse");
-        let built = RigBuilder::new(loaded, PendingApprovals::new()).get_agent_config();
+        let built = RigBuilder::new(loaded, PendingApprovals::new()).build_context();
         assert_eq!(built.effective_memory_dir(), Some("/tmp/legacy"));
     }
 
@@ -696,7 +696,7 @@ enabled = false
 memory_dir = "/tmp/legacy-single-agent"
 "#;
         let loaded = load_config_from_str(config).expect("should parse");
-        let built = RigBuilder::new(loaded, PendingApprovals::new()).get_agent_config();
+        let built = RigBuilder::new(loaded, PendingApprovals::new()).build_context();
         assert_eq!(
             built.effective_memory_dir(),
             Some("/tmp/legacy-single-agent"),
@@ -721,7 +721,7 @@ api_key = "test"
 model = "gpt-4o"
 "#;
         let loaded = load_config_from_str(config).expect("should parse");
-        let built = RigBuilder::new(loaded, PendingApprovals::new()).get_agent_config();
+        let built = RigBuilder::new(loaded, PendingApprovals::new()).build_context();
         assert_eq!(built.effective_memory_dir(), None);
     }
 
@@ -787,11 +787,11 @@ skills.local = []
         );
 
         let config = aura_config::Config::parse_toml(&config_str).expect("config should parse");
-        let agent_config = RigBuilder::new(config, PendingApprovals::new())
-            .discovered_agent_config(None)
+        let build_context = RigBuilder::new(config, PendingApprovals::new())
+            .discovered_build_context(None)
             .expect("discovery should succeed");
 
-        match agent_config
+        match build_context
             .worker_skills
             .get("skilled")
             .expect("explicit sources should discover skills into the map")
@@ -804,20 +804,20 @@ skills.local = []
         }
 
         assert!(
-            !agent_config.worker_skills.contains_key("inheriting"),
+            !build_context.worker_skills.contains_key("inheriting"),
             "worker without skills key should inherit (absent) from [agent.skills]"
         );
 
         assert!(
             matches!(
-                agent_config.worker_skills.get("disabled"),
+                build_context.worker_skills.get("disabled"),
                 Some(WorkerSkills::Disable)
             ),
             "skills.local = [] should disable skills, not inherit"
         );
 
-        assert_eq!(agent_config.agent.skills.len(), 1);
-        assert_eq!(agent_config.agent.skills[0].name, "agent-skill");
+        assert_eq!(build_context.agent.skills.len(), 1);
+        assert_eq!(build_context.agent.skills[0].name, "agent-skill");
     }
 
     #[test]
@@ -844,7 +844,7 @@ source = '/nonexistent/path/to/worker/skills'
 "#;
         let config = aura_config::Config::parse_toml(config_str).expect("config should parse");
         let err = RigBuilder::new(config, PendingApprovals::new())
-            .discovered_agent_config(None)
+            .discovered_build_context(None)
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
     }

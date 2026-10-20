@@ -52,7 +52,7 @@ use rig::client::CompletionClient;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{AgentRuntimeConfig, LlmConfig};
+use crate::config::{AgentBuildContext, LlmConfig};
 use crate::inactivity::{Liveness, STALL_MESSAGE, liveness_of};
 use crate::mcp::McpManager;
 use crate::provider_agent::{BuilderState, ProviderAgent, StreamError, StreamItem};
@@ -239,19 +239,20 @@ struct CoordinatorArtifacts {
 // Helper Functions
 // ============================================================================
 
-/// Apply the per-worker skill override onto the cloned agent config.
+/// Apply the per-worker skill override onto a worker's build context, cloned
+/// from the agent's.
 ///
 /// Overrides live in `worker_skills`, keyed by worker name and discovered by
 /// `RigBuilder` at build time: a present key replaces `[agent.skills]` for
 /// that worker; an absent key inherits.
 fn apply_worker_skills_override(
-    worker_config: &mut crate::config::AgentRuntimeConfig,
+    worker_build_context: &mut crate::config::AgentBuildContext,
     worker_name: Option<&str>,
 ) {
     if let Some(override_skills) =
-        worker_name.and_then(|name| worker_config.worker_skills.get(name))
+        worker_name.and_then(|name| worker_build_context.worker_skills.get(name))
     {
-        worker_config.agent.skills = match override_skills {
+        worker_build_context.agent.skills = match override_skills {
             crate::config::WorkerSkills::Disable => Vec::new(),
             crate::config::WorkerSkills::Override(skills) => skills.clone(),
         };
@@ -519,7 +520,7 @@ pub struct Orchestrator {
     config: OrchestrationConfig,
 
     /// The underlying agent configuration (for creating workers)
-    agent_config: AgentRuntimeConfig,
+    agent_build_context: AgentBuildContext,
 
     /// The run the orchestration serves.
     run_id: crate::config::RunId,
@@ -689,19 +690,22 @@ enum LoopStep {
 
 impl Orchestrator {
     /// Create a new orchestrator from configuration, for the run
-    /// `agent_config.run_id` names, or for a fresh run when it names none.
+    /// `agent_build_context.run_id` names, or for a fresh run when it names none.
     pub async fn new(
-        mut agent_config: AgentRuntimeConfig,
+        mut agent_build_context: AgentBuildContext,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Minted once, here, so every agent of the orchestration begins its
         // run within the same one.
-        let run_id = *agent_config
+        let run_id = *agent_build_context
             .run_id
             .get_or_insert_with(crate::config::RunId::mint);
-        let orchestration_config = agent_config.orchestration.clone().unwrap_or_default();
+        let orchestration_config = agent_build_context
+            .orchestration
+            .clone()
+            .unwrap_or_default();
 
         // Initialize MCP manager (shared across coordinator and all workers via Arc)
-        let mcp_manager = if let Some(ref mcp_config) = agent_config.mcp {
+        let mcp_manager = if let Some(ref mcp_config) = agent_build_context.mcp {
             tracing::info!("Orchestrator: initializing MCP connections");
             Some(Arc::new(
                 McpManager::initialize_from_config(mcp_config).await?,
@@ -715,13 +719,13 @@ impl Orchestrator {
         let (tool_call_observer, _rx) = ToolCallObserver::new(32);
 
         // Initialize execution persistence for debugging and retry intelligence.
-        let effective_memory_dir = agent_config.effective_memory_dir();
+        let effective_memory_dir = agent_build_context.effective_memory_dir();
         let persistence = if let Some(memory_dir) = effective_memory_dir {
             tracing::info!(
                 "Orchestrator: Initializing execution persistence at: {}",
                 memory_dir
             );
-            let p = ExecutionPersistence::new(memory_dir, agent_config.session_id.clone())
+            let p = ExecutionPersistence::new(memory_dir, agent_build_context.session_id.clone())
                 .await
                 .map_err(|e| format!("Failed to initialize persistence: {}", e))?;
             p.prune_session_runs(orchestration_config.max_session_runs())
@@ -739,7 +743,7 @@ impl Orchestrator {
         // is named by its `RunId`. The two are distinct.
         let run_id_str = persistence.lock().await.run_id().to_string();
         // One guard per park-mode run; `ParkGuard` documents arming and drop.
-        let park_guard = agent_config
+        let park_guard = agent_build_context
             .hitl
             .as_ref()
             .filter(|hitl| hitl.park_enabled)
@@ -749,7 +753,7 @@ impl Orchestrator {
                 }
                 crate::hitl::DecisionRoute::Webhook { .. } => None,
             });
-        let default_turn_depth = agent_config
+        let default_turn_depth = agent_build_context
             .agent
             .turn_depth
             .unwrap_or(crate::builder::DEFAULT_MAX_DEPTH);
@@ -767,7 +771,7 @@ impl Orchestrator {
             run_id,
             unscoped_run: std::sync::OnceLock::new(),
             config: orchestration_config,
-            agent_config,
+            agent_build_context,
             tool_call_observer,
             mcp_manager,
             persistence,
@@ -892,29 +896,29 @@ impl Orchestrator {
         ));
 
         // Create a modified config for workers with extension fields
-        let mut worker_config = self.agent_config.clone();
+        let mut worker_build_context = self.agent_build_context.clone();
         let worker_cfg = worker_name.and_then(|name| self.config.workers.get(name));
 
         // Named workers report their own agent name (Rig stamps it on turn
         // spans as `gen_ai.agent.name`); the generic worker keeps the base
         // agent's name.
         if let Some(name) = worker_name {
-            worker_config.agent.name = name.to_string();
+            worker_build_context.agent.name = name.to_string();
         }
 
         // Resolve per-worker LLM override (falls back to [agent.llm] when absent)
         if let Some(override_llm) = worker_cfg.and_then(|w| w.llm.as_ref()) {
-            worker_config.llm = override_llm.clone();
+            worker_build_context.llm = override_llm.clone();
         }
 
-        apply_worker_skills_override(&mut worker_config, worker_name);
+        apply_worker_skills_override(&mut worker_build_context, worker_name);
 
         // Per-worker scratchpad override falls back to [agent.scratchpad].
         // Each worker gets a FRESH ContextBudget scoped to its effective LLM —
         // workers never share a budget.
         let effective_scratchpad = worker_cfg
             .and_then(|w| w.scratchpad.as_ref())
-            .or(self.agent_config.agent.scratchpad.as_ref())
+            .or(self.agent_build_context.agent.scratchpad.as_ref())
             .cloned();
 
         // The slot every wrapper and tool built below reaches this worker's
@@ -930,8 +934,10 @@ impl Orchestrator {
                 .as_ref()
                 .map(|m| m.tool_names_per_server())
                 .unwrap_or_default();
-            let scratchpad_tool_map =
-                scratchpad::scratchpad_tool_map(self.agent_config.mcp.as_ref(), &tools_per_server);
+            let scratchpad_tool_map = scratchpad::scratchpad_tool_map(
+                self.agent_build_context.mcp.as_ref(),
+                &tools_per_server,
+            );
             let worker_filter = worker_cfg.and_then(|w| w.mcp_filter.as_deref());
             let accessible_tools = self
                 .mcp_manager
@@ -960,7 +966,7 @@ impl Orchestrator {
             } else {
                 // Validation enforces these upstream; re-check here so runtime
                 // misconfiguration fails loudly instead of silently degrading.
-                let context_window = worker_config.llm.context_window().ok_or_else(
+                let context_window = worker_build_context.llm.context_window().ok_or_else(
                     || -> Box<dyn std::error::Error + Send + Sync> {
                         format!(
                             "Worker {}: scratchpad enabled but context_window unset on effective LLM!",
@@ -968,7 +974,7 @@ impl Orchestrator {
                         ).into()
                     },
                 )? as usize;
-                let (provider, model) = worker_config.llm.model_info();
+                let (provider, model) = worker_build_context.llm.model_info();
                 let token_counter = scratchpad::token_counter_for_provider(provider, model);
                 let initial_used = scratchpad::estimate_scratchpad_overhead(&*token_counter, &[])
                     + self.worker_fixed_overhead(worker_cfg, &*token_counter);
@@ -994,7 +1000,7 @@ impl Orchestrator {
 
                 scratchpad_tools.push(build.layer);
                 scratchpad_budget = Some(build.budget);
-                worker_config.scratchpad_tools_config = Some(build.tools_config);
+                worker_build_context.scratchpad_tools_config = Some(build.tools_config);
             }
         }
 
@@ -1002,9 +1008,9 @@ impl Orchestrator {
         // `read_artifact` inlines: a plain budget the reads add up in, capped
         // per read at a quarter of the window.
         if scratchpad_budget.is_none()
-            && let Some(window) = worker_config.llm.context_window()
+            && let Some(window) = worker_build_context.llm.context_window()
         {
-            let (provider, model) = worker_config.llm.model_info();
+            let (provider, model) = worker_build_context.llm.model_info();
             let token_counter = scratchpad::token_counter_for_provider(provider, model);
             let initial_used = self.worker_fixed_overhead(worker_cfg, &*token_counter);
             scratchpad_budget = Some(
@@ -1023,16 +1029,16 @@ impl Orchestrator {
         let base_depth = worker_name
             .and_then(|name| self.config.workers.get(name))
             .and_then(|w| w.turn_depth)
-            .or(self.agent_config.agent.turn_depth)
+            .or(self.agent_build_context.agent.turn_depth)
             .unwrap_or(crate::builder::DEFAULT_MAX_DEPTH);
-        let scratchpad_bonus = worker_config
+        let scratchpad_bonus = worker_build_context
             .scratchpad_tools_config
             .as_ref()
             .and(effective_scratchpad.as_ref())
             .map(|sp| sp.turn_depth_bonus)
             .unwrap_or(0);
         let resolved_depth = base_depth + scratchpad_bonus;
-        worker_config.agent.turn_depth = Some(resolved_depth);
+        worker_build_context.agent.turn_depth = Some(resolved_depth);
         if scratchpad_bonus > 0 {
             tracing::info!(
                 "Worker {} turn_depth={} (base={}, scratchpad_bonus={})",
@@ -1046,8 +1052,8 @@ impl Orchestrator {
         }
 
         let turn_nudge = crate::turn_nudge::TurnNudgeState::new_with_submit_tool(
-            worker_config.agent.nudge_last_turn,
-            worker_config.agent.nudge_turns_remaining,
+            worker_build_context.agent.nudge_last_turn,
+            worker_build_context.agent.nudge_turns_remaining,
             resolved_depth,
         );
 
@@ -1075,8 +1081,8 @@ impl Orchestrator {
             tracing::info!(
                 "Worker {} turn-limit nudging enabled (last_turn={}, wrap_up_threshold={:?})",
                 task_id,
-                worker_config.agent.nudge_last_turn,
-                worker_config.agent.nudge_turns_remaining
+                worker_build_context.agent.nudge_last_turn,
+                worker_build_context.agent.nudge_turns_remaining
             );
         }
 
@@ -1088,7 +1094,7 @@ impl Orchestrator {
         // a denial short-circuits the call. The gate only implements
         // `pre_call`, so placing it outside leaves the documented
         // `transform_output` ordering above untouched.
-        if let Some(hitl) = worker_config.hitl.clone() {
+        if let Some(hitl) = worker_build_context.hitl.clone() {
             let (run_id_str, session_id_owned) = {
                 let p = self.persistence.lock().await;
                 (p.run_id().to_string(), p.session_id().map(String::from))
@@ -1108,8 +1114,8 @@ impl Orchestrator {
                 hitl.patterns.clone(),
                 hitl.route.clone(),
                 scope.clone(),
-                worker_config.agent.name.clone(),
-                worker_config.instance_id.clone(),
+                worker_build_context.agent.name.clone(),
+                worker_build_context.instance_id.clone(),
             );
             // The park arm needs the store-bearing route; webhook deployments
             // keep the live decision path.
@@ -1125,12 +1131,12 @@ impl Orchestrator {
                 gate = gate.with_recorded_decisions(Arc::clone(recorded));
             }
             layers.insert(0, Arc::new(WrapperLayer(Arc::new(gate))));
-            worker_config.hitl_request_approval_tool = Some(
+            worker_build_context.hitl_request_approval_tool = Some(
                 crate::hitl::RequestApprovalTool::new(
                     hitl.route.clone(),
                     scope,
-                    worker_config.agent.name.clone(),
-                    worker_config.instance_id.clone(),
+                    worker_build_context.agent.name.clone(),
+                    worker_build_context.instance_id.clone(),
                 )
                 .with_gated_patterns(hitl.patterns.clone()),
             );
@@ -1149,24 +1155,24 @@ impl Orchestrator {
             tracing::info!("Creating worker '{}' for task {}", name, task_id);
             let full_preamble = super::config::WORKER_PREAMBLE_TEMPLATE
                 .replace("{{worker_system_prompt}}", &worker.preamble);
-            worker_config.preamble_override = Some(full_preamble);
+            worker_build_context.preamble_override = Some(full_preamble);
             if let Some(filter) = &worker.mcp_filter {
-                worker_config.mcp_filter = Some(filter.clone());
+                worker_build_context.mcp_filter = Some(filter.clone());
             }
 
             // Filter vector stores: worker only gets stores explicitly assigned to it
             // Empty vector_stores = no RAG access (must opt-in)
             let assigned_stores: std::collections::HashSet<&str> =
                 worker.vector_stores.iter().map(|s| s.as_str()).collect();
-            worker_config
+            worker_build_context
                 .vector_stores
                 .retain(|vs| assigned_stores.contains(vs.name.as_str()));
 
             // Inject vector store context into preamble if stores assigned
-            if !worker_config.vector_stores.is_empty() {
+            if !worker_build_context.vector_stores.is_empty() {
                 let vs_context =
-                    super::config::build_vector_store_context(&worker_config.vector_stores);
-                if let Some(ref mut preamble) = worker_config.preamble_override {
+                    super::config::build_vector_store_context(&worker_build_context.vector_stores);
+                if let Some(ref mut preamble) = worker_build_context.preamble_override {
                     preamble.push_str(&vs_context);
                 }
             }
@@ -1174,7 +1180,7 @@ impl Orchestrator {
             tracing::debug!(
                 "Worker '{}' vector stores: {:?}",
                 name,
-                worker_config
+                worker_build_context
                     .vector_stores
                     .iter()
                     .map(|vs| &vs.name)
@@ -1183,7 +1189,7 @@ impl Orchestrator {
             let worker_name_copy = String::from(name);
 
             // Orchestrator provides context factory with task metadata
-            worker_config.tool_context_factory = Some(Arc::new(move |tool_name: &str| {
+            worker_build_context.tool_context_factory = Some(Arc::new(move |tool_name: &str| {
                 ToolCallContext::new(tool_name).with_task_context(
                     task_id,
                     worker_name_copy.clone(),
@@ -1191,12 +1197,12 @@ impl Orchestrator {
                 )
             }));
         } else {
-            worker_config.preamble_override =
+            worker_build_context.preamble_override =
                 Some(super::config::build_worker_preamble(&self.config));
             let orchestrator_id_copy = self.orchestrator_id.clone();
 
             // Orchestrator provides context factory with task metadata
-            worker_config.tool_context_factory = Some(Arc::new(move |tool_name: &str| {
+            worker_build_context.tool_context_factory = Some(Arc::new(move |tool_name: &str| {
                 ToolCallContext::new(tool_name).with_task_context(
                     task_id,
                     orchestrator_id_copy.clone(),
@@ -1207,29 +1213,30 @@ impl Orchestrator {
 
         // Orchestrator owns tool wrapping decision: the worker stack is the
         // whole stack, in place of any wrapper the agent config carries.
-        worker_config.tool_middleware = Some(stack);
-        worker_config.tool_wrapper = None;
+        worker_build_context.tool_middleware = Some(stack);
+        worker_build_context.tool_wrapper = None;
 
         // Give workers access to result artifacts
-        worker_config.orchestration_persistence = Some(self.persistence.clone());
+        worker_build_context.orchestration_persistence = Some(self.persistence.clone());
 
         // Give workers the submit_result tool for structured output
         let submit_result_decision: super::tools::SubmitResultDecision = Arc::new(Mutex::new(None));
-        worker_config.orchestration_submit_result = Some(submit_result_decision.clone());
+        worker_build_context.orchestration_submit_result = Some(submit_result_decision.clone());
 
         // Disable orchestration in worker config to avoid nested orchestration
-        worker_config.orchestration = None;
+        worker_build_context.orchestration = None;
 
-        if worker_config.scratchpad_tools_config.is_some()
-            && let Some(ref mut preamble) = worker_config.preamble_override
+        if worker_build_context.scratchpad_tools_config.is_some()
+            && let Some(ref mut preamble) = worker_build_context.preamble_override
         {
             preamble.push_str(scratchpad::SCRATCHPAD_PREAMBLE);
         }
 
         // Workers bypass Agent::build's catalog append (their preamble is the
         // worker template override), so the skill catalog lands here instead.
-        if let Some(catalog) = crate::skill_tool::render_skill_catalog(&worker_config.agent.skills)
-            && let Some(ref mut preamble) = worker_config.preamble_override
+        if let Some(catalog) =
+            crate::skill_tool::render_skill_catalog(&worker_build_context.agent.skills)
+            && let Some(ref mut preamble) = worker_build_context.preamble_override
         {
             preamble.push_str(&catalog);
         }
@@ -1237,16 +1244,16 @@ impl Orchestrator {
         tracing::debug!(
             "Worker {} config: preamble length = {} chars, mcp_filter = {:?}",
             task_id,
-            worker_config
+            worker_build_context
                 .preamble_override
                 .as_ref()
                 .map(|s| s.len())
                 .unwrap_or(0),
-            worker_config.mcp_filter
+            worker_build_context.mcp_filter
         );
 
         // Capture preamble before config is consumed by builder
-        let preamble = worker_config
+        let preamble = worker_build_context
             .preamble_override
             .as_deref()
             .unwrap_or("")
@@ -1256,7 +1263,7 @@ impl Orchestrator {
         // Client-side tools are not supported in orchestration mode and are
         // never attached to workers (or the coordinator).
         let (provider_agent, model_name) = self
-            .build_worker_provider_agent(&worker_config, &run)
+            .build_worker_provider_agent(&worker_build_context, &run)
             .await?;
 
         // A worker is prepared for exactly one task attempt, so its single
@@ -1274,14 +1281,16 @@ impl Orchestrator {
             fallback_tool_parsing: false,
             fallback_tool_names: vec![],
             fallback_mcp_filter: None,
-            context_window: worker_config.llm.context_window(),
+            context_window: worker_build_context.llm.context_window(),
             scratchpad_budget,
             client_tool_names: Default::default(),
             turn_nudge,
             system_prompt: preamble.clone(),
-            invocation_parameters: crate::logging::llm_invocation_parameters(&worker_config.llm),
-            skills: worker_config.agent.skills.clone(),
-            forwarded_headers: worker_config.forwarded_headers.clone(),
+            invocation_parameters: crate::logging::llm_invocation_parameters(
+                &worker_build_context.llm,
+            ),
+            skills: worker_build_context.agent.skills.clone(),
+            forwarded_headers: worker_build_context.forwarded_headers.clone(),
             run,
             active: Default::default(),
         });
@@ -1329,7 +1338,7 @@ impl Orchestrator {
 
     /// `[hitl.park].enabled` on the conversational route.
     fn park_enabled(&self) -> bool {
-        self.agent_config.hitl.as_ref().is_some_and(|hitl| {
+        self.agent_build_context.hitl.as_ref().is_some_and(|hitl| {
             hitl.park_enabled
                 && matches!(
                     &*hitl.route,
@@ -1370,7 +1379,7 @@ impl Orchestrator {
         worker_name: Option<&str>,
         pending: &[PendingCall],
     ) {
-        let Some(hitl) = self.agent_config.hitl.clone() else {
+        let Some(hitl) = self.agent_build_context.hitl.clone() else {
             return;
         };
         let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route else {
@@ -2140,9 +2149,11 @@ impl Orchestrator {
             &coordinator_state.preamble,
         );
         // The coordinator always runs on [agent.llm] (see `create_coordinator`).
-        let (provider, model) = self.agent_config.llm.model_info();
+        let (provider, model) = self.agent_build_context.llm.model_info();
         crate::logging::set_llm_identifiers(&tracing::Span::current(), provider, model);
-        if let Some(params) = crate::logging::llm_invocation_parameters(&self.agent_config.llm) {
+        if let Some(params) =
+            crate::logging::llm_invocation_parameters(&self.agent_build_context.llm)
+        {
             crate::logging::set_llm_invocation_parameters(&tracing::Span::current(), &params);
         }
 
@@ -2716,7 +2727,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
 
         // Collect from vector stores (context_prefix becomes the description)
-        for store in &self.agent_config.vector_stores {
+        for store in &self.agent_build_context.vector_stores {
             let tool_name = format!("vector_search_{}", store.name);
             let description = store
                 .context_prefix
@@ -2820,7 +2831,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         preamble: &mut String,
         run: &Arc<BoundRun>,
     ) -> Result<CoordinatorArtifacts, Box<dyn std::error::Error + Send + Sync>> {
-        let llm = &self.agent_config.llm;
+        let llm = &self.agent_build_context.llm;
         let read_artifact = ReadArtifactTool::new(self.persistence.clone());
         let Some(window) = llm.context_window() else {
             tracing::warn!(
@@ -2840,7 +2851,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let token_counter = scratchpad::token_counter_for_provider(provider, model);
 
         let sp_cfg = self
-            .agent_config
+            .agent_build_context
             .agent
             .scratchpad
             .as_ref()
@@ -2932,16 +2943,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let include_history_tools = self.config.memory_dir().is_some()
             && self.persistence.lock().await.session_id().is_some();
         let mut preamble = super::config::build_coordinator_preamble(
-            self.agent_config.effective_preamble(),
+            self.agent_build_context.effective_preamble(),
             include_recon_tools,
             include_history_tools,
         );
         if let Some(catalog) =
-            crate::skill_tool::render_skill_catalog(&self.agent_config.agent.skills)
+            crate::skill_tool::render_skill_catalog(&self.agent_build_context.agent.skills)
         {
             preamble.push_str(&catalog);
         }
-        let temperature = self.agent_config.llm.temperature();
+        let temperature = self.agent_build_context.llm.temperature();
 
         // Filter vector stores for coordinator (if any configured)
         let coordinator_stores: Vec<_> = if !self.config.coordinator_vector_stores.is_empty() {
@@ -2951,7 +2962,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .iter()
                 .map(|s| s.as_str())
                 .collect();
-            self.agent_config
+            self.agent_build_context
                 .vector_stores
                 .iter()
                 .filter(|vs| assigned.contains(vs.name.as_str()))
@@ -2981,7 +2992,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Load and inject session history from prior runs
         if self.config.session_history_turns() > 0
-            && let Some(memory_dir) = self.agent_config.effective_memory_dir()
+            && let Some(memory_dir) = self.agent_build_context.effective_memory_dir()
         {
             let persistence = self.persistence.lock().await;
             if let Some(session_id) = persistence.session_id() {
@@ -3036,7 +3047,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 None
             },
             skill_tools: crate::skill_tool::SkillToolset::new(
-                &self.agent_config.agent.skills,
+                &self.agent_build_context.agent.skills,
                 Some(Arc::clone(&run)),
             ),
             scratchpad: artifacts.scratchpad,
@@ -3046,7 +3057,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // before its prompt: the preamble and every tool definition.
         let scratchpad_budget = match artifacts.budget {
             Some(budget) => {
-                let (provider, model) = self.agent_config.llm.model_info();
+                let (provider, model) = self.agent_build_context.llm.model_info();
                 let counter = scratchpad::token_counter_for_provider(provider, model);
                 let overhead = counter.count_tokens(&preamble)
                     + coordinator_tools.schema_tokens(&*counter).await;
@@ -3059,20 +3070,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .build_provider_agent_with_tools(
                 &preamble,
                 temperature,
-                self.agent_config.llm.additional_params(),
-                self.agent_config.llm.max_tokens(),
+                self.agent_build_context.llm.additional_params(),
+                self.agent_build_context.llm.max_tokens(),
                 coordinator_tools,
             )
             .await?;
 
-        let model_name = self.agent_config.llm.model_name().to_string();
+        let model_name = self.agent_build_context.llm.model_name().to_string();
 
         // The top-level agent block configures the coordinator in orchestration
         // mode, so the coordinator inherits `[agent].turn_depth`. The
         // decision_ready early-exit is the primary guard; the depth cap is
         // defense-in-depth.
         let max_depth = self
-            .agent_config
+            .agent_build_context
             .agent
             .turn_depth
             .unwrap_or(crate::builder::DEFAULT_MAX_DEPTH)
@@ -3088,16 +3099,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
             fallback_tool_parsing: false,
             fallback_tool_names: vec![],
             fallback_mcp_filter: None,
-            context_window: self.agent_config.llm.context_window(),
+            context_window: self.agent_build_context.llm.context_window(),
             scratchpad_budget,
             client_tool_names: Default::default(),
             turn_nudge: None,
             system_prompt: preamble.clone(),
             invocation_parameters: crate::logging::llm_invocation_parameters(
-                &self.agent_config.llm,
+                &self.agent_build_context.llm,
             ),
-            skills: self.agent_config.agent.skills.clone(),
-            forwarded_headers: self.agent_config.forwarded_headers.clone(),
+            skills: self.agent_build_context.agent.skills.clone(),
+            forwarded_headers: self.agent_build_context.forwarded_headers.clone(),
             hitl_gate: None,
             hitl_approval_tool: None,
             run,
@@ -3105,7 +3116,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         });
         let agent = prepared.begin_run_within(
             &self.orchestration_run(),
-            self.agent_config.skill_recorder.clone(),
+            self.agent_build_context.skill_recorder.clone(),
         )?;
 
         Ok(AgentWithPreamble {
@@ -3128,8 +3139,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
         max_tokens: Option<u64>,
         tools: CoordinatorTools,
     ) -> Result<ProviderAgent, Box<dyn std::error::Error + Send + Sync>> {
-        let (llm_provider, llm_model) = self.agent_config.llm.model_info();
-        match &self.agent_config.llm {
+        let (llm_provider, llm_model) = self.agent_build_context.llm.model_info();
+        match &self.agent_build_context.llm {
             LlmConfig::OpenAI {
                 api_key,
                 model,
@@ -3317,16 +3328,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ///
     /// Workers share the orchestrator's `Arc<McpManager>` rather than creating
     /// their own MCP connections. Tool filtering is handled by `add_all_tools`
-    /// via `worker_config.mcp_filter`. Workers never receive client-side
+    /// via `worker_build_context.mcp_filter`. Workers never receive client-side
     /// passthrough tools — see `create_worker` for the rationale.
     async fn build_worker_provider_agent(
         &self,
-        worker_config: &AgentRuntimeConfig,
+        worker_build_context: &AgentBuildContext,
         run: &Arc<BoundRun>,
     ) -> Result<(ProviderAgent, String), Box<dyn std::error::Error + Send + Sync>> {
-        let preamble = worker_config.effective_preamble();
-        let temperature = worker_config.llm.temperature();
-        let (llm_provider, llm_model) = worker_config.llm.model_info();
+        let preamble = worker_build_context.effective_preamble();
+        let temperature = worker_build_context.llm.temperature();
+        let (llm_provider, llm_model) = worker_build_context.llm.model_info();
         let shared_mcp: Option<Arc<McpManager>> = self.mcp_manager.clone();
 
         // Box<dyn ToolDyn> is not Clone, so each provider arm constructs its own instance.
@@ -3334,7 +3345,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Test-only model injection (park/reify rig): a queued override builds
         // this worker from a scripted model. The override's extra tools go
-        // through the worker's own layers — `worker_config.tool_middleware`
+        // through the worker's own layers — `worker_build_context.tool_middleware`
         // carries the stack (observer, duplicate guard, persistence,
         // HITL gate) create_worker assembled — so a scripted worker's gated
         // calls park exactly like live ones. No override queued: unchanged
@@ -3347,15 +3358,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
             use crate::tool_middleware::MiddlewareTool;
 
             let mut builder = rig::agent::AgentBuilder::new(worker_override.model);
-            builder = builder.name(&worker_config.agent.name);
+            builder = builder.name(&worker_build_context.agent.name);
             builder = builder.provider_name(llm_provider).model_name(llm_model);
             builder = builder.preamble(preamble);
             let mut state = BuilderState::Initial(builder);
             for tool in worker_override.extra_tools {
                 let shim = DynToolAsTool::new(tool);
                 match (
-                    worker_config.tool_middleware_stack(),
-                    &worker_config.tool_context_factory,
+                    worker_build_context.tool_middleware_stack(),
+                    &worker_build_context.tool_context_factory,
                 ) {
                     (Some(stack), Some(factory)) => {
                         let factory = factory.clone();
@@ -3373,7 +3384,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
             let state = PreparedAgent::add_all_tools(
                 state,
-                worker_config,
+                worker_build_context,
                 &shared_mcp,
                 run,
                 wait_for_tools(),
@@ -3385,7 +3396,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             ));
         }
 
-        match &worker_config.llm {
+        match &worker_build_context.llm {
             LlmConfig::OpenAI {
                 api_key,
                 model,
@@ -3405,7 +3416,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .completions_api()
                     .completion_model(model);
                 let mut builder = rig::agent::AgentBuilder::new(cm);
-                builder = builder.name(&worker_config.agent.name);
+                builder = builder.name(&worker_build_context.agent.name);
                 builder = builder.provider_name(llm_provider).model_name(llm_model);
                 builder = builder.preamble(preamble);
                 if let Some(temp) = temperature {
@@ -3426,13 +3437,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(params) = combined_params {
                     builder = builder.additional_params(params);
                 }
-                if let Some(max) = worker_config.llm.max_tokens() {
+                if let Some(max) = worker_build_context.llm.max_tokens() {
                     builder = builder.max_tokens(max);
                 }
                 let state = BuilderState::Initial(builder);
                 let state = PreparedAgent::add_all_tools(
                     state,
-                    worker_config,
+                    worker_build_context,
                     &shared_mcp,
                     run,
                     wait_for_tools(),
@@ -3461,13 +3472,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     cm = cm.with_prompt_caching();
                 }
                 let mut builder = rig::agent::AgentBuilder::new(cm);
-                builder = builder.name(&worker_config.agent.name);
+                builder = builder.name(&worker_build_context.agent.name);
                 builder = builder.provider_name(llm_provider).model_name(llm_model);
                 builder = builder.preamble(preamble);
                 if let Some(temp) = temperature {
                     builder = builder.temperature(temp);
                 }
-                if let Some(max) = worker_config.llm.max_tokens() {
+                if let Some(max) = worker_build_context.llm.max_tokens() {
                     builder = builder.max_tokens(max);
                 }
                 if let Some(params) = additional_params {
@@ -3476,7 +3487,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 let state = BuilderState::Initial(builder);
                 let state = PreparedAgent::add_all_tools(
                     state,
-                    worker_config,
+                    worker_build_context,
                     &shared_mcp,
                     run,
                     wait_for_tools(),
@@ -3513,13 +3524,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     cm = cm.with_prompt_caching();
                 }
                 let mut builder = rig::agent::AgentBuilder::new(cm);
-                builder = builder.name(&worker_config.agent.name);
+                builder = builder.name(&worker_build_context.agent.name);
                 builder = builder.provider_name(llm_provider).model_name(llm_model);
                 builder = builder.preamble(preamble);
                 if let Some(temp) = temperature {
                     builder = builder.temperature(temp);
                 }
-                if let Some(max) = worker_config.llm.max_tokens() {
+                if let Some(max) = worker_build_context.llm.max_tokens() {
                     builder = builder.max_tokens(max);
                 }
                 if let Some(params) = additional_params {
@@ -3528,7 +3539,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 let state = BuilderState::Initial(builder);
                 let state = PreparedAgent::add_all_tools(
                     state,
-                    worker_config,
+                    worker_build_context,
                     &shared_mcp,
                     run,
                     wait_for_tools(),
@@ -3553,7 +3564,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .map_err(|e| format!("Failed to build Gemini worker: {}", e))?
                     .completion_model(model);
                 let mut builder = rig::agent::AgentBuilder::new(cm);
-                builder = builder.name(&worker_config.agent.name);
+                builder = builder.name(&worker_build_context.agent.name);
                 builder = builder.provider_name(llm_provider).model_name(llm_model);
                 builder = builder.preamble(preamble);
                 if let Some(temp) = temperature {
@@ -3565,7 +3576,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 let state = BuilderState::Initial(builder);
                 let state = PreparedAgent::add_all_tools(
                     state,
-                    worker_config,
+                    worker_build_context,
                     &shared_mcp,
                     run,
                     wait_for_tools(),
@@ -3587,7 +3598,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .map_err(|e| format!("Failed to build Ollama worker: {}", e))?
                     .completion_model(model);
                 let mut builder = rig::agent::AgentBuilder::new(cm);
-                builder = builder.name(&worker_config.agent.name);
+                builder = builder.name(&worker_build_context.agent.name);
                 builder = builder.provider_name(llm_provider).model_name(llm_model);
                 builder = builder.preamble(preamble);
                 if let Some(temp) = temperature {
@@ -3601,7 +3612,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 let state = BuilderState::Initial(builder);
                 let state = PreparedAgent::add_all_tools(
                     state,
-                    worker_config,
+                    worker_build_context,
                     &shared_mcp,
                     run,
                     wait_for_tools(),
@@ -3626,13 +3637,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .map_err(|e| format!("Failed to build OpenRouter worker: {}", e))?
                     .completion_model(model);
                 let mut builder = rig::agent::AgentBuilder::new(cm);
-                builder = builder.name(&worker_config.agent.name);
+                builder = builder.name(&worker_build_context.agent.name);
                 builder = builder.provider_name(llm_provider).model_name(llm_model);
                 builder = builder.preamble(preamble);
                 if let Some(temp) = temperature {
                     builder = builder.temperature(temp);
                 }
-                if let Some(max) = worker_config.llm.max_tokens() {
+                if let Some(max) = worker_build_context.llm.max_tokens() {
                     builder = builder.max_tokens(max);
                 }
                 if let Some(params) = additional_params {
@@ -3641,7 +3652,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 let state = BuilderState::Initial(builder);
                 let state = PreparedAgent::add_all_tools(
                     state,
-                    worker_config,
+                    worker_build_context,
                     &shared_mcp,
                     run,
                     wait_for_tools(),
@@ -3703,7 +3714,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
             let parallel_count = ready_tasks.len();
             let default_depth = self
-                .agent_config
+                .agent_build_context
                 .agent
                 .turn_depth
                 .unwrap_or(crate::builder::DEFAULT_MAX_DEPTH);
@@ -4038,7 +4049,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             let worker_cfg = worker_name.and_then(|name| self.config.workers.get(name));
             let effective_llm = worker_cfg
                 .and_then(|w| w.llm.as_ref())
-                .unwrap_or(&self.agent_config.llm);
+                .unwrap_or(&self.agent_build_context.llm);
             let (provider, model) = effective_llm.model_info();
             crate::logging::set_llm_identifiers(&span, provider, model);
             if let Some(params) = crate::logging::llm_invocation_parameters(effective_llm) {
@@ -4532,7 +4543,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         };
 
         // Step 5: the consumed decisions leave the store with the task.
-        if let Some(hitl) = self.agent_config.hitl.clone()
+        if let Some(hitl) = self.agent_build_context.hitl.clone()
             && let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route
         {
             for call in &continuation.pending {
@@ -4835,7 +4846,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         let orchestration_start = Instant::now();
         let default_turn_depth = self
-            .agent_config
+            .agent_build_context
             .agent
             .turn_depth
             .unwrap_or(crate::builder::DEFAULT_MAX_DEPTH);
@@ -5650,7 +5661,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         park_records: &ParkedTaskRecords,
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
     ) -> Result<String, StreamError> {
-        let Some(hitl) = self.agent_config.hitl.clone() else {
+        let Some(hitl) = self.agent_build_context.hitl.clone() else {
             return Err("run parked without a HITL policy configured".into());
         };
         let crate::hitl::DecisionRoute::Conversational { registry, timeout } = &*hitl.route else {
@@ -5661,7 +5672,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
             (p.run_id().to_string(), p.session_id().map(String::from))
         };
 
-        let Some(memory_dir) = self.agent_config.effective_memory_dir().map(str::to_string) else {
+        let Some(memory_dir) = self
+            .agent_build_context
+            .effective_memory_dir()
+            .map(str::to_string)
+        else {
             // No memory_dir means no checkpoint can exist, so the run's
             // approvals must not stay decidable.
             tracing::error!(
@@ -5692,7 +5707,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             records: park_records,
             registry,
             memory_dir: &memory_dir,
-            config: &self.agent_config,
+            build_context: &self.agent_build_context,
             decision_window: *timeout,
         };
 
@@ -5746,7 +5761,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Sweep the run's parked approvals by owner id, so no decidable
     /// approval outlives a run that has no checkpoint.
     async fn cancel_run_parked_approvals(&self, run_id: &str) {
-        let Some(hitl) = self.agent_config.hitl.clone() else {
+        let Some(hitl) = self.agent_build_context.hitl.clone() else {
             return;
         };
         let crate::hitl::DecisionRoute::Conversational { registry, .. } = &*hitl.route else {
@@ -6094,19 +6109,19 @@ mod tests {
     #[tokio::test]
     async fn a_plain_worker_budget_starts_from_the_fixed_overhead() {
         let temp = tempfile::TempDir::new().unwrap();
-        let mut config = crate::config::AgentRuntimeConfig {
+        let mut build_context = crate::config::AgentBuildContext {
             memory_dir: Some(temp.path().join("memory").to_string_lossy().into_owned()),
-            ..crate::config::AgentRuntimeConfig::default()
+            ..crate::config::AgentBuildContext::default()
         };
-        set_context_window(&mut config.llm, 128_000);
-        let orchestrator = Orchestrator::new(config).await.unwrap();
+        set_context_window(&mut build_context.llm, 128_000);
+        let orchestrator = Orchestrator::new(build_context).await.unwrap();
 
         let worker = orchestrator
             .create_worker(0, 1, None, None, None)
             .await
             .unwrap();
         let budget = worker.agent.scratchpad_budget().expect("a plain budget");
-        let (provider, model) = orchestrator.agent_config.llm.model_info();
+        let (provider, model) = orchestrator.agent_build_context.llm.model_info();
         let counter = crate::scratchpad::token_counter_for_provider(provider, model);
         let overhead = orchestrator.worker_fixed_overhead(None, &*counter);
         assert!(overhead > 0);
@@ -7670,7 +7685,7 @@ mod tests {
     // ========================================================================
 
     /// Per-worker skills resolution (`apply_worker_skills_override`, called by
-    /// `create_worker`): the cloned AgentRuntimeConfig keeps `[agent.skills]`
+    /// `create_worker`): the cloned AgentBuildContext keeps `[agent.skills]`
     /// unless the discovered `worker_skills` map carries an entry for the
     /// worker; an explicit empty entry disables skills.
     #[test]
@@ -7688,20 +7703,20 @@ mod tests {
             path: std::path::PathBuf::from("/skills/worker-skill"),
         };
 
-        let mut agent_config = crate::config::AgentRuntimeConfig::default();
-        agent_config.agent.skills = vec![agent_skill];
-        agent_config.worker_skills.insert(
+        let mut agent_build_context = crate::config::AgentBuildContext::default();
+        agent_build_context.agent.skills = vec![agent_skill];
+        agent_build_context.worker_skills.insert(
             "overriding".to_string(),
             WorkerSkills::Override(vec![worker_skill]),
         );
-        agent_config
+        agent_build_context
             .worker_skills
             .insert("disabling".to_string(), WorkerSkills::Disable);
 
         let resolve = |worker_name: &str| {
-            let mut worker_config = agent_config.clone();
-            super::apply_worker_skills_override(&mut worker_config, Some(worker_name));
-            worker_config.agent.skills
+            let mut worker_build_context = agent_build_context.clone();
+            super::apply_worker_skills_override(&mut worker_build_context, Some(worker_name));
+            worker_build_context.agent.skills
         };
 
         let inherited = resolve("inheriting");
@@ -7882,7 +7897,7 @@ mod tests {
     /// run, under the id the orchestrator was created with.
     #[tokio::test]
     async fn an_unscoped_orchestration_names_one_run() {
-        let orchestrator = Orchestrator::new(crate::config::AgentRuntimeConfig::default())
+        let orchestrator = Orchestrator::new(crate::config::AgentBuildContext::default())
             .await
             .unwrap();
         let first = orchestrator.orchestration_run();
@@ -7893,13 +7908,13 @@ mod tests {
         );
         assert_eq!(first.id(), second.id());
         assert_eq!(
-            orchestrator.agent_config.run_id,
+            orchestrator.agent_build_context.run_id,
             Some(first.id()),
             "the config carries the id the orchestrator minted"
         );
 
         let named = crate::run_context::named_run_id("req_named");
-        let orchestrator = Orchestrator::new(crate::config::AgentRuntimeConfig {
+        let orchestrator = Orchestrator::new(crate::config::AgentBuildContext {
             run_id: Some(named),
             ..Default::default()
         })
@@ -7912,7 +7927,7 @@ mod tests {
     /// dependency results, and alone when the task has no dependencies.
     #[tokio::test]
     async fn task_context_lists_attached_artifacts() {
-        let orchestrator = Orchestrator::new(crate::config::AgentRuntimeConfig::default())
+        let orchestrator = Orchestrator::new(crate::config::AgentBuildContext::default())
             .await
             .unwrap();
         let mut plan = Plan::new("Artifacts");
@@ -7954,7 +7969,7 @@ mod tests {
     /// awaiting state survives untouched.
     #[tokio::test]
     async fn execute_parks_at_quiescence_without_dispatching() {
-        let orchestrator = Orchestrator::new(crate::config::AgentRuntimeConfig::default())
+        let orchestrator = Orchestrator::new(crate::config::AgentBuildContext::default())
             .await
             .unwrap();
         let mut plan = Plan::new("Park smoke");
@@ -8014,7 +8029,7 @@ mod tests {
             }
         }
 
-        let mut orchestrator = Orchestrator::new(AgentRuntimeConfig::default())
+        let mut orchestrator = Orchestrator::new(AgentBuildContext::default())
             .await
             .unwrap();
         assert!(orchestrator.worker_own_tools().is_empty());
@@ -8062,8 +8077,8 @@ mod tests {
 
     #[tokio::test]
     async fn park_enabled_requires_flag_and_conversational_route() {
-        fn config(park_enabled: bool, conversational: bool) -> AgentRuntimeConfig {
-            let mut config = AgentRuntimeConfig::default();
+        fn hitl_build_context(park_enabled: bool, conversational: bool) -> AgentBuildContext {
+            let mut build_context = AgentBuildContext::default();
             let route = if conversational {
                 crate::hitl::DecisionRoute::Conversational {
                     registry: crate::hitl::PendingApprovals::new(),
@@ -8078,26 +8093,32 @@ mod tests {
                     timeout: Duration::from_secs(5),
                 }
             };
-            config.hitl = Some(crate::hitl::HitlPolicy {
+            build_context.hitl = Some(crate::hitl::HitlPolicy {
                 patterns: Arc::from(["kubectl_*".into()]),
                 route: Arc::new(route),
                 park_enabled,
             });
-            config
+            build_context
         }
 
-        let no_hitl = Orchestrator::new(AgentRuntimeConfig::default())
+        let no_hitl = Orchestrator::new(AgentBuildContext::default())
             .await
             .unwrap();
         assert!(!no_hitl.park_enabled(), "no [hitl] table: park off");
 
-        let off = Orchestrator::new(config(false, true)).await.unwrap();
+        let off = Orchestrator::new(hitl_build_context(false, true))
+            .await
+            .unwrap();
         assert!(!off.park_enabled(), "flag off: park off");
 
-        let on = Orchestrator::new(config(true, true)).await.unwrap();
+        let on = Orchestrator::new(hitl_build_context(true, true))
+            .await
+            .unwrap();
         assert!(on.park_enabled(), "flag on + conversational: park on");
 
-        let webhook = Orchestrator::new(config(true, false)).await.unwrap();
+        let webhook = Orchestrator::new(hitl_build_context(true, false))
+            .await
+            .unwrap();
         assert!(!webhook.park_enabled(), "webhook route: park off");
     }
 
@@ -8119,7 +8140,7 @@ mod tests {
             Arc::new(InMemoryApprovalStore::new());
         let registry =
             PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
-        let config = AgentRuntimeConfig {
+        let build_context = AgentBuildContext {
             hitl: Some(crate::hitl::HitlPolicy {
                 patterns: Arc::from(["kubectl_*".into()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
@@ -8129,9 +8150,9 @@ mod tests {
                 park_enabled: true,
             }),
             run_id: Some(run_id),
-            ..AgentRuntimeConfig::default()
+            ..AgentBuildContext::default()
         };
-        let orchestrator = Orchestrator::new(config).await.unwrap();
+        let orchestrator = Orchestrator::new(build_context).await.unwrap();
 
         // Two durable registrations, as the park arm would make them.
         let now = chrono::Utc::now();
@@ -8233,7 +8254,7 @@ mod tests {
         use crate::session_store::InMemoryEventBus;
 
         let registry = PendingApprovals::with_backend(store, Arc::new(InMemoryEventBus::new()));
-        let config = AgentRuntimeConfig {
+        let build_context = AgentBuildContext {
             hitl: Some(crate::hitl::HitlPolicy {
                 patterns: Arc::from(["kubectl_*".into()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
@@ -8245,9 +8266,9 @@ mod tests {
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some("park-sess".to_string()),
             run_id: Some(aura_events::RunId::mint()),
-            ..AgentRuntimeConfig::default()
+            ..AgentBuildContext::default()
         };
-        let orchestrator = Orchestrator::new(config).await.unwrap();
+        let orchestrator = Orchestrator::new(build_context).await.unwrap();
         let run_id = orchestrator.persistence.lock().await.run_id().to_string();
         (orchestrator, registry, run_id)
     }
@@ -8493,7 +8514,7 @@ mod tests {
         let (orchestrator, store, registry, run_id) = park_orchestrator(dir.path()).await;
         let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
         let this_run = orchestrator
-            .agent_config
+            .agent_build_context
             .run_id
             .expect("a park orchestrator is built for a run");
         let (run, mut events) = crate::run_context::RunContext::channel(this_run);
@@ -8587,7 +8608,7 @@ mod tests {
         let (orchestrator, store, registry, run_id) = park_orchestrator(dir.path()).await;
         let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
         let this_run = orchestrator
-            .agent_config
+            .agent_build_context
             .run_id
             .expect("a park orchestrator is built for a run");
         let (run, mut events) = crate::run_context::RunContext::channel(this_run);
@@ -8678,7 +8699,7 @@ mod tests {
             park_orchestrator_over(store.clone(), dir.path()).await;
         let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
         let this_run = orchestrator
-            .agent_config
+            .agent_build_context
             .run_id
             .expect("a park orchestrator is built for a run");
         let (run, mut events) = crate::run_context::RunContext::channel(this_run);
@@ -8806,7 +8827,7 @@ mod tests {
         )]);
         let run_id = aura_events::RunId::mint();
         let request_id = run_id.to_string();
-        let config = AgentRuntimeConfig {
+        let build_context = AgentBuildContext {
             hitl: Some(crate::hitl::HitlPolicy {
                 patterns: Arc::from(["echo_tool".into()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
@@ -8823,9 +8844,9 @@ mod tests {
                 workers,
                 ..Default::default()
             }),
-            ..AgentRuntimeConfig::default()
+            ..AgentBuildContext::default()
         };
-        let orchestrator = Orchestrator::new(config).await.unwrap();
+        let orchestrator = Orchestrator::new(build_context).await.unwrap();
         (orchestrator, store, registry, request_id)
     }
 
@@ -9099,7 +9120,7 @@ mod tests {
                 skills: None,
             },
         )]);
-        let config = AgentRuntimeConfig {
+        let build_context = AgentBuildContext {
             hitl: Some(crate::hitl::HitlPolicy {
                 patterns: Arc::from(["echo_tool".into()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
@@ -9116,9 +9137,9 @@ mod tests {
                 workers,
                 ..Default::default()
             }),
-            ..AgentRuntimeConfig::default()
+            ..AgentBuildContext::default()
         };
-        let orchestrator = Orchestrator::new(config).await.unwrap();
+        let orchestrator = Orchestrator::new(build_context).await.unwrap();
         let run_id = orchestrator.persistence.lock().await.run_id().to_string();
         (orchestrator, run_id)
     }
@@ -9631,7 +9652,7 @@ mod tests {
 mod coordinator_artifact_tests {
     use super::tests::set_context_window;
     use super::*;
-    use crate::config::AgentRuntimeConfig;
+    use crate::config::AgentBuildContext;
     use crate::orchestration::persistence::ExecutionPersistence;
     use crate::orchestration::tools::read_artifact::ReadArtifactArgs;
     use crate::run_context::RunContext;
@@ -9645,16 +9666,16 @@ mod coordinator_artifact_tests {
         window: Option<u64>,
         scratchpad: Option<ScratchpadConfig>,
     ) -> Orchestrator {
-        let mut config = AgentRuntimeConfig {
+        let mut build_context = AgentBuildContext {
             memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             session_id: Some(SESSION.to_string()),
-            ..AgentRuntimeConfig::default()
+            ..AgentBuildContext::default()
         };
         if let Some(window) = window {
-            set_context_window(&mut config.llm, window);
+            set_context_window(&mut build_context.llm, window);
         }
-        config.agent.scratchpad = scratchpad;
-        Orchestrator::new(config).await.unwrap()
+        build_context.agent.scratchpad = scratchpad;
+        Orchestrator::new(build_context).await.unwrap()
     }
 
     fn scratchpad_cfg(coordinator: bool) -> Option<ScratchpadConfig> {
@@ -9832,7 +9853,7 @@ mod coordinator_artifact_tests {
 
         let on = orchestrator(&memory_dir, Some(128_000), scratchpad_cfg(true)).await;
         let base = on
-            .agent_config
+            .agent_build_context
             .agent
             .turn_depth
             .unwrap_or(crate::builder::DEFAULT_MAX_DEPTH);

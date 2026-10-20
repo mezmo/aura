@@ -731,7 +731,7 @@ pub(crate) async fn park_orchestrator_in(
     );
     let mut workers = std::collections::HashMap::new();
     workers.insert(worker_name, worker);
-    let config = crate::config::AgentRuntimeConfig {
+    let build_context = crate::config::AgentBuildContext {
         hitl: Some(crate::hitl::HitlPolicy {
             patterns: Arc::from(["kubectl_*".into()]),
             route: Arc::new(crate::hitl::DecisionRoute::Conversational {
@@ -748,9 +748,9 @@ pub(crate) async fn park_orchestrator_in(
             workers,
             ..Default::default()
         }),
-        ..crate::config::AgentRuntimeConfig::default()
+        ..crate::config::AgentBuildContext::default()
     };
-    let orchestrator = super::Orchestrator::new(config)
+    let orchestrator = super::Orchestrator::new(build_context)
         .await
         .expect("orchestrator builds");
     (orchestrator, store, registry)

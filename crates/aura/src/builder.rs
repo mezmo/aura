@@ -1,5 +1,5 @@
 use crate::{
-    config::{AgentRuntimeConfig, LlmConfig, McpServerConfig, VectorStoreType},
+    config::{AgentBuildContext, LlmConfig, McpServerConfig, VectorStoreType},
     error::{BuilderError, BuilderResult},
     forwarded_headers::ForwardedHeaders,
     mcp::McpManager,
@@ -232,15 +232,15 @@ impl PreparedAgent {
     /// `Agent::stream_*_with_timeout`, not here, so this constructor stays
     /// free of request-shape parameters.
     async fn setup_single_agent_scratchpad(
-        config: &mut AgentRuntimeConfig,
+        build_context: &mut AgentBuildContext,
         mcp_manager: Option<&Arc<McpManager>>,
         run: &Arc<BoundRun>,
     ) -> Result<Option<ContextBudget>, Box<dyn std::error::Error + Send + Sync>> {
-        if config.orchestration_enabled() {
+        if build_context.orchestration_enabled() {
             return Ok(None);
         }
 
-        let sp_cfg = match config.agent.scratchpad.as_ref() {
+        let sp_cfg = match build_context.agent.scratchpad.as_ref() {
             Some(sp) if sp.enabled => sp.clone(),
             _ => return Ok(None),
         };
@@ -249,12 +249,12 @@ impl PreparedAgent {
             .map(|mgr| mgr.tool_names_per_server())
             .unwrap_or_default();
         let scratchpad_tool_map =
-            scratchpad::scratchpad_tool_map(config.mcp.as_ref(), &tools_per_server);
+            scratchpad::scratchpad_tool_map(build_context.mcp.as_ref(), &tools_per_server);
         let accessible_tools = mcp_manager.map(|mgr| mgr.all_tools()).unwrap_or_default();
-        let filter = config
+        let filter = build_context
             .mcp_filter
             .as_deref()
-            .or(config.agent.mcp_filter.as_deref());
+            .or(build_context.agent.mcp_filter.as_deref());
         if !scratchpad::has_accessible_scratchpad_tool(
             &accessible_tools,
             filter,
@@ -268,19 +268,19 @@ impl PreparedAgent {
 
         // Validation enforces these upstream; re-check here so runtime
         // misconfiguration fails loudly instead of silently degrading.
-        let context_window = config.llm.context_window().ok_or_else(
+        let context_window = build_context.llm.context_window().ok_or_else(
             || -> Box<dyn std::error::Error + Send + Sync> {
                 "Scratchpad enabled but [agent.llm].context_window is not set".into()
             },
         )? as usize;
-        let memory_dir = config
+        let memory_dir = build_context
             .effective_memory_dir()
             .map(str::to_owned)
             .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
                 "Scratchpad enabled but `memory_dir` is not set".into()
             })?;
 
-        let (provider, model) = config.llm.model_info();
+        let (provider, model) = build_context.llm.model_info();
         let token_counter = scratchpad::token_counter_for_provider(provider, model);
 
         // Exact MCP tool-schema tokens (BPE on the JSON each tool serializes to).
@@ -300,7 +300,7 @@ impl PreparedAgent {
 
         let initial_used = scratchpad::estimate_scratchpad_overhead(
             &*token_counter,
-            &[config.effective_preamble()],
+            &[build_context.effective_preamble()],
         ) + mcp_tool_tokens;
 
         let build = scratchpad::build_scratchpad(scratchpad::ScratchpadBuildInputs {
@@ -323,13 +323,13 @@ impl PreparedAgent {
         // layer leaves them, which is unchanged, since it adds no fields.
         // `test_scratchpad_layer_outside_existing_observes_raw_output` at
         // the bottom of this module pins this.
-        config.add_outer_tool_layer(build.layer);
-        config.preamble_override = Some(format!(
+        build_context.add_outer_tool_layer(build.layer);
+        build_context.preamble_override = Some(format!(
             "{}{}",
-            config.effective_preamble(),
+            build_context.effective_preamble(),
             scratchpad::SCRATCHPAD_PREAMBLE
         ));
-        config.scratchpad_tools_config = Some(build.tools_config);
+        build_context.scratchpad_tools_config = Some(build.tools_config);
 
         Ok(Some(build.budget))
     }
@@ -348,14 +348,14 @@ impl PreparedAgent {
     /// scratchpad wrappers composed below reach the run they serve through
     /// the agent's [`BoundRun`], filled in by [`begin_run`](Self::begin_run).
     pub async fn prepare(
-        config: &AgentRuntimeConfig,
+        build_context: &AgentBuildContext,
         additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
         client_tools: Option<Vec<ClientTool>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let run = Arc::new(BoundRun::default());
 
         // Initialize MCP manager first (shared across all providers)
-        let mcp_manager = if let Some(mcp_config) = &config.mcp {
+        let mcp_manager = if let Some(mcp_config) = &build_context.mcp {
             tracing::info!("Initializing MCP tools using dynamic adaptors");
             Some(Arc::new(
                 McpManager::initialize_from_config(mcp_config).await?,
@@ -367,21 +367,24 @@ impl PreparedAgent {
         // Clone so setup_single_agent_scratchpad and HITL can mutate extension
         // fields (tool_wrapper, preamble_override, scratchpad_tools_config,
         // hitl_request_approval_tool).
-        let mut config_owned = config.clone();
-        let agent_scratchpad_budget =
-            Self::setup_single_agent_scratchpad(&mut config_owned, mcp_manager.as_ref(), &run)
-                .await?;
+        let mut build_context_owned = build_context.clone();
+        let agent_scratchpad_budget = Self::setup_single_agent_scratchpad(
+            &mut build_context_owned,
+            mcp_manager.as_ref(),
+            &run,
+        )
+        .await?;
 
         // HITL gate for single-agent mode. Orchestration workers wire their
         // own gate in create_worker with per-task AgentScope::Worker; this
         // covers single-agent only (AgentScope::Single).
         let mut hitl_gate = None;
         let mut hitl_approval_tool = None;
-        if !config_owned.orchestration_enabled()
-            && let Some(hitl) = config_owned.hitl.clone()
+        if !build_context_owned.orchestration_enabled()
+            && let Some(hitl) = build_context_owned.hitl.clone()
         {
             let scope = crate::hitl::AgentScope::Single {
-                session_id: config_owned
+                session_id: build_context_owned
                     .session_id
                     .clone()
                     .map(crate::config::SessionId::new),
@@ -390,29 +393,32 @@ impl PreparedAgent {
                 hitl.patterns.clone(),
                 hitl.route.clone(),
                 scope.clone(),
-                config_owned.agent.name.clone(),
-                config_owned.instance_id.clone(),
+                build_context_owned.agent.name.clone(),
+                build_context_owned.instance_id.clone(),
             ));
             hitl_gate = Some(Arc::clone(&wrapper));
-            config_owned.add_outer_tool_layer(Arc::new(WrapperLayer(wrapper)));
+            build_context_owned.add_outer_tool_layer(Arc::new(WrapperLayer(wrapper)));
             let approval_tool = crate::hitl::RequestApprovalTool::new(
                 hitl.route.clone(),
                 scope,
-                config_owned.agent.name.clone(),
-                config_owned.instance_id.clone(),
+                build_context_owned.agent.name.clone(),
+                build_context_owned.instance_id.clone(),
             )
             .with_gated_patterns(hitl.patterns.clone());
             hitl_approval_tool = Some(approval_tool.clone());
-            config_owned.hitl_request_approval_tool = Some(approval_tool);
+            build_context_owned.hitl_request_approval_tool = Some(approval_tool);
         }
 
         // Scratchpad bonus only applies when scratchpad was actually wired up
         // (enabled + context_window + a matching MCP tool).
-        let base_depth = config_owned.agent.turn_depth.unwrap_or(DEFAULT_MAX_DEPTH);
-        let scratchpad_bonus = config_owned
+        let base_depth = build_context_owned
+            .agent
+            .turn_depth
+            .unwrap_or(DEFAULT_MAX_DEPTH);
+        let scratchpad_bonus = build_context_owned
             .scratchpad_tools_config
             .as_ref()
-            .and(config_owned.agent.scratchpad.as_ref())
+            .and(build_context_owned.agent.scratchpad.as_ref())
             .map(|sp| sp.turn_depth_bonus)
             .unwrap_or(0);
         let max_depth = base_depth + scratchpad_bonus;
@@ -421,29 +427,29 @@ impl PreparedAgent {
         // wire their own in `create_worker`. The wrapper reads the run's
         // counters through the slot; `turn_nudge` here is what each run's
         // counters start from.
-        let turn_nudge = if config_owned.orchestration_enabled() {
+        let turn_nudge = if build_context_owned.orchestration_enabled() {
             None
         } else {
             TurnNudgeState::new(
-                config_owned.agent.nudge_last_turn,
-                config_owned.agent.nudge_turns_remaining,
+                build_context_owned.agent.nudge_last_turn,
+                build_context_owned.agent.nudge_turns_remaining,
                 max_depth,
             )
         };
         if turn_nudge.is_some() {
             // Outermost, so it runs last on the way up, on the text the LLM
             // actually sees (after any scratchpad pointer rewrite).
-            config_owned.add_outer_tool_layer(Arc::new(WrapperLayer(Arc::new(
+            build_context_owned.add_outer_tool_layer(Arc::new(WrapperLayer(Arc::new(
                 crate::turn_nudge::TurnNudgeWrapper::new(Arc::clone(&run)),
             ))));
             tracing::info!(
                 "  Turn-limit nudging: ENABLED (last_turn={}, wrap_up_threshold={:?})",
-                config_owned.agent.nudge_last_turn,
-                config_owned.agent.nudge_turns_remaining
+                build_context_owned.agent.nudge_last_turn,
+                build_context_owned.agent.nudge_turns_remaining
             );
         }
 
-        let config = &config_owned;
+        let build_context = &build_context_owned;
         if scratchpad_bonus > 0 {
             tracing::info!(
                 "  Max turn depth: {} (base={}, scratchpad_bonus={})",
@@ -462,11 +468,11 @@ impl PreparedAgent {
         // sorted-server-id winner) so the model is only ever told about,
         // and can only ever reach, a tool it would actually be registered
         // with — never one `mcp_filter` excludes or another server shadows.
-        let fallback_mcp_filter: Option<Vec<aura_config::GlobPattern>> = config
+        let fallback_mcp_filter: Option<Vec<aura_config::GlobPattern>> = build_context
             .mcp_filter
             .clone()
-            .or_else(|| config.agent.mcp_filter.clone());
-        let fallback_tool_parsing = config.llm.is_fallback_tool_parsing_enabled();
+            .or_else(|| build_context.agent.mcp_filter.clone());
+        let fallback_tool_parsing = build_context.llm.is_fallback_tool_parsing_enabled();
         let fallback_tool_names = if fallback_tool_parsing {
             match &mcp_manager {
                 Some(mgr) => {
@@ -504,18 +510,18 @@ impl PreparedAgent {
         };
 
         // Extract model name for logging
-        let model_name = config.llm.model_name().to_string();
-        let (llm_provider, _) = config.llm.model_info();
+        let model_name = build_context.llm.model_name().to_string();
+        let (llm_provider, _) = build_context.llm.model_info();
 
-        let mut system_prompt = config.effective_preamble().to_string();
-        if let Some(catalog) = render_skill_catalog(&config.agent.skills) {
+        let mut system_prompt = build_context.effective_preamble().to_string();
+        if let Some(catalog) = render_skill_catalog(&build_context.agent.skills) {
             system_prompt.push_str(&catalog);
         }
 
         // Build provider-specific agent with tools
         // Each branch creates its own completion model and agent builder,
         // adds tools using the shared BuilderState helper, then wraps in ProviderAgent
-        let provider_agent = match &config.llm {
+        let provider_agent = match &build_context.llm {
             LlmConfig::OpenAI {
                 api_key,
                 model,
@@ -547,7 +553,7 @@ impl PreparedAgent {
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
                 agent_builder = agent_builder
-                    .name(&config.agent.name)
+                    .name(&build_context.agent.name)
                     .provider_name(llm_provider)
                     .model_name(&model_name)
                     .preamble(&system_prompt);
@@ -572,7 +578,7 @@ impl PreparedAgent {
                     agent_builder = agent_builder.additional_params(params);
                 }
 
-                if let Some(max) = config.llm.max_tokens() {
+                if let Some(max) = build_context.llm.max_tokens() {
                     agent_builder = agent_builder.max_tokens(max);
                 }
 
@@ -585,7 +591,7 @@ impl PreparedAgent {
                 };
                 let builder_state = Self::add_all_tools(
                     builder_state,
-                    config,
+                    build_context,
                     &mcp_manager,
                     &run,
                     additional_tools,
@@ -628,7 +634,7 @@ impl PreparedAgent {
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
                 agent_builder = agent_builder
-                    .name(&config.agent.name)
+                    .name(&build_context.agent.name)
                     .provider_name(llm_provider)
                     .model_name(&model_name)
                     .preamble(&system_prompt);
@@ -636,7 +642,7 @@ impl PreparedAgent {
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
-                if let Some(max) = config.llm.max_tokens() {
+                if let Some(max) = build_context.llm.max_tokens() {
                     agent_builder = agent_builder.max_tokens(max);
                 }
                 if let Some(params) = additional_params {
@@ -651,7 +657,7 @@ impl PreparedAgent {
                 };
                 let builder_state = Self::add_all_tools(
                     builder_state,
-                    config,
+                    build_context,
                     &mcp_manager,
                     &run,
                     additional_tools,
@@ -710,7 +716,7 @@ impl PreparedAgent {
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
                 agent_builder = agent_builder
-                    .name(&config.agent.name)
+                    .name(&build_context.agent.name)
                     .provider_name(llm_provider)
                     .model_name(&model_name)
                     .preamble(&system_prompt);
@@ -718,7 +724,7 @@ impl PreparedAgent {
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
-                if let Some(max) = config.llm.max_tokens() {
+                if let Some(max) = build_context.llm.max_tokens() {
                     agent_builder = agent_builder.max_tokens(max);
                 }
                 if let Some(params) = additional_params {
@@ -733,7 +739,7 @@ impl PreparedAgent {
                 };
                 let builder_state = Self::add_all_tools(
                     builder_state,
-                    config,
+                    build_context,
                     &mcp_manager,
                     &run,
                     additional_tools,
@@ -769,7 +775,7 @@ impl PreparedAgent {
 
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
                 agent_builder = agent_builder
-                    .name(&config.agent.name)
+                    .name(&build_context.agent.name)
                     .provider_name(llm_provider)
                     .model_name(&model_name)
                     .preamble(&system_prompt);
@@ -789,7 +795,7 @@ impl PreparedAgent {
                 };
                 let builder_state = Self::add_all_tools(
                     builder_state,
-                    config,
+                    build_context,
                     &mcp_manager,
                     &run,
                     additional_tools,
@@ -823,7 +829,7 @@ impl PreparedAgent {
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
                 agent_builder = agent_builder
-                    .name(&config.agent.name)
+                    .name(&build_context.agent.name)
                     .provider_name(llm_provider)
                     .model_name(&model_name)
                     .preamble(&system_prompt);
@@ -844,7 +850,7 @@ impl PreparedAgent {
                 };
                 let builder_state = Self::add_all_tools(
                     builder_state,
-                    config,
+                    build_context,
                     &mcp_manager,
                     &run,
                     additional_tools,
@@ -881,7 +887,7 @@ impl PreparedAgent {
 
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
                 agent_builder = agent_builder
-                    .name(&config.agent.name)
+                    .name(&build_context.agent.name)
                     .provider_name(llm_provider)
                     .model_name(&model_name)
                     .preamble(&system_prompt);
@@ -889,7 +895,7 @@ impl PreparedAgent {
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
-                if let Some(max) = config.llm.max_tokens() {
+                if let Some(max) = build_context.llm.max_tokens() {
                     agent_builder = agent_builder.max_tokens(max);
                 }
                 if let Some(params) = additional_params {
@@ -904,7 +910,7 @@ impl PreparedAgent {
                 };
                 let builder_state = Self::add_all_tools(
                     builder_state,
-                    config,
+                    build_context,
                     &mcp_manager,
                     &run,
                     additional_tools,
@@ -929,16 +935,16 @@ impl PreparedAgent {
             fallback_tool_parsing,
             fallback_tool_names,
             fallback_mcp_filter,
-            context_window: config.llm.context_window(),
+            context_window: build_context.llm.context_window(),
             scratchpad_budget: agent_scratchpad_budget,
             client_tool_names,
             turn_nudge,
             hitl_gate,
             hitl_approval_tool,
             system_prompt,
-            invocation_parameters: crate::logging::llm_invocation_parameters(&config.llm),
-            skills: config.agent.skills.clone(),
-            forwarded_headers: config.forwarded_headers.clone(),
+            invocation_parameters: crate::logging::llm_invocation_parameters(&build_context.llm),
+            skills: build_context.agent.skills.clone(),
+            forwarded_headers: build_context.forwarded_headers.clone(),
             run,
             active: Mutex::new(Weak::new()),
         })
@@ -1071,12 +1077,12 @@ impl PreparedAgent {
 
     /// Add all tools to a builder state (shared across all providers)
     ///
-    /// When `config.tool_wrapper` is set, MCP tools are wrapped with the provided
-    /// wrapper. The `config.tool_context_factory` is used to create context for each
+    /// When `build_context.tool_wrapper` is set, MCP tools are wrapped with the provided
+    /// wrapper. The `build_context.tool_context_factory` is used to create context for each
     /// wrapped tool call.
     pub(crate) async fn add_all_tools<M>(
         mut builder_state: BuilderState<M>,
-        config: &AgentRuntimeConfig,
+        build_context: &AgentBuildContext,
         mcp_manager: &Option<Arc<McpManager>>,
         run: &Arc<BoundRun>,
         additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
@@ -1084,7 +1090,7 @@ impl PreparedAgent {
     where
         M: rig::completion::CompletionModel + Send + Sync,
     {
-        let tool_stack = config.tool_middleware_stack();
+        let tool_stack = build_context.tool_middleware_stack();
         if let Some(stack) = &tool_stack {
             tracing::info!(
                 "Tool middleware configured ({} layers)",
@@ -1094,10 +1100,10 @@ impl PreparedAgent {
         // `(namespace, name)` of each tool registered behind the middleware
         // stack, the only tools the HITL config gate can stop.
         let mut wrapped_tools: Vec<(String, String)> = Vec::new();
-        let effective_filter = config
+        let effective_filter = build_context
             .mcp_filter
             .as_ref()
-            .or(config.agent.mcp_filter.as_ref());
+            .or(build_context.agent.mcp_filter.as_ref());
         if let Some(patterns) = effective_filter {
             tracing::info!("MCP filter: {} pattern(s): {:?}", patterns.len(), patterns);
         }
@@ -1159,7 +1165,7 @@ impl PreparedAgent {
             for (server_name, client, server_tools, label, transport_kind) in servers {
                 let filtered_tools: Vec<_> = server_tools
                     .iter()
-                    .filter(|t| config.tool_matches_filter(t))
+                    .filter(|t| build_context.tool_matches_filter(t))
                     .collect();
                 log_filtered_tools(
                     "",
@@ -1203,14 +1209,14 @@ impl PreparedAgent {
                         builder_state,
                         tool_adaptor,
                         mcp_tool.namespace().clone(),
-                        config,
+                        build_context,
                     );
                 }
             }
         }
 
         // Add filesystem tools if configured
-        if let Some(tools_config) = &config.tools
+        if let Some(tools_config) = &build_context.tools
             && tools_config.filesystem
         {
             tracing::info!("Adding filesystem tools");
@@ -1223,10 +1229,13 @@ impl PreparedAgent {
         }
 
         // Add vector store tools if configured
-        if !config.vector_stores.is_empty() {
-            tracing::info!("Adding {} vector store tool(s)", config.vector_stores.len());
+        if !build_context.vector_stores.is_empty() {
+            tracing::info!(
+                "Adding {} vector store tool(s)",
+                build_context.vector_stores.len()
+            );
 
-            for vector_store_config in &config.vector_stores {
+            for vector_store_config in &build_context.vector_stores {
                 tracing::info!("  Configuring vector store: {}", vector_store_config.name);
 
                 let vector_store_manager =
@@ -1253,7 +1262,7 @@ impl PreparedAgent {
             tracing::info!("All vector stores configured successfully");
         }
 
-        if let Some(ref scratchpad) = config.scratchpad_tools_config {
+        if let Some(ref scratchpad) = build_context.scratchpad_tools_config {
             use crate::scratchpad::{
                 GetInTool, GrepTool, HeadTool, ItemSchemaTool, IterateOverTool, ReadTool,
                 SchemaTool, SliceTool,
@@ -1303,10 +1312,10 @@ impl PreparedAgent {
         // When the scratchpad is active, hand it the budget + storage so a
         // large artifact is returned as an in-place pointer (explored with the
         // scratchpad read tools).
-        if let Some(ref persistence) = config.orchestration_persistence {
+        if let Some(ref persistence) = build_context.orchestration_persistence {
             let mut read_artifact =
                 crate::orchestration::ReadArtifactTool::new(persistence.clone());
-            if let Some(ref scratchpad) = config.scratchpad_tools_config {
+            if let Some(ref scratchpad) = build_context.scratchpad_tools_config {
                 let read_root = scratchpad.storage.read_root().to_path_buf();
                 let run_path = persistence.lock().await.run_path().to_path_buf();
                 if !run_path.starts_with(&read_root) {
@@ -1320,7 +1329,7 @@ impl PreparedAgent {
                 }
                 read_artifact = read_artifact
                     .with_scratchpad(scratchpad.run.clone(), scratchpad.storage.clone());
-            } else if config.llm.context_window().is_some() {
+            } else if build_context.llm.context_window().is_some() {
                 // Without a scratchpad the run's budget still bounds what the
                 // tool inlines; `create_worker` builds that budget from the
                 // context window.
@@ -1330,7 +1339,7 @@ impl PreparedAgent {
                     "Agent {}: [agent.llm].context_window is unset, so read_artifact returns \
                      artifacts over {} bytes as a preview of their start; set context_window \
                      to the model's window so artifacts that fit come back whole",
-                    config.agent.name,
+                    build_context.agent.name,
                     crate::orchestration::tools::PREVIEW_BYTES,
                 );
             }
@@ -1338,7 +1347,7 @@ impl PreparedAgent {
         }
 
         // Add submit_result tool when orchestration submit decision is available
-        if let Some(ref decision) = config.orchestration_submit_result {
+        if let Some(ref decision) = build_context.orchestration_submit_result {
             let submit_tool = crate::orchestration::SubmitResultTool::new(decision.clone());
             builder_state = builder_state.add_tool(submit_tool);
         }
@@ -1346,7 +1355,7 @@ impl PreparedAgent {
         // Attach the agent-callable request_approval tool when HITL pre-built one
         // for this build (orchestration workers set it in `create_worker`; the
         // single-agent path leaves it unset until that surface is wired).
-        if let Some(ref approval_tool) = config.hitl_request_approval_tool {
+        if let Some(ref approval_tool) = build_context.hitl_request_approval_tool {
             let approval_tool = approval_tool.clone().with_gated_tools(
                 wrapped_tools
                     .iter()
@@ -1361,10 +1370,11 @@ impl PreparedAgent {
             builder_state = builder_state.add_tools_dyn(additional_tools);
         }
 
-        if let Some(toolset) = SkillToolset::new(&config.agent.skills, Some(Arc::clone(run))) {
+        if let Some(toolset) = SkillToolset::new(&build_context.agent.skills, Some(Arc::clone(run)))
+        {
             tracing::info!(
                 "Adding skill tools (load_skill, read_skill_file) with {} skills",
-                config.agent.skills.len(),
+                build_context.agent.skills.len(),
             );
             builder_state = builder_state
                 .add_tool(toolset.load)
@@ -1374,10 +1384,10 @@ impl PreparedAgent {
         Ok(builder_state)
     }
 
-    /// Helper to add an MCP tool, optionally wrapping with config.tool_wrapper.
+    /// Helper to add an MCP tool, optionally wrapping with `build_context.tool_wrapper`.
     ///
-    /// If `config.tool_wrapper` is set, the tool is wrapped and a context is
-    /// created using `config.tool_context_factory` (or a default context),
+    /// If `build_context.tool_wrapper` is set, the tool is wrapped and a context is
+    /// created using `build_context.tool_context_factory` (or a default context),
     /// always stamped with `namespace` so wrapper-layer consumers (HITL
     /// approval requests, in particular) can attribute the call to its MCP
     /// server without it ever touching the tool's model-facing name.
@@ -1385,7 +1395,7 @@ impl PreparedAgent {
         builder_state: BuilderState<M>,
         tool: T,
         namespace: crate::mcp::ToolNamespace,
-        config: &AgentRuntimeConfig,
+        build_context: &AgentBuildContext,
     ) -> BuilderState<M>
     where
         M: rig::completion::CompletionModel + Send + Sync,
@@ -1395,10 +1405,10 @@ impl PreparedAgent {
             + Clone
             + 'static,
     {
-        match config.tool_middleware_stack() {
+        match build_context.tool_middleware_stack() {
             Some(stack) => {
                 let tool_name = tool.name();
-                let base_ctx_factory = config.tool_context_factory.clone();
+                let base_ctx_factory = build_context.tool_context_factory.clone();
                 let wrapped = MiddlewareTool::new(tool, stack).with_context_factory(move |_| {
                     let mut ctx = base_ctx_factory
                         .as_ref()
@@ -1553,25 +1563,25 @@ impl Agent {
 
     /// Prepare an agent from configuration and begin its single run.
     ///
-    /// The run is for the request `config` was resolved for: its id is
-    /// `config.run_id` (a fresh one when unset), its headers are the ones
-    /// `config.forwarded_headers` recorded, and `config.skill_recorder`
+    /// The run is for the request `build_context` was resolved for: its id is
+    /// `build_context.run_id` (a fresh one when unset), its headers are the ones
+    /// `build_context.forwarded_headers` recorded, and `build_context.skill_recorder`
     /// records its skill-tool invocations. See [`PreparedAgent::prepare`] for
     /// `additional_tools` and `client_tools`; callers that want to reuse the
     /// prepared half across turns call that and [`PreparedAgent::begin_run`]
     /// themselves.
     pub async fn new(
-        config: &AgentRuntimeConfig,
+        build_context: &AgentBuildContext,
         additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
         client_tools: Option<Vec<ClientTool>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let prepared =
-            Arc::new(PreparedAgent::prepare(config, additional_tools, client_tools).await?);
-        let req_headers = config.forwarded_headers.as_request();
+            Arc::new(PreparedAgent::prepare(build_context, additional_tools, client_tools).await?);
+        let req_headers = build_context.forwarded_headers.as_request();
         Ok(prepared.begin_run(
-            config.run_id.unwrap_or_else(RunId::mint),
+            build_context.run_id.unwrap_or_else(RunId::mint),
             Some(&req_headers),
-            config.skill_recorder.clone(),
+            build_context.skill_recorder.clone(),
         )?)
     }
 
@@ -2103,10 +2113,10 @@ impl StreamingAgent for Agent {
 /// with a warning. In single-agent mode, they are attached to the agent only
 /// when `[agent].enable_client_tools = true` (filtered by `client_tool_filter`).
 pub async fn build_streaming_agent(
-    config: &crate::config::AgentRuntimeConfig,
+    build_context: &crate::config::AgentBuildContext,
     client_tools: Option<Vec<ClientTool>>,
 ) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
-    build_streaming_agent_with_tools(config, client_tools, no_run_tools()).await
+    build_streaming_agent_with_tools(build_context, client_tools, no_run_tools()).await
 }
 
 /// A factory for the rig tools that exist for one run.
@@ -2124,13 +2134,13 @@ pub fn no_run_tools() -> RunToolFactory {
 /// once per worker and every worker gets its own instances, while the
 /// coordinator, whose tool set is routing only, gets none.
 pub async fn build_streaming_agent_with_tools(
-    config: &crate::config::AgentRuntimeConfig,
+    build_context: &crate::config::AgentBuildContext,
     client_tools: Option<Vec<ClientTool>>,
     run_tools: RunToolFactory,
 ) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
     use crate::orchestration::OrchestratorFactory;
 
-    if config.orchestration_enabled() {
+    if build_context.orchestration_enabled() {
         tracing::info!("Building OrchestratorFactory (orchestration.enabled = true)");
         if client_tools.as_ref().is_some_and(|t| !t.is_empty()) {
             tracing::warn!(
@@ -2139,46 +2149,46 @@ pub async fn build_streaming_agent_with_tools(
                  will be ignored. Use a non-orchestrated agent config to enable them."
             );
         }
-        let factory = OrchestratorFactory::new(config.clone()).with_run_tools(run_tools);
+        let factory = OrchestratorFactory::new(build_context.clone()).with_run_tools(run_tools);
         Ok(Arc::new(factory))
     } else {
         // Standard single-agent mode: gate client tools on the agent's TOML opt-in
         // and apply its client_tool_filter.
         tracing::info!("Building Agent (orchestration.enabled = false)");
-        if config.hitl.is_some() {
+        if build_context.hitl.is_some() {
             tracing::info!(
                 "Single-agent HITL gate active: tool calls matching configured \
                  globs will require approval via the configured route"
             );
         }
-        let attached = if config.agent.enable_client_tools {
+        let attached = if build_context.agent.enable_client_tools {
             client_tools.map(|tools| {
                 tools
                     .into_iter()
-                    .filter(|t| config.client_tool_matches_filter(&t.name))
+                    .filter(|t| build_context.client_tool_matches_filter(&t.name))
                     .collect::<Vec<_>>()
             })
         } else {
             None
         };
-        let agent = Agent::new(config, run_tools(), attached).await?;
+        let agent = Agent::new(build_context, run_tools(), attached).await?;
         Ok(Arc::new(agent))
     }
 }
 
 /// Builder for constructing Rig agents from configuration
 pub struct AgentBuilder {
-    config: AgentRuntimeConfig,
+    build_context: AgentBuildContext,
 }
 
 impl AgentBuilder {
     /// Create a new builder from configuration
-    pub fn new(config: AgentRuntimeConfig) -> Self {
+    pub fn new(build_context: AgentBuildContext) -> Self {
         // Log the configuration for debugging
         tracing::info!("=== Agent Configuration ===");
 
         // Log provider and model based on enum variant
-        match &config.llm {
+        match &build_context.llm {
             LlmConfig::OpenAI { model, .. } => {
                 tracing::info!("LLM Provider: OpenAI");
                 tracing::info!("LLM Model: {}", model);
@@ -2221,9 +2231,9 @@ impl AgentBuilder {
             }
         }
 
-        tracing::info!("Agent Name: {}", config.agent.name);
+        tracing::info!("Agent Name: {}", build_context.agent.name);
 
-        if let Some(mcp_config) = &config.mcp {
+        if let Some(mcp_config) = &build_context.mcp {
             tracing::info!("=== MCP Servers Configuration ===");
             for (name, server) in &mcp_config.servers {
                 match server {
@@ -2284,9 +2294,9 @@ impl AgentBuilder {
             tracing::info!("No MCP servers configured");
         }
 
-        if !config.vector_stores.is_empty() {
+        if !build_context.vector_stores.is_empty() {
             tracing::info!("=== Vector Stores Configuration ===");
-            for vector_store in &config.vector_stores {
+            for vector_store in &build_context.vector_stores {
                 tracing::info!("Store: {}", vector_store.name);
                 match &vector_store.store {
                     VectorStoreType::InMemory { embedding_model } => {
@@ -2318,7 +2328,7 @@ impl AgentBuilder {
             }
         }
 
-        if let Some(tools) = &config.tools {
+        if let Some(tools) = &build_context.tools {
             tracing::info!("=== Tools Configuration ===");
             tracing::info!("Filesystem tool enabled: {}", tools.filesystem);
             tracing::info!("Custom tools: {:?}", tools.custom_tools);
@@ -2326,14 +2336,14 @@ impl AgentBuilder {
 
         tracing::info!("=== Configuration Ready ===");
 
-        Self { config }
+        Self { build_context }
     }
 
     /// Build an agent with all configured capabilities using Rig's DynClientBuilder
     pub async fn build_agent(&self) -> BuilderResult<Agent> {
         tracing::info!("=== Building Agent ===");
 
-        let agent = Agent::new(&self.config, vec![], None)
+        let agent = Agent::new(&self.build_context, vec![], None)
             .await
             .map_err(|e| BuilderError::AgentError(e.to_string()))?;
 
@@ -2463,16 +2473,22 @@ mod tests {
         /// Compose an agent the way a request does — gate wrapper included —
         /// over a manager whose tools span all three transports.
         async fn compose_agent(server: &RecordingMcpServer) -> rig::agent::Agent<UnpromptedModel> {
-            let config = AgentRuntimeConfig {
+            let build_context = AgentBuildContext {
                 tool_wrapper: Some(Arc::new(AlwaysOverrides)),
                 ..Default::default()
             };
             let manager = Some(Arc::new(manager_serving_all_transports(server).await));
             let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
-            PreparedAgent::add_all_tools(state, &config, &manager, &Arc::default(), Vec::new())
-                .await
-                .expect("composition succeeds")
-                .build()
+            PreparedAgent::add_all_tools(
+                state,
+                &build_context,
+                &manager,
+                &Arc::default(),
+                Vec::new(),
+            )
+            .await
+            .expect("composition succeeds")
+            .build()
         }
 
         /// The stdio branch must tag its adaptors `Stdio`, or a gated stdio
@@ -2580,10 +2596,10 @@ mod tests {
         /// The gate is bound to `run` here rather than left to find one,
         /// because rig calls the tool on its server task and no scope reaches
         /// there.
-        fn gated_config(
+        fn gated_build_context(
             pattern: &str,
             run: Arc<crate::run_context::RunContext>,
-        ) -> AgentRuntimeConfig {
+        ) -> AgentBuildContext {
             let gate = HitlApprovalWrapper::new(
                 Arc::from([pattern.into()]),
                 Arc::new(DecisionRoute::Conversational {
@@ -2595,7 +2611,7 @@ mod tests {
                 "test-instance-id".to_owned(),
             );
             gate.bind_run(run);
-            AgentRuntimeConfig {
+            AgentBuildContext {
                 tool_wrapper: Some(Arc::new(gate)),
                 ..Default::default()
             }
@@ -2608,7 +2624,7 @@ mod tests {
             tool: &str,
             run: Arc<crate::run_context::RunContext>,
         ) -> rig::agent::Agent<UnpromptedModel> {
-            let config = gated_config(pattern, run);
+            let config = gated_build_context(pattern, run);
             let manager = Some(Arc::new(manager_serving(server, namespace, tool).await));
             let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
             PreparedAgent::add_all_tools(state, &config, &manager, &Arc::default(), Vec::new())
@@ -2644,7 +2660,7 @@ mod tests {
                 "test-instance-id".to_owned(),
             );
             gate.bind_run(run);
-            let mut config = AgentRuntimeConfig {
+            let mut build_context = AgentBuildContext {
                 hitl_request_approval_tool: Some(
                     RequestApprovalTool::new(
                         route,
@@ -2656,16 +2672,21 @@ mod tests {
                 ),
                 ..Default::default()
             };
-            config.add_outer_tool_layer(Arc::new(WrapperLayer(Arc::new(gate))));
+            build_context.add_outer_tool_layer(Arc::new(WrapperLayer(Arc::new(gate))));
             let manager = Some(Arc::new(
                 manager_serving(&server, "github", "list_repos").await,
             ));
             let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
-            let agent =
-                PreparedAgent::add_all_tools(state, &config, &manager, &Arc::default(), Vec::new())
-                    .await
-                    .expect("composition succeeds")
-                    .build();
+            let agent = PreparedAgent::add_all_tools(
+                state,
+                &build_context,
+                &manager,
+                &Arc::default(),
+                Vec::new(),
+            )
+            .await
+            .expect("composition succeeds")
+            .build();
 
             let definitions = agent
                 .tool_server_handle
@@ -2756,14 +2777,14 @@ mod tests {
             manager.streamable_clients.extend(github.streamable_clients);
             manager.streamable_tools.extend(github.streamable_tools);
 
-            let config = AgentRuntimeConfig {
+            let build_context = AgentBuildContext {
                 mcp_filter: Some(vec!["github:*".into()]),
                 ..Default::default()
             };
             let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
             let agent = PreparedAgent::add_all_tools(
                 state,
-                &config,
+                &build_context,
                 &Some(Arc::new(manager)),
                 &Arc::default(),
                 Vec::new(),
@@ -2817,11 +2838,11 @@ mod tests {
         /// Each server gets its own loopback, so which one a call reached
         /// identifies the winner.
         async fn compose_over(manager: McpManager) -> rig::agent::Agent<UnpromptedModel> {
-            let config = AgentRuntimeConfig::default();
+            let build_context = AgentBuildContext::default();
             let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
             PreparedAgent::add_all_tools(
                 state,
-                &config,
+                &build_context,
                 &Some(Arc::new(manager)),
                 &Arc::default(),
                 Vec::new(),
@@ -3344,7 +3365,7 @@ mod tests {
                 "test-agent".to_owned(),
                 "test-instance-id".to_owned(),
             ));
-            let config = AgentRuntimeConfig {
+            let build_context = AgentBuildContext {
                 tool_wrapper: Some(Arc::clone(&gate) as Arc<dyn crate::tool_wrapper::ToolWrapper>),
                 ..Default::default()
             };
@@ -3354,11 +3375,16 @@ mod tests {
             let state = BuilderState::Initial(rig::agent::AgentBuilder::new(
                 ScriptedCompletionModel::new(Vec::new()),
             ));
-            let inner =
-                PreparedAgent::add_all_tools(state, &config, &manager, &Arc::default(), Vec::new())
-                    .await
-                    .expect("composition succeeds")
-                    .build();
+            let inner = PreparedAgent::add_all_tools(
+                state,
+                &build_context,
+                &manager,
+                &Arc::default(),
+                Vec::new(),
+            )
+            .await
+            .expect("composition succeeds")
+            .build();
             let prepared = prepared_over(
                 ProviderAgent::Scripted(inner),
                 ForwardedHeaders::default(),

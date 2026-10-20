@@ -17,7 +17,7 @@
 //! use aura::{RunId, StreamError, StreamItem};
 //! use futures::StreamExt;
 //!
-//! // `agent` was built for `run_id` (`AgentRuntimeConfig::run_id`), the one
+//! // `agent` was built for `run_id` (`AgentBuildContext::run_id`), the one
 //! // id it streams under.
 //! async fn handle_request(agent: impl StreamingAgent, run_id: RunId, query: &str) {
 //!     // The default leaves the run unbounded and lets it mint its own token.

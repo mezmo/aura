@@ -924,10 +924,6 @@ pub struct TodoToolsConfig {
 }
 
 /// Agent configuration (TOML `[agent]` table shape).
-///
-/// This is the TOML-facing view of the agent config. The runtime
-/// `AgentRuntimeConfig` in the `aura` crate extracts a subset (`AgentSettings`)
-/// for agent construction.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
@@ -1058,12 +1054,8 @@ pub struct SkillConfig {
     pub path: std::path::PathBuf,
 }
 
-/// Agent behavior settings (runtime-facing subset of [`AgentConfig`]).
-///
-/// This is the struct embedded in `aura::AgentRuntimeConfig`. It is produced by
-/// flattening `AgentConfig` inside the Rig builder, dropping TOML-only fields
-/// (`alias`, `created_at`, `model_owner`, `llm`) that runtime agent construction
-/// receives through other channels.
+/// Agent behavior settings: the subset of [`AgentConfig`] an agent is built
+/// with.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSettings {
     pub name: String,

@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{AgentRuntimeConfig, RunId};
+use crate::config::{AgentBuildContext, RunId};
 use crate::provider_agent::{StreamError, StreamItem};
 use crate::streaming::StreamingAgent;
 
@@ -24,7 +24,7 @@ use super::orchestrator::{
 /// Defers `Orchestrator` construction to `stream()` to avoid duplicate resource
 /// allocation and ensure MCP progress notifications route correctly.
 pub struct OrchestratorFactory {
-    agent_config: AgentRuntimeConfig,
+    agent_build_context: AgentBuildContext,
     run_tools: crate::builder::RunToolFactory,
     /// The one run this factory streams.
     run_id: RunId,
@@ -67,12 +67,12 @@ fn final_response(
 }
 
 impl OrchestratorFactory {
-    /// A factory for the run `agent_config.run_id`, or for a fresh run when
-    /// the config names none. The orchestration it spawns sees the same id.
-    pub fn new(mut agent_config: AgentRuntimeConfig) -> Self {
-        let run_id = *agent_config.run_id.get_or_insert_with(RunId::mint);
+    /// A factory for the run `agent_build_context.run_id`, or for a fresh run when
+    /// the build context names none. The orchestration it spawns sees the same id.
+    pub fn new(mut agent_build_context: AgentBuildContext) -> Self {
+        let run_id = *agent_build_context.run_id.get_or_insert_with(RunId::mint);
         Self {
-            agent_config,
+            agent_build_context,
             run_tools: crate::builder::no_run_tools(),
             run_id,
             stream_claim: crate::streaming::StreamClaim::default(),
@@ -101,7 +101,7 @@ impl OrchestratorFactory {
         usage_state: crate::UsageState,
         outer_budget: Option<Duration>,
     ) -> BoxStream<'static, Result<StreamItem, StreamError>> {
-        let agent_config = self.agent_config.clone();
+        let agent_build_context = self.agent_build_context.clone();
         let run_tools = std::sync::Arc::clone(&self.run_tools);
 
         // Create channel for orchestrator events
@@ -120,7 +120,7 @@ impl OrchestratorFactory {
         tokio::spawn(tracing::Instrument::instrument(
             crate::run_context::with_run(std::sync::Arc::clone(&run), async move {
                 let _done_guard = done_guard;
-                let mut orchestrator = match Orchestrator::new(agent_config).await {
+                let mut orchestrator = match Orchestrator::new(agent_build_context).await {
                     Ok(o) => o,
                     Err(e) => {
                         let _ = event_tx.send(Err(e)).await;
@@ -206,7 +206,7 @@ impl OrchestratorFactory {
 #[async_trait]
 impl StreamingAgent for OrchestratorFactory {
     fn get_provider_info(&self) -> (&str, &str) {
-        self.agent_config.llm.model_info()
+        self.agent_build_context.llm.model_info()
     }
 
     fn run_id(&self) -> RunId {
@@ -216,11 +216,11 @@ impl StreamingAgent for OrchestratorFactory {
     /// The coordinator's window: it holds the persistent conversation, so it
     /// is the context a client measures the session against.
     fn context_window(&self) -> Option<u64> {
-        self.agent_config.llm.context_window()
+        self.agent_build_context.llm.context_window()
     }
 
     fn skills(&self) -> &[aura_config::SkillConfig] {
-        &self.agent_config.agent.skills
+        &self.agent_build_context.agent.skills
     }
 
     async fn stream(
@@ -295,17 +295,17 @@ mod tests {
     #[test]
     fn a_factory_streams_the_run_it_was_built_for() {
         let named = crate::run_context::named_run_id("req_a");
-        let config = AgentRuntimeConfig {
+        let build_context = AgentBuildContext {
             run_id: Some(named),
-            ..AgentRuntimeConfig::default()
+            ..AgentBuildContext::default()
         };
-        let factory = OrchestratorFactory::new(config);
+        let factory = OrchestratorFactory::new(build_context);
         assert_eq!(factory.run_id(), named);
-        assert_eq!(factory.agent_config.run_id, Some(named));
+        assert_eq!(factory.agent_build_context.run_id, Some(named));
 
-        let unnamed = OrchestratorFactory::new(AgentRuntimeConfig::default());
-        let other = OrchestratorFactory::new(AgentRuntimeConfig::default());
-        assert_eq!(unnamed.agent_config.run_id, Some(unnamed.run_id()));
+        let unnamed = OrchestratorFactory::new(AgentBuildContext::default());
+        let other = OrchestratorFactory::new(AgentBuildContext::default());
+        assert_eq!(unnamed.agent_build_context.run_id, Some(unnamed.run_id()));
         assert_ne!(
             unnamed.run_id(),
             other.run_id(),
@@ -315,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_factory_refuses_a_stream_naming_another_run() {
-        let factory = OrchestratorFactory::new(AgentRuntimeConfig::default());
+        let factory = OrchestratorFactory::new(AgentBuildContext::default());
         let items: Vec<_> = factory
             .stream(
                 "q",

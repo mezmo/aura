@@ -57,7 +57,7 @@ pub use builder::{
     Agent, AgentBuilder, BeginRunError, FilesystemTools, PreparedAgent, RunToolFactory,
     build_streaming_agent, build_streaming_agent_with_tools, no_run_tools,
 };
-pub use config::{AgentRuntimeConfig, RunId, SessionId, ToolContextFactory};
+pub use config::{AgentBuildContext, RunId, SessionId, ToolContextFactory};
 // Pure config types are owned by `aura-config` and re-exported here for
 // ergonomic consumption (`aura::LlmConfig`, etc.).
 pub use aura_config::{

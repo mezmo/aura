@@ -1,10 +1,9 @@
-//! Runtime agent configuration.
+//! The context an agent is built from.
 //!
 //! Pure, serializable config types live in the `aura-config` crate. This module
-//! holds the runtime build-context struct (`AgentRuntimeConfig`) that composes
-//! those TOML-parsed values with non-serializable runtime fields: tool wrappers,
-//! persistence handles, shared chat history, scratchpad runtime state, and the
-//! session id.
+//! holds [`AgentBuildContext`], which composes those TOML-parsed values with
+//! non-serializable fields: tool wrappers, persistence handles, scratchpad
+//! state, and the session id.
 
 use crate::forwarded_headers::ForwardedHeaders;
 use crate::hitl::HitlPolicy;
@@ -28,10 +27,9 @@ pub type ToolContextFactory = Arc<dyn Fn(&str) -> ToolCallContext + Send + Sync>
 
 /// Resolved per-worker skill override.
 ///
-/// Absence from [`AgentRuntimeConfig::worker_skills`] means the worker
-/// inherits `[agent.skills]`. There is deliberately no `Inherit` variant and
-/// no `Default` impl, so map lookups cannot silently turn "inherit" into
-/// "disable" via `unwrap_or_default()`.
+/// Inheriting `[agent.skills]` is not a variant: there is deliberately no
+/// `Inherit` and no `Default` impl, so a map lookup cannot silently turn
+/// "inherit" into "disable" via `unwrap_or_default()`.
 #[derive(Debug, Clone)]
 pub enum WorkerSkills {
     /// `skills.local = []`: the worker gets no skills.
@@ -42,16 +40,14 @@ pub enum WorkerSkills {
 
 pub use aura_events::{RunId, SessionId};
 
-/// Runtime build context for constructing agents.
+/// The resolved input to preparing an agent: the TOML sections, what one
+/// request resolves before the build (forwarded headers, the HITL route,
+/// discovered skills), and what the orchestrator injects for a worker (tool
+/// wrapper, middleware, persistence, the `submit_result` decision).
 ///
-/// This composes the pure TOML-parsed config types from `aura-config` with
-/// non-serializable runtime extension points: tool wrappers, persistence
-/// handles, shared chat history, scratchpad runtime state, and the session id.
-///
-/// Note: this is the renamed successor of the old `AgentConfig`. The TOML
-/// `[agent]` table shape is now `aura_config::AgentConfig` — a distinct type.
+/// The TOML `[agent]` table is the distinct `aura_config::AgentConfig`.
 #[derive(Default)]
-pub struct AgentRuntimeConfig {
+pub struct AgentBuildContext {
     pub llm: LlmConfig,
     pub agent: AgentSettings,
     pub vector_stores: Vec<VectorStoreConfig>,
@@ -134,7 +130,7 @@ pub struct AgentRuntimeConfig {
 }
 
 // Manual Clone implementation because Arc<dyn Trait> fields require special handling
-impl Clone for AgentRuntimeConfig {
+impl Clone for AgentBuildContext {
     fn clone(&self) -> Self {
         Self {
             llm: self.llm.clone(),
@@ -166,9 +162,9 @@ impl Clone for AgentRuntimeConfig {
 }
 
 // Manual Debug implementation because Arc<dyn Trait> fields don't implement Debug
-impl std::fmt::Debug for AgentRuntimeConfig {
+impl std::fmt::Debug for AgentBuildContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AgentRuntimeConfig")
+        f.debug_struct("AgentBuildContext")
             .field("llm", &self.llm)
             .field("agent", &self.agent)
             .field("vector_stores", &self.vector_stores)
@@ -223,7 +219,7 @@ impl std::fmt::Debug for AgentRuntimeConfig {
     }
 }
 
-impl AgentRuntimeConfig {
+impl AgentBuildContext {
     /// The stack MCP tools run through: the placed layers outside the
     /// caller's `tool_wrapper`, so the wrapper sees the raw tool output and
     /// every layer still runs when both are set.
@@ -387,8 +383,8 @@ mod tests {
             }
         }
 
-        async fn run(config: &AgentRuntimeConfig) -> String {
-            let stack = config.tool_middleware_stack().expect("a stack");
+        async fn run(build_context: &AgentBuildContext) -> String {
+            let stack = build_context.tool_middleware_stack().expect("a stack");
             MiddlewareTool::new(Raw, stack)
                 .call(serde_json::json!({}))
                 .await
@@ -397,37 +393,37 @@ mod tests {
 
         #[tokio::test]
         async fn a_placed_layer_runs_outside_the_caller_wrapper() {
-            let mut config = AgentRuntimeConfig {
+            let mut build_context = AgentBuildContext {
                 tool_wrapper: Some(Arc::new(TagWrapper("w"))),
                 ..Default::default()
             };
-            config.add_outer_tool_layer(Arc::new(TagLayer("a")));
-            config.add_outer_tool_layer(Arc::new(TagLayer("b")));
-            assert_eq!(run(&config).await, "raw<w<a<b");
+            build_context.add_outer_tool_layer(Arc::new(TagLayer("a")));
+            build_context.add_outer_tool_layer(Arc::new(TagLayer("b")));
+            assert_eq!(run(&build_context).await, "raw<w<a<b");
         }
 
         #[tokio::test]
         async fn a_supplied_stack_keeps_the_caller_wrapper() {
-            let config = AgentRuntimeConfig {
+            let build_context = AgentBuildContext {
                 tool_wrapper: Some(Arc::new(TagWrapper("w"))),
                 tool_middleware: Some(MiddlewareStack::new(vec![Arc::new(TagLayer("a"))])),
                 ..Default::default()
             };
-            assert_eq!(run(&config).await, "raw<w<a");
+            assert_eq!(run(&build_context).await, "raw<w<a");
         }
 
         #[tokio::test]
         async fn either_alone_is_the_stack() {
-            let wrapper_only = AgentRuntimeConfig {
+            let wrapper_only = AgentBuildContext {
                 tool_wrapper: Some(Arc::new(TagWrapper("w"))),
                 ..Default::default()
             };
             assert_eq!(run(&wrapper_only).await, "raw<w");
-            let mut layers_only = AgentRuntimeConfig::default();
+            let mut layers_only = AgentBuildContext::default();
             layers_only.add_outer_tool_layer(Arc::new(TagLayer("a")));
             assert_eq!(run(&layers_only).await, "raw<a");
             assert!(
-                AgentRuntimeConfig::default()
+                AgentBuildContext::default()
                     .tool_middleware_stack()
                     .is_none()
             );
@@ -445,72 +441,72 @@ mod tests {
 
     #[test]
     fn test_tool_matches_filter_none() {
-        let config = AgentRuntimeConfig::default();
-        assert!(config.tool_matches_filter(&aura_tool("mezmo", "any_tool")));
+        let build_context = AgentBuildContext::default();
+        assert!(build_context.tool_matches_filter(&aura_tool("mezmo", "any_tool")));
     }
 
     #[test]
     fn test_tool_matches_filter_empty_denies_all() {
-        let config = AgentRuntimeConfig {
+        let build_context = AgentBuildContext {
             mcp_filter: Some(vec![]),
             ..Default::default()
         };
-        assert!(!config.tool_matches_filter(&aura_tool("mezmo", "any_tool")));
+        assert!(!build_context.tool_matches_filter(&aura_tool("mezmo", "any_tool")));
     }
 
     #[test]
     fn test_tool_matches_filter_patterns() {
-        let config = AgentRuntimeConfig {
+        let build_context = AgentBuildContext {
             mcp_filter: Some(vec!["mezmo_*".into(), "QueryKnowledgeBases".into()]),
             ..Default::default()
         };
 
-        assert!(config.tool_matches_filter(&aura_tool("mezmo", "mezmo_logs")));
-        assert!(config.tool_matches_filter(&aura_tool("mezmo", "mezmo_pipelines")));
-        assert!(config.tool_matches_filter(&aura_tool("kb", "QueryKnowledgeBases")));
-        assert!(!config.tool_matches_filter(&aura_tool("mezmo", "other_tool")));
+        assert!(build_context.tool_matches_filter(&aura_tool("mezmo", "mezmo_logs")));
+        assert!(build_context.tool_matches_filter(&aura_tool("mezmo", "mezmo_pipelines")));
+        assert!(build_context.tool_matches_filter(&aura_tool("kb", "QueryKnowledgeBases")));
+        assert!(!build_context.tool_matches_filter(&aura_tool("mezmo", "other_tool")));
     }
 
     #[test]
     fn test_tool_matches_filter_namespace_scoped_pattern() {
-        let config = AgentRuntimeConfig {
+        let build_context = AgentBuildContext {
             mcp_filter: Some(vec!["k8s:*".into()]),
             ..Default::default()
         };
 
-        assert!(config.tool_matches_filter(&aura_tool("k8s", "get_pods")));
-        assert!(!config.tool_matches_filter(&aura_tool("mezmo", "get_pods")));
+        assert!(build_context.tool_matches_filter(&aura_tool("k8s", "get_pods")));
+        assert!(!build_context.tool_matches_filter(&aura_tool("mezmo", "get_pods")));
     }
 
     #[test]
     fn test_client_tool_matches_filter_none() {
-        let config = AgentRuntimeConfig::default();
-        assert!(config.client_tool_matches_filter("Read"));
+        let build_context = AgentBuildContext::default();
+        assert!(build_context.client_tool_matches_filter("Read"));
     }
 
     #[test]
     fn test_client_tool_matches_filter_empty() {
-        let config = AgentRuntimeConfig {
+        let build_context = AgentBuildContext {
             agent: AgentSettings {
                 client_tool_filter: Some(vec![]),
                 ..AgentSettings::default()
             },
             ..Default::default()
         };
-        assert!(config.client_tool_matches_filter("Read"));
+        assert!(build_context.client_tool_matches_filter("Read"));
     }
 
     #[test]
     fn test_client_tool_matches_filter_patterns() {
-        let config = AgentRuntimeConfig {
+        let build_context = AgentBuildContext {
             agent: AgentSettings {
                 client_tool_filter: Some(vec!["Read".into(), "Find*".into()]),
                 ..AgentSettings::default()
             },
             ..Default::default()
         };
-        assert!(config.client_tool_matches_filter("Read"));
-        assert!(config.client_tool_matches_filter("FindFiles"));
-        assert!(!config.client_tool_matches_filter("Shell"));
+        assert!(build_context.client_tool_matches_filter("Read"));
+        assert!(build_context.client_tool_matches_filter("FindFiles"));
+        assert!(!build_context.client_tool_matches_filter("Shell"));
     }
 }

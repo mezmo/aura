@@ -279,8 +279,8 @@ pub struct AppState {
 
 Flow of ownership: `main` constructs one `PendingApprovals`, stores it on
 `AppState`, and the completions handler clones it into the per-request build
-context (`AgentRuntimeConfig`, the type [PR #201](https://github.com/mezmo/aura/pull/201)
-renamed from the old `AgentConfig`), alongside the `request_id`. The
+context (`AgentBuildContext`, the type [PR #201](https://github.com/mezmo/aura/pull/201)
+split from the old `AgentConfig`), alongside the `request_id`. The
 builder/orchestrator construct `DecisionRoute::Conversational` with it, and the
 ingress handler resolves through the same instance via `State`. The CLI in
 standalone mode constructs its own instance. If A2A grows HITL support, the
