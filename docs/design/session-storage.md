@@ -564,7 +564,7 @@ in-memory impl are always compiled.
 - **`/health`**: include a `session_store` block (`backend`, `ping` ok/latency) alongside
   the existing `a2a_server` block.
 
-The `RigBuilder` → `HitlRuntime` threading is unchanged in shape; only the concrete type
+The `RigBuilder` → `HitlPolicy` threading is unchanged in shape; only the concrete type
 behind `PendingApprovals` gains the store/bus handles.
 
 ---

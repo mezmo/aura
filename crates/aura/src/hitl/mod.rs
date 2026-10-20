@@ -49,7 +49,7 @@ pub use gate::HitlApprovalWrapper;
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 pub use registry::{ParkedApproval, PendingApprovals, ResolveError};
 pub use route::{
-    ApprovalError, DecisionRoute, HitlRuntime, PlaintextWebhookUrlError, WebhookClient,
+    ApprovalError, DecisionRoute, HitlPolicy, PlaintextWebhookUrlError, WebhookClient,
     cleartext_capture_warning, validate_webhook_signing_config, warn_on_cleartext_capture,
 };
 pub use signing::{

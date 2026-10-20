@@ -7,7 +7,7 @@
 //! session id.
 
 use crate::forwarded_headers::ForwardedHeaders;
-use crate::hitl::HitlRuntime;
+use crate::hitl::HitlPolicy;
 use crate::scratchpad::ScratchpadToolsConfig;
 use crate::tool_middleware::{MiddlewareStack, ToolMiddleware};
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper};
@@ -110,10 +110,8 @@ pub struct AgentRuntimeConfig {
     /// When set, workers get the `submit_result` tool for structured output.
     pub orchestration_submit_result: Option<crate::orchestration::SubmitResultDecision>,
 
-    /// Resolved HITL approval runtime (compiled globs + decision route), built
-    /// from `[hitl]` once per request and shared with orchestration workers.
-    /// `None` disables approval gating.
-    pub hitl: Option<HitlRuntime>,
+    /// The resolved `[hitl]` approval policy.
+    pub hitl: Option<HitlPolicy>,
 
     /// The run this build serves.
     pub run_id: Option<RunId>,

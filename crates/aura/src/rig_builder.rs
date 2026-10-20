@@ -75,7 +75,7 @@ impl RigBuilder {
     /// fallible build paths run it via [`Self::discovered_agent_config`].
     ///
     /// `req_headers` threads the inbound client request's HTTP headers through
-    /// to [`HitlRuntime::from_config`] for `[hitl.route]` `headers_from_request`
+    /// to [`HitlPolicy::from_config`] for `[hitl.route]` `headers_from_request`
     /// resolution. Pass `None` outside an HTTP request context.
     fn to_agent_config(&self, req_headers: Option<&HashMap<String, String>>) -> AgentRuntimeConfig {
         let agent = AgentSettings {
@@ -101,7 +101,7 @@ impl RigBuilder {
             memory_dir: self.config.memory_dir.clone(),
             orchestration: self.config.orchestration.clone(),
             hitl: self.config.hitl.as_ref().map(|cfg| {
-                crate::hitl::HitlRuntime::from_config(
+                crate::hitl::HitlPolicy::from_config(
                     cfg,
                     &self.pending_approvals,
                     self.hitl_hmac.as_ref(),

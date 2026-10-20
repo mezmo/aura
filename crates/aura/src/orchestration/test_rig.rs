@@ -732,7 +732,7 @@ pub(crate) async fn park_orchestrator_in(
     let mut workers = std::collections::HashMap::new();
     workers.insert(worker_name, worker);
     let config = crate::config::AgentRuntimeConfig {
-        hitl: Some(crate::hitl::HitlRuntime {
+        hitl: Some(crate::hitl::HitlPolicy {
             patterns: Arc::from(["kubectl_*".into()]),
             route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                 registry: registry.clone(),

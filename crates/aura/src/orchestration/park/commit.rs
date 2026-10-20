@@ -712,7 +712,7 @@ mod tests {
     fn config_fingerprint_stable_and_sensitive() {
         fn config(pattern: &str) -> crate::config::AgentRuntimeConfig {
             crate::config::AgentRuntimeConfig {
-                hitl: Some(crate::hitl::HitlRuntime {
+                hitl: Some(crate::hitl::HitlPolicy {
                     patterns: Arc::from([pattern.into()]),
                     route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                         registry: PendingApprovals::new(),

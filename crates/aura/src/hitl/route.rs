@@ -24,25 +24,26 @@ use crate::run_context::emit;
 /// phase for the full route timeout (e.g. 300s).
 const WEBHOOK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Request-stable HITL state shared by the config gate and the agent-callable
-/// tool: the compiled glob patterns and the resolved decision route. Built once
-/// per request in the builder and shared (by `Arc`) across orchestration
-/// workers; the per-agent [`AgentScope`] and request id are supplied at gate
-/// construction rather than stored here.
-///
-/// [`AgentScope`]: super::decision::AgentScope
+/// An agent's approval policy: which tool calls need approval (the compiled
+/// `require_approval` globs), where the decision comes from (the resolved
+/// route), and whether an unattended call parks.
 #[derive(Clone)]
-pub struct HitlRuntime {
+pub struct HitlPolicy {
     pub patterns: Arc<[GlobPattern]>,
     pub route: Arc<DecisionRoute>,
     /// `[hitl.park].enabled`.
     pub park_enabled: bool,
 }
 
-impl HitlRuntime {
-    /// Resolve the request-stable runtime from parsed `[hitl]` config: share the
-    /// compiled globs and build the decision route once (the webhook client and
-    /// its connection pool are created here).
+impl HitlPolicy {
+    /// Resolve the policy from parsed `[hitl]` config, once per request: share
+    /// the compiled globs and build the decision route (the webhook client and
+    /// its connection pool are created here). The config gate, the
+    /// agent-callable tool, and every orchestration worker share the result,
+    /// so the per-agent [`AgentScope`] and the request id are supplied when
+    /// each gate is built rather than stored here.
+    ///
+    /// [`AgentScope`]: super::decision::AgentScope
     ///
     /// `hmac` is the startup-loaded webhook HMAC shared by every agent build;
     /// `None` leaves the webhook route unsigned.
@@ -426,7 +427,7 @@ impl WebhookReply {
 impl WebhookClient {
     /// Builds an unsigned client. Deliberately does NOT read the environment
     /// (so constructing one in a test never races env-mutating tests):
-    /// production construction goes through [`HitlRuntime::from_config`],
+    /// production construction goes through [`HitlPolicy::from_config`],
     /// which receives the startup-loaded HMAC and calls `with_signing`.
     #[must_use]
     pub fn new(client: reqwest::Client, url: WebhookUrl) -> Self {
@@ -1649,8 +1650,8 @@ mod tests {
             }
         }
 
-        fn signing_of(runtime: &super::super::HitlRuntime) -> &EgressSigning {
-            match &*runtime.route {
+        fn signing_of(policy: &super::super::HitlPolicy) -> &EgressSigning {
+            match &*policy.route {
                 super::super::DecisionRoute::Webhook { client, .. } => &client.signing,
                 super::super::DecisionRoute::Conversational { .. } => {
                     panic!("expected webhook route")
@@ -1660,14 +1661,14 @@ mod tests {
 
         #[test]
         fn from_config_threads_hmac_into_webhook_route() {
-            use super::super::HitlRuntime;
+            use super::super::HitlPolicy;
 
             let config =
                 |url: &str| webhook_config(url, aura_config::ToolHeaderMappings::default());
             let pending = crate::hitl::PendingApprovals::new();
             let hmac = test_hmac();
 
-            let signed = HitlRuntime::from_config(
+            let signed = HitlPolicy::from_config(
                 &config("https://approvals.example.com/aura"),
                 &pending,
                 Some(&hmac),
@@ -1678,7 +1679,7 @@ mod tests {
                 "a threaded secret must produce signed egress"
             );
 
-            let unsigned = HitlRuntime::from_config(
+            let unsigned = HitlPolicy::from_config(
                 &config("http://approvals.example.com/aura"),
                 &pending,
                 None,
@@ -1689,7 +1690,7 @@ mod tests {
                 "no threaded secret must produce unsigned egress"
             );
 
-            let plaintext = HitlRuntime::from_config(
+            let plaintext = HitlPolicy::from_config(
                 &config("http://approvals.example.com/aura"),
                 &pending,
                 Some(&hmac),
@@ -1704,11 +1705,11 @@ mod tests {
         /// Capture does not require https: TLS may be terminated ahead of the process (trusted gateway, service-to-service), so a cleartext url with mappings builds a usable unsigned route. Only the HMAC-secret rule rejects plaintext, unchanged by capture.
         #[test]
         fn from_config_allows_capture_over_plaintext_url() {
-            use super::super::HitlRuntime;
+            use super::super::HitlPolicy;
 
             let pending = crate::hitl::PendingApprovals::new();
 
-            let plaintext = HitlRuntime::from_config(
+            let plaintext = HitlPolicy::from_config(
                 &webhook_config("http://approvals.example.com/aura", user_mapping()),
                 &pending,
                 None,
@@ -1719,7 +1720,7 @@ mod tests {
                 "plaintext http:// with capture and no secret must stay usable"
             );
 
-            let secure = HitlRuntime::from_config(
+            let secure = HitlPolicy::from_config(
                 &webhook_config("https://approvals.example.com/aura", user_mapping()),
                 &pending,
                 None,
@@ -1730,7 +1731,7 @@ mod tests {
                 "https:// with capture and no secret is a usable unsigned route"
             );
 
-            let legacy = HitlRuntime::from_config(
+            let legacy = HitlPolicy::from_config(
                 &webhook_config(
                     "http://approvals.example.com/aura",
                     aura_config::ToolHeaderMappings::default(),
@@ -1746,7 +1747,7 @@ mod tests {
 
             // The HMAC-secret rule is the one that still rejects plaintext,
             // and capture being configured does not soften it.
-            let signed_plaintext = HitlRuntime::from_config(
+            let signed_plaintext = HitlPolicy::from_config(
                 &webhook_config("http://approvals.example.com/aura", user_mapping()),
                 &pending,
                 Some(&test_hmac()),
@@ -1773,12 +1774,12 @@ mod tests {
             String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string()
         }
 
-        /// Construction (`HitlRuntime::from_config`, and so `WebhookClient` construction) runs once per chat request, not once at startup, so it must never warn on cleartext capture itself, or every request on the route would repeat the warning. [`warn_on_cleartext_capture`] is the boot-time seam for it.
+        /// Construction (`HitlPolicy::from_config`, and so `WebhookClient` construction) runs once per chat request, not once at startup, so it must never warn on cleartext capture itself, or every request on the route would repeat the warning. [`warn_on_cleartext_capture`] is the boot-time seam for it.
         #[test]
         fn capture_over_plaintext_url_stays_silent_at_construction() {
             let pending = crate::hitl::PendingApprovals::new();
             let log = captured_warn_log(|| {
-                let _ = super::super::HitlRuntime::from_config(
+                let _ = super::super::HitlPolicy::from_config(
                     &webhook_config("http://approvals.example.com/aura", user_mapping()),
                     &pending,
                     None,

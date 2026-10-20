@@ -5633,7 +5633,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
     ) -> Result<String, StreamError> {
         let Some(hitl) = self.agent_config.hitl.clone() else {
-            return Err("run parked without the HITL runtime configured".into());
+            return Err("run parked without a HITL policy configured".into());
         };
         let crate::hitl::DecisionRoute::Conversational { registry, timeout } = &*hitl.route else {
             return Err("run parked without the conversational route".into());
@@ -8041,7 +8041,7 @@ mod tests {
                     timeout: Duration::from_secs(5),
                 }
             };
-            config.hitl = Some(crate::hitl::HitlRuntime {
+            config.hitl = Some(crate::hitl::HitlPolicy {
                 patterns: Arc::from(["kubectl_*".into()]),
                 route: Arc::new(route),
                 park_enabled,
@@ -8083,7 +8083,7 @@ mod tests {
         let registry =
             PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
         let config = AgentRuntimeConfig {
-            hitl: Some(crate::hitl::HitlRuntime {
+            hitl: Some(crate::hitl::HitlPolicy {
                 patterns: Arc::from(["kubectl_*".into()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                     registry: registry.clone(),
@@ -8197,7 +8197,7 @@ mod tests {
 
         let registry = PendingApprovals::with_backend(store, Arc::new(InMemoryEventBus::new()));
         let config = AgentRuntimeConfig {
-            hitl: Some(crate::hitl::HitlRuntime {
+            hitl: Some(crate::hitl::HitlPolicy {
                 patterns: Arc::from(["kubectl_*".into()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                     registry: registry.clone(),
@@ -8770,7 +8770,7 @@ mod tests {
         let run_id = aura_events::RunId::mint();
         let request_id = run_id.to_string();
         let config = AgentRuntimeConfig {
-            hitl: Some(crate::hitl::HitlRuntime {
+            hitl: Some(crate::hitl::HitlPolicy {
                 patterns: Arc::from(["echo_tool".into()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                     registry: registry.clone(),
@@ -9063,7 +9063,7 @@ mod tests {
             },
         )]);
         let config = AgentRuntimeConfig {
-            hitl: Some(crate::hitl::HitlRuntime {
+            hitl: Some(crate::hitl::HitlPolicy {
                 patterns: Arc::from(["echo_tool".into()]),
                 route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                     registry: registry.clone(),
