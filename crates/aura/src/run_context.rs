@@ -601,7 +601,7 @@ mod tests {
 
         child
             .emit(AgentEvent::new(
-                aura_events::AgentContext::single_agent(),
+                aura_events::EmittingAgent::single_agent(),
                 aura_events::agent::AgentEventPayload::TextDelta {
                     content: "hi".into(),
                 },

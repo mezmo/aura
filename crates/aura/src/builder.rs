@@ -2032,7 +2032,7 @@ impl StreamingAgent for Agent {
         // call can still find it.
         if let Some(mcp_manager) = &self.prepared.mcp_manager {
             mcp_manager
-                .bind_call(Arc::clone(&run), aura_events::AgentContext::single_agent())
+                .bind_call(Arc::clone(&run), aura_events::EmittingAgent::single_agent())
                 .await;
         }
 
@@ -2049,7 +2049,7 @@ impl StreamingAgent for Agent {
                 Arc::clone(&run),
                 Box::pin(crate::streaming::tee_content(
                     run,
-                    aura_events::AgentContext::single_agent(),
+                    aura_events::EmittingAgent::single_agent(),
                     stream,
                 )),
             ))

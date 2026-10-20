@@ -31,7 +31,7 @@ use crate::mcp::response::extract_tool_result;
 use crate::mcp::types::ToolNamespace;
 use aura_events::ToolName;
 use aura_events::agent::{AgentEvent, AgentEventPayload};
-use aura_events::{AgentContext, RunId};
+use aura_events::{EmittingAgent, RunId};
 
 /// Custom HTTP client that captures the underlying HTTP status when a request
 /// fails.
@@ -416,7 +416,7 @@ fn owners_of(
 #[derive(Clone, Debug)]
 pub struct CallContext {
     pub run: Arc<crate::run_context::RunContext>,
-    pub agent: AgentContext,
+    pub agent: EmittingAgent,
 }
 
 impl Clone for McpClient {
@@ -554,7 +554,7 @@ impl McpClient {
     ///
     /// Run and agent are stored together so a reader sees one run paired with
     /// that same run's agent.
-    pub async fn bind_call(&self, run: Arc<crate::run_context::RunContext>, agent: AgentContext) {
+    pub async fn bind_call(&self, run: Arc<crate::run_context::RunContext>, agent: EmittingAgent) {
         debug!("Bound MCP client to call: {}", run.id());
         *self.bound_call.write().await = Some(CallContext { run, agent });
     }
@@ -1095,7 +1095,7 @@ pub(crate) mod tests {
     fn owner(name: &str) -> CallContext {
         CallContext {
             run: crate::run_context::RunContext::detached(crate::run_context::named_run_id(name)),
-            agent: AgentContext::single_agent(),
+            agent: EmittingAgent::single_agent(),
         }
     }
 
@@ -1631,7 +1631,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_call_answers_only_for_the_request_that_named_it() {
         let (_server, client) = client_and_server(&requester_headers()).await;
-        let worker = AgentContext::worker("log_worker", None, "coordinator");
+        let worker = EmittingAgent::worker("log_worker", None, "coordinator");
         let req_1 = crate::run_context::named_run_id("req-1").to_string();
         let req_2 = crate::run_context::named_run_id("req-2").to_string();
 
@@ -1677,7 +1677,7 @@ pub(crate) mod tests {
                 crate::run_context::RunContext::detached(crate::run_context::named_run_id(
                     "req_bound",
                 )),
-                AgentContext::single_agent(),
+                EmittingAgent::single_agent(),
             )
             .await;
         assert_eq!(
@@ -1696,7 +1696,7 @@ pub(crate) mod tests {
                 crate::run_context::RunContext::detached(crate::run_context::named_run_id(
                     "req_bound",
                 )),
-                AgentContext::single_agent(),
+                EmittingAgent::single_agent(),
             )
             .await;
 

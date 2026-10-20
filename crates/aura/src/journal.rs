@@ -778,7 +778,7 @@ mod tests {
         // channel the drain reads.
         let passed = crate::streaming::tee_content(
             context,
-            aura_events::AgentContext::single_agent(),
+            aura_events::EmittingAgent::single_agent(),
             futures::stream::iter(items),
         )
         .collect::<Vec<_>>()

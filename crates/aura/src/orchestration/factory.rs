@@ -142,7 +142,7 @@ impl OrchestratorFactory {
                     mcp_manager
                         .bind_call(
                             std::sync::Arc::clone(&run),
-                            aura_events::AgentContext::coordinator(),
+                            aura_events::EmittingAgent::coordinator(),
                         )
                         .await;
                     let snapshot = mcp_manager.server_status_snapshot();
@@ -272,7 +272,7 @@ impl StreamingAgent for OrchestratorFactory {
         // is attributed there rather than to any worker that fed it.
         let stream = Box::pin(crate::streaming::tee_content(
             run,
-            aura_events::AgentContext::coordinator(),
+            aura_events::EmittingAgent::coordinator(),
             stream,
         ));
 

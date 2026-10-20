@@ -831,7 +831,7 @@ impl McpManager {
     pub async fn bind_call(
         &self,
         run: std::sync::Arc<crate::run_context::RunContext>,
-        agent: aura_events::AgentContext,
+        agent: aura_events::EmittingAgent,
     ) {
         let mut total_clients = 0;
         for client in self.clients() {

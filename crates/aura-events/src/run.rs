@@ -328,7 +328,7 @@ impl SessionEvent {
 mod tests {
     use super::*;
     use crate::agent::AgentEventPayload;
-    use crate::{AgentContext, TokenCount};
+    use crate::{EmittingAgent, TokenCount};
     use serde_json::json;
 
     const RUN: &str = "0191e8c0-1111-7000-8000-000000000001";
@@ -914,7 +914,7 @@ mod tests {
             1,
             Some(run_id()),
             SessionEventPayload::Agent(AgentEvent::new(
-                AgentContext::single_agent(),
+                EmittingAgent::single_agent(),
                 AgentEventPayload::TextDelta {
                     content: "done".to_string(),
                 },
@@ -934,7 +934,7 @@ mod tests {
             7,
             Some(run_id()),
             SessionEventPayload::Agent(AgentEvent::new(
-                AgentContext::coordinator(),
+                EmittingAgent::coordinator(),
                 AgentEventPayload::RunParked {
                     run_id: RUN.to_string(),
                     decision_ids: vec!["d1".to_string()],

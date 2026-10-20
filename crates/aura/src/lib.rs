@@ -107,7 +107,7 @@ pub use request_cancellation::{RequestCancelToken, RequestId};
 pub use rmcp::model::{NumberOrString, ProgressToken};
 pub use skill_tool::{LoadSkillTool, ReadSkillFileTool, SkillToolset, render_skill_catalog};
 pub use stream_events::{
-    AgentContext, AuraStreamEvent, CorrelationContext, CorrelationContextExt, WorkerPhase,
+    AuraStreamEvent, CorrelationContext, CorrelationContextExt, EmittingAgent, WorkerPhase,
     format_named_sse,
 };
 pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};

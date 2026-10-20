@@ -162,7 +162,7 @@ pub mod context {
 
     use super::openai::UsageInfo;
     use aura::CorrelationContextExt;
-    use aura::stream_events::{AgentContext, CorrelationContext};
+    use aura::stream_events::{CorrelationContext, EmittingAgent};
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -186,7 +186,7 @@ pub mod context {
         pub model_str: String,
         pub created_timestamp: u64,
         pub max_tokens: Option<u32>,
-        pub agent_context: AgentContext,
+        pub emitting_agent: EmittingAgent,
         pub correlation: CorrelationContext,
     }
 
@@ -203,14 +203,14 @@ pub mod context {
                 model_str,
                 created_timestamp,
                 max_tokens,
-                agent_context: AgentContext::single_agent(),
+                emitting_agent: EmittingAgent::single_agent(),
                 correlation: CorrelationContext::from_current_span(session_id),
             }
         }
 
-        /// Set agent_context to "coordinator" for orchestration mode.
+        /// Set `emitting_agent` to the coordinator for orchestration mode.
         pub fn with_orchestration(mut self) -> Self {
-            self.agent_context = AgentContext::coordinator();
+            self.emitting_agent = EmittingAgent::coordinator();
             self
         }
     }

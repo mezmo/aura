@@ -23,24 +23,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::orchestration::{IterationTimings, RoutingMode};
 use crate::{
-    AgentContext, ApprovalCompleted, ApprovalPending, ApprovalRequested, McpServerStatus, Progress,
-    ProgressToken, TokenCount, TokenUsage, ToolCallId, ToolName, WorkerPhase,
+    ApprovalCompleted, ApprovalPending, ApprovalRequested, EmittingAgent, McpServerStatus,
+    Progress, ProgressToken, TokenCount, TokenUsage, ToolCallId, ToolName, WorkerPhase,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentEvent {
-    pub agent: AgentContext,
+    pub agent: EmittingAgent,
     pub payload: AgentEventPayload,
 }
 
 impl AgentEvent {
-    pub fn new(agent: AgentContext, payload: AgentEventPayload) -> Self {
+    pub fn new(agent: EmittingAgent, payload: AgentEventPayload) -> Self {
         Self { agent, payload }
     }
 
     /// Attributes the payload to `agent_id: "main"`.
     pub fn single_agent(payload: AgentEventPayload) -> Self {
-        Self::new(AgentContext::single_agent(), payload)
+        Self::new(EmittingAgent::single_agent(), payload)
     }
 }
 
@@ -326,7 +326,7 @@ mod tests {
 
         let alone = AgentEvent::single_agent(payload());
         let worker = AgentEvent::new(
-            AgentContext::worker("log_worker", None, "coordinator"),
+            EmittingAgent::worker("log_worker", None, "coordinator"),
             payload(),
         );
 
@@ -338,16 +338,16 @@ mod tests {
     /// the same id a lone agent uses, so only the parent tells them apart.
     #[test]
     fn a_coordinator_owned_call_named_main_is_not_the_lone_agent() {
-        let coordinator_owned = AgentContext::worker("main", None, "coordinator");
+        let coordinator_owned = EmittingAgent::worker("main", None, "coordinator");
 
         assert!(!coordinator_owned.is_single_agent());
-        assert!(AgentContext::single_agent().is_single_agent());
+        assert!(EmittingAgent::single_agent().is_single_agent());
     }
 
     #[test]
     fn an_event_carries_its_emitting_agent() {
         let event = AgentEvent::new(
-            AgentContext::worker("log_worker", None, "orchestrator"),
+            EmittingAgent::worker("log_worker", None, "orchestrator"),
             AgentEventPayload::TextDelta {
                 content: "scanning".to_string(),
             },
@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn an_unknown_type_reads_as_unknown_and_cannot_be_serialized() {
         let event: AgentEvent = serde_json::from_value(json!({
-            "agent": serde_json::to_value(AgentContext::single_agent()).unwrap(),
+            "agent": serde_json::to_value(EmittingAgent::single_agent()).unwrap(),
             "payload": { "type": "telemetry", "cpu": 0.5 }
         }))
         .unwrap();

@@ -223,7 +223,7 @@ string_newtype! {
 }
 
 /// Identifier for one run: a unit of work within a session, from a prompt to
-/// a terminal state. It is not [`AgentContext::agent_id`], which attributes an
+/// a terminal state. It is not [`EmittingAgent::agent_id`], which attributes an
 /// event *within* a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "uuid::Uuid", into = "uuid::Uuid")]
@@ -505,16 +505,16 @@ pub const COORDINATOR_AGENT_ID: &str = "coordinator";
 /// the coordinator's place in the agent hierarchy.
 pub const CONVERSATION_AGENT_ID: &str = "main";
 
-/// Context identifying which agent emitted an event.
+/// The agent that emitted an event.
 ///
-/// For single-agent deployments, use `AgentContext::single_agent()` which sets
+/// For single-agent deployments, use `EmittingAgent::single_agent()` which sets
 /// `agent_id: "main"`. For multi-agent orchestrators, populate `parent_agent_id`
 /// to establish the agent hierarchy.
 ///
-/// Note: `AgentContext::default()` gives an empty `agent_id` - use `single_agent()`
-/// for the standard single-agent context.
+/// Note: `EmittingAgent::default()` gives an empty `agent_id` - use `single_agent()`
+/// for the lone agent of a single-agent run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct AgentContext {
+pub struct EmittingAgent {
     /// Unique identifier for this agent (e.g., "main", "log_worker", "rca_worker")
     #[serde(default)]
     pub agent_id: String,
@@ -526,8 +526,8 @@ pub struct AgentContext {
     pub parent_agent_id: Option<String>,
 }
 
-impl AgentContext {
-    /// Create a default single-agent context, identified as
+impl EmittingAgent {
+    /// The lone agent of an unorchestrated run, identified as
     /// [`CONVERSATION_AGENT_ID`].
     pub fn single_agent() -> Self {
         Self {
@@ -547,7 +547,7 @@ impl AgentContext {
         }
     }
 
-    /// Create a single-agent context with a custom name
+    /// The lone agent of an unorchestrated run, with a display name.
     pub fn single_agent_with_name(name: impl Into<String>) -> Self {
         Self {
             agent_id: CONVERSATION_AGENT_ID.to_string(),
@@ -566,7 +566,7 @@ impl AgentContext {
         self.agent_id == CONVERSATION_AGENT_ID && self.parent_agent_id.is_none()
     }
 
-    /// Create a worker agent context with parent hierarchy
+    /// A worker, naming the agent above it in the hierarchy.
     pub fn worker(
         id: impl Into<String>,
         name: Option<String>,
@@ -816,7 +816,7 @@ pub enum AuraStreamEvent {
         tool_name: String,
         arguments: serde_json::Value,
         #[serde(flatten)]
-        agent: AgentContext,
+        agent: EmittingAgent,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -836,7 +836,7 @@ pub enum AuraStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
         #[serde(flatten)]
-        agent: AgentContext,
+        agent: EmittingAgent,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -849,7 +849,7 @@ pub enum AuraStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         progress_token: Option<ProgressToken>,
         #[serde(flatten)]
-        agent: AgentContext,
+        agent: EmittingAgent,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -857,7 +857,7 @@ pub enum AuraStreamEvent {
     Reasoning {
         content: String,
         #[serde(flatten)]
-        agent: AgentContext,
+        agent: EmittingAgent,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -872,7 +872,7 @@ pub enum AuraStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         progress_token: Option<ProgressToken>,
         #[serde(flatten)]
-        agent: AgentContext,
+        agent: EmittingAgent,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -882,7 +882,7 @@ pub enum AuraStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         task_id: Option<String>,
         #[serde(flatten)]
-        agent: AgentContext,
+        agent: EmittingAgent,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -902,7 +902,7 @@ pub enum AuraStreamEvent {
         /// Total tokens used
         total_tokens: u64,
         #[serde(flatten)]
-        agent: AgentContext,
+        agent: EmittingAgent,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -936,7 +936,7 @@ pub enum AuraStreamEvent {
         /// Tokens extracted from scratchpad back into context by this agent.
         tokens_extracted: usize,
         #[serde(flatten)]
-        agent: AgentContext,
+        agent: EmittingAgent,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -951,7 +951,7 @@ pub enum AuraStreamEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_window: Option<u64>,
         #[serde(flatten)]
-        agent: AgentContext,
+        agent: EmittingAgent,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -1007,7 +1007,7 @@ impl AuraStreamEvent {
         tool_id: impl Into<String>,
         tool_name: impl Into<String>,
         arguments: serde_json::Value,
-        agent: AgentContext,
+        agent: EmittingAgent,
         correlation: CorrelationContext,
     ) -> Self {
         Self::ToolRequested {
@@ -1024,7 +1024,7 @@ impl AuraStreamEvent {
         tool_id: impl Into<String>,
         tool_name: impl Into<String>,
         progress_token: Option<ProgressToken>,
-        agent: AgentContext,
+        agent: EmittingAgent,
         correlation: CorrelationContext,
     ) -> Self {
         Self::ToolStart {
@@ -1042,7 +1042,7 @@ impl AuraStreamEvent {
         tool_name: impl Into<String>,
         duration_ms: u64,
         result: impl Into<String>,
-        agent: AgentContext,
+        agent: EmittingAgent,
         correlation: CorrelationContext,
     ) -> Self {
         Self::ToolComplete {
@@ -1063,7 +1063,7 @@ impl AuraStreamEvent {
         tool_name: impl Into<String>,
         duration_ms: u64,
         error: impl Into<String>,
-        agent: AgentContext,
+        agent: EmittingAgent,
         correlation: CorrelationContext,
     ) -> Self {
         Self::ToolComplete {
@@ -1081,7 +1081,7 @@ impl AuraStreamEvent {
     /// Create a Reasoning event.
     pub fn reasoning(
         content: impl Into<String>,
-        agent: AgentContext,
+        agent: EmittingAgent,
         correlation: CorrelationContext,
     ) -> Self {
         Self::Reasoning {
@@ -1097,7 +1097,7 @@ impl AuraStreamEvent {
         phase: impl Into<String>,
         percent: Option<u8>,
         progress_token: Option<ProgressToken>,
-        agent: AgentContext,
+        agent: EmittingAgent,
         correlation: CorrelationContext,
     ) -> Self {
         Self::Progress {
@@ -1137,7 +1137,7 @@ impl AuraStreamEvent {
         prompt_tokens: u64,
         completion_tokens: u64,
         total_tokens: u64,
-        agent: AgentContext,
+        agent: EmittingAgent,
         correlation: CorrelationContext,
     ) -> Self {
         Self::ToolUsage {
@@ -1182,7 +1182,7 @@ impl AuraStreamEvent {
     pub fn scratchpad_usage(
         tokens_intercepted: usize,
         tokens_extracted: usize,
-        agent: AgentContext,
+        agent: EmittingAgent,
         correlation: CorrelationContext,
     ) -> Self {
         Self::ScratchpadUsage {
@@ -1198,7 +1198,7 @@ impl AuraStreamEvent {
         context_tokens: u64,
         response_tokens: u64,
         context_window: Option<u64>,
-        agent: AgentContext,
+        agent: EmittingAgent,
         correlation: CorrelationContext,
     ) -> Self {
         Self::ContextUsage {
@@ -1231,6 +1231,28 @@ mod tests {
     #[test]
     fn percent_is_capped_at_a_hundred() {
         assert_eq!(Progress::ratio(150.0, 100.0).percent(), Some(100));
+    }
+
+    /// Clients read these keys off the `agent` field of every event.
+    #[test]
+    fn an_emitting_agent_serializes_to_the_agent_keys_clients_read() {
+        assert_eq!(
+            serde_json::to_value(EmittingAgent::single_agent()).unwrap(),
+            serde_json::json!({ "agent_id": "main" }),
+        );
+        assert_eq!(
+            serde_json::to_value(EmittingAgent::worker(
+                "log_worker",
+                Some("Log Worker".to_string()),
+                "coordinator",
+            ))
+            .unwrap(),
+            serde_json::json!({
+                "agent_id": "log_worker",
+                "agent_name": "Log Worker",
+                "parent_agent_id": "coordinator",
+            }),
+        );
     }
 
     #[test]
@@ -1465,7 +1487,7 @@ mod tests {
             "Shell",
             1500,
             "output",
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::new("s1", None),
         );
         let json = serde_json::to_string(&event).unwrap();
@@ -1540,7 +1562,7 @@ mod tests {
             12_000,
             340,
             Some(200_000),
-            AgentContext::worker("log-analyst", None, "orchestrator"),
+            EmittingAgent::worker("log-analyst", None, "orchestrator"),
             CorrelationContext::new("s1", None),
         );
         assert_eq!(event.event_name(), "aura.context_usage");
@@ -1612,7 +1634,7 @@ mod tests {
             "call_1",
             "Shell",
             serde_json::json!({"cmd": "ls"}),
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::new("s1", None),
         );
         let json = serde_json::to_string(&event).unwrap();

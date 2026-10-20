@@ -304,13 +304,13 @@ fn extract_task_id(tool_call_id: &str) -> Option<usize> {
 /// attribution the envelope already holds.
 fn by_worker(worker_id: &str, payload: AgentEventPayload) -> AgentEvent {
     AgentEvent::new(
-        aura_events::AgentContext::worker(worker_id, None, aura_events::COORDINATOR_AGENT_ID),
+        aura_events::EmittingAgent::worker(worker_id, None, aura_events::COORDINATOR_AGENT_ID),
         payload,
     )
 }
 
 fn by_coordinator(payload: AgentEventPayload) -> AgentEvent {
-    AgentEvent::new(aura_events::AgentContext::coordinator(), payload)
+    AgentEvent::new(aura_events::EmittingAgent::coordinator(), payload)
 }
 
 /// Converts an observed tool call into the agent event it is published as.

@@ -238,7 +238,7 @@ impl AgentRun {
 /// is the coordinator's, not that of any worker that fed it.
 pub fn tee_content<S>(
     run: std::sync::Arc<RunContext>,
-    agent: aura_events::AgentContext,
+    agent: aura_events::EmittingAgent,
     inner: S,
 ) -> impl futures::Stream<Item = Result<StreamItem, StreamError>>
 where
@@ -608,14 +608,15 @@ mod tests {
         }
 
         async fn teed(items: Vec<Result<StreamItem, StreamError>>) -> (usize, Vec<Payload>) {
-            let (_, passed, seen) = teed_as(aura_events::AgentContext::single_agent(), items).await;
+            let (_, passed, seen) =
+                teed_as(aura_events::EmittingAgent::single_agent(), items).await;
             (passed, seen)
         }
 
         async fn teed_as(
-            agent: aura_events::AgentContext,
+            agent: aura_events::EmittingAgent,
             items: Vec<Result<StreamItem, StreamError>>,
-        ) -> (Vec<aura_events::AgentContext>, usize, Vec<Payload>) {
+        ) -> (Vec<aura_events::EmittingAgent>, usize, Vec<Payload>) {
             let (run, mut events) =
                 RunContext::channel(crate::run_context::named_run_id("run_tee"));
             let passed = tee_content(run, agent, futures::stream::iter(items))
@@ -678,7 +679,7 @@ mod tests {
         #[tokio::test]
         async fn orchestrated_content_is_the_coordinators() {
             let (agents, _, seen) = teed_as(
-                aura_events::AgentContext::coordinator(),
+                aura_events::EmittingAgent::coordinator(),
                 vec![say("the answer"), finish("the answer")],
             )
             .await;
@@ -690,7 +691,7 @@ mod tests {
             for agent in &agents {
                 assert_eq!(
                     agent,
-                    &aura_events::AgentContext::coordinator(),
+                    &aura_events::EmittingAgent::coordinator(),
                     "every copied item is attributed to the coordinator"
                 );
             }
@@ -706,7 +707,7 @@ mod tests {
 
             let passed = tee_content(
                 run,
-                aura_events::AgentContext::single_agent(),
+                aura_events::EmittingAgent::single_agent(),
                 futures::stream::iter(vec![say("a"), finish("a")]),
             )
             .collect::<Vec<_>>()

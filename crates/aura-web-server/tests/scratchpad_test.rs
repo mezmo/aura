@@ -562,7 +562,7 @@ async fn single_agent_small_output_passes_through() {
 }
 
 /// Single-agent: the `aura.scratchpad_usage` event carries `agent_id="main"`
-/// (matches what `AgentContext::single_agent` injects). Validates payload
+/// (matches what `EmittingAgent::single_agent` injects). Validates payload
 /// shape parity with the orchestration variant aside from this field.
 #[tokio::test]
 async fn single_agent_scratchpad_usage_event_payload() {

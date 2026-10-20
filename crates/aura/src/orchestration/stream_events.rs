@@ -5,12 +5,12 @@ pub use aura_events::orchestration::{EventContext, OrchestrationStreamEvent, eve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stream_events::{AgentContext, CorrelationContext};
+    use crate::stream_events::{CorrelationContext, EmittingAgent};
     use aura_events::orchestration::RoutingMode;
 
     fn test_ctx() -> EventContext {
         EventContext::new(
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::new("test-session", None),
         )
     }

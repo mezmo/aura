@@ -234,7 +234,7 @@ mod tests {
     fn call(name: &str) -> CallContext {
         CallContext {
             run: crate::run_context::RunContext::detached(crate::run_context::named_run_id(name)),
-            agent: aura_events::AgentContext::single_agent(),
+            agent: aura_events::EmittingAgent::single_agent(),
         }
     }
 
