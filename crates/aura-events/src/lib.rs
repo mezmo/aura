@@ -222,8 +222,8 @@ impl std::fmt::Display for EmptyId {
 impl std::error::Error for EmptyId {}
 
 nonempty_string_newtype! {
-    /// Identifier for a session: an agent's identity over time, and the key
-    /// its [`SessionEvent`](run::SessionEvent) stream is ordered under.
+    /// Identifier for a session: a conversation's identity over time, and the
+    /// key its [`SessionEvent`](run::SessionEvent) stream is ordered under.
     SessionId
 }
 
