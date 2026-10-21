@@ -225,19 +225,25 @@ impl ToolMiddleware for ScratchpadMiddleware {
     /// it (see `intercept`). Tool
     /// errors must reach the LLM inline so it can react, and oversized
     /// errors are bounded upstream at the tool-result source
-    /// (`mcp_response::bound_error_content`), so passing them through here
+    /// (`crate::mcp::response::bound_error_content`), so passing them through here
     /// cannot flood the context. Exact-name lookup against
     /// `scratchpad_tools`, which `scratchpad::scratchpad_tool_map` resolves
     /// from the per-server glob patterns when the agent is prepared.
     async fn call(&self, req: ToolRequest, next: Next<'_>) -> Result<ToolReply, CallFailure> {
         let ctx = Arc::clone(&req.ctx);
         match next.run(req).await? {
-            ToolReply::Tool { output, outcome } if !outcome.is_error() => {
+            ToolReply::Tool {
+                output,
+                is_error: false,
+            } => {
                 let output = match self.scratchpad_tools.get(&ctx.tool_name) {
                     Some(&min_tokens) => self.intercept(&ctx, output, min_tokens).await,
                     None => output,
                 };
-                Ok(ToolReply::Tool { output, outcome })
+                Ok(ToolReply::Tool {
+                    output,
+                    is_error: false,
+                })
             }
             reply => Ok(reply),
         }

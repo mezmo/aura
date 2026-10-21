@@ -28,7 +28,7 @@ use serde_json::Value;
 
 use crate::approver_headers::{APPROVER_OVERRIDES, ApproverHeaders, OverrideApplicationError};
 use crate::config::ToolContextFactory;
-use crate::mcp::CallOutcome;
+use crate::tool_error_detection::is_tool_error;
 use crate::tool_wrapper::{PreCallOutcome, ToolCallContext, ToolWrapper, TransformArgsResult};
 
 /// A prepared tool call.
@@ -64,11 +64,8 @@ impl ToolRequest {
 /// The result of a call that produced one.
 #[non_exhaustive]
 pub enum ToolReply {
-    /// The inner tool's output, with the classification of its raw output.
-    Tool {
-        output: String,
-        outcome: CallOutcome,
-    },
+    /// The inner tool's output, and whether its raw output reports a failure.
+    Tool { output: String, is_error: bool },
     /// A layer's answer in place of the inner tool's.
     ShortCircuit { output: String },
 }
@@ -222,8 +219,8 @@ where
         }
         match result {
             Ok(output) => {
-                let outcome = CallOutcome::classify_from_output(&output);
-                Ok(ToolReply::Tool { output, outcome })
+                let is_error = is_tool_error(&output);
+                Ok(ToolReply::Tool { output, is_error })
             }
             Err(error) => Err(CallFailure::Tool(error)),
         }
@@ -410,17 +407,17 @@ impl ToolMiddleware for WrapperLayer {
         let ctx = Arc::clone(&req.ctx);
         let extracted = req.extracted.clone();
         match next.run(req).await {
-            Ok(ToolReply::Tool { output, outcome }) => {
+            Ok(ToolReply::Tool { output, is_error }) => {
                 let transformed = self
                     .0
-                    .transform_output(output, &outcome, &ctx, extracted.as_deref())
+                    .transform_output(output, is_error, &ctx, extracted.as_deref())
                     .await;
                 if let Some(warning) = &transformed.warning {
                     tracing::warn!("Tool wrapper warning for {}: {}", ctx.tool_name, warning);
                 }
                 Ok(ToolReply::Tool {
                     output: transformed.output,
-                    outcome,
+                    is_error,
                 })
             }
             Ok(short_circuit) => Ok(short_circuit),
@@ -527,6 +524,16 @@ where
     }
 }
 
+/// What `on_complete` is told about a reply. A reply that reports a failure
+/// completes as `Err`, so no layer has to classify the text again.
+fn reported(output: &str, is_error: bool) -> Result<String, String> {
+    if is_error {
+        Err(output.to_string())
+    } else {
+        Ok(output.to_string())
+    }
+}
+
 /// Drive one call through the three phases.
 ///
 /// The onion runs on a task of its own, under the caller's span, so a gate
@@ -589,13 +596,19 @@ where
             let duration_ms = elapsed_ms();
             let caller_present = || !caller_gone.load(Ordering::SeqCst);
             match result {
-                Ok(ToolReply::Tool { output, .. }) => {
-                    onion_stack.complete(ctx, extracted, Ok(output.clone()), duration_ms);
+                Ok(ToolReply::Tool { output, is_error }) => {
+                    onion_stack.complete(ctx, extracted, reported(&output, is_error), duration_ms);
                     Ok(output)
                 }
                 Ok(ToolReply::ShortCircuit { output }) => {
                     if caller_present() {
-                        onion_stack.complete(ctx, extracted, Ok(output.clone()), duration_ms);
+                        let is_error = is_tool_error(&output);
+                        onion_stack.complete(
+                            ctx,
+                            extracted,
+                            reported(&output, is_error),
+                            duration_ms,
+                        );
                     }
                     Ok(output)
                 }
@@ -647,7 +660,6 @@ mod parity {
         WrapperLayer,
     };
     use crate::approver_headers::tests::captured_overrides;
-    use crate::mcp::CallOutcome;
     use crate::tool_wrapper::{
         ComposedWrapper, PreCallOutcome, ToolCallContext, ToolWrapper, TransformArgsResult,
         TransformOutputResult, WrappedTool,
@@ -781,17 +793,13 @@ mod parity {
         async fn transform_output(
             &self,
             output: String,
-            outcome: &CallOutcome,
+            is_error: bool,
             _ctx: &ToolCallContext,
             _extracted: Option<&Value>,
         ) -> TransformOutputResult {
             note(
                 &self.log,
-                format!(
-                    "{}.out({})",
-                    self.id,
-                    if outcome.is_error() { "err" } else { "ok" }
-                ),
+                format!("{}.out({})", self.id, if is_error { "err" } else { "ok" }),
             );
             match &self.script.post {
                 Post::Pass => {}
@@ -1339,9 +1347,9 @@ mod parity {
             let reply = next.run(req).await;
             note(&self.log, "n.out");
             match reply {
-                Ok(ToolReply::Tool { output, outcome }) => Ok(ToolReply::Tool {
+                Ok(ToolReply::Tool { output, is_error }) => Ok(ToolReply::Tool {
                     output: format!("{output}<n"),
-                    outcome,
+                    is_error,
                 }),
                 other => other,
             }

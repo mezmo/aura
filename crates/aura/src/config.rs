@@ -332,7 +332,7 @@ mod tests {
             async fn transform_output(
                 &self,
                 output: String,
-                _outcome: &crate::mcp::CallOutcome,
+                _is_error: bool,
                 _ctx: &ToolCallContext,
                 _extracted: Option<&Value>,
             ) -> TransformOutputResult {
@@ -350,9 +350,9 @@ mod tests {
                 next: Next<'_>,
             ) -> Result<ToolReply, CallFailure> {
                 match next.run(req).await? {
-                    ToolReply::Tool { output, outcome } => Ok(ToolReply::Tool {
+                    ToolReply::Tool { output, is_error } => Ok(ToolReply::Tool {
                         output: format!("{output}<{}", self.0),
-                        outcome,
+                        is_error,
                     }),
                     other => Ok(other),
                 }

@@ -736,7 +736,10 @@ fn format_tool_result_content(content: &rig::OneOrMany<ToolResultContent>) -> St
     content
         .iter()
         .map(|c| match c {
-            ToolResultContent::Text(text) => text.text.clone(),
+            // Rig JSON-encodes a tool's `Ok` output; an `Err` arrives as plain text.
+            ToolResultContent::Text(text) => {
+                serde_json::from_str::<String>(&text.text).unwrap_or_else(|_| text.text.clone())
+            }
             ToolResultContent::Image(_) => "[Image content]".to_string(),
         })
         .collect::<Vec<_>>()
@@ -787,5 +790,28 @@ where
             BuilderState::Initial(builder) => builder.build(),
             BuilderState::WithTools(builder) => builder.build(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_of(raw: &str) -> String {
+        format_tool_result_content(&rig::OneOrMany::one(ToolResultContent::text(raw)))
+    }
+
+    #[test]
+    fn tool_result_text_is_decoded_from_rigs_json_encoding() {
+        assert_eq!(text_of(r#""line one\nline two""#), "line one\nline two");
+    }
+
+    #[test]
+    fn tool_result_text_that_is_not_a_json_string_is_kept() {
+        assert_eq!(
+            text_of("Toolset error: ToolCallError: boom"),
+            "Toolset error: ToolCallError: boom"
+        );
+        assert_eq!(text_of(r#"{"files": []}"#), r#"{"files": []}"#);
     }
 }
