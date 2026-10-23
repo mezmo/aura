@@ -14,8 +14,9 @@ use crate::config::SessionId;
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError, Timestamp};
 
 use super::{
-    ApprovalStore, EventBus, JournalEntry, JournalStore, MAX_SKILL_RECORDS_PER_LOG,
-    SessionStoreError, SkillInvocationRecord, SkillInvocationStore, SkillLogKey, Subscription,
+    ApprovalStore, EventBus, JournalEntry, JournalStore, MAX_SKILL_RECORDS_PER_LOG, RunFacts,
+    RunFilter, RunStore, SessionStoreError, SkillInvocationRecord, SkillInvocationStore,
+    SkillLogKey, Subscription,
 };
 
 /// Buffered payloads per topic before slow subscribers start lagging.
@@ -39,6 +40,9 @@ pub const DEFAULT_MAX_JOURNAL_SESSIONS: usize = 256;
 /// Sessions whose newest sequence number a journal store remembers, per
 /// session whose entries it keeps.
 const JOURNAL_MARKS_PER_SESSION: usize = 64;
+
+/// Runs kept by [`InMemoryRunStore::new`] before one is let go.
+pub const DEFAULT_MAX_RUNS: usize = 4096;
 
 /// A recorded decision and its retention deadline.
 struct DecidedEntry {
@@ -434,6 +438,90 @@ impl JournalStore for InMemoryJournalStore {
     }
 }
 
+/// Each run's facts as a map ordered by run id.
+pub struct InMemoryRunStore {
+    // `std::sync::Mutex`: every operation is a synchronous map op; nothing
+    // awaits while holding the lock.
+    runs: Mutex<BTreeMap<RunId, RunFacts>>,
+    max_runs: usize,
+}
+
+impl Default for InMemoryRunStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InMemoryRunStore {
+    /// A store with the default bound.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_bounds(DEFAULT_MAX_RUNS)
+    }
+
+    /// A store keeping the facts of at most `max_runs` runs. A bound of zero
+    /// keeps one, as the journal store's does.
+    #[must_use]
+    pub fn with_bounds(max_runs: usize) -> Self {
+        Self {
+            runs: Mutex::new(BTreeMap::new()),
+            max_runs: max_runs.max(1),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<RunId, RunFacts>> {
+        self.runs.lock().expect("run store lock poisoned")
+    }
+}
+
+#[async_trait]
+impl RunStore for InMemoryRunStore {
+    /// Past the bound, the oldest ended run goes, and the oldest run of any
+    /// status when none has ended. Minted run ids order by when they were
+    /// minted, so the map's first entries are the oldest.
+    async fn put(&self, facts: &RunFacts) -> Result<(), SessionStoreError> {
+        let mut runs = self.lock();
+        runs.insert(facts.run_id, facts.clone());
+        if runs.len() > self.max_runs {
+            let evict = runs
+                .iter()
+                .find(|(_, facts)| facts.status.is_terminal())
+                .or_else(|| runs.iter().next())
+                .map(|(id, _)| *id);
+            if let Some(evict) = evict {
+                runs.remove(&evict);
+            }
+        }
+        Ok(())
+    }
+
+    async fn get(&self, run: &RunId) -> Result<Option<RunFacts>, SessionStoreError> {
+        Ok(self.lock().get(run).cloned())
+    }
+
+    async fn list(&self, filter: &RunFilter) -> Result<Vec<RunFacts>, SessionStoreError> {
+        use std::ops::Bound;
+
+        let start = filter.after.map_or(Bound::Unbounded, Bound::Excluded);
+        Ok(self
+            .lock()
+            .range((start, Bound::Unbounded))
+            .map(|(_, facts)| facts)
+            .filter(|facts| filter.matches(facts))
+            .take(filter.limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn finish(
+        &self,
+        _terminal: &SessionEvent,
+        facts: &RunFacts,
+    ) -> Result<(), SessionStoreError> {
+        self.put(facts).await
+    }
+}
+
 /// A local `tokio::broadcast` registry keyed by topic. Single-instance pub/sub:
 /// publish and subscribe never leave the process.
 #[derive(Default)]
@@ -521,6 +609,7 @@ mod tests {
     use crate::hitl::{
         AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, PROTOCOL_VERSION,
     };
+    use crate::session_store::RunStatus;
 
     fn parked(request_id: &str) -> ParkedApproval {
         let now = chrono::Utc::now();
@@ -1233,5 +1322,190 @@ mod tests {
 
         assert_eq!(sub_a.next().await.unwrap(), Bytes::from_static(b"for-a"));
         assert_eq!(sub_b.next().await.unwrap(), Bytes::from_static(b"for-b"));
+    }
+
+    /// A run id that orders by `n`, as minted ids order by when they were
+    /// minted.
+    fn run_id(n: u128) -> RunId {
+        RunId::try_from(uuid::Uuid::from_u128(n)).expect("a non-zero UUID is a run id")
+    }
+
+    fn facts(n: u128, session: &str, status: RunStatus) -> RunFacts {
+        RunFacts {
+            run_id: run_id(n),
+            session_id: SessionId::new(session).unwrap(),
+            agent: "agent".to_owned(),
+            status,
+            liveness: aura_events::run::Liveness::default(),
+            started_at: aura_events::Timestamp::from_unix_millis(n as u64),
+            ended_at: None,
+            usage: aura_events::TokenUsage::default(),
+            first_seq: None,
+            latest_seq: None,
+            pending_approvals: Vec::new(),
+            checkpoint: None,
+            continues: None,
+        }
+    }
+
+    async fn listed(store: &InMemoryRunStore, filter: RunFilter) -> Vec<u128> {
+        store
+            .list(&filter)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|facts| facts.run_id.as_uuid().as_u128())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn run_store_put_replaces_and_get_reads_back() {
+        use RunStatus::*;
+        let store = InMemoryRunStore::new();
+        assert_eq!(store.get(&run_id(1)).await.unwrap(), None);
+
+        store.put(&facts(1, "sess-1", Preparing)).await.unwrap();
+        store.put(&facts(1, "sess-1", Running)).await.unwrap();
+
+        assert_eq!(
+            store.get(&run_id(1)).await.unwrap(),
+            Some(facts(1, "sess-1", Running))
+        );
+        assert_eq!(store.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_store_finish_keeps_the_terminal_facts() {
+        use RunStatus::*;
+        let store = InMemoryRunStore::new();
+        store.put(&facts(1, "sess-1", Running)).await.unwrap();
+        let terminal = SessionEvent {
+            session_id: SessionId::new("sess-1").unwrap(),
+            run_id: Some(run_id(1)),
+            seq: SequenceNumber::FIRST,
+            at: aura_events::Timestamp::from_unix_millis(2),
+            payload: SessionEventPayload::Lifecycle(aura_events::run::LifecycleEvent::Finished {
+                usage: aura_events::TokenUsage::default(),
+            }),
+        };
+
+        store
+            .finish(&terminal, &facts(1, "sess-1", Finished))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get(&run_id(1)).await.unwrap().unwrap().status,
+            Finished
+        );
+    }
+
+    #[tokio::test]
+    async fn run_store_lists_in_run_id_order_by_session_and_status() {
+        use RunStatus::*;
+        let store = InMemoryRunStore::new();
+        for run in [
+            facts(3, "sess-a", Finished),
+            facts(1, "sess-a", Running),
+            facts(2, "sess-b", Finished),
+            facts(4, "sess-b", Cancelled),
+        ] {
+            store.put(&run).await.unwrap();
+        }
+
+        assert_eq!(listed(&store, RunFilter::default()).await, vec![1, 2, 3, 4]);
+        let in_a = RunFilter {
+            session: Some(SessionId::new("sess-a").unwrap()),
+            ..RunFilter::default()
+        };
+        assert_eq!(listed(&store, in_a.clone()).await, vec![1, 3]);
+        let finished = RunFilter {
+            status: Some(Finished),
+            ..RunFilter::default()
+        };
+        assert_eq!(listed(&store, finished).await, vec![2, 3]);
+        let finished_in_a = RunFilter {
+            status: Some(Finished),
+            ..in_a
+        };
+        assert_eq!(listed(&store, finished_in_a).await, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn run_store_lists_by_whether_a_run_waits_on_an_approval() {
+        use RunStatus::*;
+        let store = InMemoryRunStore::new();
+        let mut waiting = facts(2, "sess-a", Running);
+        waiting.pending_approvals = vec![DecisionId::generate()];
+        store.put(&facts(1, "sess-a", Running)).await.unwrap();
+        store.put(&waiting).await.unwrap();
+
+        let pending = |pending| RunFilter {
+            pending_approval: Some(pending),
+            ..RunFilter::default()
+        };
+        assert_eq!(listed(&store, pending(true)).await, vec![2]);
+        assert_eq!(listed(&store, pending(false)).await, vec![1]);
+    }
+
+    /// The last id of a page continues the listing, and the limit counts the
+    /// runs the filter selects, not the ones it skips.
+    #[tokio::test]
+    async fn run_store_pages_through_a_listing() {
+        use RunStatus::*;
+        let store = InMemoryRunStore::new();
+        for n in 1..=7 {
+            let status = if n % 2 == 0 { Running } else { Finished };
+            store.put(&facts(n, "sess-a", status)).await.unwrap();
+        }
+        let page = |after: Option<u128>| RunFilter {
+            status: Some(Finished),
+            limit: 2,
+            after: after.map(run_id),
+            ..RunFilter::default()
+        };
+
+        assert_eq!(listed(&store, page(None)).await, vec![1, 3]);
+        assert_eq!(listed(&store, page(Some(3))).await, vec![5, 7]);
+        assert!(listed(&store, page(Some(7))).await.is_empty());
+        let none = RunFilter {
+            limit: 0,
+            ..RunFilter::default()
+        };
+        assert!(listed(&store, none).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_store_lets_the_oldest_ended_run_go_past_its_bound() {
+        use RunStatus::*;
+        let store = InMemoryRunStore::with_bounds(3);
+        store.put(&facts(1, "sess-a", Running)).await.unwrap();
+        store.put(&facts(2, "sess-a", Finished)).await.unwrap();
+        store.put(&facts(3, "sess-a", Failed)).await.unwrap();
+
+        store.put(&facts(4, "sess-a", Running)).await.unwrap();
+
+        assert_eq!(listed(&store, RunFilter::default()).await, vec![1, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn run_store_lets_the_oldest_run_go_when_none_has_ended() {
+        use RunStatus::*;
+        let store = InMemoryRunStore::with_bounds(2);
+        for n in 1..=3 {
+            store.put(&facts(n, "sess-a", Running)).await.unwrap();
+        }
+
+        assert_eq!(listed(&store, RunFilter::default()).await, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn run_store_bound_of_zero_keeps_one() {
+        use RunStatus::*;
+        let store = InMemoryRunStore::with_bounds(0);
+        store.put(&facts(1, "sess-a", Finished)).await.unwrap();
+        store.put(&facts(2, "sess-a", Finished)).await.unwrap();
+
+        assert_eq!(listed(&store, RunFilter::default()).await, vec![2]);
     }
 }

@@ -159,7 +159,7 @@ impl RigBuilder {
     ///
     /// - `req_headers`: HTTP headers for MCP `headers_from_request` resolution. Pass `None` when not in an HTTP context.
     /// - `additional_tools`: Extra rig tools the agent will execute itself (e.g. CLI/library-supplied tools). Pass `vec![]` when none needed.
-    /// - `client_tools`: Passthrough tools the LLM may call but the *client* executes. Pass `None` when client-side tools are not in use.
+    /// - `client_tools`: Passthrough tools the LLM may call but the *client* executes, attached as [`PreparedAgent::prepare`] decides. Pass `None` when client-side tools are not in use.
     /// - `session_id`: The chat session the agent serves; scopes its HITL approvals.
     pub async fn prepare_agent(
         &self,
@@ -209,10 +209,9 @@ impl RigBuilder {
     /// - An `Orchestrator` wrapped as `Arc<dyn StreamingAgent>` if `orchestration.enabled = true`
     /// - A standard `Agent` wrapped as `Arc<dyn StreamingAgent>` otherwise
     ///
-    /// `client_tools` is the request-supplied passthrough tool definitions. The orchestrator
-    /// attaches them only to the coordinator / workers whose TOML config sets
-    /// `enable_client_tools = true`, filtered by `client_tool_filter`. In single-agent mode,
-    /// callers should attach client tools via `build_agent` instead.
+    /// `client_tools` is the request-supplied passthrough tool definitions. An
+    /// orchestrated config drops them, with a warning; a single agent is given
+    /// them as [`PreparedAgent::prepare`] decides.
     pub async fn build_streaming_agent_with_headers(
         &self,
         req_headers: Option<&HashMap<String, String>>,
@@ -818,6 +817,54 @@ skills.local = []
 
         assert_eq!(build_context.agent.skills.len(), 1);
         assert_eq!(build_context.agent.skills[0].name, "agent-skill");
+    }
+
+    /// Every single-agent build attaches client tools only when the config
+    /// opts in, and only those `client_tool_filter` lets through.
+    #[tokio::test]
+    async fn prepare_agent_applies_the_client_tool_filter() {
+        use std::collections::HashSet;
+
+        let tool = |name: &str| ClientTool {
+            name: name.to_owned(),
+            description: String::new(),
+            parameters: serde_json::json!({ "type": "object" }),
+        };
+        let config = |enabled: bool| {
+            let config_str = format!(
+                r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+enable_client_tools = {enabled}
+client_tool_filter = ["Read"]
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+"#
+            );
+            load_config_from_str(&config_str).expect("config should parse")
+        };
+
+        let prepared = RigBuilder::new(config(true), PendingApprovals::new())
+            .prepare_agent(None, vec![], Some(vec![tool("Read"), tool("Shell")]), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared.client_tool_names,
+            HashSet::from(["Read".to_owned()])
+        );
+
+        let prepared = RigBuilder::new(config(false), PendingApprovals::new())
+            .prepare_agent(None, vec![], Some(vec![tool("Read")]), None)
+            .await
+            .unwrap();
+        assert!(
+            prepared.client_tool_names.is_empty(),
+            "a config that did not opt in gets no client tools"
+        );
     }
 
     #[test]

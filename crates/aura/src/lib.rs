@@ -32,6 +32,7 @@ pub mod rag_tools;
 pub mod request_cancellation;
 pub mod rig_builder;
 pub mod run_context;
+pub mod runtime;
 mod schema_sanitize; // Private - MCP schema sanitization for OpenAI compatibility
 pub mod scratchpad;
 pub mod session_store;
@@ -87,6 +88,9 @@ pub use rig::one_or_many::OneOrMany;
 pub use rig::tool::{Tool as RigTool, ToolDyn};
 pub use rig_builder::{RigBuilder, resolve_mcp_headers_in};
 pub use run_context::{BoundRun, RunContext, RunInProgress, RunLease};
+pub use runtime::{
+    AgentRuntime, AgentState, BlockReason, RigBuilderPreparer, RuntimeStores, StartError, StartRun,
+};
 pub use scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
 pub use streaming::StreamingAgent;
 
