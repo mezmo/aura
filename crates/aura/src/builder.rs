@@ -342,7 +342,10 @@ impl PreparedAgent {
     ///
     /// `client_tools` registers passthrough tools — the LLM sees them as callable,
     /// but the streaming layer terminates the stream when one is invoked so the
-    /// client can execute the tool locally. Pass `None` to disable.
+    /// client can execute the tool locally. Pass `None` to disable. They are
+    /// attached only when the config sets `[agent].enable_client_tools`, and
+    /// only the ones its `client_tool_filter` matches. Every single-agent
+    /// build comes through here, so this is the one place that rule lives.
     ///
     /// Nothing here depends on a request: the HITL gate, turn nudge, and
     /// scratchpad wrappers composed below reach the run they serve through
@@ -353,6 +356,21 @@ impl PreparedAgent {
         client_tools: Option<Vec<ClientTool>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let run = Arc::new(BoundRun::default());
+
+        let client_tools = client_tools
+            .filter(|_| build_context.agent.enable_client_tools)
+            .map(|tools| {
+                tools
+                    .into_iter()
+                    .filter(|tool| {
+                        let allowed = build_context.client_tool_matches_filter(&tool.name);
+                        if !allowed {
+                            tracing::debug!(tool = %tool.name, "client tool left out by client_tool_filter");
+                        }
+                        allowed
+                    })
+                    .collect::<Vec<_>>()
+            });
 
         // Initialize MCP manager first (shared across all providers)
         let mcp_manager = if let Some(mcp_config) = &build_context.mcp {
@@ -2149,8 +2167,8 @@ pub async fn build_streaming_agent_with_tools(
         let factory = OrchestratorFactory::new(build_context.clone()).with_run_tools(run_tools);
         Ok(Arc::new(factory))
     } else {
-        // Standard single-agent mode: gate client tools on the agent's TOML opt-in
-        // and apply its client_tool_filter.
+        // Standard single-agent mode. `PreparedAgent::prepare` decides which
+        // client tools the agent gets.
         tracing::info!("Building Agent (orchestration.enabled = false)");
         if build_context.hitl.is_some() {
             tracing::info!(
@@ -2158,17 +2176,7 @@ pub async fn build_streaming_agent_with_tools(
                  globs will require approval via the configured route"
             );
         }
-        let attached = if build_context.agent.enable_client_tools {
-            client_tools.map(|tools| {
-                tools
-                    .into_iter()
-                    .filter(|t| build_context.client_tool_matches_filter(&t.name))
-                    .collect::<Vec<_>>()
-            })
-        } else {
-            None
-        };
-        let agent = Agent::new(build_context, run_tools(), attached).await?;
+        let agent = Agent::new(build_context, run_tools(), client_tools).await?;
         Ok(Arc::new(agent))
     }
 }

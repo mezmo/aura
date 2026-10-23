@@ -281,9 +281,9 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub user: Option<String>,
 
-    /// Client-side tool definitions. Per-agent opt-in via
-    /// `[agent].enable_client_tools` and `[orchestration.worker.<name>].enable_client_tools`
-    /// in TOML; tools are filtered with the matching `client_tool_filter`.
+    /// Client-side tool definitions. A single agent is given them only when
+    /// its TOML sets `[agent].enable_client_tools`, and only those its
+    /// `client_tool_filter` lets through; an orchestrated config drops them.
     #[serde(default)]
     pub tools: Option<Vec<ClientToolDefinition>>,
 }
