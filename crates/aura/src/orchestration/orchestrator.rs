@@ -647,6 +647,65 @@ struct ForwardedRun {
     /// Provider-reported usage of the loop's last turn — context-window
     /// occupancy, as opposed to `response.usage`'s loop total.
     last_turn: rig::completion::Usage,
+    /// The per-call timeout cut the loop; `response` holds only what
+    /// streamed before the cut.
+    timed_out: bool,
+}
+
+/// What a worker streamed so far, kept outside the timed future so a
+/// per-call timeout does not drop it with the future.
+#[derive(Default)]
+struct PartialRun {
+    text: String,
+    tool_results: Vec<String>,
+}
+
+type ItemStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>>;
+
+/// Copy text and tool results into `progress` as they pass.
+fn record_progress(stream: ItemStream, progress: Arc<std::sync::Mutex<PartialRun>>) -> ItemStream {
+    use crate::provider_agent::{StreamedAssistantContent, StreamedUserContent};
+    use futures::StreamExt;
+    Box::pin(stream.inspect(move |item| {
+        let mut p = progress.lock().expect("partial-run lock");
+        match item {
+            Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
+                p.text.push_str(t)
+            }
+            Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(tr))) => {
+                p.tool_results.push(tr.result.clone())
+            }
+            _ => {}
+        }
+    }))
+}
+
+/// The run a timed-out worker returns: its partial output, or `None`
+/// when nothing streamed and the timeout stays an error.
+fn timed_out_run(phase: &str, secs: u64, p: &PartialRun) -> Option<ForwardedRun> {
+    if p.text.trim().is_empty() && p.tool_results.is_empty() {
+        return None;
+    }
+    let mut content = format!(
+        "{phase} timed out after {secs}s before calling submit_result. Partial output so far:\n{}",
+        p.text
+    );
+    if !p.tool_results.is_empty() {
+        content.push_str("\n\nTool results so far:");
+        for r in &p.tool_results {
+            content.push_str("\n- ");
+            content.push_str(r);
+        }
+    }
+    Some(ForwardedRun {
+        response: crate::provider_agent::CompletionResponse {
+            content,
+            usage: rig::completion::Usage::new(),
+        },
+        last_turn: rig::completion::Usage::new(),
+        timed_out: true,
+    })
 }
 
 const EMPTY_WORKER_RESULT: &str = "The worker produced no output and did not call submit_result.";
@@ -1617,6 +1676,7 @@ impl Orchestrator {
                 usage: final_total.unwrap_or(tally.total),
             },
             last_turn: tally.last,
+            timed_out: false,
         })
     }
 
@@ -1650,6 +1710,7 @@ impl Orchestrator {
             ..
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
+        let progress = Arc::new(std::sync::Mutex::new(PartialRun::default()));
         let stream_future = async {
             let stream = match park_key {
                 Some(key) => agent
@@ -1664,7 +1725,7 @@ impl Orchestrator {
                 None => agent.stream_chat(prompt, history).await,
             };
             Self::drive_forward_loop(
-                stream,
+                record_progress(stream, Arc::clone(&progress)),
                 &self.usage_state,
                 self.config.stream_inactivity_timeout_secs(),
                 agent.scratchpad_budget(),
@@ -1688,6 +1749,10 @@ impl Orchestrator {
                         timeout_secs,
                         timeout_secs,
                     );
+                    let p = progress.lock().expect("partial-run lock");
+                    if let Some(run) = timed_out_run(phase, timeout_secs, &p) {
+                        return Ok(run);
+                    }
                     Err(format!(
                         "{} timed out after {}s — the LLM provider did not respond in time",
                         phase, timeout_secs
@@ -4236,7 +4301,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
             // Emit this agent's context-window occupancy from its final
             // response turn — provider-reported, no local tokenizer.
-            if let (Ok(run), Some(tx)) = (&stream_result, event_tx) {
+            // A timed-out run carries no provider usage to report.
+            if let (Some(run), Some(tx)) = (
+                stream_result.as_ref().ok().filter(|r| !r.timed_out),
+                event_tx,
+            ) {
                 let agent_id = worker_name
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| self.orchestrator_id.clone());
@@ -4250,6 +4319,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .await;
             }
 
+            let timed_out = matches!(&stream_result, Ok(r) if r.timed_out);
             // Detect context overflow and other errors — don't retry hard errors
             let result = match stream_result {
                 Ok(r) => Ok(r.response.content),
@@ -4303,7 +4373,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 }),
                             }));
                         }
-                        None if is_final_attempt => {
+                        // A timed-out attempt is not retried: its partial
+                        // output goes to the planner.
+                        None if is_final_attempt || timed_out => {
                             tracing::warn!(
                                 "Worker did not call submit_result for task {} after {} attempts. Preserving raw output via artifact flow.",
                                 task_id,
@@ -6409,6 +6481,46 @@ mod tests {
         )
         .await
         .expect("scripted stream should drive to completion")
+    }
+
+    /// A worker cut off by `per_call_timeout_secs`
+    /// keeps the text and tool results it streamed before the cut.
+    #[tokio::test]
+    async fn test_timed_out_worker_keeps_partial_output() {
+        use futures::StreamExt;
+        let usage_state = crate::UsageState::new();
+        let progress = Arc::new(std::sync::Mutex::new(PartialRun::default()));
+        let items = scripted(vec![
+            Ok(StreamItem::StreamAssistantItem(
+                crate::provider_agent::StreamedAssistantContent::Text("checked the pool".into()),
+            )),
+            tool_result("t1"),
+        ])
+        .chain(futures::stream::pending());
+        let stream = record_progress(Box::pin(items), Arc::clone(&progress));
+        let cut = tokio::time::timeout(
+            Duration::from_millis(50),
+            Orchestrator::drive_forward_loop(
+                stream,
+                &usage_state,
+                0,
+                None,
+                "test",
+                None,
+                None,
+                never_ready(),
+            ),
+        )
+        .await;
+        assert!(cut.is_err(), "the pending stream must hit the timeout");
+        let run = timed_out_run("Worker task", 7, &progress.lock().unwrap())
+            .expect("captured progress must yield a run");
+        assert!(run.timed_out);
+        let text = &run.response.content;
+        assert!(text.contains("timed out after 7s"), "{text}");
+        assert!(text.contains("checked the pool"), "{text}");
+        assert!(text.contains("ok"), "tool result kept: {text}");
+        assert!(timed_out_run("Worker task", 7, &PartialRun::default()).is_none());
     }
 
     /// Turn figures are Bedrock invocation-log records for one `arithmetic`
