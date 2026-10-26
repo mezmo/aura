@@ -3,9 +3,9 @@
 //! Catches pathological looping behavior where a model calls the same tool
 //! with identical arguments repeatedly despite receiving the same result.
 //!
-//! Uses `CallOutcome` for error-kind-aware counting:
-//! - `Success` / `SchemaError` with identical output → counter increments
-//! - `GeneralToolError` → counter unchanged (legitimate retries)
+//! A successful call whose output matches the last output for the same
+//! tool and arguments increments that call's counter. An error leaves the
+//! counter unchanged, since retrying after an error is legitimate.
 //!
 //! Two escalation stages, both via annotation on the real tool output:
 //! - `nudge_threshold` → appends `[DUPLICATE_CALL_GUIDANCE]`
@@ -19,7 +19,6 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::mcp::CallOutcome;
 use crate::tool_wrapper::{
     ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult,
 };
@@ -111,7 +110,7 @@ impl ToolWrapper for DuplicateCallGuard {
     async fn transform_output(
         &self,
         output: String,
-        outcome: &CallOutcome,
+        is_error: bool,
         _ctx: &ToolCallContext,
         extracted: Option<&Value>,
     ) -> TransformOutputResult {
@@ -120,7 +119,7 @@ impl ToolWrapper for DuplicateCallGuard {
             None => return TransformOutputResult::new(output),
         };
 
-        if matches!(outcome, CallOutcome::GeneralToolError { .. }) {
+        if is_error {
             return TransformOutputResult::new(output);
         }
 
@@ -208,30 +207,12 @@ mod tests {
         ctx: &ToolCallContext,
         args: &Value,
         output: &str,
-        outcome: &CallOutcome,
+        is_error: bool,
     ) -> TransformOutputResult {
         let r = guard.transform_args(args.clone(), ctx);
         guard
-            .transform_output(output.to_string(), outcome, ctx, r.extracted.as_ref())
+            .transform_output(output.to_string(), is_error, ctx, r.extracted.as_ref())
             .await
-    }
-
-    fn success(s: &str) -> CallOutcome {
-        CallOutcome::Success(s.to_string())
-    }
-
-    fn general_error(s: &str) -> CallOutcome {
-        CallOutcome::GeneralToolError {
-            content: s.to_string(),
-            code: None,
-        }
-    }
-
-    fn schema_error(s: &str) -> CallOutcome {
-        CallOutcome::SchemaError {
-            content: s.to_string(),
-            code: -32602,
-        }
     }
 
     #[test]
@@ -257,7 +238,7 @@ mod tests {
         let args = serde_json::json!({"numbers": [1, 2, 3]});
 
         for _ in 0..2 {
-            let r = call(&guard, &ctx, &args, "2.0", &success("2.0")).await;
+            let r = call(&guard, &ctx, &args, "2.0", false).await;
             assert!(!r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
             assert!(!r.output.contains("[DUPLICATE_CALL_ABORT]"));
         }
@@ -271,10 +252,10 @@ mod tests {
         let args = serde_json::json!({"numbers": [1, 2, 3]});
 
         for _ in 0..2 {
-            call(&guard, &ctx, &args, "2.0", &success("2.0")).await;
+            call(&guard, &ctx, &args, "2.0", false).await;
         }
 
-        let r = call(&guard, &ctx, &args, "2.0", &success("2.0")).await;
+        let r = call(&guard, &ctx, &args, "2.0", false).await;
         assert!(r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
         assert!(r.output.starts_with("2.0"));
         assert!(!flag.load(Ordering::SeqCst));
@@ -287,55 +268,28 @@ mod tests {
         let args = serde_json::json!({"numbers": [1, 2, 3]});
 
         for _ in 0..4 {
-            call(&guard, &ctx, &args, "2.0", &success("2.0")).await;
+            call(&guard, &ctx, &args, "2.0", false).await;
         }
 
-        let r = call(&guard, &ctx, &args, "2.0", &success("2.0")).await;
+        let r = call(&guard, &ctx, &args, "2.0", false).await;
         assert!(r.output.contains("[DUPLICATE_CALL_ABORT]"));
         assert!(r.output.starts_with("2.0"));
         assert!(flag.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
-    async fn test_general_error_does_not_increment() {
+    async fn test_error_does_not_increment() {
         let (guard, flag) = make_guard(2, 4);
         let ctx = ToolCallContext::new("api");
         let args = serde_json::json!({"q": "test"});
 
-        call(&guard, &ctx, &args, "timeout", &success("timeout")).await;
+        call(&guard, &ctx, &args, "timeout", false).await;
 
         for _ in 0..5 {
-            let r = call(&guard, &ctx, &args, "timeout", &general_error("timeout")).await;
+            let r = call(&guard, &ctx, &args, "timeout", true).await;
             assert!(!r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
             assert!(!r.output.contains("[DUPLICATE_CALL_ABORT]"));
         }
-        assert!(!flag.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn test_schema_error_increments() {
-        let (guard, flag) = make_guard(2, 4);
-        let ctx = ToolCallContext::new("api");
-        let args = serde_json::json!({"bad": "field"});
-
-        call(
-            &guard,
-            &ctx,
-            &args,
-            "missing param",
-            &schema_error("missing param"),
-        )
-        .await;
-
-        let r = call(
-            &guard,
-            &ctx,
-            &args,
-            "missing param",
-            &schema_error("missing param"),
-        )
-        .await;
-        assert!(r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
         assert!(!flag.load(Ordering::SeqCst));
     }
 
@@ -345,10 +299,10 @@ mod tests {
         let ctx = ToolCallContext::new("get_time");
         let args = serde_json::json!({"tz": "UTC"});
 
-        call(&guard, &ctx, &args, "12:00", &success("12:00")).await;
-        call(&guard, &ctx, &args, "12:01", &success("12:01")).await;
+        call(&guard, &ctx, &args, "12:00", false).await;
+        call(&guard, &ctx, &args, "12:01", false).await;
 
-        let r = call(&guard, &ctx, &args, "12:01", &success("12:01")).await;
+        let r = call(&guard, &ctx, &args, "12:01", false).await;
         assert!(r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
     }
 
@@ -359,10 +313,10 @@ mod tests {
         let ctx_a = ToolCallContext::new("tool_a");
         let ctx_b = ToolCallContext::new("tool_b");
 
-        call(&guard, &ctx_a, &args, "1", &success("1")).await;
-        call(&guard, &ctx_a, &args, "1", &success("1")).await;
+        call(&guard, &ctx_a, &args, "1", false).await;
+        call(&guard, &ctx_a, &args, "1", false).await;
 
-        let r = call(&guard, &ctx_b, &args, "1", &success("1")).await;
+        let r = call(&guard, &ctx_b, &args, "1", false).await;
         assert!(!r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
     }
 
@@ -373,11 +327,11 @@ mod tests {
         let args = serde_json::json!({"x": 1});
 
         for _ in 0..3 {
-            call(&guard, &ctx, &args, "r", &success("r")).await;
+            call(&guard, &ctx, &args, "r", false).await;
         }
         assert!(flag.load(Ordering::SeqCst));
 
-        let r = call(&guard, &ctx, &args, "r", &success("r")).await;
+        let r = call(&guard, &ctx, &args, "r", false).await;
         assert!(!r.output.contains("[DUPLICATE_CALL_ABORT]"));
         assert!(flag.load(Ordering::SeqCst));
     }
@@ -388,8 +342,8 @@ mod tests {
         let ctx = ToolCallContext::new("calc");
         let args = serde_json::json!({"x": 5});
 
-        call(&guard, &ctx, &args, "25", &success("25")).await;
-        let r = call(&guard, &ctx, &args, "25", &success("25")).await;
+        call(&guard, &ctx, &args, "25", false).await;
+        let r = call(&guard, &ctx, &args, "25", false).await;
         assert!(r.output.starts_with("25"));
         assert!(r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
     }
@@ -402,7 +356,7 @@ mod tests {
 
         // Calls 1-2: below nudge_threshold=3
         for i in 1..=2 {
-            let r = call(&guard, &ctx, &args, "25", &success("25")).await;
+            let r = call(&guard, &ctx, &args, "25", false).await;
             assert!(
                 !r.output.contains("[DUPLICATE_CALL"),
                 "unexpected annotation on call {i}"
@@ -411,14 +365,14 @@ mod tests {
 
         // Calls 3-4: at/above nudge, below block
         for _ in 3..=4 {
-            let r = call(&guard, &ctx, &args, "25", &success("25")).await;
+            let r = call(&guard, &ctx, &args, "25", false).await;
             assert!(r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
             assert!(!r.output.contains("[DUPLICATE_CALL_ABORT]"));
         }
         assert!(!flag.load(Ordering::SeqCst));
 
         // Call 5: block + flag
-        let r = call(&guard, &ctx, &args, "25", &success("25")).await;
+        let r = call(&guard, &ctx, &args, "25", false).await;
         assert!(r.output.contains("[DUPLICATE_CALL_ABORT]"));
         assert!(flag.load(Ordering::SeqCst));
     }
@@ -432,16 +386,16 @@ mod tests {
 
         // Alternate: A, B, A, B — each pair's counter is independent
         for _ in 0..2 {
-            call(&guard, &ctx, &args_a, "1", &success("1")).await;
-            call(&guard, &ctx, &args_b, "2", &success("2")).await;
+            call(&guard, &ctx, &args_a, "1", false).await;
+            call(&guard, &ctx, &args_b, "2", false).await;
         }
 
         // A at count=3 → nudge
-        let r = call(&guard, &ctx, &args_a, "1", &success("1")).await;
+        let r = call(&guard, &ctx, &args_a, "1", false).await;
         assert!(r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
 
         // B at count=3 → nudge
-        let r = call(&guard, &ctx, &args_b, "2", &success("2")).await;
+        let r = call(&guard, &ctx, &args_b, "2", false).await;
         assert!(r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
 
         assert!(!flag.load(Ordering::SeqCst));

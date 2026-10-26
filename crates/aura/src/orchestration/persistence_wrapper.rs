@@ -25,8 +25,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, Notify};
 
 use super::persistence::{ExecutionPersistence, ToolOutcome, ToolTraceEntry};
-use crate::mcp::CallOutcome;
-use crate::tool_error_detection::is_reported_error;
 use crate::tool_wrapper::{
     ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult, non_blank,
 };
@@ -35,6 +33,13 @@ const TRACE_ERROR_MAX_CHARS: usize = 200;
 
 /// The namespaced field name for reasoning (signals framework/internal field).
 const REASONING_FIELD: &str = "_aura_reasoning";
+
+/// The inner tool's output as `transform_output` received it.
+struct RawOutput {
+    text: String,
+    /// Whether the output reports a tool failure.
+    is_error: bool,
+}
 
 /// Per-call metadata key stashed in `extracted` so `transform_output` and
 /// `on_complete` can rendezvous on the same entry in `raw_outputs`.
@@ -86,7 +91,7 @@ pub struct PersistenceWrapper {
     /// Cache keyed by `_persistence_call_id`. Entries are inserted in
     /// `transform_output` and removed in `on_complete`. Bounded because each
     /// tool call inserts and removes exactly one entry.
-    raw_outputs: Arc<StdMutex<HashMap<String, String>>>,
+    raw_outputs: Arc<StdMutex<HashMap<String, RawOutput>>>,
     /// In-flight write counter (shared across all wrappers in an iteration)
     in_flight: Arc<AtomicUsize>,
     /// Notification channel for drain waiters
@@ -211,20 +216,23 @@ impl ToolWrapper for PersistenceWrapper {
     async fn transform_output(
         &self,
         output: String,
-        outcome: &CallOutcome,
+        is_error: bool,
         ctx: &ToolCallContext,
         extracted: Option<&Value>,
     ) -> TransformOutputResult {
         // 1. Cache raw output for persistence (before any footer append)
         if let Some(call_id) = find_field(extracted, CALL_ID_FIELD) {
-            self.raw_outputs
-                .lock()
-                .unwrap()
-                .insert(call_id.to_string(), output.clone());
+            self.raw_outputs.lock().unwrap().insert(
+                call_id.to_string(),
+                RawOutput {
+                    text: output.clone(),
+                    is_error,
+                },
+            );
         }
 
         // 2. Artifact footer (only if persistence enabled + size qualifies)
-        if !self.persistence_enabled || outcome.is_error() {
+        if !self.persistence_enabled || is_error {
             return TransformOutputResult::new(output);
         }
 
@@ -276,11 +284,24 @@ impl ToolWrapper for PersistenceWrapper {
             .and_then(|id| self.raw_outputs.lock().unwrap().remove(id));
 
         // Prefer the raw output captured in `transform_output` over the
-        // possibly-transformed `result` the framework hands us on success.
-        // On error, `result` is authoritative (transform_output didn't run).
+        // `result` later wrappers may have added to. An `Err` takes the raw
+        // output only when it is the tool's reported error that later layers
+        // passed on. Any other `Err`, such as a later layer's panic, keeps
+        // its own text.
         let (output, error) = match result {
-            Ok(_) => (raw_output.or_else(|| result.ok().map(String::from)), None),
-            Err(e) => (None, Some(e.to_string())),
+            Ok(_) => (
+                raw_output
+                    .map(|raw| raw.text)
+                    .or_else(|| result.ok().map(String::from)),
+                None,
+            ),
+            Err(e) => (
+                None,
+                Some(match raw_output {
+                    Some(raw) if raw.is_error && e.contains(raw.text.as_str()) => raw.text,
+                    _ => e.to_string(),
+                }),
+            ),
         };
 
         // Artifact promotion: use raw output from cache (clean, no footer)
@@ -289,9 +310,7 @@ impl ToolWrapper for PersistenceWrapper {
         // Strip any artifact footer appended by transform_output so we write
         // clean output and compute thresholds on the original size.
         let output_clean = strip_artifact_footer(output_text);
-        let error = error
-            .as_deref()
-            .or_else(|| is_reported_error(output_clean).then_some(output_clean));
+        let error = error.as_deref();
         // A tool error is never promoted.
         let should_promote = error.is_none()
             && match (
@@ -863,15 +882,19 @@ mod tests {
             .to_string();
 
         let raw = "gigantic raw tool output that scratchpad would rewrite to a pointer";
-        let outcome = crate::mcp::CallOutcome::Success(raw.to_string());
         let _ = wrapper
-            .transform_output(raw.to_string(), &outcome, &ctx, Some(&extracted))
+            .transform_output(raw.to_string(), false, &ctx, Some(&extracted))
             .await;
 
         // Cached under the call id until on_complete consumes it.
         assert_eq!(
-            wrapper.raw_outputs.lock().unwrap().get(&call_id),
-            Some(&raw.to_string()),
+            wrapper
+                .raw_outputs
+                .lock()
+                .unwrap()
+                .get(&call_id)
+                .map(|raw| raw.text.as_str()),
+            Some(raw),
         );
 
         // on_complete pulls the raw output (via the call id) rather than using
@@ -1117,11 +1140,10 @@ mod tests {
 
         let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
-        let outcome = CallOutcome::Success(String::new());
         let long_output = "x".repeat(20);
 
         let result = wrapper
-            .transform_output(long_output.clone(), &outcome, &ctx, Some(&extracted))
+            .transform_output(long_output.clone(), false, &ctx, Some(&extracted))
             .await;
         assert!(result.output.contains(
             "[Tool output saved to artifact: task-0-sre-iter-2-log-search-0-output.txt]"
@@ -1135,10 +1157,9 @@ mod tests {
 
         let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
-        let outcome = CallOutcome::Success(String::new());
 
         let result = wrapper
-            .transform_output("short output".to_string(), &outcome, &ctx, Some(&extracted))
+            .transform_output("short output".to_string(), false, &ctx, Some(&extracted))
             .await;
         assert_eq!(result.output, "short output");
         assert!(!result.output.contains("[Tool output saved to artifact"));
@@ -1150,10 +1171,9 @@ mod tests {
 
         let ctx = ToolCallContext::new("my_tool").with_task_context(3, "w".to_string(), 1);
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
-        let outcome = CallOutcome::Success(String::new());
 
         let result = wrapper
-            .transform_output("tiny".to_string(), &outcome, &ctx, Some(&extracted))
+            .transform_output("tiny".to_string(), false, &ctx, Some(&extracted))
             .await;
         assert!(result.output.contains(
             "[Tool output saved to artifact: task-3-default-iter-1-my-tool-0-output.txt]"
@@ -1298,10 +1318,9 @@ mod tests {
 
         let ctx = ToolCallContext::new("my_search tool").with_task_context(0, "sre".to_string(), 1);
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
-        let outcome = CallOutcome::Success(String::new());
 
         let result = wrapper
-            .transform_output("output".to_string(), &outcome, &ctx, Some(&extracted))
+            .transform_output("output".to_string(), false, &ctx, Some(&extracted))
             .await;
         assert!(
             result
@@ -1316,15 +1335,9 @@ mod tests {
 
         let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
-        let outcome = CallOutcome::Success(String::new());
 
         let result = wrapper
-            .transform_output(
-                "big output here".to_string(),
-                &outcome,
-                &ctx,
-                Some(&extracted),
-            )
+            .transform_output("big output here".to_string(), false, &ctx, Some(&extracted))
             .await;
         assert_eq!(result.output, "big output here");
         assert!(!result.output.contains("[Tool output saved to artifact"));
@@ -1402,18 +1415,13 @@ mod tests {
         let error = "Tool returned an error: 401 Unauthorized";
 
         let output = wrapper
-            .transform_output(
-                error.to_string(),
-                &CallOutcome::classify_from_output(error),
-                &ctx,
-                Some(&extracted),
-            )
+            .transform_output(error.to_string(), true, &ctx, Some(&extracted))
             .await
             .output;
         assert_eq!(output, error, "an error gets no artifact footer");
 
         wrapper
-            .on_complete(&ctx, Some(&extracted), Ok(&output), 100)
+            .on_complete(&ctx, Some(&extracted), Err(&output), 100)
             .await;
 
         let p = persistence.lock().await;
@@ -1442,12 +1450,10 @@ mod tests {
             "code": "AUTH_FAILED",
             "detail": "token expired",
         }));
-        let output = crate::mcp::extract_tool_result(result, "list_pods")
-            .unwrap()
-            .into_prefixed_string();
+        let output = crate::mcp::extract_tool_result(result, "list_pods");
 
         wrapper
-            .on_complete(&ctx, Some(&extracted), Ok(&output), 100)
+            .on_complete(&ctx, Some(&extracted), Err(&output), 100)
             .await;
 
         let p = persistence.lock().await;
@@ -1479,7 +1485,7 @@ mod tests {
             .on_complete(
                 &ctx,
                 Some(&extracted),
-                Ok(&format!("Tool returned an error: {body}")),
+                Err(&format!("Tool returned an error: {body}")),
                 100,
             )
             .await;
@@ -1561,7 +1567,7 @@ mod tests {
             .on_complete(
                 &ctx,
                 Some(&extracted),
-                Ok("Tool returned an error: 401 Unauthorized"),
+                Err("Tool returned an error: 401 Unauthorized"),
                 100,
             )
             .await;
@@ -1573,6 +1579,139 @@ mod tests {
             matches!(
                 &traces[0].outcome,
                 ToolOutcome::Error { message } if message == "Tool returned an error: 401 Unauthorized"
+            ),
+            "{:?}",
+            traces[0].outcome
+        );
+    }
+
+    /// A reported error is traced as the tool produced it, not as a later
+    /// layer rewrote it.
+    #[tokio::test]
+    async fn a_reported_error_is_traced_as_the_tool_produced_it() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let persistence = Arc::new(Mutex::new(
+            ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+                .await
+                .unwrap(),
+        ));
+        let wrapper =
+            enabled_wrapper(persistence.clone(), Some("sre".to_string()), 500, 5000).await;
+        let ctx = ToolCallContext::new("list_pods").with_task_context(0, "sre".to_string(), 1);
+        let extracted = wrapper
+            .transform_args(serde_json::json!({}), &ctx)
+            .extracted
+            .expect("transform_args always produces extracted");
+
+        let raw = "Tool returned an error: 401 Unauthorized";
+        let _ = wrapper
+            .transform_output(raw.to_string(), true, &ctx, Some(&extracted))
+            .await;
+        wrapper
+            .on_complete(
+                &ctx,
+                Some(&extracted),
+                Err(&format!("{raw}\n\n[turn 9 of 10]")),
+                100,
+            )
+            .await;
+
+        let p = persistence.lock().await;
+        let traces = p.tool_traces_for_task(0);
+        assert_eq!(traces.len(), 1);
+        assert!(
+            matches!(&traces[0].outcome, ToolOutcome::Error { message } if message == raw),
+            "{:?}",
+            traces[0].outcome
+        );
+    }
+
+    /// A later layer's failure after the tool reported an error is traced
+    /// with the later failure, which is what the call ended with.
+    #[tokio::test]
+    async fn a_failure_after_a_reported_error_is_traced_with_its_own_error() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let persistence = Arc::new(Mutex::new(
+            ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+                .await
+                .unwrap(),
+        ));
+        let wrapper =
+            enabled_wrapper(persistence.clone(), Some("sre".to_string()), 500, 5000).await;
+        let ctx = ToolCallContext::new("list_pods").with_task_context(0, "sre".to_string(), 1);
+        let extracted = wrapper
+            .transform_args(serde_json::json!({}), &ctx)
+            .extracted
+            .expect("transform_args always produces extracted");
+
+        let _ = wrapper
+            .transform_output(
+                "Tool returned an error: 401 Unauthorized".to_string(),
+                true,
+                &ctx,
+                Some(&extracted),
+            )
+            .await;
+        wrapper
+            .on_complete(
+                &ctx,
+                Some(&extracted),
+                Err("ToolCallError: task 7 panicked with message \"boom\""),
+                100,
+            )
+            .await;
+
+        let p = persistence.lock().await;
+        let traces = p.tool_traces_for_task(0);
+        assert_eq!(traces.len(), 1);
+        assert!(
+            matches!(
+                &traces[0].outcome,
+                ToolOutcome::Error { message } if message.starts_with("task 7 panicked")
+            ),
+            "{:?}",
+            traces[0].outcome
+        );
+    }
+
+    /// A layer outside persistence can fail the call after the tool
+    /// succeeded, for example by panicking. The trace names that failure,
+    /// not the successful output persistence saw.
+    #[tokio::test]
+    async fn a_failure_after_a_successful_output_is_traced_with_its_own_error() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let persistence = Arc::new(Mutex::new(
+            ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+                .await
+                .unwrap(),
+        ));
+        let wrapper =
+            enabled_wrapper(persistence.clone(), Some("sre".to_string()), 500, 5000).await;
+        let ctx = ToolCallContext::new("list_pods").with_task_context(0, "sre".to_string(), 1);
+        let extracted = wrapper
+            .transform_args(serde_json::json!({}), &ctx)
+            .extracted
+            .expect("transform_args always produces extracted");
+
+        let _ = wrapper
+            .transform_output("pod-a pod-b".to_string(), false, &ctx, Some(&extracted))
+            .await;
+        wrapper
+            .on_complete(
+                &ctx,
+                Some(&extracted),
+                Err("ToolCallError: task 7 panicked with message \"boom\""),
+                100,
+            )
+            .await;
+
+        let p = persistence.lock().await;
+        let traces = p.tool_traces_for_task(0);
+        assert_eq!(traces.len(), 1);
+        assert!(
+            matches!(
+                &traces[0].outcome,
+                ToolOutcome::Error { message } if message.starts_with("task 7 panicked")
             ),
             "{:?}",
             traces[0].outcome

@@ -26,7 +26,6 @@
 //! ```ignore
 //! use std::sync::Arc;
 //!
-//! use aura::mcp::CallOutcome;
 //! use aura::tool_wrapper::{
 //!     ToolCallContext, ToolWrapper, TransformOutputResult, WrappedTool,
 //! };
@@ -41,7 +40,7 @@
 //!     async fn transform_output(
 //!         &self,
 //!         output: String,
-//!         _outcome: &CallOutcome,
+//!         _is_error: bool,
 //!         _ctx: &ToolCallContext,
 //!         _extracted: Option<&Value>,
 //!     ) -> TransformOutputResult {
@@ -60,7 +59,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::mcp::CallOutcome;
 use crate::tool_middleware::{MiddlewareStack, MiddlewareTool};
 
 /// Context passed to wrapper methods during tool execution.
@@ -255,13 +253,15 @@ pub trait ToolWrapper: Send + Sync {
 
     /// Transform output after tool execution.
     ///
-    /// Called after each successful tool invocation. Use this to:
+    /// Called whenever the inner tool returns `Ok`, including output that
+    /// reports a failure (see `is_error`). Use this to:
     /// - Convert field formats in the response
     /// - Add metadata to the response
     /// - Trigger side effects (logging, metrics)
     ///
     /// # Arguments
     /// * `output` - Output from the inner tool
+    /// * `is_error` - Whether `output` reports a tool failure
     /// * `ctx` - Context about the current tool call
     /// * `extracted` - Data extracted during `transform_args`
     ///
@@ -270,7 +270,7 @@ pub trait ToolWrapper: Send + Sync {
     async fn transform_output(
         &self,
         output: String,
-        _outcome: &CallOutcome,
+        _is_error: bool,
         _ctx: &ToolCallContext,
         _extracted: Option<&Value>,
     ) -> TransformOutputResult {
@@ -372,7 +372,8 @@ pub trait ToolWrapper: Send + Sync {
     /// # Arguments
     /// * `ctx` - Context about the current tool call
     /// * `extracted` - Data extracted during `transform_args`
-    /// * `result` - The final result (output or error message)
+    /// * `result` - The final output, or `Err` with the call's text when the
+    ///   call failed, whether the tool returned an error or reported one
     /// * `duration_ms` - How long the tool call took
     async fn on_complete(
         &self,
@@ -565,13 +566,13 @@ impl ToolWrapper for ComposedWrapper {
     async fn transform_output(
         &self,
         mut output: String,
-        outcome: &CallOutcome,
+        is_error: bool,
         ctx: &ToolCallContext,
         extracted: Option<&Value>,
     ) -> TransformOutputResult {
         for wrapper in self.wrappers.iter().rev() {
             let result = wrapper
-                .transform_output(output, outcome, ctx, extracted)
+                .transform_output(output, is_error, ctx, extracted)
                 .await;
             output = result.output;
         }
@@ -673,9 +674,8 @@ mod tests {
 
         // Output unchanged
         let output = "test output".to_string();
-        let outcome = CallOutcome::Success(output.clone());
         let result = wrapper
-            .transform_output(output.clone(), &outcome, &ctx, None)
+            .transform_output(output.clone(), false, &ctx, None)
             .await;
         assert_eq!(result.output, output);
     }
