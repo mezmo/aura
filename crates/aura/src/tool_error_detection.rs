@@ -1,6 +1,7 @@
 //! Tells a tool call's failure apart from its output, and what part of a
 //! failure to show people.
 
+use crate::hitl::DENIAL_PREFIX;
 use crate::mcp::MCP_ERROR_PREFIX;
 
 /// Rig's `ToolServerError`, the text a tool's `Err` reaches the model as.
@@ -9,9 +10,10 @@ const TOOLSET_ERROR_PREFIX: &str = "Toolset error: ";
 /// Rig's `ToolError` and `ToolSetError`, which can nest several deep.
 const TOOL_CALL_ERROR_PREFIX: &str = "ToolCallError: ";
 
-/// Whether a tool's output reports a failure: an MCP error result.
+/// Whether a tool's output reports a failure: an MCP error result, or a HITL
+/// approver's denial.
 ///
-/// Only that reaches a call as output. Any other failure is the call's
+/// Only those two reach a call as output. Any other failure is the call's
 /// `Err`, so an output that merely starts like one is still a success.
 ///
 /// ```
@@ -21,7 +23,13 @@ const TOOL_CALL_ERROR_PREFIX: &str = "ToolCallError: ";
 /// assert!(!is_reported_error("Tool execution failed: disk full on node-3"));
 /// ```
 pub fn is_reported_error(output: &str) -> bool {
-    output.starts_with(MCP_ERROR_PREFIX)
+    output.starts_with(MCP_ERROR_PREFIX) || is_tool_denial(output)
+}
+
+/// Whether `output` is a HITL approver's denial, a failure a person chose
+/// rather than a fault.
+pub fn is_tool_denial(output: &str) -> bool {
+    output.starts_with(DENIAL_PREFIX)
 }
 
 /// A failed call's text without the layers rig wraps around a tool's `Err`,
@@ -60,6 +68,15 @@ mod tests {
         )]);
         let text = crate::mcp::extract_tool_result(result, "auth_tool");
         assert!(is_reported_error(&text), "{text}");
+    }
+
+    #[test]
+    fn a_denial_is_a_reported_error() {
+        let denial = format!("{DENIAL_PREFIX}not today");
+        assert!(is_reported_error(&denial));
+        assert!(is_tool_denial(&denial));
+        assert!(!is_tool_denial("Tool returned an error: 401 Unauthorized"));
+        assert!(!is_tool_denial("denied by policy"));
     }
 
     #[test]
@@ -131,6 +148,8 @@ mod tests {
         ] {
             assert_eq!(tool_error_message(text), text);
         }
+        let denial = format!("{DENIAL_PREFIX}not today");
+        assert_eq!(tool_error_message(&denial), denial);
     }
 
     #[test]

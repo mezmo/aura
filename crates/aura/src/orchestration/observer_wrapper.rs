@@ -364,4 +364,46 @@ mod tests {
             _ => panic!("Expected CallCompleted event"),
         }
     }
+
+    /// Answers every call with a HITL denial, as the gate does.
+    struct Denies;
+
+    #[async_trait]
+    impl ToolWrapper for Denies {
+        async fn pre_call(
+            &self,
+            _args: &Value,
+            _ctx: &ToolCallContext,
+        ) -> Result<crate::tool_wrapper::PreCallOutcome, ToolError> {
+            Ok(crate::tool_wrapper::PreCallOutcome::ShortCircuit {
+                output: format!(
+                    "{}too risky. Do not execute this action.",
+                    crate::hitl::DENIAL_PREFIX
+                ),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_denied_call_completes_as_a_failure() {
+        use rig::tool::Tool as _;
+
+        let (observer, mut rx) = ToolCallObserver::new(8);
+        let wrapper = crate::tool_wrapper::ComposedWrapper::new(vec![
+            Arc::new(ObserverWrapper::new(observer, 0)) as Arc<dyn ToolWrapper>,
+            Arc::new(Denies),
+        ]);
+        let tool = crate::tool_wrapper::WrappedTool::new(McpErrorTool, Arc::new(wrapper));
+
+        let output = tool.call(serde_json::json!({})).await.unwrap();
+        assert!(output.starts_with(crate::hitl::DENIAL_PREFIX), "{output}");
+
+        let _started = rx.recv().await.unwrap();
+        match rx.recv().await.unwrap() {
+            ToolEvent::CallCompleted { result, .. } => {
+                assert!(matches!(&result, ToolOutcome::Failure { .. }), "{result:?}")
+            }
+            _ => panic!("Expected CallCompleted event"),
+        }
+    }
 }

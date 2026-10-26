@@ -28,6 +28,7 @@ use super::types::{
     TurnState, format_sse_chunk, truncate_result,
 };
 use aura::stream_events::{AuraStreamEvent, CorrelationContext};
+use aura::tool_error_detection::is_tool_denial;
 use aura::{
     EventContext, OrchestrationStreamEvent, PASSTHROUGH_MARKER, ResponseContent, StreamError,
     StreamItem, StreamedAssistantContent, StreamedUserContent, StreamingAgent, ToolCall,
@@ -1108,11 +1109,12 @@ fn handle_tool_result(
         );
 
         let event = if let Some(error) = tool_result.failure() {
-            tracing::warn!(
-                "Tool '{}' returned error: {}",
-                tool_name,
-                truncate_result(error, 200)
-            );
+            let error_preview = truncate_result(error, 200);
+            if is_tool_denial(error) {
+                tracing::info!("Tool '{}' was denied: {}", tool_name, error_preview);
+            } else {
+                tracing::warn!("Tool '{}' returned error: {}", tool_name, error_preview);
+            }
             AuraStreamEvent::tool_complete_failure(
                 &tool_result.id,
                 &tool_name,
@@ -1985,6 +1987,36 @@ mod tests {
             openwebui_result_arguments(output, aura::ToolResultKind::Json, 0),
             output
         );
+    }
+
+    #[test]
+    fn a_hitl_denial_reports_success_false() {
+        let config = StreamConfig::new(true, false, ToolResultMode::Aura, 0);
+        let ctx = test_turn_ctx();
+        let mut state = TurnState::new();
+        state
+            .tool_call_map
+            .insert("call_2".to_string(), ("echo".to_string(), 0));
+        let denial = "Tool call blocked by human approval denial: scripted denial. Do not execute this action.";
+        let tool_result = ToolResult {
+            id: "call_2".to_string(),
+            call_id: None,
+            result: denial.to_string(),
+            kind: aura::ToolResultKind::Text,
+        };
+
+        let output: String = handle_tool_result(&config, &ctx, &mut state, &tool_result)
+            .iter()
+            .filter_map(|b| std::str::from_utf8(b).ok())
+            .collect();
+        let data = output
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("an aura.tool_complete frame");
+        let frame: serde_json::Value = serde_json::from_str(data).unwrap();
+
+        assert_eq!(frame["success"], false, "{frame}");
+        assert_eq!(frame["error"], denial, "{frame}");
     }
 
     #[test]
