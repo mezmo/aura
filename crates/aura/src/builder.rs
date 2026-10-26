@@ -2995,7 +2995,6 @@ mod tests {
     /// them, which is unchanged.
     #[tokio::test]
     async fn test_scratchpad_layer_outside_existing_observes_raw_output() {
-        use crate::mcp::CallOutcome;
         use crate::scratchpad::context_budget::TiktokenCounter;
         use crate::scratchpad::{ScratchpadMiddleware, ScratchpadStorage};
         use crate::tool_middleware::{MiddlewareStack, MiddlewareTool, WrapperLayer};
@@ -3033,7 +3032,7 @@ mod tests {
             async fn transform_output(
                 &self,
                 output: String,
-                _outcome: &CallOutcome,
+                _is_error: bool,
                 _ctx: &ToolCallContext,
                 _extracted: Option<&Value>,
             ) -> TransformOutputResult {

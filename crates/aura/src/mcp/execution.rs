@@ -294,6 +294,56 @@ mod tests {
         assert!(bounded.starts_with("Tool execution failed:"));
     }
 
+    /// An `mcp.tool_call` span is ERROR for an MCP error result only. A
+    /// successful output that starts like another failure stays OK.
+    #[cfg(feature = "otel")]
+    mod span_status {
+        use opentelemetry::trace::{Status, TracerProvider as _};
+        use opentelemetry_sdk::trace::TracerProvider;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        use super::*;
+        use crate::test_span_capture::CapturedSpans;
+
+        fn status_for(response: &str) -> Status {
+            let captured = CapturedSpans::default();
+            let provider = TracerProvider::builder()
+                .with_simple_exporter(captured.clone())
+                .build();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry()
+                    .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test"))),
+            );
+            {
+                let span = tracing::info_span!("mcp.tool_call");
+                record_tool_call_result(&span, &Ok(response.to_string()));
+            }
+            let spans = captured.spans();
+            spans
+                .iter()
+                .find(|span| span.name == "mcp.tool_call")
+                .expect("the mcp.tool_call span was never exported")
+                .status
+                .clone()
+        }
+
+        #[test]
+        fn an_mcp_error_result_is_an_error() {
+            assert!(matches!(
+                status_for("Tool returned an error: 401 Unauthorized"),
+                Status::Error { .. }
+            ));
+        }
+
+        #[test]
+        fn a_success_that_reads_like_a_failure_is_ok() {
+            assert_eq!(
+                status_for("Tool execution failed: disk full on node-3 (12:04:11)"),
+                Status::Ok
+            );
+        }
+    }
+
     /// Trace correlation: a gated call's `mcp.tool_call` span carries the captured override's header NAMES, never their values, and an ungated call's span carries neither. Gated on `otel`: without the feature there is no span data to assert against.
     #[cfg(feature = "otel")]
     mod applied_headers_span {

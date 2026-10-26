@@ -6,95 +6,11 @@
  * and traditional text-based responses.
  */
 
-use anyhow::Result;
 use base64::Engine;
 use rmcp::model::CallToolResult;
 use tracing::{debug, info, warn};
 
 pub(crate) const MCP_ERROR_PREFIX: &str = "Tool returned an error: ";
-
-/// JSON-RPC 2.0 error codes that indicate input/schema validation failures.
-const SCHEMA_ERROR_CODES: [i32; 3] = [
-    -32602, // InvalidParams — malformed or missing required arguments
-    -32600, // InvalidRequest — structurally invalid JSON-RPC request
-    -32700, // ParseError — not valid JSON at all
-];
-
-/// Classified outcome of an MCP tool call, preserving error-kind fidelity
-/// that would otherwise be lost during stringification.
-///
-/// Downstream consumers (e.g., duplicate-call guard) can branch on this
-/// structurally instead of parsing string prefixes.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CallOutcome {
-    /// Tool executed successfully.
-    Success(String),
-
-    /// JSON-RPC protocol-level error indicating input validation failure
-    /// (e.g., `-32602 InvalidParams`).
-    SchemaError { content: String, code: i32 },
-
-    /// Tool error that is NOT clearly a schema/validation failure.
-    /// Includes application-level `is_error: true` responses (ambiguous)
-    /// and non-schema JSON-RPC errors (e.g., `-32603 InternalError`).
-    GeneralToolError { content: String, code: Option<i32> },
-}
-
-impl CallOutcome {
-    pub fn content(&self) -> &str {
-        match self {
-            Self::Success(s) => s,
-            Self::SchemaError { content, .. } | Self::GeneralToolError { content, .. } => content,
-        }
-    }
-
-    pub fn is_error(&self) -> bool {
-        !matches!(self, Self::Success(_))
-    }
-
-    pub fn is_schema_error(&self) -> bool {
-        matches!(self, Self::SchemaError { .. })
-    }
-
-    /// Convert to the legacy prefixed-string format consumed by existing callers.
-    pub fn into_prefixed_string(self) -> String {
-        match self {
-            Self::Success(s) => s,
-            Self::SchemaError { content, .. } | Self::GeneralToolError { content, .. } => {
-                format!("{MCP_ERROR_PREFIX}{content}")
-            }
-        }
-    }
-
-    /// Classify from a prefixed tool-output string (reverse of `into_prefixed_string`).
-    /// Used at the WrappedTool boundary where only a String is available.
-    pub fn classify_from_output(output: &str) -> Self {
-        if let Some(msg) = output.strip_prefix(MCP_ERROR_PREFIX) {
-            Self::GeneralToolError {
-                content: msg.to_string(),
-                code: None,
-            }
-        } else {
-            Self::Success(output.to_string())
-        }
-    }
-
-    /// Construct from a JSON-RPC error, mapping error codes to the
-    /// appropriate variant.
-    pub fn from_jsonrpc_error(code: i32, message: &str) -> Self {
-        if SCHEMA_ERROR_CODES.contains(&code) {
-            Self::SchemaError {
-                content: bound_error_content(message.to_string(), MAX_TOOL_ERROR_BYTES),
-                code,
-            }
-        } else {
-            Self::GeneralToolError {
-                content: bound_error_content(message.to_string(), MAX_TOOL_ERROR_BYTES),
-                code: Some(code),
-            }
-        }
-    }
-}
 
 /// Target budget (in bytes) for an MCP tool *error* surfaced to an agent.
 pub const MAX_TOOL_ERROR_BYTES: usize = 8 * 1024;
@@ -211,8 +127,8 @@ fn debug_preview(s: &str) -> String {
 /// * `tool_name` - Name of the tool (for logging)
 ///
 /// ## Returns
-/// * `Ok(String)` - The tool result as a string (JSON for structured, text for unstructured)
-/// * `Err(anyhow::Error)` - If result processing fails
+/// The tool result as a string (JSON for structured, text for unstructured),
+/// prefixed with `MCP_ERROR_PREFIX` when the server flags it as an error.
 ///
 /// ## FastMCP x-fastmcp-wrap-result Extension
 /// FastMCP tools with `x-fastmcp-wrap-result: true` in their outputSchema
@@ -230,7 +146,7 @@ fn debug_preview(s: &str) -> String {
 /// }
 /// ```
 /// Returns: `{"result": ["metric1", "metric2", ...]}`
-pub fn extract_tool_result(result: CallToolResult, tool_name: &str) -> Result<CallOutcome> {
+pub fn extract_tool_result(result: CallToolResult, tool_name: &str) -> String {
     let is_error = result.is_error.unwrap_or(false);
     if is_error {
         warn!("Tool '{}' returned error result", tool_name);
@@ -263,12 +179,9 @@ pub fn extract_tool_result(result: CallToolResult, tool_name: &str) -> Result<Ca
         );
 
         return if is_error {
-            Ok(CallOutcome::GeneralToolError {
-                content: bound_error_content(json_str, MAX_TOOL_ERROR_BYTES),
-                code: None,
-            })
+            error_result(json_str)
         } else {
-            Ok(CallOutcome::Success(json_str))
+            json_str
         };
     }
 
@@ -302,13 +215,17 @@ pub fn extract_tool_result(result: CallToolResult, tool_name: &str) -> Result<Ca
     debug!("   Content preview: {}", debug_preview(&content));
 
     if is_error {
-        Ok(CallOutcome::GeneralToolError {
-            content: bound_error_content(content, MAX_TOOL_ERROR_BYTES),
-            code: None,
-        })
+        error_result(content)
     } else {
-        Ok(CallOutcome::Success(content))
+        content
     }
+}
+
+fn error_result(content: String) -> String {
+    format!(
+        "{MCP_ERROR_PREFIX}{}",
+        bound_error_content(content, MAX_TOOL_ERROR_BYTES)
+    )
 }
 
 #[cfg(test)]
@@ -330,16 +247,15 @@ mod tests {
             meta: None,
         };
 
-        let outcome = extract_tool_result(result, "list_metrics").unwrap();
-        assert!(!outcome.is_error());
-        let extracted = outcome.content();
+        let extracted = extract_tool_result(result, "list_metrics");
+        assert!(!extracted.starts_with(MCP_ERROR_PREFIX));
 
         assert!(extracted.contains("\"result\""));
         assert!(extracted.contains("metric1"));
         assert!(extracted.contains("metric2"));
         assert!(extracted.contains("metric3"));
 
-        let parsed: Value = serde_json::from_str(extracted).unwrap();
+        let parsed: Value = serde_json::from_str(&extracted).unwrap();
         assert_eq!(parsed["result"].as_array().unwrap().len(), 3);
     }
 
@@ -358,8 +274,8 @@ mod tests {
             meta: None,
         };
 
-        let outcome = extract_tool_result(result, "echo").unwrap();
-        assert_eq!(outcome, CallOutcome::Success("Hello, world!".to_string()));
+        let extracted = extract_tool_result(result, "echo");
+        assert_eq!(extracted, "Hello, world!");
     }
 
     #[test]
@@ -378,11 +294,9 @@ mod tests {
             meta: None,
         };
 
-        let outcome = extract_tool_result(result, "test").unwrap();
-        let content = outcome.content();
-
-        assert!(content.contains("structured"));
-        assert!(!content.contains("Fallback text"));
+        let extracted = extract_tool_result(result, "test");
+        assert!(extracted.contains("structured"));
+        assert!(!extracted.contains("Fallback text"));
     }
 
     #[test]
@@ -394,8 +308,8 @@ mod tests {
             meta: None,
         };
 
-        let outcome = extract_tool_result(result, "empty").unwrap();
-        assert_eq!(outcome, CallOutcome::Success("".to_string()));
+        let extracted = extract_tool_result(result, "empty");
+        assert_eq!(extracted, "");
     }
 
     #[test]
@@ -413,13 +327,8 @@ mod tests {
             meta: None,
         };
 
-        let outcome = extract_tool_result(result, "failing_tool").unwrap();
-        assert!(outcome.is_error());
-        assert!(!outcome.is_schema_error());
-        assert_eq!(outcome.content(), "Connection refused");
-
-        let prefixed = outcome.into_prefixed_string();
-        assert!(prefixed.starts_with("Tool returned an error:"));
+        let extracted = extract_tool_result(result, "failing_tool");
+        assert_eq!(extracted, "Tool returned an error: Connection refused");
     }
 
     #[test]
@@ -433,9 +342,9 @@ mod tests {
             meta: None,
         };
 
-        let outcome = extract_tool_result(result, "auth_tool").unwrap();
-        assert!(outcome.is_error());
-        assert!(outcome.content().contains("AUTH_FAILED"));
+        let extracted = extract_tool_result(result, "auth_tool");
+        assert!(extracted.starts_with(MCP_ERROR_PREFIX));
+        assert!(extracted.contains("AUTH_FAILED"));
     }
 
     #[test]
@@ -454,8 +363,8 @@ mod tests {
             meta: None,
         };
 
-        let outcome = extract_tool_result(result, "test").unwrap();
-        assert_eq!(outcome, CallOutcome::Success("Success message".to_string()));
+        let extracted = extract_tool_result(result, "test");
+        assert_eq!(extracted, "Success message");
     }
 
     // --- Embedded Resource extraction tests ---
@@ -480,9 +389,7 @@ mod tests {
             meta: None,
         };
 
-        let extracted = extract_tool_result(result, "get_file")
-            .unwrap()
-            .into_prefixed_string();
+        let extracted = extract_tool_result(result, "get_file");
         assert_eq!(extracted, "# Hello World\nThis is a readme.");
     }
 
@@ -510,9 +417,7 @@ mod tests {
             meta: None,
         };
 
-        let extracted = extract_tool_result(result, "get_file")
-            .unwrap()
-            .into_prefixed_string();
+        let extracted = extract_tool_result(result, "get_file");
         assert_eq!(extracted, "console.log('hello');");
     }
 
@@ -536,9 +441,7 @@ mod tests {
             meta: None,
         };
 
-        let extracted = extract_tool_result(result, "get_file")
-            .unwrap()
-            .into_prefixed_string();
+        let extracted = extract_tool_result(result, "get_file");
         assert!(extracted.starts_with("[Binary resource:"));
         assert!(extracted.contains("image/png"));
     }
@@ -567,9 +470,7 @@ mod tests {
             meta: None,
         };
 
-        let extracted = extract_tool_result(result, "get_file")
-            .unwrap()
-            .into_prefixed_string();
+        let extracted = extract_tool_result(result, "get_file");
         assert_eq!(extracted, r#"{"key": "value"}"#);
     }
 
@@ -594,9 +495,7 @@ mod tests {
             meta: None,
         };
 
-        let extracted = extract_tool_result(result, "get_file")
-            .unwrap()
-            .into_prefixed_string();
+        let extracted = extract_tool_result(result, "get_file");
         assert!(extracted.contains("Resource link:"));
         assert!(extracted.contains("big-file.md"));
         assert!(extracted.contains("repo://"));
@@ -647,109 +546,9 @@ mod tests {
             meta: None,
         };
 
-        let extracted = extract_tool_result(result, "get_file")
-            .unwrap()
-            .into_prefixed_string();
+        let extracted = extract_tool_result(result, "get_file");
         assert!(extracted.contains("Successfully downloaded file"));
         assert!(extracted.contains("# File Content"));
-    }
-
-    // --- CallOutcome tests ---
-
-    #[test]
-    fn test_call_outcome_success() {
-        let outcome = CallOutcome::Success("result".to_string());
-        assert!(!outcome.is_error());
-        assert!(!outcome.is_schema_error());
-        assert_eq!(outcome.content(), "result");
-        assert_eq!(outcome.into_prefixed_string(), "result");
-    }
-
-    #[test]
-    fn test_call_outcome_schema_error() {
-        let outcome = CallOutcome::SchemaError {
-            content: "Invalid params".to_string(),
-            code: -32602,
-        };
-        assert!(outcome.is_error());
-        assert!(outcome.is_schema_error());
-        assert_eq!(outcome.content(), "Invalid params");
-        assert_eq!(
-            outcome.into_prefixed_string(),
-            "Tool returned an error: Invalid params"
-        );
-    }
-
-    #[test]
-    fn test_call_outcome_general_tool_error() {
-        let outcome = CallOutcome::GeneralToolError {
-            content: "Internal error".to_string(),
-            code: Some(-32603),
-        };
-        assert!(outcome.is_error());
-        assert!(!outcome.is_schema_error());
-        assert_eq!(outcome.content(), "Internal error");
-    }
-
-    #[test]
-    fn test_call_outcome_application_level_error_is_general() {
-        let result = CallToolResult {
-            content: vec![Content {
-                raw: RawContent::Text(RawTextContent {
-                    text: "rate limited".to_string(),
-                    meta: None,
-                }),
-                annotations: None,
-            }],
-            structured_content: None,
-            is_error: Some(true),
-            meta: None,
-        };
-
-        let outcome = extract_tool_result(result, "test").unwrap();
-        assert!(matches!(
-            outcome,
-            CallOutcome::GeneralToolError { code: None, .. }
-        ));
-        assert_eq!(outcome.content(), "rate limited");
-    }
-
-    #[test]
-    fn test_from_jsonrpc_error_invalid_params() {
-        let outcome = CallOutcome::from_jsonrpc_error(-32602, "missing field: x");
-        assert!(outcome.is_schema_error());
-        assert_eq!(outcome.content(), "missing field: x");
-        assert!(matches!(
-            outcome,
-            CallOutcome::SchemaError { code: -32602, .. }
-        ));
-    }
-
-    #[test]
-    fn test_from_jsonrpc_error_internal() {
-        let outcome = CallOutcome::from_jsonrpc_error(-32603, "server crashed");
-        assert!(!outcome.is_schema_error());
-        assert!(outcome.is_error());
-        assert!(matches!(
-            outcome,
-            CallOutcome::GeneralToolError {
-                code: Some(-32603),
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn test_classify_from_output_success() {
-        let outcome = CallOutcome::classify_from_output("normal result");
-        assert_eq!(outcome, CallOutcome::Success("normal result".to_string()));
-    }
-
-    #[test]
-    fn test_classify_from_output_error_prefix() {
-        let outcome = CallOutcome::classify_from_output("Tool returned an error: 503");
-        assert!(outcome.is_error());
-        assert_eq!(outcome.content(), "503");
     }
 
     #[test]
@@ -825,14 +624,14 @@ mod tests {
             meta: None,
         };
 
-        let outcome = extract_tool_result(result, "exploding_tool").unwrap();
-        assert!(outcome.is_error());
+        let extracted = extract_tool_result(result, "exploding_tool");
+        assert!(extracted.starts_with(MCP_ERROR_PREFIX));
         assert!(
-            outcome.content().len() <= MAX_TOOL_ERROR_BYTES + 128,
+            extracted.len() <= MCP_ERROR_PREFIX.len() + MAX_TOOL_ERROR_BYTES + 128,
             "error content must be bounded; got {} bytes",
-            outcome.content().len()
+            extracted.len()
         );
-        assert!(outcome.content().contains("[tool error truncated:"));
+        assert!(extracted.contains("[tool error truncated:"));
     }
 
     #[test]
@@ -845,12 +644,12 @@ mod tests {
             meta: None,
         };
 
-        let outcome = extract_tool_result(result, "exploding_tool").unwrap();
-        assert!(outcome.is_error());
+        let extracted = extract_tool_result(result, "exploding_tool");
+        assert!(extracted.starts_with(MCP_ERROR_PREFIX));
         assert!(
-            outcome.content().len() <= MAX_TOOL_ERROR_BYTES + 128,
+            extracted.len() <= MCP_ERROR_PREFIX.len() + MAX_TOOL_ERROR_BYTES + 128,
             "structured error content must be bounded; got {} bytes",
-            outcome.content().len()
+            extracted.len()
         );
     }
 
@@ -872,24 +671,12 @@ mod tests {
             meta: None,
         };
 
-        let outcome = extract_tool_result(result, "big_success").unwrap();
-        assert!(!outcome.is_error());
+        let extracted = extract_tool_result(result, "big_success");
+        assert!(!extracted.starts_with(MCP_ERROR_PREFIX));
         assert_eq!(
-            outcome.content().len(),
+            extracted.len(),
             huge.len(),
             "successful output must not be truncated by error bounding"
-        );
-    }
-
-    #[test]
-    fn test_from_jsonrpc_error_is_bounded() {
-        let huge = "e".repeat(50_000);
-        let outcome = CallOutcome::from_jsonrpc_error(-32603, &huge);
-        assert!(outcome.is_error());
-        assert!(
-            outcome.content().len() <= MAX_TOOL_ERROR_BYTES + 128,
-            "jsonrpc error message must be bounded; got {} bytes",
-            outcome.content().len()
         );
     }
 
@@ -926,8 +713,8 @@ mod tests {
                 is_error: None,
                 meta: None,
             };
-            let outcome = extract_tool_result(result, "fetch_container_logs").unwrap();
-            assert!(!outcome.is_error());
+            let extracted = extract_tool_result(result, "fetch_container_logs");
+            assert!(!extracted.starts_with(MCP_ERROR_PREFIX));
         }
     }
 
@@ -942,20 +729,8 @@ mod tests {
                 is_error: None,
                 meta: None,
             };
-            let outcome = extract_tool_result(result, "fetch_container_logs").unwrap();
-            assert!(!outcome.is_error());
+            let extracted = extract_tool_result(result, "fetch_container_logs");
+            assert!(!extracted.starts_with(MCP_ERROR_PREFIX));
         }
-    }
-
-    #[test]
-    fn test_classify_roundtrip() {
-        let original = CallOutcome::GeneralToolError {
-            content: "timeout".to_string(),
-            code: None,
-        };
-        let prefixed = original.clone().into_prefixed_string();
-        let reconstructed = CallOutcome::classify_from_output(&prefixed);
-        assert_eq!(reconstructed.content(), original.content());
-        assert!(reconstructed.is_error());
     }
 }
