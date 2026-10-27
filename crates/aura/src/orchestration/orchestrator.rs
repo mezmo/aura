@@ -1724,8 +1724,14 @@ impl Orchestrator {
                     .into_events(),
                 None => agent.stream_chat(prompt, history).await,
             };
+            // With no per-call timeout nothing reads `progress`, so skip the copy.
+            let stream = if timeout_secs == 0 {
+                stream
+            } else {
+                record_progress(stream, Arc::clone(&progress))
+            };
             Self::drive_forward_loop(
-                record_progress(stream, Arc::clone(&progress)),
+                stream,
                 &self.usage_state,
                 self.config.stream_inactivity_timeout_secs(),
                 agent.scratchpad_budget(),
