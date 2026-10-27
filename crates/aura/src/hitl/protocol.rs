@@ -59,6 +59,19 @@ pub struct ApprovalDecisionWire {
     pub approved: bool,
     #[serde(default)]
     pub reason: Option<String>,
+    /// The receiver's verdict on each item of the request.
+    #[serde(default)]
+    pub decisions: Option<Vec<ItemDecisionWire>>,
+}
+
+/// Wire form of one item's verdict inside [`ApprovalDecisionWire::decisions`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct ItemDecisionWire {
+    /// The item's `id` as it was sent in the request.
+    pub id: u64,
+    pub approved: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 impl From<ApprovalDecisionWire> for ApprovalDecision {
