@@ -647,13 +647,11 @@ struct ForwardedRun {
     /// Provider-reported usage of the loop's last turn — context-window
     /// occupancy, as opposed to `response.usage`'s loop total.
     last_turn: rig::completion::Usage,
-    /// The per-call timeout cut the loop; `response` holds only what
-    /// streamed before the cut.
+    /// The per-call timeout cut the loop.
     timed_out: bool,
 }
 
-/// What a worker streamed so far, kept outside the timed future so a
-/// per-call timeout does not drop it with the future.
+/// Text and tool results a worker has streamed so far.
 #[derive(Default)]
 struct PartialRun {
     text: String,
@@ -1710,6 +1708,8 @@ impl Orchestrator {
             ..
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
+        // Kept outside the timed future so a per-call timeout does not drop
+        // what already streamed with the future.
         let progress = Arc::new(std::sync::Mutex::new(PartialRun::default()));
         let stream_future = async {
             let stream = match park_key {
