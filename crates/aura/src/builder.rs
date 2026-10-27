@@ -2036,6 +2036,9 @@ impl StreamingAgent for Agent {
             return crate::streaming::AgentRun::refused(refused);
         }
         let run_id = run.id().to_string();
+        // Set before the run starts, since its tools read attendance from
+        // this context.
+        run.attend(options.attendance());
 
         // The run's token is what its work watches and what dropping the
         // handle cancels. A caller that handed in a token of its own gets the
@@ -2069,16 +2072,19 @@ impl StreamingAgent for Agent {
                 .await
         };
 
-        let started = started.map_stream(move |stream| {
-            Box::pin(crate::run_context::scope_stream(
-                Arc::clone(&run),
-                Box::pin(crate::streaming::tee_content(
-                    run,
-                    aura_events::EmittingAgent::single_agent(),
-                    stream,
-                )),
-            ))
-        });
+        let context = Arc::clone(&run);
+        let started = started
+            .map_stream(move |stream| {
+                Box::pin(crate::run_context::scope_stream(
+                    Arc::clone(&run),
+                    Box::pin(crate::streaming::tee_content(
+                        run,
+                        aura_events::EmittingAgent::single_agent(),
+                        stream,
+                    )),
+                ))
+            })
+            .within(context);
         // One observer per run: the first stream hands the receiver over,
         // a later stream of the same run has no second one to give.
         match self

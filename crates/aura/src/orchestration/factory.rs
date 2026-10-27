@@ -234,6 +234,7 @@ impl StreamingAgent for OrchestratorFactory {
         if let Err(refused) = self.stream_claim.claim(run_id, request_id) {
             return crate::streaming::AgentRun::refused(refused);
         }
+        let attendance = options.attendance();
         let (timeout, cancel) = options.into_parts();
         let cancel_token = cancel.unwrap_or_default();
 
@@ -256,6 +257,10 @@ impl StreamingAgent for OrchestratorFactory {
         let usage_state = crate::UsageState::new();
         let (run, run_events) =
             crate::run_context::RunContext::channel_on(run_id, cancel_token.clone());
+        // Set before the orchestration is spawned, since each worker's tools
+        // read attendance through a child of this context.
+        run.attend(attendance);
+        let context = std::sync::Arc::clone(&run);
         let stream = self.spawn_orchestration_stream(
             query.to_string(),
             chat_history,
@@ -276,7 +281,9 @@ impl StreamingAgent for OrchestratorFactory {
             stream,
         ));
 
-        crate::streaming::AgentRun::new(stream, cancel_token, usage_state).observed_by(run_events)
+        crate::streaming::AgentRun::new(stream, cancel_token, usage_state)
+            .observed_by(run_events)
+            .within(context)
     }
 
     async fn cancel_and_close_mcp(&self, _request_id: &str, _reason: &str) -> usize {

@@ -30,10 +30,12 @@ use crate::passthrough_tool::PASSTHROUGH_MARKER;
 use crate::provider_agent::{
     ProviderAgent, StreamError, StreamItem, StreamedUserContent, ToolResult,
 };
-use crate::run_context::RunContext;
+use crate::run_context::{Attendance, RunContext};
 use crate::session_store::JournalEntry;
 use crate::streaming::{AgentRun, RunOptions, StreamingAgent};
 use crate::streaming_request_hook::UsageState;
+
+mod observe;
 
 // ---------------------------------------------------------------------------
 // Test agents
@@ -65,6 +67,8 @@ struct FakeAgent {
     closed: Arc<Mutex<Vec<(String, String)>>>,
     /// Woken by `cancel_and_close_mcp`.
     mcp_cancelled: Arc<Notify>,
+    /// The run's attendance as each `stream` call saw it.
+    attended: Arc<Mutex<Vec<Attendance>>>,
 }
 
 #[async_trait]
@@ -84,9 +88,13 @@ impl StreamingAgent for FakeAgent {
         options: RunOptions,
         _request_id: &str,
     ) -> AgentRun {
+        let attendance = options.attendance();
         let (_, cancel) = options.into_parts();
         let cancel = cancel.unwrap_or_default();
         let (run, events) = RunContext::channel_on(self.run_id, cancel.clone());
+        run.attend(attendance);
+        self.attended.lock().unwrap().push(run.attendance());
+        let context = Arc::clone(&run);
         let steps = self.steps.clone();
         let token = cancel.clone();
         let mcp_cancelled = Arc::clone(&self.mcp_cancelled);
@@ -138,7 +146,9 @@ impl StreamingAgent for FakeAgent {
         };
         let items: futures::stream::BoxStream<'static, Result<StreamItem, StreamError>> =
             Box::pin(items);
-        AgentRun::new(items, cancel, UsageState::new()).observed_by(events)
+        AgentRun::new(items, cancel, UsageState::new())
+            .observed_by(events)
+            .within(context)
     }
 
     async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize {
@@ -172,6 +182,8 @@ struct TestPreparer {
     prepared: Mutex<Vec<String>>,
     /// What every fake agent's `cancel_and_close_mcp` was called with.
     closed: Arc<Mutex<Vec<(String, String)>>>,
+    /// The attendance every fake agent's `stream` saw.
+    attended: Arc<Mutex<Vec<Attendance>>>,
 }
 
 impl TestPreparer {
@@ -182,6 +194,7 @@ impl TestPreparer {
             gate: None,
             prepared: Mutex::new(Vec::new()),
             closed: Arc::default(),
+            attended: Arc::default(),
         }
     }
 
@@ -248,6 +261,7 @@ impl AgentPreparer for TestPreparer {
                 steps,
                 closed: Arc::clone(&self.closed),
                 mcp_cancelled: Arc::default(),
+                attended: Arc::clone(&self.attended),
             }))),
             Prepared::Fail(error) => Err(BuilderError::AgentError(error)),
         }
@@ -287,13 +301,31 @@ fn harness_over(
     store: Arc<dyn RunStore>,
     runs: Arc<InMemoryRunStore>,
 ) -> Harness {
-    let preparer = Arc::new(preparer);
     let journals = Arc::new(InMemoryJournalStore::new());
+    harness_build(
+        preparer,
+        retention,
+        store,
+        runs,
+        Arc::clone(&journals) as Arc<dyn JournalStore>,
+        journals,
+    )
+}
+
+fn harness_build(
+    preparer: TestPreparer,
+    retention: Duration,
+    store: Arc<dyn RunStore>,
+    runs: Arc<InMemoryRunStore>,
+    journal_store: Arc<dyn JournalStore>,
+    journals: Arc<InMemoryJournalStore>,
+) -> Harness {
+    let preparer = Arc::new(preparer);
     let runtime = AgentRuntime::with_preparer(
         Arc::clone(&preparer) as Arc<dyn AgentPreparer>,
         RuntimeStores {
             runs: store,
-            journals: Arc::clone(&journals) as Arc<dyn JournalStore>,
+            journals: journal_store,
             skills: Arc::new(InMemorySkillInvocationStore::new()),
         },
         PendingApprovals::new(),
@@ -479,6 +511,9 @@ fn kind(event: &SessionEvent) -> &'static str {
             LifecycleEvent::Failed { .. } => "failed",
             LifecycleEvent::Cancelled { .. } => "cancelled",
             LifecycleEvent::Parked { .. } => "parked",
+            LifecycleEvent::ObserverAttached { .. } => "observer_attached",
+            LifecycleEvent::ObserverDetached { .. } => "observer_detached",
+            LifecycleEvent::ClaimsExhausted => "claims_exhausted",
             _ => "lifecycle",
         },
         SessionEventPayload::Agent(agent) => match &agent.payload {

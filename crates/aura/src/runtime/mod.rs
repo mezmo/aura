@@ -11,8 +11,10 @@
 //! [`AgentState`], or a listing read through the [`RunStore`]. The agent, the
 //! run's event channel, and its task are never handed out.
 
+mod observe;
 mod prepare;
 mod record;
+mod recorder;
 mod start;
 mod state;
 mod task;
@@ -22,20 +24,25 @@ mod tests;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
 use aura_config::Config;
-use aura_events::run::{Liveness, LivenessPolicy, RunCancelReason};
+use aura_events::run::{
+    LifecycleEvent, Liveness, LivenessPolicy, Observer, ObserverId, RunCancelReason,
+    SessionEventPayload,
+};
 use aura_events::{RunId, SessionId};
+use tokio_util::sync::CancellationToken;
 
 use crate::hitl::PendingApprovals;
-use crate::journal::SessionJournal;
+use crate::journal::{Cursor, SessionJournal};
 use crate::session_store::{
     InMemoryJournalStore, InMemoryRunStore, InMemorySkillInvocationStore, JournalStore, RunFacts,
     RunFilter, RunStatus, RunStore, SessionStoreError, SkillInvocationStore,
 };
 
+pub use observe::{Attach, AttachError, ObserverCounts, Subscription};
 pub use prepare::RigBuilderPreparer;
 pub use start::{StartError, StartRun};
 pub use state::{AgentState, BlockReason};
@@ -83,6 +90,10 @@ struct Shared {
     /// How long an ended run stays held.
     retention: Duration,
     draining: AtomicBool,
+    /// Cancelled once a drain has let everything go.
+    shut_down: CancellationToken,
+    /// The task that does the async work a `Drop` cannot.
+    recorder: OnceLock<recorder::Recorder>,
 }
 
 impl AgentRuntime {
@@ -121,6 +132,8 @@ impl AgentRuntime {
                 admission: Mutex::new(()),
                 retention,
                 draining: AtomicBool::new(false),
+                shut_down: CancellationToken::new(),
+                recorder: OnceLock::new(),
             }),
         }
     }
@@ -277,7 +290,74 @@ impl AgentRuntime {
         for record in runs.values() {
             record.abort_task();
         }
+        self.shared.stop_recorder();
+        self.shared.shut_down.cancel();
         self.shared.lock_sessions().clear();
+    }
+
+    /// Attaches an observer to `session` and returns its `Subscription`: the
+    /// session's event stream, read from the cursor the observer asked for.
+    /// A session this process does not hold is opened first.
+    ///
+    /// The subscription joins the stream before the attach is appended to
+    /// it, so a subscriber starting live finds its own `ObserverAttached`
+    /// among its first events. An event the live run was already appending
+    /// at that moment arrives ahead of it.
+    ///
+    /// What the observer declares applies to the session's live run, which
+    /// the attach event names, and to every run that starts while the
+    /// observer stays attached. A claim is refused with the holder's id while
+    /// the session already has a claimant. Once [`drain`](Self::drain) has
+    /// begun, every attach is refused.
+    pub async fn attach(
+        &self,
+        session: &SessionId,
+        how: Attach,
+    ) -> Result<Subscription, AttachError> {
+        let observer = Observer {
+            id: new_observer_id(),
+            kind: how.kind,
+            presence: how.presence,
+        };
+        self.shared.start_recorder();
+        let mut registered = self.shared.register(session, &observer).await?;
+        let record = Arc::clone(&registered.record);
+        // A live cursor is pinned to the journal's newest number, so the
+        // subscription can pick up from the same place on a reopened journal.
+        let from = match how.from {
+            Cursor::Live => record.journal.latest().map_or(Cursor::Start, Cursor::After),
+            from => from,
+        };
+        let events = record.journal.subscribe(from);
+        let attached = LifecycleEvent::ObserverAttached {
+            observer: observer.clone(),
+        };
+        let append = record
+            .journal
+            .append(registered.run_id, SessionEventPayload::Lifecycle(attached));
+        // An attach still writing when a drain has let everything go gives
+        // up, so it does not keep the session's journal alive past shutdown.
+        tokio::select! {
+            appended = append => appended?,
+            () = self.shared.shut_down.cancelled() => return Err(AttachError::ShuttingDown),
+        };
+        registered.recorded = true;
+        drop(registered);
+        Ok(Subscription::new(
+            observer,
+            events,
+            from,
+            &record,
+            Arc::downgrade(&self.shared),
+        ))
+    }
+
+    /// How many observers `session` has, or `None` for a session this
+    /// process does not hold.
+    pub fn observer_counts(&self, session: &SessionId) -> Option<ObserverCounts> {
+        let session = self.shared.lock_sessions().get(session).cloned()?;
+        let counts = session.lock().observers.counts();
+        Some(counts)
     }
 
     /// The run's facts, or `None` once the runtime has let the run go, a
@@ -345,11 +425,8 @@ impl Shared {
             .cloned()
     }
 
-    /// Waits out the retention window, then lets the ended run go. If the
-    /// session then has no live run and no other retained run, it goes too.
-    /// Its journal goes with it, which ends the journal's subscriptions. The
-    /// journal store still holds the session's events and newest sequence
-    /// number, so a later start on the session continues the sequence.
+    /// Waits out the retention window, then lets the ended run go, and the
+    /// session too if it is then idle.
     async fn retire(&self, session: &Arc<SessionRecord>, record: &RunRecord) {
         tokio::time::sleep(self.retention).await;
         let _admitted = self.lock_admission();
@@ -357,27 +434,41 @@ impl Shared {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&record.id);
-        let idle = {
+        {
             let mut state = session.lock();
             state.retained = state.retained.saturating_sub(1);
-            state.is_idle()
-        };
-        if idle {
-            // Remove the session only if the map still holds this record.
-            // The session may have been reopened since, and the new record
-            // is not this run's to let go.
-            let mut sessions = self.lock_sessions();
-            if sessions
-                .get(&session.id)
-                .is_some_and(|held| Arc::ptr_eq(held, session))
-            {
-                sessions.remove(&session.id);
-            }
+        }
+        self.let_go_if_idle_admitted(session);
+    }
+
+    /// Takes `admission`, then calls
+    /// [`let_go_if_idle_admitted`](Self::let_go_if_idle_admitted).
+    fn let_go_if_idle(&self, session: &Arc<SessionRecord>) {
+        let _admitted = self.lock_admission();
+        self.let_go_if_idle_admitted(session);
+    }
+
+    /// Removes the session if it is idle (see `SessionState::is_idle`). Its
+    /// journal goes with it, which ends its subscriptions. The store keeps
+    /// the session's events and newest sequence number, so a later start
+    /// continues the sequence. Only this exact record is removed: if the
+    /// session was reopened since, the newer record stays. The caller holds
+    /// `admission`.
+    fn let_go_if_idle_admitted(&self, session: &Arc<SessionRecord>) {
+        if !session.lock().is_idle() {
+            return;
+        }
+        let mut sessions = self.lock_sessions();
+        if sessions
+            .get(&session.id)
+            .is_some_and(|held| Arc::ptr_eq(held, session))
+        {
+            sessions.remove(&session.id);
         }
     }
 
     /// Locks `admission` and returns the guard with the session `id`. Fails
-    /// with [`StartError::ShuttingDown`] once a drain has begun.
+    /// once a drain has begun.
     ///
     /// The session needs a new journal when this process does not hold it,
     /// or holds it idle with a journal another writer has fenced. Opening a
@@ -389,13 +480,19 @@ impl Shared {
     /// drain may have begun in the meantime. Another start may also have
     /// opened the session, and then its journal is used and this one is
     /// dropped.
+    ///
+    /// A reopened session keeps its last run and its observers. Their
+    /// subscriptions move to the new journal, and a later detach comes off
+    /// the new record. The records are swapped under the sessions lock, so a
+    /// failed open changes nothing and a concurrent detach lands on exactly
+    /// one record.
     async fn admit(
         &self,
         id: &SessionId,
-    ) -> Result<(MutexGuard<'_, ()>, Arc<SessionRecord>), StartError> {
+    ) -> Result<(MutexGuard<'_, ()>, Arc<SessionRecord>), AdmitError> {
         let admitted = self.lock_admission();
         if self.draining.load(Ordering::Acquire) {
-            return Err(StartError::ShuttingDown);
+            return Err(AdmitError::ShuttingDown);
         }
         if let Some(session) = self.usable_session(id) {
             return Ok((admitted, session));
@@ -406,20 +503,26 @@ impl Shared {
 
         let admitted = self.lock_admission();
         if self.draining.load(Ordering::Acquire) {
-            return Err(StartError::ShuttingDown);
+            return Err(AdmitError::ShuttingDown);
         }
         if let Some(session) = self.usable_session(id) {
             return Ok((admitted, session));
         }
-        let fenced = self.lock_sessions().get(id).cloned();
-        let last_run = fenced.and_then(|fenced| {
-            tracing::info!(session_id = %id, "another writer fenced the session's journal; reopening it");
-            fenced.lock().last_run
-        });
         let session = Arc::new(SessionRecord::new(id.clone(), journal));
-        session.lock().last_run = last_run;
-        self.lock_sessions()
-            .insert(id.clone(), Arc::clone(&session));
+        let mut sessions = self.lock_sessions();
+        let fenced = sessions.get(id).cloned();
+        if let Some(fenced) = &fenced {
+            tracing::info!(session_id = %id, "another writer fenced the session's journal; reopening it");
+            let mut from = fenced.lock();
+            let mut to = session.lock();
+            to.last_run = from.last_run;
+            to.observers = std::mem::take(&mut from.observers);
+        }
+        sessions.insert(id.clone(), Arc::clone(&session));
+        drop(sessions);
+        if let Some(fenced) = fenced {
+            fenced.superseded.cancel();
+        }
         Ok((admitted, session))
     }
 
@@ -432,6 +535,104 @@ impl Shared {
         let held = self.lock_sessions().get(id).cloned()?;
         let usable = !held.journal.is_fenced() || held.lock().live.is_some();
         usable.then_some(held)
+    }
+}
+
+/// Why [`Shared::admit`] refused.
+enum AdmitError {
+    ShuttingDown,
+    Store(SessionStoreError),
+}
+
+impl From<SessionStoreError> for AdmitError {
+    fn from(error: SessionStoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<AdmitError> for StartError {
+    fn from(refused: AdmitError) -> Self {
+        match refused {
+            AdmitError::ShuttingDown => Self::ShuttingDown,
+            AdmitError::Store(error) => Self::Store(error),
+        }
+    }
+}
+
+impl From<AdmitError> for AttachError {
+    fn from(refused: AdmitError) -> Self {
+        match refused {
+            AdmitError::ShuttingDown => Self::ShuttingDown,
+            AdmitError::Store(error) => Self::Store(error),
+        }
+    }
+}
+
+/// An observer whose attach is not yet on the session's stream.
+struct Registered {
+    shared: Arc<Shared>,
+    record: Arc<SessionRecord>,
+    observer: ObserverId,
+    /// The live run the attach names.
+    run_id: Option<RunId>,
+    /// Whether the attach reached the session's stream.
+    recorded: bool,
+}
+
+impl Shared {
+    /// Registers `observer` on the session `id`, opening the session when
+    /// this process does not hold it, and returns the guard that takes the
+    /// observer off again unless its attach reaches the stream. Holds
+    /// `admission` only while it does this, so an attach and a start cannot
+    /// both open the session, and a stalled append afterwards holds up only
+    /// this session. Until the guard is dropped, the session is not let go,
+    /// and its runs append neither `Started` nor an ending.
+    async fn register(
+        self: &Arc<Self>,
+        id: &SessionId,
+        observer: &Observer,
+    ) -> Result<Registered, AttachError> {
+        let (_admitted, record) = self.admit(id).await?;
+        let mut state = record.lock();
+        state
+            .observers
+            .attach(observer.clone())
+            .map_err(|by| AttachError::AlreadyClaimed { by })?;
+        state.observer_writes += 1;
+        // A run whose stream has ended is past what the observer declares.
+        let run_id = state
+            .live
+            .as_ref()
+            .filter(|live| live.stoppable())
+            .map(|live| {
+                live.mirror(state.observers.attendance());
+                live.id
+            });
+        drop(state);
+        Ok(Registered {
+            shared: Arc::clone(self),
+            record,
+            observer: observer.id.clone(),
+            run_id,
+            recorded: false,
+        })
+    }
+}
+
+impl Drop for Registered {
+    /// Ends the attach's count in `observer_writes`. An attach that never
+    /// reached the stream also takes its observer off again, without
+    /// recording or reacting to it, and lets the session go if it then holds
+    /// nothing.
+    fn drop(&mut self) {
+        if !self.recorded {
+            drop(self.shared.unregister(&self.record.id, &self.observer));
+        }
+        self.record.finish_observer_write();
+        if !self.recorded {
+            self.shared
+                .hand_off(recorder::Chore::LetGo(Arc::clone(&self.record)));
+        }
     }
 }
 
@@ -458,8 +659,17 @@ fn honours(config: &Config, liveness: Liveness) -> bool {
     }
 }
 
+/// A new id: `prefix`, an underscore, and a random UUID.
+fn mint_id(prefix: &str) -> String {
+    format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
+}
+
+/// A new observer id.
+fn new_observer_id() -> ObserverId {
+    ObserverId::new(mint_id("ob")).expect("a minted id starts with its prefix, so it is not blank")
+}
+
 /// A new session id, in the form the server gives a chat session it mints.
 fn new_session_id() -> SessionId {
-    SessionId::new(format!("cs_{}", uuid::Uuid::new_v4().simple()))
-        .expect("a minted session id starts with \"cs_\", so it is not blank")
+    SessionId::new(mint_id("cs")).expect("a minted id starts with its prefix, so it is not blank")
 }

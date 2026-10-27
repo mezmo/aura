@@ -11,6 +11,7 @@
 
 use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -30,6 +31,45 @@ use crate::turn_nudge::TurnNudgeState;
 /// Events a run may buffer before its observer reads them.
 pub const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
+/// Whether a run's session has an observer with presence, and whether it
+/// has a claimant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Attendance {
+    /// An observer with presence is attached.
+    pub present: bool,
+    /// A claiming observer is attached.
+    pub claimed: bool,
+}
+
+/// An [`Attendance`] held in one atomic, so a reader never sees half of an
+/// update.
+#[derive(Debug, Default)]
+struct AttendanceCell(AtomicU8);
+
+impl AttendanceCell {
+    const PRESENT: u8 = 1;
+    const CLAIMED: u8 = 1 << 1;
+
+    fn load(&self) -> Attendance {
+        let bits = self.0.load(Ordering::Acquire);
+        Attendance {
+            present: bits & Self::PRESENT != 0,
+            claimed: bits & Self::CLAIMED != 0,
+        }
+    }
+
+    fn store(&self, attendance: Attendance) {
+        let mut bits = 0;
+        if attendance.present {
+            bits |= Self::PRESENT;
+        }
+        if attendance.claimed {
+            bits |= Self::CLAIMED;
+        }
+        self.0.store(bits, Ordering::Release);
+    }
+}
+
 /// One run — what its own work needs to correlate, where its events go, and
 /// the state an agent's tools keep for it.
 pub struct RunContext {
@@ -37,6 +77,8 @@ pub struct RunContext {
     tool_calls: Mutex<VecDeque<ToolCallId>>,
     events: mpsc::Sender<AgentEvent>,
     cancel: CancellationToken,
+    /// The run's session attendance.
+    attendance: Arc<AttendanceCell>,
     /// The run's context budget.
     scratchpad_budget: Option<ContextBudget>,
     /// The run's turn-limit tracking.
@@ -79,6 +121,7 @@ impl RunContext {
             tool_calls: Mutex::new(VecDeque::new()),
             events,
             cancel,
+            attendance: Arc::default(),
             scratchpad_budget,
             turn_nudge,
             skill_recorder,
@@ -86,10 +129,13 @@ impl RunContext {
         (run, receiver)
     }
 
-    /// A run within `parent` for one agent of it, an orchestration worker or
-    /// coordinator: the same id, observer and cancellation, with tool state
-    /// of its own. Its tool-call queue stays empty, an agent within a run
-    /// streaming under a key of its own rather than the run's id.
+    /// A context for one agent within `parent`'s run, such as an
+    /// orchestration worker or the coordinator. It shares the parent's id,
+    /// event channel, cancellation and attendance, and keeps its own tool
+    /// state. Its tool-call queue stays empty, because the agent streams
+    /// under its own key rather than the run's id. Attendance is shared, not
+    /// copied, because presence and claims belong to the session, so a
+    /// worker's tools see the same value as the run's.
     pub fn child(
         parent: &Arc<Self>,
         scratchpad_budget: Option<ContextBudget>,
@@ -101,6 +147,7 @@ impl RunContext {
             tool_calls: Mutex::new(VecDeque::new()),
             events: parent.events.clone(),
             cancel: parent.cancel.clone(),
+            attendance: Arc::clone(&parent.attendance),
             scratchpad_budget,
             turn_nudge,
             skill_recorder,
@@ -174,6 +221,20 @@ impl RunContext {
     pub fn has_id(&self, id: &str) -> bool {
         let mut spelled = uuid::Uuid::encode_buffer();
         *self.id.as_uuid().hyphenated().encode_lower(&mut spelled) == *id
+    }
+
+    /// Whether the run's session has an observer with presence, and whether
+    /// it has a claimant. The runtime keeps this current (see
+    /// `runtime::record::RunRecord::mirror`). Outside the runtime it keeps
+    /// what the run's `RunOptions` set, which is neither by default.
+    pub fn attendance(&self) -> Attendance {
+        self.attendance.load()
+    }
+
+    /// Sets the run's attendance. Child contexts share it, so every agent in
+    /// the run sees the change.
+    pub(crate) fn attend(&self, attendance: Attendance) {
+        self.attendance.store(attendance);
     }
 
     /// The token that cancels this run.
@@ -419,6 +480,30 @@ mod tests {
 
     fn run(name: &str) -> Arc<RunContext> {
         RunContext::detached(named_run_id(name))
+    }
+
+    /// A run starts with no attendance, and a child context sees a change
+    /// made through its parent, and the other way round.
+    #[test]
+    fn a_child_shares_its_parents_attendance() {
+        let parent = run("parent");
+        let child = RunContext::child(&parent, None, None, None);
+        assert_eq!(parent.attendance(), Attendance::default());
+        assert_eq!(child.attendance(), Attendance::default());
+
+        let present = Attendance {
+            present: true,
+            claimed: false,
+        };
+        parent.attend(present);
+        assert_eq!(child.attendance(), present);
+
+        let claimed = Attendance {
+            present: false,
+            claimed: true,
+        };
+        child.attend(claimed);
+        assert_eq!(parent.attendance(), claimed);
     }
 
     #[tokio::test]
