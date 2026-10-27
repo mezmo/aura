@@ -218,6 +218,15 @@ mod tests {
     }
 
     #[test]
+    fn test_coordinator_preamble_keeps_planning_rules() {
+        let preamble = build_coordinator_preamble("", true, false);
+
+        assert!(preamble.contains("favor granularity over consolidation"));
+        assert!(preamble.contains("Avoid compound tasks"));
+        assert!(preamble.contains("Split fetch from analyze"));
+    }
+
+    #[test]
     fn test_orchestrator_preamble_template_loaded() {
         assert!(!ORCHESTRATOR_PREAMBLE_TEMPLATE.is_empty());
         assert!(ORCHESTRATOR_PREAMBLE_TEMPLATE.contains("{{orchestration_system_prompt}}"));
