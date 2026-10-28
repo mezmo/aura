@@ -2359,4 +2359,64 @@ user_agent = "aura-legacy/1"
         assert_eq!(McpUserAgent::new("  aura/1  ").unwrap(), "aura/1");
         assert_eq!(McpUserAgent::new("aura").unwrap(), "aura");
     }
+
+    const HEADER_CASE_BASE: &str = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4"
+"#;
+
+    /// Header names are lowercased before use, so two names equal ignoring
+    /// case would collapse into one entry with an arbitrary value.
+    #[test]
+    fn header_names_differing_only_by_case_are_rejected() {
+        for (table, location) in [
+            (
+                "[mcp.servers.example]\ntransport = \"http_streamable\"\nurl = \"http://localhost:9999/mcp\"\nheaders = { Authorization = \"Bearer A\", authorization = \"Bearer B\" }\n",
+                "mcp.servers.example.headers",
+            ),
+            (
+                "[mcp.servers.example]\ntransport = \"sse\"\nurl = \"http://localhost:9999/sse\"\nheaders_from_request = { X-Tenant = \"x-a\", x-tenant = \"x-b\" }\n",
+                "mcp.servers.example.headers_from_request",
+            ),
+            (
+                "[hitl]\nrequire_approval = []\n\n[hitl.route]\nmode = \"webhook\"\nurl = \"https://approvals.example.com/decide\"\nheaders = { X-Tenant = \"a\", x-tenant = \"b\" }\n",
+                "hitl.route.headers",
+            ),
+            (
+                "[governance.catalog]\nurl = \"https://catalog.example.com/sync\"\nheaders_from_request = { Authorization = \"authorization\", AUTHORIZATION = \"x-token\" }\n",
+                "governance.catalog.headers_from_request",
+            ),
+            (
+                "[hitl]\nrequire_approval = []\n\n[hitl.route]\nmode = \"webhook\"\nurl = \"https://approvals.example.com/decide\"\nheaders_from_request = { Authorization = \"authorization\", authorization = \"x-token\" }\n",
+                "hitl.route.headers_from_request",
+            ),
+            (
+                "[governance.catalog]\nurl = \"https://catalog.example.com/sync\"\nheaders = { X-Tenant = \"a\", x-tenant = \"b\" }\n",
+                "governance.catalog.headers",
+            ),
+        ] {
+            let toml = format!("{HEADER_CASE_BASE}\n{table}");
+            let err = load_config_from_str(&toml)
+                .expect_err(&format!("{location} should be rejected"))
+                .to_string();
+            assert!(
+                err.contains("differ only by case") && err.contains(&format!("[{location}]")),
+                "unexpected error for {location}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_names_with_distinct_lowercase_forms_are_accepted() {
+        let toml = format!(
+            "{HEADER_CASE_BASE}\n[mcp.servers.example]\ntransport = \"http_streamable\"\nurl = \"http://localhost:9999/mcp\"\nheaders = {{ Authorization = \"Bearer A\", X-Tenant = \"t\" }}\nheaders_from_request = {{ authorization = \"authorization\" }}\n"
+        );
+        load_config_from_str(&toml).expect("distinct header names should load");
+    }
 }
