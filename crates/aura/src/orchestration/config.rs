@@ -218,6 +218,23 @@ mod tests {
     }
 
     #[test]
+    fn test_coordinator_preamble_keeps_planning_rules() {
+        let preamble = build_coordinator_preamble("", true, false);
+
+        assert!(
+            preamble
+                .contains("for multi-source investigations, favor granularity over consolidation")
+        );
+        assert!(!preamble.contains("(most common)"));
+        assert!(preamble.contains("Discover, then fan out"));
+        assert!(preamble.contains("correlate the results yourself"));
+        assert!(preamble.contains("confirmed negative"));
+        assert!(preamble.contains("Fan-Out After Discovery"));
+        assert!(!preamble.contains("Split fetch from analyze"));
+        assert!(!preamble.contains("Parallel Fetch, Then Correlate"));
+    }
+
+    #[test]
     fn test_orchestrator_preamble_template_loaded() {
         assert!(!ORCHESTRATOR_PREAMBLE_TEMPLATE.is_empty());
         assert!(ORCHESTRATOR_PREAMBLE_TEMPLATE.contains("{{orchestration_system_prompt}}"));
