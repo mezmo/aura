@@ -647,7 +647,7 @@ fn default_true() -> bool {
 }
 
 fn default_max_planning_cycles() -> usize {
-    3
+    4
 }
 
 fn default_max_tools_per_worker() -> usize {
@@ -722,7 +722,7 @@ mod tests {
     fn test_default_values() {
         let config = OrchestrationConfig::default();
         assert!(!config.enabled);
-        assert_eq!(config.max_planning_cycles, 3);
+        assert_eq!(config.max_planning_cycles, 4);
         assert_eq!(config.max_plan_parse_retries, 3);
         assert!(config.worker_system_prompt.is_none());
         assert!(config.workers.is_empty());
@@ -748,7 +748,7 @@ mod tests {
         "#;
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();
         assert!(config.enabled);
-        assert_eq!(config.max_planning_cycles, 3);
+        assert_eq!(config.max_planning_cycles, 4);
     }
 
     #[test]
