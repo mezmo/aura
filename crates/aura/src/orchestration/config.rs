@@ -226,9 +226,12 @@ mod tests {
                 .contains("for multi-source investigations, favor granularity over consolidation")
         );
         assert!(!preamble.contains("(most common)"));
-        assert!(preamble.contains("Parallel Fetch, Then Correlate"));
-        assert!(preamble.contains("Avoid compound tasks"));
-        assert!(preamble.contains("Split fetch from analyze"));
+        assert!(preamble.contains("Discover, then fan out"));
+        assert!(preamble.contains("correlate the results yourself"));
+        assert!(preamble.contains("confirmed negative"));
+        assert!(preamble.contains("Fan-Out After Discovery"));
+        assert!(!preamble.contains("Split fetch from analyze"));
+        assert!(!preamble.contains("Parallel Fetch, Then Correlate"));
     }
 
     #[test]

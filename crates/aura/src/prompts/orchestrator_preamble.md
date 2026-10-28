@@ -38,9 +38,12 @@ When creating plans with `create_plan`, provide an ordered list of **steps**:
 - **Use `{"parallel": [...]}` only when tasks are truly independent** (no task in the group needs another's output).
 - Assign each step to the worker whose capabilities best match it.
 - Keep task descriptions specific and actionable.
-- **Avoid compound tasks**: For complex investigations requiring multiple tool calls or disparate data sources, do not combine data-gathering with analysis or correlation in the same task. Split into separate steps — one to fetch, another to analyze.
-- **Split fetch from analyze**: If a task requires fetching data from multiple sources AND reasoning about the results together, use a parallel group to fetch independently, then a sequential task to correlate.
-- **Use parallel execution** whenever data sources are independent (e.g., querying two APIs simultaneously, inspecting separate resources in parallel).
+- **Discover, then fan out**: For multi-source investigations, do not run one long chain of single tasks. Plan two iterations:
+  1. **Discovery**: a small parallel group of shallow tasks that only find coordinates (onset times, affected components, which sources show anomalies). No drill-downs yet.
+  2. **Fan-out**: a wide parallel group of narrow tasks built from those coordinates. Put the exact timestamps and names from discovery in each task description. No fan-out task may depend on another; correlate the results yourself with `respond_directly`.
+- Plan a third iteration only for one question that blocks the conclusion, never to re-verify completed work.
+- **Null results are results**: A worker that reports a confirmed negative ("no errors in that window") has finished its task. Do not re-run or rephrase it.
+- Simple questions still get a direct answer or a single task — do not force structure onto them.
 
 ### Example: Sequential
 
@@ -73,20 +76,23 @@ When creating plans with `create_plan`, provide an ordered list of **steps**:
 }
 ```
 
-### Example: Parallel Fetch, Then Correlate
+### Example: Fan-Out After Discovery
+
+Discovery found an error onset at 14:02 in `checkout` and `payments`. The second iteration fans out:
 
 ```json
 {
-  "goal": "Find why checkout latency rose after 14:00",
+  "goal": "Find why checkout errors started at 14:02",
   "steps": [
     {"type": "parallel", "items": [
-      {"type": "task", "task": "Fetch checkout service error logs from 13:30 to 15:00", "worker": "logs"},
-      {"type": "task", "task": "Fetch checkout p95 latency and database connection-pool usage from 13:30 to 15:00", "worker": "metrics"}
-    ]},
-    {"type": "task", "task": "Correlate the checkout error logs with the latency and connection-pool metrics and name the most likely cause", "worker": "analysis"}
+      {"type": "task", "task": "Search checkout and payments info logs from 13:52 to 14:12 for deploy, config or restart events", "worker": "logs"},
+      {"type": "task", "task": "List checkout error templates from 14:02 to 14:32 that did not occur from 13:32 to 14:02", "worker": "logs"},
+      {"type": "task", "task": "List payments error templates from 14:02 to 14:32 that did not occur from 13:32 to 14:02", "worker": "logs"},
+      {"type": "task", "task": "Get checkout p95 latency and database connection-pool usage from 13:32 to 14:32", "worker": "metrics"}
+    ]}
   ],
-  "routing_rationale": "Two independent data sources, then one step that reasons over both",
-  "planning_summary": "Fetch logs and metrics in parallel, then correlate"
+  "routing_rationale": "Independent narrow checks built from the discovery coordinates",
+  "planning_summary": "Fan out one change-event hunt, two baseline-vs-incident drilldowns and one metrics check; correlate the results directly"
 }
 ```
 
