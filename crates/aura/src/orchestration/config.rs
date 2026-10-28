@@ -221,7 +221,12 @@ mod tests {
     fn test_coordinator_preamble_keeps_planning_rules() {
         let preamble = build_coordinator_preamble("", true, false);
 
-        assert!(preamble.contains("favor granularity over consolidation"));
+        assert!(
+            preamble
+                .contains("for multi-source investigations, favor granularity over consolidation")
+        );
+        assert!(!preamble.contains("(most common)"));
+        assert!(preamble.contains("Parallel Fetch, Then Correlate"));
         assert!(preamble.contains("Avoid compound tasks"));
         assert!(preamble.contains("Split fetch from analyze"));
     }
