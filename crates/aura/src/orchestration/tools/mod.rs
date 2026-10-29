@@ -4,6 +4,7 @@
 //! inspection of available tools during planning, and to make structured
 //! routing decisions (respond directly, create plan, or request clarification).
 
+pub mod decision;
 mod inspect_tool_params;
 mod list_prior_runs;
 mod list_tools;
@@ -13,6 +14,7 @@ pub mod submit_result;
 pub mod wait_for;
 pub(crate) mod write_artifact;
 
+pub use decision::{DecisionRequest, DecisionRequestRef, DecisionRequestStore, DecisionToolset};
 pub use inspect_tool_params::InspectToolParamsTool;
 pub use list_prior_runs::ListPriorRunsTool;
 pub use list_tools::ListToolsTool;

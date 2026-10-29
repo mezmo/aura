@@ -106,7 +106,7 @@ struct JevTaskInput {
     upstream: Vec<UpstreamResult>,
     /// Run artifact filenames attached to the task.
     artifacts: Vec<String>,
-    request: Option<crate::models::jev::DecisionRequest>,
+    request: Option<crate::orchestration::tools::DecisionRequest>,
 }
 
 /// A completed dependency's result.
@@ -188,7 +188,7 @@ struct CoordinatorTools {
     list_prior_runs: Option<super::tools::ListPriorRunsTool>,
     skill_tools: Option<crate::skill_tool::SkillToolset>,
     scratchpad: Option<scratchpad::ScratchpadToolsConfig>,
-    decision_tools: Option<crate::models::jev::DecisionToolset>,
+    decision_tools: Option<crate::orchestration::tools::DecisionToolset>,
 }
 
 impl CoordinatorTools {
@@ -586,10 +586,10 @@ pub struct Orchestrator {
     pub(super) run_tools: crate::builder::RunToolFactory,
 
     /// Clients for the configured Jev workers, by name.
-    pub(super) jev_workers: crate::models::jev::JevWorkers,
+    pub(super) jev_workers: crate::orchestration::jev::JevWorkers,
 
     /// Decision requests the coordinator prepared this run, by name.
-    decision_requests: crate::models::jev::DecisionRequestStore,
+    decision_requests: crate::orchestration::tools::DecisionRequestStore,
 }
 
 /// The task and worker a stream's reasoning is attributed to.
@@ -818,7 +818,7 @@ impl Orchestrator {
             Arc::new(Mutex::new(ExecutionPersistence::disabled()))
         };
 
-        let jev_workers = crate::models::jev::JevWorker::all_from(&orchestration_config)
+        let jev_workers = crate::orchestration::jev::JevWorker::all_from(&orchestration_config)
             .map_err(|e| format!("Failed to initialize Jev workers: {e}"))?;
 
         let orchestrator_id = uuid::Uuid::new_v4().to_string();
@@ -3181,7 +3181,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 Some(Arc::clone(&run)),
             ),
             scratchpad: artifacts.scratchpad,
-            decision_tools: crate::models::jev::DecisionToolset::new(
+            decision_tools: crate::orchestration::tools::DecisionToolset::new(
                 self.jev_workers.clone(),
                 self.decision_requests.clone(),
                 Some(Arc::clone(&run)),
@@ -4146,7 +4146,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         &self,
         task_id: usize,
         task_description: &str,
-        jev: &crate::models::jev::JevWorker,
+        jev: &crate::orchestration::jev::JevWorker,
         input: &JevTaskInput,
     ) -> Result<TaskOutcome, StreamError> {
         let span = tracing::Span::current();
@@ -10285,10 +10285,11 @@ mod coordinator_artifact_tests {
 mod jev_worker_tests {
     use super::*;
     use crate::config::AgentBuildContext;
-    use crate::models::jev::fake::FakeTransport;
-    use crate::models::jev::{DecisionRequest, JevClient, RetryConfig};
+    use crate::orchestration::jev::fake::FakeTransport;
+    use crate::orchestration::tools::DecisionRequest;
     use crate::orchestration::types::Task;
     use aura_config::JevQuestion;
+    use jev_driver::client::{JevClient, RetryConfig};
     use serde_json::json;
 
     fn jev_orchestration(questions: &str) -> OrchestrationConfig {
@@ -10490,7 +10491,7 @@ mod jev_worker_tests {
             FakeTransport::new([]),
         )
         .await;
-        let toolset = crate::models::jev::DecisionToolset::new(
+        let toolset = crate::orchestration::tools::DecisionToolset::new(
             orchestrator.jev_workers.clone(),
             orchestrator.decision_requests.clone(),
             None,
@@ -10503,7 +10504,7 @@ mod jev_worker_tests {
             .await
             .unwrap();
         assert!(
-            crate::models::jev::DecisionToolset::new(
+            crate::orchestration::tools::DecisionToolset::new(
                 plain.jev_workers.clone(),
                 plain.decision_requests.clone(),
                 None

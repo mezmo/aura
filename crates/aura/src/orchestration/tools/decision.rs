@@ -17,9 +17,7 @@ use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::answer::Answers;
-use super::decision::Decision;
-use super::worker::{JevWorker, JevWorkers};
+use crate::orchestration::jev::{Answers, Decision, JevWorker, JevWorkers};
 use crate::run_context::BoundRun;
 
 /// Questions and state the coordinator prepared for one planned Jev task.
@@ -503,8 +501,8 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::models::jev::fake::FakeTransport;
-    use crate::models::jev::{JevClient, RetryConfig};
+    use crate::orchestration::jev::fake::FakeTransport;
+    use jev_driver::client::{JevClient, RetryConfig};
 
     fn workers(names: &[&str], configured: usize) -> JevWorkers {
         let mut map = BTreeMap::new();

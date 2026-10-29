@@ -6,8 +6,9 @@
 //! The coordinator calls exactly one of these tools during the planning phase.
 //! A shared `RoutingDecision` captures the decision for the orchestrator to read.
 
-use crate::models::jev::{DecisionRequestRef, DecisionRequestStore, JevWorkers};
+use crate::orchestration::jev::JevWorkers;
 use crate::orchestration::persistence::ExecutionPersistence;
+use crate::orchestration::tools::decision::{DecisionRequestRef, DecisionRequestStore};
 use crate::orchestration::types::{PlanningResponse, StepInput, flatten_steps};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
@@ -451,7 +452,7 @@ impl CreatePlanTool {
                         ));
                     }
                     let added = request.as_ref().map_or(&[][..], |r| r.questions.as_slice());
-                    crate::models::jev::Decision::new(
+                    crate::orchestration::jev::Decision::new(
                         serde_json::Value::Null,
                         &jev.questions_with(added),
                     )
@@ -1082,7 +1083,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     fn decision_toolset(configured_questions: usize) -> (RoutingToolSet, DecisionRequestStore) {
-        use crate::models::jev::JevWorker;
+        use crate::orchestration::jev::JevWorker;
         let mut toml = "type = \"jev\"\ndescription = \"Scores\"\n".to_string();
         for i in 0..configured_questions {
             toml.push_str(&format!(
@@ -1125,7 +1126,7 @@ mod tests {
 
     #[tokio::test]
     async fn named_decision_request_is_resolved_into_the_task() {
-        use crate::models::jev::DecisionRequest;
+        use crate::orchestration::tools::DecisionRequest;
         let (toolset, store) = decision_toolset(0);
         store.lock().unwrap().insert(
             "sev".to_string(),
@@ -1164,7 +1165,7 @@ mod tests {
 
     #[tokio::test]
     async fn decision_request_errors_reach_the_model() {
-        use crate::models::jev::DecisionRequest;
+        use crate::orchestration::tools::DecisionRequest;
         let (toolset, store) = decision_toolset(1);
         store.lock().unwrap().insert(
             "other".to_string(),

@@ -228,7 +228,7 @@ pub fn worker_overview(config: &Config) -> Vec<WorkerOverview> {
                 aura_config::WorkerConfig::Jev(jev) => jev
                     .model
                     .as_deref()
-                    .unwrap_or(crate::models::jev::DEFAULT_MODEL),
+                    .unwrap_or(jev_driver::client::DEFAULT_MODEL),
             };
             WorkerOverview {
                 name: name.clone(),
