@@ -88,7 +88,7 @@ aura/
 
 ### Scratchpad (Context Window Management)
 - Intercepts large MCP tool outputs and saves them to disk instead of filling the context window; works in both single-agent and orchestration mode. Full usage/config docs: https://docs.mezmo.com/aura/scratchpad
-- Code pointers: token-counter dispatch lives in `token_counter_for_provider` (`scratchpad/context_budget.rs`); per-agent budgets live on `Agent.scratchpad_budget`, created at `create_worker()` time; read tools resolve files under a per-agent **read root** distinct from the write-confined scratchpad dir (`ScratchpadStorage::with_read_root`)
+- Code pointers: token-counter dispatch lives in `token_counter_for_provider` (`scratchpad/context_budget.rs`); per-agent budgets live on `PreparedAgent.scratchpad_budget` and each run gets a fresh copy, created in `create_worker()` for workers and `coordinator_artifact_tools()` for the coordinator (which `[agent.scratchpad].coordinator = false` turns off); without a scratchpad, `read_artifact` counts reads against a plain budget when `[agent.llm].context_window` is set and returns previews otherwise; read tools resolve files under a per-agent **read root** distinct from the write-confined scratchpad dir (`ScratchpadStorage::with_read_root`)
 
 ### Orchestration (Multi-Agent)
 - Coordinator/worker architecture with DAG-based parallel task execution
@@ -134,8 +134,9 @@ aura/
 
 ### Shared Event Types (`aura-events`)
 - Lightweight crate defining `AuraStreamEvent` and `OrchestrationStreamEvent` enums
+- `run::SessionEvent` is a session's own envelope: its `SessionId`, the `RunId` when the event belongs to a run, a `SequenceNumber` dense per session, a `Timestamp`, and either an `agent::AgentEvent` or a `LifecycleEvent` (started, observer attached/detached, claims exhausted, liveness decided, parked, finished, cancelled, failed). `RunId` is a UUID (v7 when minted); there is one per run. `aura::journal::SessionJournal` is what stamps one (see Key Modules); nothing in production drives a run's channel into a journal yet
 - Both `Serialize + Deserialize` — used by the web server (producer) and CLI (consumer)
-- No agent, MCP, or provider dependencies — only `serde` and `serde_json`
+- No agent, MCP, or provider dependencies — only `serde`, `serde_json`, and `uuid`
 - `ProgressToken` type uses a local wire-compatible definition by default; enables `rmcp-types` feature for direct rmcp interop (used by the `aura` crate)
 
 ## Environment Setup
@@ -162,7 +163,9 @@ export AWS_REGION="your-region"       # For Knowledge Base
 - `provider_agent.rs` - Type-erased streaming across providers
 - `stream_events.rs` - Custom aura SSE events
 - `request_cancellation.rs` - The signal that stops a run, as awaiting work sees it
+- `tool_middleware.rs` - `MiddlewareStack`, the layers a tool call passes through: a forward pass that prepares arguments and context, then an onion of `ToolMiddleware::call` layers around the tool; `WrappedTool` runs a `ToolWrapper` through it as `WrapperLayer`s, and the parity suite there records the hook order every layer can rely on
 - `run_context.rs` - `RunContext`, the run a task is working on: its event channel, the FIFO queue for tool_call_id correlation (see critical assumption below), and the scratchpad budget, turn-nudge counters and skill-invocation recorder an agent keeps for it; `BoundRun` is the slot through which prepare-time tools and wrappers (turn nudge, scratchpad, skills, HITL) reach it, and `RunLease` is what `begin_run` counts to serve one run at a time
+- `journal.rs` - `SessionJournal`, one session's append-only stream of `SessionEvent`s across its runs: `append` is the one serialized path, and the store mints each event's `SequenceNumber` inside it, refusing an append whose expected newest number it does not hold (`SessionStoreError::Conflict`), which fences the journal so a second writer is stopped rather than interleaved (agent events via `drain`, which is the sole reader of a run's channel, and lifecycle events alike), and `subscribe(Cursor)` replays from the store then follows live as one stream; the store supplies only what was published before the subscriber joined and what the broadcast drops when it falls behind, so `JournalItem::Gap` means only that neither the subscriber's buffer nor the store holds the events (cursor older than the store keeps, session evicted, subscriber slower than both). Storage is `session_store::JournalStore`, a `SessionStore` capability beside approvals, skills and the bus; only `InMemoryJournalStore` exists, bounded per session and by session count, and remembering each session's newest number past its entries so a reopened session never reuses one
 - `orchestration/` - Multi-agent coordinator, workers, DAG execution, orchestration SSE events
 
 ### Critical Assumption: Rig Sequential Tool Execution

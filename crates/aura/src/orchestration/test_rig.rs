@@ -731,8 +731,8 @@ pub(crate) async fn park_orchestrator_in(
     );
     let mut workers = std::collections::HashMap::new();
     workers.insert(worker_name, worker);
-    let config = crate::config::AgentRuntimeConfig {
-        hitl: Some(crate::hitl::HitlRuntime {
+    let build_context = crate::config::AgentBuildContext {
+        hitl: Some(crate::hitl::HitlPolicy {
             patterns: Arc::from(["kubectl_*".into()]),
             route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                 registry: registry.clone(),
@@ -741,16 +741,16 @@ pub(crate) async fn park_orchestrator_in(
             park_enabled: true,
         }),
         memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
-        session_id: Some("park-sess".to_string()),
-        request_id: Some(format!("req_rig_{}", uuid::Uuid::new_v4().simple())),
+        session_id: Some(crate::config::SessionId::new("park-sess").unwrap()),
+        run_id: Some(aura_events::RunId::mint()),
         orchestration: Some(super::OrchestrationConfig {
             enabled: true,
             workers,
             ..Default::default()
         }),
-        ..crate::config::AgentRuntimeConfig::default()
+        ..crate::config::AgentBuildContext::default()
     };
-    let orchestrator = super::Orchestrator::new(config)
+    let orchestrator = super::Orchestrator::new(build_context)
         .await
         .expect("orchestrator builds");
     (orchestrator, store, registry)

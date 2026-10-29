@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+uuid = { workspace = true }
 
 # Optional: re-export rmcp's ProgressToken for interop with the aura crate.
 # When rmcp is not available, we define compatible local types.

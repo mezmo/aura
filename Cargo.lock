@@ -327,6 +327,7 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -396,6 +397,7 @@ dependencies = [
  "http-body-util",
  "loom",
  "opentelemetry",
+ "pin-project-lite",
  "redis",
  "reqwest",
  "rig-core",
@@ -413,6 +415,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-opentelemetry",
+ "tracing-subscriber",
  "uuid",
  "wiremock",
 ]

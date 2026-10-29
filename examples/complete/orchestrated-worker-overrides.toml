@@ -76,6 +76,10 @@ enabled = true
 context_safety_margin = 0.20
 max_extraction_tokens = 10_000
 turn_depth_bonus = 6
+# The coordinator gets a scratchpad of its own, so a large artifact from a
+# prior run comes back as a pointer to explore. Set false to keep its tool
+# list and turn depth unchanged; reads then come back as previews.
+coordinator = true
 
 # Default skill sources for workers that don't override them.
 [[agent.skills.local]]

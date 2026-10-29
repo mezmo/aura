@@ -1077,7 +1077,7 @@ mod tests {
         assert_eq!(caps.raw_events.len(), 1);
     }
 
-    /// A server that predates the agent context on this event still parses.
+    /// A server that predates the emitting agent on this event still parses.
     #[tokio::test]
     async fn aura_tool_usage_without_agent_id() {
         let data = serde_json::json!({

@@ -6,7 +6,7 @@
 
 // Re-export everything from aura-events so existing consumers don't break
 pub use aura_events::{
-    AgentContext, AuraStreamEvent, CorrelationContext, McpServerStatus, NumberOrString,
+    AuraStreamEvent, CorrelationContext, EmittingAgent, McpServerStatus, NumberOrString,
     ProgressToken, WorkerOverview, WorkerPhase, format_named_sse,
 };
 
@@ -43,7 +43,7 @@ mod tests {
 
     #[test]
     fn test_agent_context_single_agent() {
-        let ctx = AgentContext::single_agent();
+        let ctx = EmittingAgent::single_agent();
         assert_eq!(ctx.agent_id, "main");
         assert!(ctx.agent_name.is_none());
         assert!(ctx.parent_agent_id.is_none());
@@ -51,7 +51,7 @@ mod tests {
 
     #[test]
     fn test_agent_context_with_name() {
-        let ctx = AgentContext::single_agent_with_name("My Agent");
+        let ctx = EmittingAgent::single_agent_with_name("My Agent");
         assert_eq!(ctx.agent_id, "main");
         assert_eq!(ctx.agent_name, Some("My Agent".to_string()));
     }
@@ -59,7 +59,7 @@ mod tests {
     #[test]
     fn test_agent_context_worker() {
         let ctx =
-            AgentContext::worker("log_worker", Some("Log Worker".to_string()), "orchestrator");
+            EmittingAgent::worker("log_worker", Some("Log Worker".to_string()), "orchestrator");
         assert_eq!(ctx.agent_id, "log_worker");
         assert_eq!(ctx.agent_name, Some("Log Worker".to_string()));
         assert_eq!(ctx.parent_agent_id, Some("orchestrator".to_string()));
@@ -78,7 +78,7 @@ mod tests {
             "call_123",
             "list_pipelines",
             serde_json::json!({}),
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::default(),
         );
         assert_eq!(event.event_name(), event_names::TOOL_REQUESTED);
@@ -90,7 +90,7 @@ mod tests {
             "call_123",
             "list_pipelines",
             None,
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::default(),
         );
         assert_eq!(event.event_name(), event_names::TOOL_START);
@@ -103,7 +103,7 @@ mod tests {
             "list_pipelines",
             100,
             "Tool result content",
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::default(),
         );
         assert_eq!(event.event_name(), event_names::TOOL_COMPLETE);
@@ -113,7 +113,7 @@ mod tests {
     fn test_reasoning_event_name() {
         let event = AuraStreamEvent::reasoning(
             "Let me analyze...",
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::default(),
         );
         assert_eq!(event.event_name(), event_names::REASONING);
@@ -125,7 +125,7 @@ mod tests {
             "call_abc123",
             "list_pipelines",
             serde_json::json!({"filter": "error"}),
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::new("sess_xyz", None),
         );
         let sse = event.format_sse();
@@ -146,7 +146,7 @@ mod tests {
             Some(rmcp::model::ProgressToken(
                 rmcp::model::NumberOrString::Number(42),
             )),
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::new("sess_xyz", None),
         );
         let sse = event.format_sse();
@@ -167,7 +167,7 @@ mod tests {
             "list_pipelines",
             1234,
             "Pipeline list result",
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::new("sess_xyz", Some("trace_123".to_string())),
         );
         let sse = event.format_sse();
@@ -185,7 +185,7 @@ mod tests {
             "list_pipelines",
             500,
             "Connection timeout",
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::default(),
         );
         let sse = event.format_sse();
@@ -200,7 +200,7 @@ mod tests {
             "call_123",
             "test_tool",
             serde_json::json!({}),
-            AgentContext::single_agent(), // No agent_name or parent_agent_id
+            EmittingAgent::single_agent(), // No agent_name or parent_agent_id
             CorrelationContext::new("sess", None), // No trace_id
         );
         let sse = event.format_sse();
@@ -216,7 +216,7 @@ mod tests {
             "call_123",
             "test_tool",
             None,                                  // No progress_token
-            AgentContext::single_agent(),          // No agent_name or parent_agent_id
+            EmittingAgent::single_agent(),         // No agent_name or parent_agent_id
             CorrelationContext::new("sess", None), // No trace_id
         );
         let sse = event.format_sse();
@@ -236,7 +236,7 @@ mod tests {
             Some(rmcp::model::ProgressToken(
                 rmcp::model::NumberOrString::Number(42),
             )),
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::default(),
         );
         let sse = event.format_sse();
@@ -257,7 +257,7 @@ mod tests {
             "init",
             None,
             None, // No progress_token
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::default(),
         );
         let sse = event.format_sse();
@@ -270,7 +270,7 @@ mod tests {
         let event = AuraStreamEvent::WorkerPhase {
             phase: WorkerPhase::Executing,
             task_id: Some("task_1".to_string()),
-            agent: AgentContext::worker("log_worker", None, "orchestrator"),
+            agent: EmittingAgent::worker("log_worker", None, "orchestrator"),
             correlation: CorrelationContext::default(),
         };
         let sse = event.format_sse();
@@ -314,7 +314,7 @@ mod tests {
             18777,
             500,
             19277,
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::new("sess_123", None),
         );
         let sse = event.format_sse();
@@ -357,7 +357,7 @@ mod tests {
             0,
             0,
             0,
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::default(),
         );
         assert_eq!(tool_usage.event_name(), event_names::TOOL_USAGE);
@@ -371,7 +371,7 @@ mod tests {
         let event = AuraStreamEvent::scratchpad_usage(
             15_840,
             1_200,
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::default(),
         );
         assert_eq!(event.event_name(), "aura.scratchpad_usage");
@@ -382,7 +382,7 @@ mod tests {
         let event = AuraStreamEvent::scratchpad_usage(
             15_840,
             1_200,
-            AgentContext::worker("data-explorer", None, "orchestrator"),
+            EmittingAgent::worker("data-explorer", None, "orchestrator"),
             CorrelationContext::new("sess_xyz", Some("trace_123".to_string())),
         );
         let sse = event.format_sse();
@@ -403,7 +403,7 @@ mod tests {
         let event = AuraStreamEvent::scratchpad_usage(
             0,
             0,
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::default(),
         );
         let sse = event.format_sse();
@@ -416,7 +416,7 @@ mod tests {
         let event = AuraStreamEvent::scratchpad_usage(
             0,
             0,
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::default(),
         );
         let sse = event.format_sse();

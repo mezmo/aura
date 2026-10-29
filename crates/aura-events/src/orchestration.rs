@@ -3,7 +3,7 @@
 //! The single definition of these frames, shared by the web server that emits
 //! them and the CLI that parses them, so the two cannot disagree about a field.
 
-use crate::{format_named_sse, AgentContext, CorrelationContext};
+use crate::{format_named_sse, CorrelationContext, EmittingAgent};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,13 +52,13 @@ pub struct IterationTimings {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EventContext {
     #[serde(flatten)]
-    pub agent: AgentContext,
+    pub agent: EmittingAgent,
     #[serde(flatten)]
     pub correlation: CorrelationContext,
 }
 
 impl EventContext {
-    pub fn new(agent: AgentContext, correlation: CorrelationContext) -> Self {
+    pub fn new(agent: EmittingAgent, correlation: CorrelationContext) -> Self {
         Self { agent, correlation }
     }
 }
@@ -486,11 +486,11 @@ impl OrchestrationStreamEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgentContext, CorrelationContext};
+    use crate::{CorrelationContext, EmittingAgent};
 
     fn ctx() -> EventContext {
         EventContext::new(
-            AgentContext::coordinator(),
+            EmittingAgent::coordinator(),
             CorrelationContext::new("test-session", None),
         )
     }

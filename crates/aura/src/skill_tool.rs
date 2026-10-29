@@ -870,15 +870,24 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let configs = make_skill_configs(dir.path());
         let store = Arc::new(InMemorySkillInvocationStore::new());
-        let log = SkillLogKey::new(crate::config::SessionId::new("sess-reuse"), "agent");
+        let log = SkillLogKey::new(
+            crate::config::SessionId::new("sess-reuse").unwrap(),
+            "agent",
+        );
         let turn = |id: &str, anchor| {
             let recorder = Arc::new(SkillInvocationRecorder::new(
                 store.clone(),
                 log.clone(),
                 anchor,
             ));
-            RunContext::channel_for_agent(id, CancellationToken::new(), None, None, Some(recorder))
-                .0
+            RunContext::channel_for_agent(
+                crate::run_context::named_run_id(id),
+                CancellationToken::new(),
+                None,
+                None,
+                Some(recorder),
+            )
+            .0
         };
         let load = |name: &str| LoadSkillArgs {
             name: name.to_string(),

@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use aura_config::GlobPattern;
 use rig::completion::ToolDefinition;
 use rig::tool::{Tool, ToolError};
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,10 @@ pub struct RequestApprovalTool {
     agent_name: String,
     /// Instance ID of the AURA process that built this tool.
     instance_id: String,
+    /// The `[hitl].require_approval` patterns the config gate enforces.
+    gated_patterns: Arc<[GlobPattern]>,
+    /// Names of the registered tools the config gate wraps and a pattern matches.
+    gated_tools: Arc<[String]>,
 }
 
 impl RequestApprovalTool {
@@ -48,7 +53,69 @@ impl RequestApprovalTool {
             run: Arc::new(crate::run_context::BoundRun::captured()),
             agent_name,
             instance_id,
+            gated_patterns: Arc::from([]),
+            gated_tools: Arc::from([]),
         }
+    }
+
+    /// Names the patterns the config gate enforces, which
+    /// [`Self::with_gated_tools`] matches against.
+    #[must_use]
+    pub fn with_gated_patterns(mut self, patterns: Arc<[GlobPattern]>) -> Self {
+        self.gated_patterns = patterns;
+        self
+    }
+
+    /// Keeps the `(namespace, name)` tools a gated pattern matches, by the
+    /// rule the config gate uses (`HitlApprovalWrapper::matched_pattern`).
+    ///
+    /// Callers pass only tools registered behind the config gate's wrapper.
+    /// The gate wraps MCP tools alone (native tools are not gated yet,
+    /// mezmo/aura#764), and a native tool that matched a pattern here would
+    /// tell the agent to skip approval for a call that never prompts.
+    #[must_use]
+    pub fn with_gated_tools<'a>(
+        mut self,
+        tools: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Self {
+        self.gated_tools = tools
+            .into_iter()
+            .filter(|(namespace, name)| {
+                *name != Self::NAME
+                    && self
+                        .gated_patterns
+                        .iter()
+                        .any(|p| p.matches(Some(namespace), name))
+            })
+            .map(|(_, name)| name.to_string())
+            .collect();
+        self
+    }
+
+    /// The tool description, plus the gated-tool list when there is one: the
+    /// agent cannot see the gate, and without the list it requests approval
+    /// for calls that will prompt again on their own.
+    fn description(&self) -> String {
+        let mut description = String::from(
+            "Request human approval only when a specific approval boundary is crossed. \
+            Describe the exact action, whether it is read-only or mutating, the affected \
+            scope, and the incremental risk beyond what the user has already authorized. \
+            If the action crosses no approval boundary, do not call this tool; proceed with \
+            the action. The call blocks until a human approves or rejects.",
+        );
+        if !self.gated_tools.is_empty() {
+            let tools = self
+                .gated_tools
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            description.push_str(&format!(
+                " These tools already prompt for approval when called; call them directly \
+                and do not request approval for them first: {tools}."
+            ));
+        }
+        description
     }
 
     /// Names the run this tool's approvals belong to. Clones share the slot,
@@ -125,31 +192,81 @@ impl Tool for RequestApprovalTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Request human approval before proceeding with a sensitive action. \
-                Describe what you want to do, why it's risky, and optionally provide structured \
-                context. The call blocks until a human approves or rejects."
-                .to_string(),
+            description: self.description(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action_description": {
                         "type": "string",
-                        "description": "What you want to do (the action awaiting approval)."
+                        "description": "Concise description of the exact action awaiting approval, \
+                            including the tool name and key parameters that affect scope or impact."
                     },
+                    "risk_evaluation": {
+                        "type": "object",
+                        "description": "Structured working notes to reason through before writing the \
+                            risk_rationale. Not included in the approval request sent to the reviewer. Explain the specific approval boundary crossed \
+                            by this exact action, not generic risk language.",
+                        "properties": {
+                            "risk_category": {
+                                "type": "string",
+                                "enum": [
+                                    "sensitive_data_access",
+                                    "unauthorized_external_egress",
+                                    "irreversible_data_or_infra_destruction",
+                                    "resource_exhaustion",
+                                    "privilege_or_scope_escalation",
+                                    "binding_external_commitment",
+                                    "obfuscated_or_policy_evasive_execution",
+                                    "other",
+                                ],
+                                "description": "The primary risk category requiring approval: sensitive data access; \
+                                    unauthorized external egress; irreversible data or infrastructure destruction; \
+                                    resource exhaustion; privilege or scope escalation; binding external commitment; \
+                                    obfuscated or policy-evasive execution; or other."
+                            },
+                            "incremental_risk": {
+                                "type": "string",
+                                "description": "The specific risk introduced by this exact action beyond what the user \
+                                    has already requested or authorized. Do not cite production access alone if the user \
+                                    explicitly asked to work on production."
+                            },
+                            "scope": {
+                                "type": "string",
+                                "description": "The specific systems, services, tenants, files, databases, accounts, \
+                                    channels, or resources and their environment, such as production, staging, development, \
+                                    that the specific tool call will affect.",
+                            }
+                        },
+                        "required": [
+                            "risk_category",
+                            "incremental_risk",
+                            "scope"
+                        ]
+                    },
+                    // serde_json sorts object keys, so the model sees properties in
+                    // alphabetical order: risk_evaluation must sort before
+                    // risk_rationale so the model writes the details before the
+                    // summary of them.
                     "risk_rationale": {
                         "type": "string",
-                        "description": "Why this action requires human approval."
+                        "description": "Short reviewer-facing explanation of why this specific action requires \
+                            approval. Summarize the risk_evaluation; do not use generic risk statements."
                     },
                     "context": {
                         "type": "object",
-                        "description": "Optional additional structured metadata for the reviewer."
+                        "description": "Optional structured metadata (e.g. JSON) for the reviewer, such as \
+                            tool arguments, resource IDs, query window, destination, limits, or dry-run \
+                            settings."
                     },
                     "_aura_reasoning": {
                         "type": "string",
-                        "description": "Explain your reasoning for requesting this approval. Why does this specific action need a human decision?"
+                        "description": "One or two sentences on your intent: what you are trying to accomplish \
+                            for the user, which step of the task this action serves, and what you plan to do \
+                            next once it is approved. Recorded in traces for intent visibility; do not repeat \
+                            the risk_evaluation or risk_rationale."
                     }
                 },
-                "required": ["action_description", "risk_rationale"]
+                "required": ["action_description", "risk_rationale", "risk_evaluation"]
             }),
         }
     }
@@ -334,7 +451,7 @@ mod tests {
         route: &Arc<DecisionRoute>,
         args: RequestApprovalArgs,
     ) -> ApprovalItem {
-        let request_id = format!("req_w2_{}", uuid::Uuid::new_v4().simple());
+        let run_id = aura_events::RunId::mint();
         let tool = RequestApprovalTool::new(
             route.clone(),
             AgentScope::Single { session_id: None },
@@ -343,7 +460,7 @@ mod tests {
         );
 
         // The scope goes inside the spawn, because task-locals do not cross one.
-        let (run, mut rx) = crate::run_context::RunContext::channel(request_id.as_str());
+        let (run, mut rx) = crate::run_context::RunContext::channel(run_id);
         let call_handle: tokio::task::JoinHandle<Result<String, ToolError>> =
             tokio::spawn(crate::run_context::with_run(run, async move {
                 tool.call(args).await
@@ -378,6 +495,88 @@ mod tests {
         assert!(result.is_ok(), "approved call should succeed: {:?}", result);
 
         parked.request.items.into_iter().next().expect("one item")
+    }
+
+    fn tool_for_definition() -> RequestApprovalTool {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
+        let route = Arc::new(DecisionRoute::Conversational {
+            registry: PendingApprovals::with_backend(store, bus),
+            timeout: std::time::Duration::from_secs(60),
+        });
+        RequestApprovalTool::new(
+            route,
+            AgentScope::Single { session_id: None },
+            "test-agent".to_string(),
+            "test-instance-id".to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn definition_lists_risk_evaluation_before_risk_rationale() {
+        let definition = tool_for_definition().definition(String::new()).await;
+        let properties = definition.parameters["properties"]
+            .as_object()
+            .expect("properties object");
+        let keys: Vec<&str> = properties.keys().map(String::as_str).collect();
+        let position = |key: &str| keys.iter().position(|k| *k == key).expect(key);
+        assert!(position("risk_evaluation") < position("risk_rationale"));
+    }
+
+    #[tokio::test]
+    async fn definition_names_only_the_gated_tools_it_is_given() {
+        // `slack_post_message` is native, so the builder never passes it in:
+        // a wildcard pattern must not put it, or the pattern itself, in the list.
+        let tool = tool_for_definition()
+            .with_gated_patterns(Arc::from([GlobPattern::from("*")]))
+            .with_gated_tools([("mezmo", "search_logs")]);
+        let description = tool.definition(String::new()).await.description;
+        assert!(
+            description.contains("first: `search_logs`."),
+            "{description}"
+        );
+        assert!(!description.contains("slack_post_message"), "{description}");
+        assert!(!description.contains("`*`"), "{description}");
+    }
+
+    #[tokio::test]
+    async fn definition_lists_gated_tools_by_namespace_and_never_itself() {
+        let tool = tool_for_definition()
+            .with_gated_patterns(Arc::from([GlobPattern::from("github:*")]))
+            .with_gated_tools([
+                ("github", "create_issue"),
+                ("mezmo", "search_logs"),
+                ("github", RequestApprovalTool::NAME),
+            ]);
+        let description = tool.definition(String::new()).await.description;
+        assert!(
+            description.contains("first: `create_issue`."),
+            "{description}"
+        );
+    }
+
+    #[tokio::test]
+    async fn definition_omits_gated_line_when_no_tool_matches() {
+        let tool = tool_for_definition()
+            .with_gated_patterns(Arc::from([GlobPattern::from("github:*")]))
+            .with_gated_tools([("mezmo", "search_logs")]);
+        let description = tool.definition(String::new()).await.description;
+        assert!(
+            !description.contains("already prompt for approval"),
+            "{description}"
+        );
+    }
+
+    #[tokio::test]
+    async fn definition_omits_gated_line_without_patterns() {
+        let description = tool_for_definition()
+            .definition(String::new())
+            .await
+            .description;
+        assert!(
+            !description.contains("already prompt for approval"),
+            "{description}"
+        );
     }
 
     #[tokio::test]
@@ -499,8 +698,8 @@ mod tests {
                 timeout: std::time::Duration::from_secs(60),
             });
 
-            let request_id = format!("req_tool_span_{}", uuid::Uuid::new_v4().simple());
-            let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+            let run_id = aura_events::RunId::mint();
+            let (run, mut events) = crate::run_context::RunContext::channel(run_id);
             let tool = RequestApprovalTool::new(
                 route,
                 AgentScope::Single { session_id: None },

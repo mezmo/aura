@@ -14,29 +14,33 @@
 //!   [`CorrelationContext`](crate::CorrelationContext) (session id, trace id)
 //!   into every payload. That is ambient request state, not something an agent
 //!   knows, so it is applied by the observer rather than carried here.
+//!
+//! A `type` this version does not know reads as
+//! [`AgentEventPayload::Unknown`], which cannot be written back; the session
+//! envelope ([`crate::run`]) states the rule and why.
 
 use serde::{Deserialize, Serialize};
 
 use crate::orchestration::{IterationTimings, RoutingMode};
 use crate::{
-    AgentContext, ApprovalCompleted, ApprovalPending, ApprovalRequested, McpServerStatus, Progress,
-    ProgressToken, TokenCount, TokenUsage, ToolCallId, ToolName, WorkerPhase,
+    ApprovalCompleted, ApprovalPending, ApprovalRequested, EmittingAgent, McpServerStatus,
+    Progress, ProgressToken, TokenCount, TokenUsage, ToolCallId, ToolName, WorkerPhase,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentEvent {
-    pub agent: AgentContext,
+    pub agent: EmittingAgent,
     pub payload: AgentEventPayload,
 }
 
 impl AgentEvent {
-    pub fn new(agent: AgentContext, payload: AgentEventPayload) -> Self {
+    pub fn new(agent: EmittingAgent, payload: AgentEventPayload) -> Self {
         Self { agent, payload }
     }
 
     /// Attributes the payload to `agent_id: "main"`.
     pub fn single_agent(payload: AgentEventPayload) -> Self {
-        Self::new(AgentContext::single_agent(), payload)
+        Self::new(EmittingAgent::single_agent(), payload)
     }
 }
 
@@ -229,6 +233,10 @@ pub enum AgentEventPayload {
     Synthesizing {
         iteration: usize,
     },
+
+    /// A value this version of the crate does not know.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 #[cfg(test)]
@@ -318,7 +326,7 @@ mod tests {
 
         let alone = AgentEvent::single_agent(payload());
         let worker = AgentEvent::new(
-            AgentContext::worker("log_worker", None, "coordinator"),
+            EmittingAgent::worker("log_worker", None, "coordinator"),
             payload(),
         );
 
@@ -330,16 +338,16 @@ mod tests {
     /// the same id a lone agent uses, so only the parent tells them apart.
     #[test]
     fn a_coordinator_owned_call_named_main_is_not_the_lone_agent() {
-        let coordinator_owned = AgentContext::worker("main", None, "coordinator");
+        let coordinator_owned = EmittingAgent::worker("main", None, "coordinator");
 
         assert!(!coordinator_owned.is_single_agent());
-        assert!(AgentContext::single_agent().is_single_agent());
+        assert!(EmittingAgent::single_agent().is_single_agent());
     }
 
     #[test]
     fn an_event_carries_its_emitting_agent() {
         let event = AgentEvent::new(
-            AgentContext::worker("log_worker", None, "orchestrator"),
+            EmittingAgent::worker("log_worker", None, "orchestrator"),
             AgentEventPayload::TextDelta {
                 content: "scanning".to_string(),
             },
@@ -413,5 +421,18 @@ mod tests {
         };
         assert_eq!(content, "the answer");
         assert_eq!(usage.total_tokens.get(), 15);
+    }
+
+    /// A reader older than its producer reads a type it does not know as
+    /// `Unknown` rather than failing the event, and cannot write it back.
+    #[test]
+    fn an_unknown_type_reads_as_unknown_and_cannot_be_serialized() {
+        let event: AgentEvent = serde_json::from_value(json!({
+            "agent": serde_json::to_value(EmittingAgent::single_agent()).unwrap(),
+            "payload": { "type": "telemetry", "cpu": 0.5 }
+        }))
+        .unwrap();
+        assert!(matches!(event.payload, AgentEventPayload::Unknown));
+        assert!(serde_json::to_value(&event).is_err());
     }
 }

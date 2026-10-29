@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use aura_events::agent::{AgentEvent, AgentEventPayload};
 use aura_events::{
-    AgentContext, AgentScopeWire, ApprovalCompleted, ApprovalOriginWire, ApprovalOutcomeWire,
-    ApprovalPending, ApprovalRequested, COORDINATOR_AGENT_ID, CancelReasonWire,
+    AgentScopeWire, ApprovalCompleted, ApprovalOriginWire, ApprovalOutcomeWire, ApprovalPending,
+    ApprovalRequested, COORDINATOR_AGENT_ID, CancelReasonWire, EmittingAgent,
 };
 
 use super::decision::{
@@ -26,14 +26,14 @@ use super::registry::ParkedApproval;
 ///
 /// A named worker is attributed to itself. An unnamed worker has no name in the
 /// scope, so it is attributed to the coordinator that runs it.
-fn agent_of(scope: &AgentScope) -> AgentContext {
+fn agent_of(scope: &AgentScope) -> EmittingAgent {
     match scope {
-        AgentScope::Single { .. } => AgentContext::single_agent(),
+        AgentScope::Single { .. } => EmittingAgent::single_agent(),
         AgentScope::Worker { task, .. } => match &task.worker {
-            Some(worker) => AgentContext::worker(worker, None, COORDINATOR_AGENT_ID),
-            None => AgentContext::coordinator(),
+            Some(worker) => EmittingAgent::worker(worker, None, COORDINATOR_AGENT_ID),
+            None => EmittingAgent::coordinator(),
         },
-        AgentScope::Coordinator { .. } => AgentContext::coordinator(),
+        AgentScope::Coordinator { .. } => EmittingAgent::coordinator(),
     }
 }
 
@@ -296,12 +296,12 @@ fn outcome_to_wire(outcome: &ApprovalOutcome) -> ApprovalOutcomeWire {
 mod tests {
     use super::*;
     use crate::hitl::decision::{AgentScope, CancelReason, DecisionId};
-    use crate::orchestration::{RunId, TaskIdentity};
+    use crate::orchestration::{PersistenceRunId, TaskIdentity};
 
     #[test]
     fn sender_dropped_outcome_serializes_as_sender_dropped() {
         let id = DecisionId::generate();
-        let run_id: RunId = "0191e8c0-1111-7000-8000-000000000000".parse().unwrap();
+        let run_id: PersistenceRunId = "0191e8c0-1111-7000-8000-000000000000".parse().unwrap();
         let scope = AgentScope::Worker {
             run_id,
             task: TaskIdentity::new(0, Some("ops".to_string())),

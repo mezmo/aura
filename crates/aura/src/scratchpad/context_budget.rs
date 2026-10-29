@@ -187,6 +187,21 @@ pub fn token_counter_for_provider(provider: &str, model: &str) -> Arc<dyn TokenC
     }
 }
 
+/// The longest token any supported tokenizer emits, in bytes. cl100k and
+/// o200k both top out at 128-byte whitespace runs; the approximate
+/// counters average a few bytes per token.
+pub const MAX_BYTES_PER_TOKEN: usize = 128;
+
+/// Whether content fits a token allowance, with the count that decided it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    /// The tokenizer's count, within the allowance.
+    Fits { tokens: usize },
+    /// Over the allowance; `estimated` marks a count derived from byte
+    /// length rather than the tokenizer.
+    Exceeds { tokens: usize, estimated: bool },
+}
+
 // ============================================================================
 // ContextBudget
 // ============================================================================
@@ -263,6 +278,20 @@ impl ContextBudget {
         }
     }
 
+    /// A budget with the same limits, `initial_used` tokens of fixed
+    /// overhead, and no usage.
+    pub fn with_initial_used(&self, initial_used: usize) -> Self {
+        Self {
+            max_extraction_tokens: self.max_extraction_tokens,
+            ..Self::new(
+                self.context_window,
+                self.safety_margin,
+                initial_used,
+                Arc::clone(&self.token_counter),
+            )
+        }
+    }
+
     /// Usable token budget (context window minus safety margin).
     pub fn usable_budget(&self) -> usize {
         ((self.context_window as f64) * (1.0 - self.safety_margin as f64)) as usize
@@ -277,6 +306,72 @@ impl ContextBudget {
     /// Count tokens for a string using the real tokenizer.
     pub fn count_tokens(&self, content: &str) -> usize {
         self.token_counter.count_tokens(content)
+    }
+
+    /// Count tokens for the content a message sends to the provider: text,
+    /// tool-result text, tool-call names and JSON arguments, and reasoning.
+    /// Images, audio, video, and documents count as zero: no history reaching
+    /// this count carries them. MCP images are flattened to text markers in
+    /// `extract_tool_result`, rig wraps every tool output as a text part, and
+    /// chat history is built from text messages, so the zero branches exist
+    /// only because the match over rig's `Message` must be exhaustive.
+    pub fn count_message_tokens(&self, message: &rig::completion::Message) -> usize {
+        use rig::completion::Message;
+        use rig::completion::message::{AssistantContent, ToolResultContent, UserContent};
+
+        match message {
+            Message::User { content } => content
+                .iter()
+                .map(|c| match c {
+                    UserContent::Text(t) => self.count_tokens(&t.text),
+                    UserContent::ToolResult(r) => r
+                        .content
+                        .iter()
+                        .map(|rc| match rc {
+                            ToolResultContent::Text(t) => self.count_tokens(&t.text),
+                            ToolResultContent::Image(_) => 0,
+                        })
+                        .sum(),
+                    _ => 0,
+                })
+                .sum(),
+            Message::Assistant { content, .. } => content
+                .iter()
+                .map(|c| match c {
+                    AssistantContent::Text(t) => self.count_tokens(&t.text),
+                    AssistantContent::ToolCall(call) => {
+                        self.count_tokens(&call.function.name)
+                            + self.count_tokens(&call.function.arguments.to_string())
+                    }
+                    AssistantContent::Reasoning(r) => {
+                        r.reasoning.iter().map(|s| self.count_tokens(s)).sum()
+                    }
+                    AssistantContent::Image(_) => 0,
+                })
+                .sum(),
+        }
+    }
+
+    /// Tokens a request's input adds to the context: the prompt plus each
+    /// history message's content.
+    pub fn request_input_tokens(
+        &self,
+        prompt: &str,
+        history: &[rig::completion::Message],
+    ) -> usize {
+        self.count_tokens(prompt)
+            + history
+                .iter()
+                .map(|m| self.count_message_tokens(m))
+                .sum::<usize>()
+    }
+
+    /// Set the estimate to the fixed overhead plus `input_tokens`, the
+    /// whole input of the call about to start, discarding what earlier
+    /// calls recorded.
+    pub fn reset_request_input(&self, input_tokens: usize) {
+        self.estimated_used
+            .store(self.initial_used + input_tokens, Ordering::Relaxed);
     }
 
     /// Check if content would fit within the remaining budget.
@@ -296,29 +391,63 @@ impl ContextBudget {
         }
     }
 
+    /// Whether `content` fits in `allowed` tokens, measured as cheaply as
+    /// the answer permits.
+    ///
+    /// Content longer than `allowed * MAX_BYTES_PER_TOKEN` bytes cannot
+    /// fit, so it is sized by the four-bytes-per-token rule of thumb instead
+    /// of being tokenized, which on multi-megabyte content would stall the
+    /// call for nothing. Anything shorter is tokenized once; callers record
+    /// and report the count from the returned [`Fit`] rather than counting
+    /// again.
+    pub fn fit(&self, content: &str, allowed: usize) -> Fit {
+        if content.len() > allowed.saturating_mul(MAX_BYTES_PER_TOKEN) {
+            return Fit::Exceeds {
+                tokens: content.len() / 4,
+                estimated: true,
+            };
+        }
+        let tokens = self.count_tokens(content);
+        if tokens > allowed {
+            Fit::Exceeds {
+                tokens,
+                estimated: false,
+            }
+        } else {
+            Fit::Fits { tokens }
+        }
+    }
+
+    /// Atomically record `tokens` of usage if there is room for them.
+    pub fn try_record_tokens(&self, tokens: usize) -> Result<(), BudgetExceeded> {
+        let usable = self.usable_budget();
+        self.estimated_used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current + tokens <= usable).then_some(current + tokens)
+            })
+            .map(drop)
+            .map_err(|current| BudgetExceeded {
+                requested_tokens: tokens,
+                remaining_tokens: usable.saturating_sub(current),
+                total_budget: usable,
+            })
+    }
+
+    /// The error for a request of `tokens` against what is left.
+    pub fn exceeded_by(&self, tokens: usize) -> BudgetExceeded {
+        BudgetExceeded {
+            requested_tokens: tokens,
+            remaining_tokens: self.remaining(),
+            total_budget: self.usable_budget(),
+        }
+    }
+
     /// Atomically check if content fits and record usage in one step.
     ///
     /// Returns the token count on success, or `BudgetExceeded` if there isn't room.
     pub fn try_record_usage(&self, content: &str) -> Result<usize, BudgetExceeded> {
         let tokens = self.count_tokens(content);
-        let usable = self.usable_budget();
-
-        match self
-            .estimated_used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                if current + tokens <= usable {
-                    Some(current + tokens)
-                } else {
-                    None
-                }
-            }) {
-            Ok(_prev) => Ok(tokens),
-            Err(current) => Err(BudgetExceeded {
-                requested_tokens: tokens,
-                remaining_tokens: usable.saturating_sub(current),
-                total_budget: usable,
-            }),
-        }
+        self.try_record_tokens(tokens).map(|()| tokens)
     }
 
     /// Record that tokens were consumed (after a successful tool return).
@@ -713,5 +842,123 @@ mod tests {
         let before = budget.remaining();
         budget.set_estimated_used(0, 0);
         assert_eq!(budget.remaining(), before);
+    }
+
+    /// A counter that refuses content past `max_len` bytes, so a test can
+    /// prove the tokenizer was never asked about it.
+    struct BoundedCounter {
+        max_len: usize,
+    }
+
+    impl TokenCounter for BoundedCounter {
+        fn count_tokens(&self, text: &str) -> usize {
+            assert!(
+                text.len() <= self.max_len,
+                "tokenizer called on {} bytes",
+                text.len()
+            );
+            text.len() / 4
+        }
+    }
+
+    #[test]
+    fn fit_reports_the_tokenizer_count_on_both_sides_of_the_allowance() {
+        let budget = ContextBudget::new(1_000, 0.0, 0, test_counter());
+        let text = "word ".repeat(50);
+        let expected = budget.count_tokens(&text);
+        assert_eq!(budget.fit(&text, expected), Fit::Fits { tokens: expected });
+        assert_eq!(
+            budget.fit(&text, expected - 1),
+            Fit::Exceeds {
+                tokens: expected,
+                estimated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn fit_skips_the_tokenizer_past_the_byte_bound() {
+        let bound = 10 * MAX_BYTES_PER_TOKEN;
+        let budget = ContextBudget::new(1_000, 0.0, 0, Arc::new(BoundedCounter { max_len: bound }));
+        let text = "x".repeat(bound + 1);
+        assert_eq!(
+            budget.fit(&text, 10),
+            Fit::Exceeds {
+                tokens: text.len() / 4,
+                estimated: true,
+            }
+        );
+        let text = "x".repeat(bound);
+        assert!(matches!(
+            budget.fit(&text, 10),
+            Fit::Exceeds {
+                estimated: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn try_record_tokens_is_the_atomic_half_of_try_record_usage() {
+        let budget = ContextBudget::new(100, 0.0, 0, test_counter());
+        assert!(budget.try_record_tokens(60).is_ok());
+        let err = budget.try_record_tokens(60).unwrap_err();
+        assert_eq!(
+            (err.requested_tokens, err.remaining_tokens, err.total_budget),
+            (60, 40, 100)
+        );
+        assert_eq!(budget.remaining(), 40);
+    }
+
+    #[test]
+    fn test_count_message_tokens_counts_tool_result_content_not_debug() {
+        let budget = ContextBudget::new(100_000, 0.20, 0, test_counter());
+        let output: String = (0..200)
+            .map(|i| format!("{{\"line\": {i}, \"msg\": \"say \\\"hi\\\"\"}}\n"))
+            .collect();
+        let message = rig::completion::Message::tool_result("call_1", output.clone());
+
+        let counted = budget.count_message_tokens(&message);
+        assert_eq!(counted, budget.count_tokens(&output));
+        assert!(counted < budget.count_tokens(&format!("{message:?}")));
+    }
+
+    #[test]
+    fn test_count_message_tokens_counts_text_tool_calls_and_reasoning() {
+        use rig::OneOrMany;
+        use rig::completion::message::{AssistantContent, Reasoning};
+
+        let budget = ContextBudget::new(100_000, 0.20, 0, test_counter());
+        assert_eq!(
+            budget.count_message_tokens(&rig::completion::Message::user("hello there")),
+            budget.count_tokens("hello there")
+        );
+
+        let args = serde_json::json!({"filename": "task-0-result.txt"});
+        let message = rig::completion::Message::Assistant {
+            id: None,
+            content: OneOrMany::many(vec![
+                AssistantContent::text("checking"),
+                AssistantContent::tool_call("call_1", "read_artifact", args.clone()),
+                AssistantContent::Reasoning(Reasoning::multi(vec!["think".to_string()])),
+            ])
+            .unwrap(),
+        };
+        assert_eq!(
+            budget.count_message_tokens(&message),
+            budget.count_tokens("checking")
+                + budget.count_tokens("read_artifact")
+                + budget.count_tokens(&args.to_string())
+                + budget.count_tokens("think")
+        );
+    }
+
+    #[test]
+    fn reset_request_input_stores_rather_than_raising() {
+        let budget = ContextBudget::new(100_000, 0.0, 1_000, test_counter());
+        budget.reset_request_input(50_000);
+        assert_eq!(budget.remaining(), 100_000 - 51_000);
+        budget.reset_request_input(10_000);
+        assert_eq!(budget.remaining(), 100_000 - 11_000);
     }
 }

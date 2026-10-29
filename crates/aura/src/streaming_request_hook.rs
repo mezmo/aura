@@ -26,7 +26,8 @@
 //!
 //! ```ignore
 //! let options = RunOptions::bounded(Some(Duration::from_secs(60)));
-//! let (hook, cancel, usage_state) = StreamingRequestHook::new(options, "req_123");
+//! // Keyed by the run's id, so this stream owns the run's tool-call queue.
+//! let (hook, cancel, usage_state) = StreamingRequestHook::new(options, run_id.to_string());
 //!
 //! // Pass hook to streaming request
 //! agent.stream_prompt(query).with_hook(hook).multi_turn(depth).await;
@@ -38,7 +39,7 @@
 //! let (prompt, completion, total) = usage_state.get_final_usage();
 //! ```
 
-use crate::hooks::{AgentHook, ClientTools, Deadline, Hooks, RunCancelReason};
+use crate::hooks::{AgentHook, ClientTools, Deadline, Hooks, StopReason};
 use aura_events::agent::{AgentEvent, AgentEventPayload};
 use rig::agent::{CancelSignal, StreamingPromptHook};
 use rig::completion::{CompletionModel, GetTokenUsage, Message};
@@ -106,7 +107,7 @@ impl Drop for ParkCellRegistration {
 /// correlates nothing until #732. Its tool events stay off the run for the same
 /// reason, and orchestration reports the worker's calls itself.
 fn queue_owner(stream_id: &str) -> Option<Arc<crate::run_context::RunContext>> {
-    current_run().filter(|run| run.id().as_ref() == stream_id)
+    current_run().filter(|run| run.has_id(stream_id))
 }
 
 /// Sends a tool event raised by this stream to the run [`queue_owner`] gives it.
@@ -430,7 +431,7 @@ impl StreamingRequestHook {
         self
     }
 
-    fn should_cancel(&self) -> Option<RunCancelReason> {
+    fn should_cancel(&self) -> Option<StopReason> {
         AgentHook::should_cancel(&self.hooks)
     }
 
@@ -463,17 +464,17 @@ impl StreamingRequestHook {
         };
         // A blown deadline is an operator's problem; the rest are routine.
         match reason {
-            RunCancelReason::Deadline { after } => tracing::warn!(
+            StopReason::Deadline { after } => tracing::warn!(
                 "Request timeout ({:?}) exceeded during {} - cancelling",
                 after,
                 context
             ),
-            RunCancelReason::External => {
+            StopReason::External => {
                 tracing::info!("Request cancelled externally during {}", context)
             }
             // Raised by `before_turn`, which logs it and ends the run itself, so
             // reaching the cancel path means a hook also reports it here.
-            RunCancelReason::ClientTool => {
+            StopReason::ClientTool => {
                 tracing::info!("Run yielding to a client tool during {}", context)
             }
         }
@@ -777,10 +778,11 @@ mod tests {
         /// scope, and its tool events must not reach the run as the run's own.
         #[tokio::test]
         async fn only_the_run_s_own_stream_sends_it_tool_events() {
-            let (run, mut events) = RunContext::channel("req_1");
+            let id = crate::run_context::named_run_id("req_1").to_string();
+            let (run, mut events) = RunContext::channel(id.parse().unwrap());
             with_run(run, async {
-                emit_from_stream("req_1:task:0:attempt:1", requested("worker")).await;
-                emit_from_stream("req_1", requested("own")).await;
+                emit_from_stream(&format!("{id}:task:0:attempt:1"), requested("worker")).await;
+                emit_from_stream(&id, requested("own")).await;
             })
             .await;
 
@@ -798,17 +800,19 @@ mod tests {
 
         #[tokio::test]
         async fn the_run_s_own_stream_owns_the_queue() {
-            let run = RunContext::detached("req_1");
-            let owned = with_run(run, async { queue_owner("req_1").is_some() }).await;
+            let id = crate::run_context::named_run_id("req_1");
+            let run = RunContext::detached(id);
+            let owned = with_run(run, async { queue_owner(&id.to_string()).is_some() }).await;
             assert!(owned);
         }
 
         /// An orchestration worker streams under its task attempt.
         #[tokio::test]
         async fn a_worker_s_stream_owns_no_queue() {
-            let run = RunContext::detached("req_1");
+            let id = crate::run_context::named_run_id("req_1");
+            let run = RunContext::detached(id);
             let owned = with_run(run, async {
-                queue_owner("req_1:task:0:attempt:1").is_some()
+                queue_owner(&format!("{id}:task:0:attempt:1")).is_some()
             })
             .await;
             assert!(
@@ -834,8 +838,8 @@ mod tests {
 
         #[async_trait::async_trait]
         impl AgentHook for AlwaysCancel {
-            fn should_cancel(&self) -> Option<RunCancelReason> {
-                Some(RunCancelReason::External)
+            fn should_cancel(&self) -> Option<StopReason> {
+                Some(StopReason::External)
             }
         }
 

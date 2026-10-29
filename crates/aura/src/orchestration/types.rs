@@ -8,6 +8,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Mutex;
 
+use aura_events::InvalidRunId;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -23,26 +24,50 @@ const MAX_STEP_NESTING: usize = 2;
 // Domain identifiers for orchestration runs and tasks, modeled as simple types
 // (opaque newtypes reached through canonical conversion traits).
 
-/// Identifier for a single orchestration run.
-///
-/// A run is an orchestration concept; single-agent requests have none. Run ids
-/// are v4 UUIDs; parse one from its string form via `FromStr`. Serializes as
-/// the bare UUID string.
+/// Identifier orchestration persistence names a run by. It is not the run's
+/// [`RunId`](aura_events::RunId).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct RunId(Uuid);
+#[serde(try_from = "Uuid", into = "Uuid")]
+pub struct PersistenceRunId(Uuid);
 
-impl fmt::Display for RunId {
+impl PersistenceRunId {
+    pub fn as_uuid(&self) -> &Uuid {
+        &self.0
+    }
+}
+
+impl TryFrom<Uuid> for PersistenceRunId {
+    type Error = InvalidRunId;
+
+    /// The nil UUID names nothing, so it is refused.
+    fn try_from(uuid: Uuid) -> Result<Self, Self::Error> {
+        if uuid.is_nil() {
+            Err(InvalidRunId::Nil)
+        } else {
+            Ok(Self(uuid))
+        }
+    }
+}
+
+impl From<PersistenceRunId> for Uuid {
+    fn from(id: PersistenceRunId) -> Self {
+        id.0
+    }
+}
+
+impl fmt::Display for PersistenceRunId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
 }
 
-impl FromStr for RunId {
-    type Err = uuid::Error;
+impl FromStr for PersistenceRunId {
+    type Err = InvalidRunId;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Uuid::from_str(s).map(Self)
+        Uuid::from_str(s)
+            .map_err(InvalidRunId::Malformed)
+            .and_then(Self::try_from)
     }
 }
 
@@ -1022,6 +1047,14 @@ impl IterationContext {
                         }
                     };
                     redesign_lines.push(line);
+                    // A task can fail after its tools succeeded — a timeout or
+                    // depth limit reached before submit_result. Those artifacts
+                    // are on disk and readable, so list them as for completed
+                    // tasks; otherwise the findings are lost at the iteration
+                    // boundary and the next plan repeats the work blind.
+                    for line in render_artifact_lines(self.tool_traces.get(&t.id)) {
+                        redesign_lines.push(format!("    {}", line));
+                    }
                     for line in render_tool_chain_lines(self.tool_traces.get(&t.id)) {
                         redesign_lines.push(format!("    {}", line));
                     }
@@ -1981,6 +2014,39 @@ mod tests {
         assert!(prompt.contains("COMPLETED TASKS"));
         assert!(prompt.contains("saved to artifact: task-0-sre-iter-1-result.txt"));
         assert!(prompt.contains("12345 chars"));
+    }
+
+    #[test]
+    fn test_continuation_prompt_lists_artifacts_of_failed_tasks() {
+        use super::super::persistence::{ToolOutcome, ToolTraceEntry};
+
+        // Regression guard: a worker that times out or exhausts its depth
+        // budget still leaves usable tool output on disk. The coordinator must
+        // see those artifacts so it can forward them to the next iteration.
+        let mut plan = Plan::new("Investigate");
+        let mut task = Task::new(0, "Search logs", "Query the log index");
+        task.fail("timed out after 120s", FailureCategory::AgentTimeout);
+        plan.add_task(task);
+
+        let mut traces = HashMap::new();
+        traces.insert(
+            0,
+            vec![ToolTraceEntry {
+                tool: "search_logs".to_string(),
+                reasoning: String::new(),
+                duration_ms: 1200,
+                outcome: ToolOutcome::Success {
+                    output_bytes: 27171,
+                },
+                artifact_filename: Some("task-0-sre-iter-1-tool-1.txt".to_string()),
+            }],
+        );
+
+        let ctx = IterationContext::new(1, plan, None, vec![], traces);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+
+        assert!(prompt.contains("FAILED TASKS"));
+        assert!(prompt.contains("[Artifact: task-0-sre-iter-1-tool-1.txt (27171 bytes)]"));
     }
 
     #[test]
@@ -3140,6 +3206,28 @@ mod tests {
             !chain_line.contains("→"),
             "single tool should have no arrow separator: {}",
             chain_line
+        );
+    }
+
+    /// The nil UUID names nothing, so persistence's id refuses it as the
+    /// run's own id does; a well-formed one round-trips as the bare string.
+    #[test]
+    fn a_persistence_run_id_refuses_the_nil_uuid() {
+        const NIL: &str = "00000000-0000-0000-0000-000000000000";
+        const ID: &str = "0191e8c0-1111-7000-8000-000000000000";
+        assert!(matches!(
+            NIL.parse::<PersistenceRunId>(),
+            Err(aura_events::InvalidRunId::Nil)
+        ));
+        assert!("not-a-uuid".parse::<PersistenceRunId>().is_err());
+        assert!(serde_json::from_value::<PersistenceRunId>(serde_json::json!(NIL)).is_err());
+
+        let id: PersistenceRunId = ID.parse().unwrap();
+        assert_eq!(id.to_string(), ID);
+        assert_eq!(serde_json::to_value(id).unwrap(), serde_json::json!(ID));
+        assert_eq!(
+            serde_json::from_value::<PersistenceRunId>(serde_json::json!(ID)).unwrap(),
+            id
         );
     }
 }

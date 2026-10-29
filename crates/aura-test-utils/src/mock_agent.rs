@@ -84,6 +84,8 @@ enum Script {
 pub struct MockAgent {
     on_stream_start: Option<StartHook>,
     script: Script,
+    run_id: aura::RunId,
+    stream_claim: aura::streaming::StreamClaim,
 }
 
 impl MockAgent {
@@ -92,6 +94,8 @@ impl MockAgent {
         Self {
             on_stream_start: None,
             script: Script::Pending,
+            run_id: aura::RunId::mint(),
+            stream_claim: aura::streaming::StreamClaim::default(),
         }
     }
 
@@ -103,13 +107,13 @@ impl MockAgent {
         Self::scripted(items.into_iter().map(Step::Item).collect())
     }
 
-    /// Runs the given steps in order, then ends the stream. The script is
-    /// consumed by the first `stream` call; a second call
-    /// on the same agent yields an empty stream.
+    /// Runs the given steps in order, then ends the stream.
     pub fn scripted(steps: Vec<Step>) -> Self {
         Self {
             on_stream_start: None,
             script: Script::Steps(Mutex::new(Some(steps))),
+            run_id: aura::RunId::mint(),
+            stream_claim: aura::streaming::StreamClaim::default(),
         }
     }
 
@@ -168,6 +172,10 @@ impl StreamingAgent for MockAgent {
         ("test", "fake")
     }
 
+    fn run_id(&self) -> aura::RunId {
+        self.run_id
+    }
+
     async fn stream(
         &self,
         _query: &str,
@@ -175,6 +183,11 @@ impl StreamingAgent for MockAgent {
         options: aura::streaming::RunOptions,
         request_id: &str,
     ) -> AgentRun {
+        // Held to the contract a real agent keeps, so a test that names the
+        // wrong run or streams twice fails the way production would.
+        if let Err(refused) = self.stream_claim.claim(self.run_id, request_id) {
+            return AgentRun::refused(refused);
+        }
         let stream = self.start(request_id).await;
         // Carries a caller-supplied token so `cancel_token()` returns the one the
         // caller named. The scripts do not race it, so cancelling does not end a
@@ -200,7 +213,12 @@ mod tests {
     async fn a_pending_agent_never_yields() {
         let agent = MockAgent::pending();
         let mut stream = agent
-            .stream("q", vec![], aura::streaming::RunOptions::default(), "req_1")
+            .stream(
+                "q",
+                vec![],
+                aura::streaming::RunOptions::default(),
+                &agent.run_id().to_string(),
+            )
             .await
             .into_events();
         assert!(
@@ -216,7 +234,12 @@ mod tests {
     async fn a_yielding_agent_produces_its_items_then_ends() {
         let agent = MockAgent::yielding(vec![items::text("hello "), items::text("world")]);
         let mut stream = agent
-            .stream("q", vec![], aura::streaming::RunOptions::default(), "req_1")
+            .stream(
+                "q",
+                vec![],
+                aura::streaming::RunOptions::default(),
+                &agent.run_id().to_string(),
+            )
             .await
             .into_events();
 
@@ -234,21 +257,31 @@ mod tests {
     #[tokio::test]
     async fn the_start_hook_runs_before_the_stream() {
         let ran = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&ran);
+        let seen = Arc::new(Mutex::new(None::<String>));
+        let (flag, seen_by_hook) = (Arc::clone(&ran), Arc::clone(&seen));
         let agent = MockAgent::pending().on_stream_start(move |request_id| {
-            let flag = Arc::clone(&flag);
+            let (flag, seen) = (Arc::clone(&flag), Arc::clone(&seen_by_hook));
             async move {
-                assert_eq!(request_id, "req_1");
+                *seen.lock().expect("seen lock") = Some(request_id);
                 flag.store(true, Ordering::SeqCst);
             }
         });
 
         let _ = agent
-            .stream("q", vec![], aura::streaming::RunOptions::default(), "req_1")
+            .stream(
+                "q",
+                vec![],
+                aura::streaming::RunOptions::default(),
+                &agent.run_id().to_string(),
+            )
             .await
             .into_events();
 
         assert!(ran.load(Ordering::SeqCst), "hook should run");
+        assert_eq!(
+            seen.lock().expect("seen lock").as_deref(),
+            Some(agent.run_id().to_string().as_str())
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -270,35 +303,82 @@ mod tests {
                 "q",
                 vec![],
                 aura::streaming::RunOptions::default(),
-                "req_42",
+                &agent.run_id().to_string(),
             )
             .await
             .into_events();
         let items: Vec<_> = stream.collect().await;
 
-        assert_eq!(order.lock().expect("order lock").as_slice(), ["req_42"]);
+        assert_eq!(
+            order.lock().expect("order lock").as_slice(),
+            [agent.run_id().to_string()]
+        );
         assert_eq!(items.len(), 1, "effects do not yield stream items");
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_script_is_consumed_by_the_first_stream_call() {
-        let agent = MockAgent::yielding([items::text("once")]);
+    /// The mock refuses what a real agent refuses: a stream naming another
+    /// run, which never reaches the start hook.
+    #[tokio::test]
+    async fn a_stream_naming_another_run_is_refused_before_the_hook() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        let agent = MockAgent::yielding([items::text("never")]).on_stream_start(move |_| {
+            let flag = Arc::clone(&flag);
+            async move { flag.store(true, Ordering::SeqCst) }
+        });
 
-        let first: Vec<_> = agent
+        let items: Vec<_> = agent
             .stream("q", vec![], aura::streaming::RunOptions::default(), "req_1")
             .await
             .into_events()
             .collect()
             .await;
+
+        let [Err(error)] = items.as_slice() else {
+            panic!("expected one refusal, got {items:?}");
+        };
+        assert!(matches!(
+            error.downcast_ref::<aura::streaming::StreamRefused>(),
+            Some(aura::streaming::StreamRefused::OtherId { .. })
+        ));
+        assert!(!ran.load(Ordering::SeqCst), "a refused stream runs nothing");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_stream_is_refused() {
+        let agent = MockAgent::yielding([items::text("once")]);
+
+        let first: Vec<_> = agent
+            .stream(
+                "q",
+                vec![],
+                aura::streaming::RunOptions::default(),
+                &agent.run_id().to_string(),
+            )
+            .await
+            .into_events()
+            .collect()
+            .await;
         let second: Vec<_> = agent
-            .stream("q", vec![], aura::streaming::RunOptions::default(), "req_1")
+            .stream(
+                "q",
+                vec![],
+                aura::streaming::RunOptions::default(),
+                &agent.run_id().to_string(),
+            )
             .await
             .into_events()
             .collect()
             .await;
 
         assert_eq!(first.len(), 1);
-        assert!(second.is_empty());
+        let [Err(error)] = second.as_slice() else {
+            panic!("expected one refusal, got {second:?}");
+        };
+        assert!(matches!(
+            error.downcast_ref::<aura::streaming::StreamRefused>(),
+            Some(aura::streaming::StreamRefused::AlreadyStreamed { .. })
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -318,7 +398,12 @@ mod tests {
         ]);
 
         let mut stream = agent
-            .stream("q", vec![], aura::streaming::RunOptions::default(), "req_1")
+            .stream(
+                "q",
+                vec![],
+                aura::streaming::RunOptions::default(),
+                &agent.run_id().to_string(),
+            )
             .await
             .into_events();
         while stream.next().await.is_some() {

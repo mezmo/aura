@@ -19,6 +19,7 @@ pub mod hitl;
 pub mod hooks;
 pub mod inactivity;
 pub mod instance_id;
+pub mod journal;
 pub mod logging;
 pub mod mcp;
 #[cfg(feature = "otel")]
@@ -44,6 +45,7 @@ pub(crate) mod string_utils;
 pub(crate) mod test_span_capture;
 pub mod tool_call_observer;
 pub mod tool_error_detection;
+pub mod tool_middleware;
 pub mod tool_wrapper;
 pub mod tools;
 pub mod turn_nudge;
@@ -55,7 +57,7 @@ pub use builder::{
     Agent, AgentBuilder, BeginRunError, FilesystemTools, PreparedAgent, RunToolFactory,
     build_streaming_agent, build_streaming_agent_with_tools, no_run_tools,
 };
-pub use config::{AgentRuntimeConfig, SessionId, ToolContextFactory};
+pub use config::{AgentBuildContext, RunId, SessionId, ToolContextFactory};
 // Pure config types are owned by `aura-config` and re-exported here for
 // ergonomic consumption (`aura::LlmConfig`, etc.).
 pub use aura_config::{
@@ -70,7 +72,7 @@ pub use orchestration::tools::{
 };
 pub use orchestration::{
     ArtifactsConfig, EventContext, OrchestrationConfig, OrchestrationStreamEvent, Orchestrator,
-    OrchestratorFactory, Plan, PlanningResponse, RoutingMode, RunId, Task, TaskIdentity, TaskJson,
+    OrchestratorFactory, Plan, PlanningResponse, RoutingMode, Task, TaskIdentity, TaskJson,
     TaskState, TaskStatus, TimeoutsConfig, agent_info, agent_info_with_tools, summarize_tools,
     worker_overview,
 };
@@ -105,12 +107,16 @@ pub use request_cancellation::{RequestCancelToken, RequestId};
 pub use rmcp::model::{NumberOrString, ProgressToken};
 pub use skill_tool::{LoadSkillTool, ReadSkillFileTool, SkillToolset, render_skill_catalog};
 pub use stream_events::{
-    AgentContext, AuraStreamEvent, CorrelationContext, CorrelationContextExt, WorkerPhase,
+    AuraStreamEvent, CorrelationContext, CorrelationContextExt, EmittingAgent, WorkerPhase,
     format_named_sse,
 };
 pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};
 pub use tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent, ToolOutcome};
 pub use tool_error_detection::{DetectedToolError, ToolResultStatus, detect_tool_error};
+pub use tool_middleware::{
+    CallFailure, MiddlewareStack, MiddlewareTool, Next, ToolMiddleware, ToolReply, ToolRequest,
+    WrapperLayer,
+};
 pub use tool_wrapper::{
     ComposedWrapper, ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult,
     WrappedTool,

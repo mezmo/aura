@@ -1,17 +1,16 @@
-//! Runtime agent configuration.
+//! The context an agent is built from.
 //!
 //! Pure, serializable config types live in the `aura-config` crate. This module
-//! holds the runtime build-context struct (`AgentRuntimeConfig`) that composes
-//! those TOML-parsed values with non-serializable runtime fields: tool wrappers,
-//! persistence handles, shared chat history, scratchpad runtime state, and the
-//! session id.
+//! holds [`AgentBuildContext`], which composes those TOML-parsed values with
+//! non-serializable fields: tool wrappers, persistence handles, scratchpad
+//! state, and the session id.
 
 use crate::forwarded_headers::ForwardedHeaders;
-use crate::hitl::HitlRuntime;
+use crate::hitl::HitlPolicy;
 use crate::scratchpad::ScratchpadToolsConfig;
+use crate::tool_middleware::{MiddlewareStack, ToolMiddleware};
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper};
 use aura_config::GlobPattern;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 // Re-export the pure config types from `aura-config` so existing
@@ -28,10 +27,9 @@ pub type ToolContextFactory = Arc<dyn Fn(&str) -> ToolCallContext + Send + Sync>
 
 /// Resolved per-worker skill override.
 ///
-/// Absence from [`AgentRuntimeConfig::worker_skills`] means the worker
-/// inherits `[agent.skills]`. There is deliberately no `Inherit` variant and
-/// no `Default` impl, so map lookups cannot silently turn "inherit" into
-/// "disable" via `unwrap_or_default()`.
+/// Inheriting `[agent.skills]` is not a variant: there is deliberately no
+/// `Inherit` and no `Default` impl, so a map lookup cannot silently turn
+/// "inherit" into "disable" via `unwrap_or_default()`.
 #[derive(Debug, Clone)]
 pub enum WorkerSkills {
     /// `skills.local = []`: the worker gets no skills.
@@ -40,39 +38,16 @@ pub enum WorkerSkills {
     Override(Vec<SkillConfig>),
 }
 
-/// Identifier for a chat session — the conversational context an agent runs in.
-///
-/// Threaded from the web server's `chat_session_id`, but meaningful for any
-/// agent run, including library use without the web layer; not every run has
-/// one. An opaque, branded string. Serializes as the bare string.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SessionId(String);
+pub use aura_events::{RunId, SessionId};
 
-impl SessionId {
-    /// Wrap a session-id string. Accepts a `&str` or an owned `String`.
-    #[must_use]
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// Borrow the underlying id as a string slice.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Runtime build context for constructing agents.
+/// The resolved input to preparing an agent: the TOML sections, what one
+/// request resolves before the build (forwarded headers, the HITL route,
+/// discovered skills), and what the orchestrator injects for a worker (tool
+/// wrapper, middleware, persistence, the `submit_result` decision).
 ///
-/// This composes the pure TOML-parsed config types from `aura-config` with
-/// non-serializable runtime extension points: tool wrappers, persistence
-/// handles, shared chat history, scratchpad runtime state, and the session id.
-///
-/// Note: this is the renamed successor of the old `AgentConfig`. The TOML
-/// `[agent]` table shape is now `aura_config::AgentConfig` — a distinct type.
+/// The TOML `[agent]` table is the distinct `aura_config::AgentConfig`.
 #[derive(Default)]
-pub struct AgentRuntimeConfig {
+pub struct AgentBuildContext {
     pub llm: LlmConfig,
     pub agent: AgentSettings,
     pub vector_stores: Vec<VectorStoreConfig>,
@@ -99,6 +74,9 @@ pub struct AgentRuntimeConfig {
     /// When set, all MCP tools are wrapped with this wrapper.
     pub tool_wrapper: Option<Arc<dyn ToolWrapper + Send + Sync>>,
 
+    /// Layers MCP tools run through, outside `tool_wrapper`.
+    pub tool_middleware: Option<MiddlewareStack>,
+
     /// Factory for creating ToolCallContext per tool.
     /// Allows callers to inject metadata (task_id, attempt) into wrapped tool calls.
     pub tool_context_factory: Option<ToolContextFactory>,
@@ -115,10 +93,8 @@ pub struct AgentRuntimeConfig {
     pub orchestration_persistence:
         Option<Arc<tokio::sync::Mutex<crate::orchestration::ExecutionPersistence>>>,
 
-    /// Session ID for grouping orchestration runs under a shared namespace.
-    /// When set, persistence paths become `{memory_dir}/{session_id}/{run_id}/...`.
-    /// Threaded from the web server's `chat_session_id`.
-    pub session_id: Option<String>,
+    /// The session this agent runs in.
+    pub session_id: Option<SessionId>,
 
     /// Scratchpad storage/budget handed to the 8 exploration tools.
     /// `Some` when scratchpad is wired up for this agent or worker.
@@ -128,13 +104,11 @@ pub struct AgentRuntimeConfig {
     /// When set, workers get the `submit_result` tool for structured output.
     pub orchestration_submit_result: Option<crate::orchestration::SubmitResultDecision>,
 
-    /// Resolved HITL approval runtime (compiled globs + decision route), built
-    /// from `[hitl]` once per request and shared with orchestration workers.
-    /// `None` disables approval gating.
-    pub hitl: Option<HitlRuntime>,
+    /// The resolved `[hitl]` approval policy.
+    pub hitl: Option<HitlPolicy>,
 
-    /// Request id (`req_…`) of the request this build serves.
-    pub request_id: Option<String>,
+    /// The run this build serves.
+    pub run_id: Option<RunId>,
 
     /// The request headers this build forwards; see [`ForwardedHeaders`].
     pub forwarded_headers: ForwardedHeaders,
@@ -154,7 +128,7 @@ pub struct AgentRuntimeConfig {
 }
 
 // Manual Clone implementation because Arc<dyn Trait> fields require special handling
-impl Clone for AgentRuntimeConfig {
+impl Clone for AgentBuildContext {
     fn clone(&self) -> Self {
         Self {
             llm: self.llm.clone(),
@@ -167,6 +141,7 @@ impl Clone for AgentRuntimeConfig {
             worker_skills: self.worker_skills.clone(),
             // Arc fields clone the Arc (shared reference)
             tool_wrapper: self.tool_wrapper.clone(),
+            tool_middleware: self.tool_middleware.clone(),
             tool_context_factory: self.tool_context_factory.clone(),
             preamble_override: self.preamble_override.clone(),
             mcp_filter: self.mcp_filter.clone(),
@@ -175,7 +150,7 @@ impl Clone for AgentRuntimeConfig {
             scratchpad_tools_config: self.scratchpad_tools_config.clone(),
             orchestration_submit_result: self.orchestration_submit_result.clone(),
             hitl: self.hitl.clone(),
-            request_id: self.request_id.clone(),
+            run_id: self.run_id,
             forwarded_headers: self.forwarded_headers.clone(),
             instance_id: self.instance_id.clone(),
             hitl_request_approval_tool: self.hitl_request_approval_tool.clone(),
@@ -185,9 +160,9 @@ impl Clone for AgentRuntimeConfig {
 }
 
 // Manual Debug implementation because Arc<dyn Trait> fields don't implement Debug
-impl std::fmt::Debug for AgentRuntimeConfig {
+impl std::fmt::Debug for AgentBuildContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AgentRuntimeConfig")
+        f.debug_struct("AgentBuildContext")
             .field("llm", &self.llm)
             .field("agent", &self.agent)
             .field("vector_stores", &self.vector_stores)
@@ -197,6 +172,10 @@ impl std::fmt::Debug for AgentRuntimeConfig {
             .field(
                 "tool_wrapper",
                 &self.tool_wrapper.as_ref().map(|_| "<wrapper>"),
+            )
+            .field(
+                "tool_middleware",
+                &self.tool_middleware.as_ref().map(|s| s.layers().len()),
             )
             .field(
                 "tool_context_factory",
@@ -220,7 +199,7 @@ impl std::fmt::Debug for AgentRuntimeConfig {
                     .map(|_| "<submit_result>"),
             )
             .field("hitl", &self.hitl.as_ref().map(|_| "<hitl>"))
-            .field("request_id", &self.request_id)
+            .field("run_id", &self.run_id)
             .field("forwarded_headers", &self.forwarded_headers)
             .field("instance_id", &self.instance_id)
             .field(
@@ -238,7 +217,29 @@ impl std::fmt::Debug for AgentRuntimeConfig {
     }
 }
 
-impl AgentRuntimeConfig {
+impl AgentBuildContext {
+    /// The stack MCP tools run through: the placed layers outside the
+    /// caller's `tool_wrapper`, so the wrapper sees the raw tool output and
+    /// every layer still runs when both are set.
+    pub fn tool_middleware_stack(&self) -> Option<MiddlewareStack> {
+        let wrapper = self
+            .tool_wrapper
+            .clone()
+            .map(|wrapper| MiddlewareStack::from_wrapper(wrapper));
+        match (self.tool_middleware.clone(), wrapper) {
+            (Some(layers), Some(inner)) => Some(layers.around(inner)),
+            (layers, inner) => layers.or(inner),
+        }
+    }
+
+    /// Place `layer` outside every layer MCP tools already run through.
+    pub fn add_outer_tool_layer(&mut self, layer: Arc<dyn ToolMiddleware>) {
+        self.tool_middleware = Some(match self.tool_middleware.take() {
+            Some(stack) => stack.wrapped_by(layer),
+            None => MiddlewareStack::new(vec![layer]),
+        });
+    }
+
     /// Check if orchestration mode is enabled.
     ///
     /// Returns true if the `[orchestration]` section exists and `enabled = true`.
@@ -312,6 +313,121 @@ impl AgentRuntimeConfig {
 mod tests {
     use super::*;
 
+    mod tool_stack {
+        use super::*;
+        use crate::tool_middleware::{
+            CallFailure, MiddlewareTool, Next, ToolMiddleware, ToolReply, ToolRequest,
+        };
+        use crate::tool_wrapper::TransformOutputResult;
+        use async_trait::async_trait;
+        use rig::tool::{Tool as _, ToolError};
+        use serde_json::Value;
+
+        /// Appends its tag to the output, so the result shows which ran and
+        /// in what order on the way up.
+        struct TagWrapper(&'static str);
+
+        #[async_trait]
+        impl ToolWrapper for TagWrapper {
+            async fn transform_output(
+                &self,
+                output: String,
+                _outcome: &crate::mcp::CallOutcome,
+                _ctx: &ToolCallContext,
+                _extracted: Option<&Value>,
+            ) -> TransformOutputResult {
+                TransformOutputResult::new(format!("{output}<{}", self.0))
+            }
+        }
+
+        struct TagLayer(&'static str);
+
+        #[async_trait]
+        impl ToolMiddleware for TagLayer {
+            async fn call(
+                &self,
+                req: ToolRequest,
+                next: Next<'_>,
+            ) -> Result<ToolReply, CallFailure> {
+                match next.run(req).await? {
+                    ToolReply::Tool { output, outcome } => Ok(ToolReply::Tool {
+                        output: format!("{output}<{}", self.0),
+                        outcome,
+                    }),
+                    other => Ok(other),
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct Raw;
+
+        impl rig::tool::Tool for Raw {
+            const NAME: &'static str = "raw";
+            type Error = ToolError;
+            type Args = Value;
+            type Output = String;
+
+            async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+                rig::completion::ToolDefinition {
+                    name: Self::NAME.to_string(),
+                    description: String::new(),
+                    parameters: serde_json::json!({ "type": "object" }),
+                }
+            }
+
+            async fn call(&self, _args: Value) -> Result<String, ToolError> {
+                Ok("raw".to_string())
+            }
+        }
+
+        async fn run(build_context: &AgentBuildContext) -> String {
+            let stack = build_context.tool_middleware_stack().expect("a stack");
+            MiddlewareTool::new(Raw, stack)
+                .call(serde_json::json!({}))
+                .await
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn a_placed_layer_runs_outside_the_caller_wrapper() {
+            let mut build_context = AgentBuildContext {
+                tool_wrapper: Some(Arc::new(TagWrapper("w"))),
+                ..Default::default()
+            };
+            build_context.add_outer_tool_layer(Arc::new(TagLayer("a")));
+            build_context.add_outer_tool_layer(Arc::new(TagLayer("b")));
+            assert_eq!(run(&build_context).await, "raw<w<a<b");
+        }
+
+        #[tokio::test]
+        async fn a_supplied_stack_keeps_the_caller_wrapper() {
+            let build_context = AgentBuildContext {
+                tool_wrapper: Some(Arc::new(TagWrapper("w"))),
+                tool_middleware: Some(MiddlewareStack::new(vec![Arc::new(TagLayer("a"))])),
+                ..Default::default()
+            };
+            assert_eq!(run(&build_context).await, "raw<w<a");
+        }
+
+        #[tokio::test]
+        async fn either_alone_is_the_stack() {
+            let wrapper_only = AgentBuildContext {
+                tool_wrapper: Some(Arc::new(TagWrapper("w"))),
+                ..Default::default()
+            };
+            assert_eq!(run(&wrapper_only).await, "raw<w");
+            let mut layers_only = AgentBuildContext::default();
+            layers_only.add_outer_tool_layer(Arc::new(TagLayer("a")));
+            assert_eq!(run(&layers_only).await, "raw<a");
+            assert!(
+                AgentBuildContext::default()
+                    .tool_middleware_stack()
+                    .is_none()
+            );
+        }
+    }
+
     fn aura_tool(namespace: &str, tool_name: &str) -> crate::mcp::AuraTool {
         let tool = rmcp::model::Tool::new(
             tool_name.to_owned(),
@@ -323,72 +439,72 @@ mod tests {
 
     #[test]
     fn test_tool_matches_filter_none() {
-        let config = AgentRuntimeConfig::default();
-        assert!(config.tool_matches_filter(&aura_tool("mezmo", "any_tool")));
+        let build_context = AgentBuildContext::default();
+        assert!(build_context.tool_matches_filter(&aura_tool("mezmo", "any_tool")));
     }
 
     #[test]
     fn test_tool_matches_filter_empty_denies_all() {
-        let config = AgentRuntimeConfig {
+        let build_context = AgentBuildContext {
             mcp_filter: Some(vec![]),
             ..Default::default()
         };
-        assert!(!config.tool_matches_filter(&aura_tool("mezmo", "any_tool")));
+        assert!(!build_context.tool_matches_filter(&aura_tool("mezmo", "any_tool")));
     }
 
     #[test]
     fn test_tool_matches_filter_patterns() {
-        let config = AgentRuntimeConfig {
+        let build_context = AgentBuildContext {
             mcp_filter: Some(vec!["mezmo_*".into(), "QueryKnowledgeBases".into()]),
             ..Default::default()
         };
 
-        assert!(config.tool_matches_filter(&aura_tool("mezmo", "mezmo_logs")));
-        assert!(config.tool_matches_filter(&aura_tool("mezmo", "mezmo_pipelines")));
-        assert!(config.tool_matches_filter(&aura_tool("kb", "QueryKnowledgeBases")));
-        assert!(!config.tool_matches_filter(&aura_tool("mezmo", "other_tool")));
+        assert!(build_context.tool_matches_filter(&aura_tool("mezmo", "mezmo_logs")));
+        assert!(build_context.tool_matches_filter(&aura_tool("mezmo", "mezmo_pipelines")));
+        assert!(build_context.tool_matches_filter(&aura_tool("kb", "QueryKnowledgeBases")));
+        assert!(!build_context.tool_matches_filter(&aura_tool("mezmo", "other_tool")));
     }
 
     #[test]
     fn test_tool_matches_filter_namespace_scoped_pattern() {
-        let config = AgentRuntimeConfig {
+        let build_context = AgentBuildContext {
             mcp_filter: Some(vec!["k8s:*".into()]),
             ..Default::default()
         };
 
-        assert!(config.tool_matches_filter(&aura_tool("k8s", "get_pods")));
-        assert!(!config.tool_matches_filter(&aura_tool("mezmo", "get_pods")));
+        assert!(build_context.tool_matches_filter(&aura_tool("k8s", "get_pods")));
+        assert!(!build_context.tool_matches_filter(&aura_tool("mezmo", "get_pods")));
     }
 
     #[test]
     fn test_client_tool_matches_filter_none() {
-        let config = AgentRuntimeConfig::default();
-        assert!(config.client_tool_matches_filter("Read"));
+        let build_context = AgentBuildContext::default();
+        assert!(build_context.client_tool_matches_filter("Read"));
     }
 
     #[test]
     fn test_client_tool_matches_filter_empty() {
-        let config = AgentRuntimeConfig {
+        let build_context = AgentBuildContext {
             agent: AgentSettings {
                 client_tool_filter: Some(vec![]),
                 ..AgentSettings::default()
             },
             ..Default::default()
         };
-        assert!(config.client_tool_matches_filter("Read"));
+        assert!(build_context.client_tool_matches_filter("Read"));
     }
 
     #[test]
     fn test_client_tool_matches_filter_patterns() {
-        let config = AgentRuntimeConfig {
+        let build_context = AgentBuildContext {
             agent: AgentSettings {
                 client_tool_filter: Some(vec!["Read".into(), "Find*".into()]),
                 ..AgentSettings::default()
             },
             ..Default::default()
         };
-        assert!(config.client_tool_matches_filter("Read"));
-        assert!(config.client_tool_matches_filter("FindFiles"));
-        assert!(!config.client_tool_matches_filter("Shell"));
+        assert!(build_context.client_tool_matches_filter("Read"));
+        assert!(build_context.client_tool_matches_filter("FindFiles"));
+        assert!(!build_context.client_tool_matches_filter("Shell"));
     }
 }

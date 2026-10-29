@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::config::AgentRuntimeConfig;
+use crate::config::AgentBuildContext;
 use crate::hitl::{DecisionId, PendingApprovals};
 use crate::orchestration::persistence::is_safe_path_component;
 use crate::orchestration::types::{PendingCall, Plan, TaskState};
@@ -25,7 +25,7 @@ pub(crate) struct ParkCommitInputs<'a> {
     pub records: &'a ParkedTaskRecords,
     pub registry: &'a PendingApprovals,
     pub memory_dir: &'a str,
-    pub config: &'a AgentRuntimeConfig,
+    pub build_context: &'a AgentBuildContext,
     /// Decision window stamped on a document with no surviving ticket.
     pub decision_window: std::time::Duration,
 }
@@ -127,7 +127,7 @@ pub(crate) async fn commit_from_run_state(
         records,
         registry,
         memory_dir,
-        config,
+        build_context,
         decision_window,
     } = inputs;
 
@@ -145,7 +145,7 @@ pub(crate) async fn commit_from_run_state(
         records,
         &refreshed.pending_by_task,
         expires_at.clone(),
-        config_fingerprint(config),
+        config_fingerprint(build_context),
     )?;
     let parked_dir = parked_document_dir(memory_dir, state.session_id);
     publish(&document, &parked_dir, state.run_id).await?;
@@ -256,8 +256,8 @@ pub(crate) fn parked_document_dir(memory_dir: &str, session_id: Option<&str>) ->
 /// Fingerprint the configuration a resume must not drift from: the HITL
 /// gating surface (globs, route, park flag), the agent's model and tool
 /// filter, and the per-worker model and tool configuration.
-pub(crate) fn config_fingerprint(config: &AgentRuntimeConfig) -> String {
-    let hitl = config.hitl.as_ref();
+pub(crate) fn config_fingerprint(build_context: &AgentBuildContext) -> String {
+    let hitl = build_context.hitl.as_ref();
     let route = hitl.map(|h| match &*h.route {
         crate::hitl::DecisionRoute::Conversational { timeout, .. } => json!({
             "kind": "conversational",
@@ -278,10 +278,10 @@ pub(crate) fn config_fingerprint(config: &AgentRuntimeConfig) -> String {
             "park_enabled": hitl.is_some_and(|h| h.park_enabled),
         },
         "agent": {
-            "llm": serde_json::to_value(&config.llm).ok(),
-            "mcp_filter": &config.agent.mcp_filter,
+            "llm": serde_json::to_value(&build_context.llm).ok(),
+            "mcp_filter": &build_context.agent.mcp_filter,
         },
-        "workers": config
+        "workers": build_context
             .orchestration
             .as_ref()
             .and_then(|o| serde_json::to_value(&o.workers).ok()),
@@ -558,8 +558,8 @@ mod tests {
         let (registry, store) = conv_registry();
         let run_id = "0191e8c0-ffff-7000-8000-000000000006";
         let owner = run_owner_id(run_id);
-        let request_id = format!("req_sweep_{}", uuid::Uuid::new_v4().simple());
-        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+        let this_run = aura_events::RunId::mint();
+        let (run, mut events) = crate::run_context::RunContext::channel(this_run);
 
         let now = chrono::Utc::now();
         let decided = DecisionId::generate();
@@ -626,8 +626,8 @@ mod tests {
         let (registry, store) = conv_registry();
         let run_id = "0191e8c0-aaaa-7000-8000-000000000007";
         let owner = run_owner_id(run_id);
-        let request_id = format!("req_sweep_{}", uuid::Uuid::new_v4().simple());
-        let (run, mut events) = crate::run_context::RunContext::channel(request_id.as_str());
+        let this_run = aura_events::RunId::mint();
+        let (run, mut events) = crate::run_context::RunContext::channel(this_run);
 
         let now = chrono::Utc::now();
         let first = DecisionId::generate();
@@ -710,9 +710,9 @@ mod tests {
     /// gating or tool surface changes.
     #[test]
     fn config_fingerprint_stable_and_sensitive() {
-        fn config(pattern: &str) -> crate::config::AgentRuntimeConfig {
-            crate::config::AgentRuntimeConfig {
-                hitl: Some(crate::hitl::HitlRuntime {
+        fn gated_build_context(pattern: &str) -> crate::config::AgentBuildContext {
+            crate::config::AgentBuildContext {
+                hitl: Some(crate::hitl::HitlPolicy {
                     patterns: Arc::from([pattern.into()]),
                     route: Arc::new(crate::hitl::DecisionRoute::Conversational {
                         registry: PendingApprovals::new(),
@@ -720,18 +720,18 @@ mod tests {
                     }),
                     park_enabled: true,
                 }),
-                ..crate::config::AgentRuntimeConfig::default()
+                ..crate::config::AgentBuildContext::default()
             }
         }
 
         assert_eq!(
-            config_fingerprint(&config("kubectl_*")),
-            config_fingerprint(&config("kubectl_*")),
+            config_fingerprint(&gated_build_context("kubectl_*")),
+            config_fingerprint(&gated_build_context("kubectl_*")),
             "unchanged config is a stable hash"
         );
         assert_ne!(
-            config_fingerprint(&config("kubectl_*")),
-            config_fingerprint(&config("helm_*")),
+            config_fingerprint(&gated_build_context("kubectl_*")),
+            config_fingerprint(&gated_build_context("helm_*")),
             "a changed gate surface changes the hash"
         );
     }

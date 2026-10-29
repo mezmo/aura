@@ -75,7 +75,7 @@ impl Tool for ListPriorRunsTool {
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
         let persistence = self.persistence.lock().await;
         let session_id = match persistence.session_id() {
-            Some(sid) => sid.to_string(),
+            Some(sid) => sid.clone(),
             None => {
                 tracing::warn!("list_prior_runs called without session_id — returning empty");
                 return Ok(ListPriorRunsOutput {
@@ -130,7 +130,8 @@ mod tests {
         temp_dir: &TempDir,
         session_id: &str,
     ) -> Arc<Mutex<ExecutionPersistence>> {
-        let persistence = ExecutionPersistence::new(temp_dir.path(), Some(session_id.to_string()))
+        let session = crate::config::SessionId::new(session_id).unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path(), Some(session))
             .await
             .unwrap();
         Arc::new(Mutex::new(persistence))

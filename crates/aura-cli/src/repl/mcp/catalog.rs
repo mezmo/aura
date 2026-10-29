@@ -43,9 +43,9 @@ pub(crate) struct HeaderTemplate {
 pub(crate) const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         key: "mezmo",
-        description: "Mezmo log analysis, export, and pipeline monitoring",
+        description: "Mezmo log analysis and pipeline monitoring",
         prerequisites: "Requires a Mezmo service API key (Mezmo UI: Settings > API Keys).\n\
-                        AURA will be able to query logs, exports, and pipeline state on your account.",
+                        AURA will be able to query logs and pipeline state on your account.",
         template: Template::Http {
             url: "https://mcp.mezmo.com/mcp",
             headers: &[HeaderTemplate {

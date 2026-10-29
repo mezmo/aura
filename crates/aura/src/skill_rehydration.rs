@@ -406,12 +406,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let skills = vec![make_skill(dir.path(), "alpha", "# Alpha instructions")];
         let store = Arc::new(InMemorySkillInvocationStore::new());
-        let log = SkillLogKey::new(crate::config::SessionId::new("sess-loop"), "agent");
+        let log = SkillLogKey::new(crate::config::SessionId::new("sess-loop").unwrap(), "agent");
 
         // Turn N: history [user], anchor = 0 + 1. The LLM calls load_skill.
         let recorder = Arc::new(SkillInvocationRecorder::new(store.clone(), log.clone(), 1));
         let (run, _events) = crate::run_context::RunContext::channel_for_agent(
-            "req-turn-n",
+            crate::run_context::named_run_id("req-turn-n"),
             tokio_util::sync::CancellationToken::new(),
             None,
             None,

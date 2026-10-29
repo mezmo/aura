@@ -10,13 +10,17 @@
 //!
 //! - [`AuraStreamEvent`] — Base aura events (tool lifecycle, usage, reasoning, progress)
 //! - [`OrchestrationStreamEvent`] — Multi-agent orchestration events
+//! - [`agent::AgentEvent`] — What a running agent emits, before any wire projection
+//! - [`run::SessionEvent`] — One session's ordered stream: its agents' events and its runs' lifecycle
 //!
-//! Both enums derive `Serialize + Deserialize` so they can be used for
+//! All derive `Serialize + Deserialize` so they can be used for
 //! producing SSE (server) and parsing SSE (client) with the same types.
 
 pub mod agent;
+pub mod duration_ms;
 pub mod event_names;
 pub mod orchestration;
+pub mod run;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -68,38 +72,17 @@ pub fn format_named_sse(event_name: &str, data: &impl Serialize) -> String {
 // and the wire schema below. Opaque newtypes reached through canonical
 // conversion traits; each serializes as its inner value.
 
-/// Generates the shared surface of a string newtype: construction, borrowing,
-/// display, and comparison against the string types.
-macro_rules! string_newtype {
-    ($(#[$meta:meta])* $name:ident) => {
-        $(#[$meta])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-        #[serde(transparent)]
-        pub struct $name(String);
-
+/// Generates the surface every string newtype shares: borrowing, display, and
+/// comparison against the string types.
+macro_rules! string_newtype_surface {
+    ($name:ident) => {
         impl $name {
-            pub fn new(value: impl Into<String>) -> Self {
-                Self(value.into())
-            }
-
             pub fn as_str(&self) -> &str {
                 &self.0
             }
 
             pub fn into_string(self) -> String {
                 self.0
-            }
-        }
-
-        impl From<String> for $name {
-            fn from(value: String) -> Self {
-                Self(value)
-            }
-        }
-
-        impl From<&str> for $name {
-            fn from(value: &str) -> Self {
-                Self(value.to_owned())
             }
         }
 
@@ -133,6 +116,194 @@ macro_rules! string_newtype {
             }
         }
     };
+}
+
+/// Generates the shared surface of a string newtype: construction, borrowing,
+/// display, and comparison against the string types.
+macro_rules! string_newtype {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Self {
+                Self(value.into())
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(value: String) -> Self {
+                Self(value)
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(value: &str) -> Self {
+                Self(value.to_owned())
+            }
+        }
+
+        $crate::string_newtype_surface!($name);
+    };
+}
+
+/// Generates a string newtype that rejects blank values (empty or only
+/// whitespace) in its constructor, its `TryFrom` impls, and deserialization.
+macro_rules! nonempty_string_newtype {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(try_from = "String", into = "String")]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Result<Self, $crate::EmptyId> {
+                let value = value.into();
+                if value.trim().is_empty() {
+                    Err($crate::EmptyId {
+                        id: stringify!($name),
+                    })
+                } else {
+                    Ok(Self(value))
+                }
+            }
+
+            /// Like `new`, but returns `None` for a blank value instead of an
+            /// error. Use it where a blank value should count as missing.
+            pub fn non_empty(value: impl Into<String>) -> Option<Self> {
+                Self::new(value).ok()
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = $crate::EmptyId;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl TryFrom<&str> for $name {
+            type Error = $crate::EmptyId;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(id: $name) -> Self {
+                id.0
+            }
+        }
+
+        $crate::string_newtype_surface!($name);
+    };
+}
+
+// Path-based so submodules can invoke them regardless of declaration order.
+pub(crate) use {nonempty_string_newtype, string_newtype_surface};
+
+/// An identifier given as a blank string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyId {
+    /// The identifier's type name.
+    pub id: &'static str,
+}
+
+impl std::fmt::Display for EmptyId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} cannot be blank", self.id)
+    }
+}
+
+impl std::error::Error for EmptyId {}
+
+nonempty_string_newtype! {
+    /// Identifier for a session: an agent's identity over time, and the key
+    /// its [`SessionEvent`](run::SessionEvent) stream is ordered under.
+    SessionId
+}
+
+/// Identifier for one run: a unit of work within a session, from a prompt to
+/// a terminal state. It is not [`EmittingAgent::agent_id`], which attributes an
+/// event *within* a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "uuid::Uuid", into = "uuid::Uuid")]
+pub struct RunId(uuid::Uuid);
+
+impl RunId {
+    /// A fresh id. Version 7, so ids order by when they were minted.
+    pub fn mint() -> Self {
+        Self(uuid::Uuid::now_v7())
+    }
+
+    pub fn as_uuid(&self) -> &uuid::Uuid {
+        &self.0
+    }
+}
+
+/// Why a value is not a run id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvalidRunId {
+    /// Not a UUID.
+    Malformed(uuid::Error),
+    /// The nil UUID.
+    Nil,
+}
+
+impl std::fmt::Display for InvalidRunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(err) => err.fmt(f),
+            Self::Nil => f.write_str("the nil UUID names no run"),
+        }
+    }
+}
+
+impl std::error::Error for InvalidRunId {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Malformed(err) => Some(err),
+            Self::Nil => None,
+        }
+    }
+}
+
+impl TryFrom<uuid::Uuid> for RunId {
+    type Error = InvalidRunId;
+
+    fn try_from(uuid: uuid::Uuid) -> Result<Self, Self::Error> {
+        if uuid.is_nil() {
+            Err(InvalidRunId::Nil)
+        } else {
+            Ok(Self(uuid))
+        }
+    }
+}
+
+impl From<RunId> for uuid::Uuid {
+    fn from(id: RunId) -> Self {
+        id.0
+    }
+}
+
+impl std::str::FromStr for RunId {
+    type Err = InvalidRunId;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        uuid::Uuid::from_str(s)
+            .map_err(InvalidRunId::Malformed)?
+            .try_into()
+    }
+}
+
+impl std::fmt::Display for RunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
 string_newtype! {
@@ -237,6 +408,98 @@ impl std::fmt::Display for Progress {
     }
 }
 
+/// An instant as Unix time in milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Timestamp(u64);
+
+impl Timestamp {
+    pub fn from_unix_millis(millis: u64) -> Self {
+        Self(millis)
+    }
+
+    pub fn unix_millis(self) -> u64 {
+        self.0
+    }
+
+    /// The current instant. A clock set before the Unix epoch reads as the
+    /// epoch itself.
+    pub fn now() -> Self {
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        Self(duration_ms::whole_millis(since_epoch))
+    }
+}
+
+impl std::fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// A position in a sequence that starts at 1 and counts every item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "u64", into = "u64")]
+pub struct SequenceNumber(u64);
+
+impl SequenceNumber {
+    /// The first position.
+    pub const FIRST: Self = Self(1);
+
+    pub fn get(self) -> u64 {
+        self.0
+    }
+
+    /// The position after this one.
+    pub fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+
+    /// Whether this is the position immediately after `previous`. `false`
+    /// means the stream did not advance by exactly one: a position was
+    /// missed, this one was delivered again, or it arrived out of order.
+    pub fn follows(self, previous: Self) -> bool {
+        self.0 == previous.0.saturating_add(1)
+    }
+}
+
+impl std::fmt::Display for SequenceNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// A sequence number of zero, which no sequence uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZeroSequenceNumber;
+
+impl std::fmt::Display for ZeroSequenceNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("sequence numbers start at 1")
+    }
+}
+
+impl std::error::Error for ZeroSequenceNumber {}
+
+impl TryFrom<u64> for SequenceNumber {
+    type Error = ZeroSequenceNumber;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        if value == 0 {
+            Err(ZeroSequenceNumber)
+        } else {
+            Ok(Self(value))
+        }
+    }
+}
+
+impl From<SequenceNumber> for u64 {
+    fn from(seq: SequenceNumber) -> Self {
+        seq.0
+    }
+}
+
 /// The agent id of an orchestrated run's coordinator. Workers name it as their
 /// parent, so it defines the agent hierarchy and every producer spells it the
 /// same way.
@@ -247,16 +510,16 @@ pub const COORDINATOR_AGENT_ID: &str = "coordinator";
 /// the coordinator's place in the agent hierarchy.
 pub const CONVERSATION_AGENT_ID: &str = "main";
 
-/// Context identifying which agent emitted an event.
+/// The agent that emitted an event.
 ///
-/// For single-agent deployments, use `AgentContext::single_agent()` which sets
+/// For single-agent deployments, use `EmittingAgent::single_agent()` which sets
 /// `agent_id: "main"`. For multi-agent orchestrators, populate `parent_agent_id`
 /// to establish the agent hierarchy.
 ///
-/// Note: `AgentContext::default()` gives an empty `agent_id` - use `single_agent()`
-/// for the standard single-agent context.
+/// Note: `EmittingAgent::default()` gives an empty `agent_id` - use `single_agent()`
+/// for the lone agent of a single-agent run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct AgentContext {
+pub struct EmittingAgent {
     /// Unique identifier for this agent (e.g., "main", "log_worker", "rca_worker")
     #[serde(default)]
     pub agent_id: String,
@@ -268,8 +531,8 @@ pub struct AgentContext {
     pub parent_agent_id: Option<String>,
 }
 
-impl AgentContext {
-    /// Create a default single-agent context, identified as
+impl EmittingAgent {
+    /// The lone agent of an unorchestrated run, identified as
     /// [`CONVERSATION_AGENT_ID`].
     pub fn single_agent() -> Self {
         Self {
@@ -289,7 +552,7 @@ impl AgentContext {
         }
     }
 
-    /// Create a single-agent context with a custom name
+    /// The lone agent of an unorchestrated run, with a display name.
     pub fn single_agent_with_name(name: impl Into<String>) -> Self {
         Self {
             agent_id: CONVERSATION_AGENT_ID.to_string(),
@@ -308,7 +571,7 @@ impl AgentContext {
         self.agent_id == CONVERSATION_AGENT_ID && self.parent_agent_id.is_none()
     }
 
-    /// Create a worker agent context with parent hierarchy
+    /// A worker, naming the agent above it in the hierarchy.
     pub fn worker(
         id: impl Into<String>,
         name: Option<String>,
@@ -558,7 +821,7 @@ pub enum AuraStreamEvent {
         tool_name: String,
         arguments: serde_json::Value,
         #[serde(flatten)]
-        agent: AgentContext,
+        agent: EmittingAgent,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -578,7 +841,7 @@ pub enum AuraStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
         #[serde(flatten)]
-        agent: AgentContext,
+        agent: EmittingAgent,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -591,7 +854,7 @@ pub enum AuraStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         progress_token: Option<ProgressToken>,
         #[serde(flatten)]
-        agent: AgentContext,
+        agent: EmittingAgent,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -599,7 +862,7 @@ pub enum AuraStreamEvent {
     Reasoning {
         content: String,
         #[serde(flatten)]
-        agent: AgentContext,
+        agent: EmittingAgent,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -614,7 +877,7 @@ pub enum AuraStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         progress_token: Option<ProgressToken>,
         #[serde(flatten)]
-        agent: AgentContext,
+        agent: EmittingAgent,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -624,7 +887,7 @@ pub enum AuraStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         task_id: Option<String>,
         #[serde(flatten)]
-        agent: AgentContext,
+        agent: EmittingAgent,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -644,7 +907,7 @@ pub enum AuraStreamEvent {
         /// Total tokens used
         total_tokens: u64,
         #[serde(flatten)]
-        agent: AgentContext,
+        agent: EmittingAgent,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -678,7 +941,7 @@ pub enum AuraStreamEvent {
         /// Tokens extracted from scratchpad back into context by this agent.
         tokens_extracted: usize,
         #[serde(flatten)]
-        agent: AgentContext,
+        agent: EmittingAgent,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -693,7 +956,7 @@ pub enum AuraStreamEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_window: Option<u64>,
         #[serde(flatten)]
-        agent: AgentContext,
+        agent: EmittingAgent,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -749,7 +1012,7 @@ impl AuraStreamEvent {
         tool_id: impl Into<String>,
         tool_name: impl Into<String>,
         arguments: serde_json::Value,
-        agent: AgentContext,
+        agent: EmittingAgent,
         correlation: CorrelationContext,
     ) -> Self {
         Self::ToolRequested {
@@ -766,7 +1029,7 @@ impl AuraStreamEvent {
         tool_id: impl Into<String>,
         tool_name: impl Into<String>,
         progress_token: Option<ProgressToken>,
-        agent: AgentContext,
+        agent: EmittingAgent,
         correlation: CorrelationContext,
     ) -> Self {
         Self::ToolStart {
@@ -784,7 +1047,7 @@ impl AuraStreamEvent {
         tool_name: impl Into<String>,
         duration_ms: u64,
         result: impl Into<String>,
-        agent: AgentContext,
+        agent: EmittingAgent,
         correlation: CorrelationContext,
     ) -> Self {
         Self::ToolComplete {
@@ -805,7 +1068,7 @@ impl AuraStreamEvent {
         tool_name: impl Into<String>,
         duration_ms: u64,
         error: impl Into<String>,
-        agent: AgentContext,
+        agent: EmittingAgent,
         correlation: CorrelationContext,
     ) -> Self {
         Self::ToolComplete {
@@ -823,7 +1086,7 @@ impl AuraStreamEvent {
     /// Create a Reasoning event.
     pub fn reasoning(
         content: impl Into<String>,
-        agent: AgentContext,
+        agent: EmittingAgent,
         correlation: CorrelationContext,
     ) -> Self {
         Self::Reasoning {
@@ -839,7 +1102,7 @@ impl AuraStreamEvent {
         phase: impl Into<String>,
         percent: Option<u8>,
         progress_token: Option<ProgressToken>,
-        agent: AgentContext,
+        agent: EmittingAgent,
         correlation: CorrelationContext,
     ) -> Self {
         Self::Progress {
@@ -879,7 +1142,7 @@ impl AuraStreamEvent {
         prompt_tokens: u64,
         completion_tokens: u64,
         total_tokens: u64,
-        agent: AgentContext,
+        agent: EmittingAgent,
         correlation: CorrelationContext,
     ) -> Self {
         Self::ToolUsage {
@@ -924,7 +1187,7 @@ impl AuraStreamEvent {
     pub fn scratchpad_usage(
         tokens_intercepted: usize,
         tokens_extracted: usize,
-        agent: AgentContext,
+        agent: EmittingAgent,
         correlation: CorrelationContext,
     ) -> Self {
         Self::ScratchpadUsage {
@@ -940,7 +1203,7 @@ impl AuraStreamEvent {
         context_tokens: u64,
         response_tokens: u64,
         context_window: Option<u64>,
-        agent: AgentContext,
+        agent: EmittingAgent,
         correlation: CorrelationContext,
     ) -> Self {
         Self::ContextUsage {
@@ -973,6 +1236,28 @@ mod tests {
     #[test]
     fn percent_is_capped_at_a_hundred() {
         assert_eq!(Progress::ratio(150.0, 100.0).percent(), Some(100));
+    }
+
+    /// Clients read these keys off the `agent` field of every event.
+    #[test]
+    fn an_emitting_agent_serializes_to_the_agent_keys_clients_read() {
+        assert_eq!(
+            serde_json::to_value(EmittingAgent::single_agent()).unwrap(),
+            serde_json::json!({ "agent_id": "main" }),
+        );
+        assert_eq!(
+            serde_json::to_value(EmittingAgent::worker(
+                "log_worker",
+                Some("Log Worker".to_string()),
+                "coordinator",
+            ))
+            .unwrap(),
+            serde_json::json!({
+                "agent_id": "log_worker",
+                "agent_name": "Log Worker",
+                "parent_agent_id": "coordinator",
+            }),
+        );
     }
 
     #[test]
@@ -1207,7 +1492,7 @@ mod tests {
             "Shell",
             1500,
             "output",
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::new("s1", None),
         );
         let json = serde_json::to_string(&event).unwrap();
@@ -1282,7 +1567,7 @@ mod tests {
             12_000,
             340,
             Some(200_000),
-            AgentContext::worker("log-analyst", None, "orchestrator"),
+            EmittingAgent::worker("log-analyst", None, "orchestrator"),
             CorrelationContext::new("s1", None),
         );
         assert_eq!(event.event_name(), "aura.context_usage");
@@ -1354,7 +1639,7 @@ mod tests {
             "call_1",
             "Shell",
             serde_json::json!({"cmd": "ls"}),
-            AgentContext::single_agent(),
+            EmittingAgent::single_agent(),
             CorrelationContext::new("s1", None),
         );
         let json = serde_json::to_string(&event).unwrap();
@@ -1402,6 +1687,72 @@ mod tests {
             }
             other => panic!("expected ApprovalCompleted, got {:?}", other),
         }
+    }
+
+    /// A session's sequence starts at 1, so a zero is refused rather than
+    /// read as an event before the first.
+    #[test]
+    fn a_zero_sequence_number_is_refused() {
+        assert_eq!(SequenceNumber::try_from(0), Err(ZeroSequenceNumber));
+        assert!(serde_json::from_value::<SequenceNumber>(serde_json::json!(0)).is_err());
+        assert_eq!(
+            serde_json::from_value::<SequenceNumber>(serde_json::json!(1)).unwrap(),
+            SequenceNumber::FIRST
+        );
+    }
+
+    /// Dense numbering is what lets a consumer tell a missed event from a
+    /// quiet stream: the next number is always exactly one more.
+    #[test]
+    fn sequence_numbers_are_dense() {
+        let first = SequenceNumber::FIRST;
+        assert_eq!(first.get(), 1);
+
+        let second = first.next();
+        assert!(second.follows(first));
+        assert!(!second.next().follows(first), "a skipped number is a gap");
+        assert!(!first.follows(second), "order matters");
+        assert!(!first.follows(first), "a repeat is not a successor");
+    }
+
+    #[test]
+    fn a_sequence_number_serializes_as_a_bare_integer() {
+        let json = serde_json::to_value(SequenceNumber::FIRST.next()).unwrap();
+        assert_eq!(json, serde_json::json!(2));
+        assert_eq!(
+            serde_json::from_value::<SequenceNumber>(json).unwrap(),
+            SequenceNumber(2)
+        );
+    }
+
+    #[test]
+    fn a_timestamp_is_unix_milliseconds() {
+        let at = Timestamp::from_unix_millis(1_700_000_000_000);
+        assert_eq!(
+            serde_json::to_value(at).unwrap(),
+            serde_json::json!(1_700_000_000_000_u64)
+        );
+        assert_eq!(at.unix_millis(), 1_700_000_000_000);
+
+        let now = Timestamp::now();
+        assert!(
+            now > at,
+            "now ({now}) should be after November 2023 ({at}) on any sane clock"
+        );
+    }
+
+    /// Both string newtype macros share one surface, so a non-empty id
+    /// compares against every string type a plain one does.
+    #[test]
+    fn a_nonempty_id_has_the_same_surface_as_a_plain_one() {
+        let plain = ToolName::new("s");
+        let nonempty = run::ObserverId::new("s").unwrap();
+        assert_eq!(plain, "s");
+        assert_eq!(nonempty, "s");
+        assert_eq!(plain, String::from("s"));
+        assert_eq!(nonempty, String::from("s"));
+        assert_eq!(nonempty.as_str(), plain.as_str());
+        assert_eq!(nonempty.to_string(), plain.into_string());
     }
 }
 

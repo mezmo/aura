@@ -599,7 +599,7 @@ async fn send_final_events(
                 context_tokens,
                 response_tokens,
                 callbacks.agent.context_window(),
-                aura::stream_events::AgentContext::single_agent(),
+                aura::stream_events::EmittingAgent::single_agent(),
                 ctx.correlation.clone(),
             );
             let _ = tx.send(Ok(Bytes::from(context_event.format_sse()))).await;
@@ -819,7 +819,7 @@ fn handle_stream_item(
                 tokens_intercepted,
                 tokens_extracted,
             );
-            let agent_ctx = aura::stream_events::AgentContext {
+            let emitting_agent = aura::stream_events::EmittingAgent {
                 agent_id: agent_id.clone(),
                 agent_name: None,
                 parent_agent_id: None,
@@ -827,7 +827,7 @@ fn handle_stream_item(
             let event = AuraStreamEvent::scratchpad_usage(
                 *tokens_intercepted,
                 *tokens_extracted,
-                agent_ctx,
+                emitting_agent,
                 ctx.correlation.clone(),
             );
             vec![Bytes::from(event.format_sse())]
@@ -844,7 +844,7 @@ fn handle_stream_item(
                 context_tokens,
                 response_tokens,
             );
-            let agent_ctx = aura::stream_events::AgentContext {
+            let emitting_agent = aura::stream_events::EmittingAgent {
                 agent_id: agent_id.clone(),
                 agent_name: None,
                 parent_agent_id: None,
@@ -853,7 +853,7 @@ fn handle_stream_item(
                 *context_tokens,
                 *response_tokens,
                 *context_window,
-                agent_ctx,
+                emitting_agent,
                 ctx.correlation.clone(),
             );
             vec![Bytes::from(event.format_sse())]
@@ -1126,7 +1126,7 @@ fn handle_tool_result(
                     &tool_name,
                     duration_ms,
                     err.full_message(),
-                    ctx.agent_context.clone(),
+                    ctx.emitting_agent.clone(),
                     ctx.correlation.clone(),
                 )
             }
@@ -1137,7 +1137,7 @@ fn handle_tool_result(
                     &tool_name,
                     duration_ms,
                     &truncated_result,
-                    ctx.agent_context.clone(),
+                    ctx.emitting_agent.clone(),
                     ctx.correlation.clone(),
                 )
             }
@@ -1212,7 +1212,7 @@ fn handle_reasoning(config: &StreamConfig, ctx: &TurnContext, reasoning: String)
     if config.emit_custom_events && config.emit_reasoning {
         let event = AuraStreamEvent::reasoning(
             reasoning,
-            ctx.agent_context.clone(),
+            ctx.emitting_agent.clone(),
             ctx.correlation.clone(),
         );
         vec![Bytes::from(event.format_sse())]
@@ -1250,7 +1250,7 @@ fn handle_orchestrator_event(
         return vec![];
     }
 
-    let event_context = EventContext::new(ctx.agent_context.clone(), ctx.correlation.clone());
+    let event_context = EventContext::new(ctx.emitting_agent.clone(), ctx.correlation.clone());
     // Orchestration frames name the worker in a field of their own; the
     // envelope is where that now comes from.
     let worker_id = &event.agent.agent_id;
@@ -1678,7 +1678,7 @@ mod tests {
         use super::super::run_event_sse;
         use aura::stream_events::CorrelationContext;
         use aura_events::agent::{AgentEvent, AgentEventPayload};
-        use aura_events::{AgentContext, NumberOrString, Progress, ProgressToken};
+        use aura_events::{EmittingAgent, NumberOrString, Progress, ProgressToken};
 
         fn correlation() -> CorrelationContext {
             CorrelationContext {
@@ -1693,7 +1693,7 @@ mod tests {
         #[test]
         fn a_carried_agent_reaches_the_frame() {
             let event = AgentEvent::new(
-                AgentContext::worker("log_worker", None, "coordinator"),
+                EmittingAgent::worker("log_worker", None, "coordinator"),
                 AgentEventPayload::ToolProgress {
                     progress_token: ProgressToken(NumberOrString::Number(7)),
                     progress: Progress::ratio(1.0, 4.0),
@@ -1807,7 +1807,7 @@ mod tests {
             model_str: "gpt-4".to_string(),
             created_timestamp: 1234567890,
             max_tokens: None,
-            agent_context: aura::stream_events::AgentContext::single_agent(),
+            emitting_agent: aura::stream_events::EmittingAgent::single_agent(),
             correlation: CorrelationContext::new("test-session", None),
         };
 
@@ -1865,10 +1865,10 @@ mod tests {
             model_str: "gpt-4".to_string(),
             created_timestamp: 1234567890,
             max_tokens: None,
-            agent_context: aura::stream_events::AgentContext::single_agent(),
+            emitting_agent: aura::stream_events::EmittingAgent::single_agent(),
             correlation: CorrelationContext::new("test-session", None),
         };
-        let worker = aura_events::AgentContext::worker("log-analyst", None, "coordinator");
+        let worker = aura_events::EmittingAgent::worker("log-analyst", None, "coordinator");
 
         let started = AgentEvent::new(
             worker.clone(),
@@ -1916,7 +1916,7 @@ mod tests {
             model_str: "gpt-4".to_string(),
             created_timestamp: 1234567890,
             max_tokens: None,
-            agent_context: aura::stream_events::AgentContext::single_agent(),
+            emitting_agent: aura::stream_events::EmittingAgent::single_agent(),
             correlation: CorrelationContext::new("test-session", None),
         };
 
@@ -2912,7 +2912,7 @@ mod tests {
         where
             F: FnOnce(&Senders) -> Vec<Step>,
         {
-            let (senders, callbacks) = channels();
+            let (senders, mut callbacks) = channels();
             let steps = build(&senders);
             let config = StreamConfig::new(emit_custom_events, false, ToolResultMode::Aura, 0);
             let ctx = TurnContext::new(
@@ -2923,13 +2923,13 @@ mod tests {
                 session_id,
             );
 
-            let stream = MockAgent::scripted(steps)
-                .stream(
-                    "q",
-                    vec![],
-                    aura::streaming::RunOptions::default(),
-                    "req_tool_events",
-                )
+            // The handler passes the run's id to both the stream and the
+            // callbacks, so the test does too.
+            let agent = MockAgent::scripted(steps);
+            let run_id = agent.run_id().to_string();
+            callbacks.request_id = run_id.clone();
+            let stream = agent
+                .stream("q", vec![], aura::streaming::RunOptions::default(), &run_id)
                 .await
                 .into_events();
 

@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::request_cancellation::RequestCancelToken;
 
 use crate::config::SessionId;
-use crate::orchestration::{RunId, TaskIdentity};
+use crate::orchestration::{PersistenceRunId, TaskIdentity};
 
 /// Wall-clock timestamp.
 ///
@@ -92,14 +92,14 @@ pub enum AgentScope {
         session_id: Option<SessionId>,
     },
     Worker {
-        run_id: RunId,
+        run_id: PersistenceRunId,
         task: TaskIdentity,
         session_id: Option<SessionId>,
     },
     /// Future coordinator-mediated surface, declared now, constructed by no
     /// current code path.
     Coordinator {
-        run_id: RunId,
+        run_id: PersistenceRunId,
     },
 }
 

@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::AgentRuntimeConfig;
+use crate::config::{AgentBuildContext, RunId};
 use crate::provider_agent::{StreamError, StreamItem};
 use crate::streaming::StreamingAgent;
 
@@ -24,8 +24,11 @@ use super::orchestrator::{
 /// Defers `Orchestrator` construction to `stream()` to avoid duplicate resource
 /// allocation and ensure MCP progress notifications route correctly.
 pub struct OrchestratorFactory {
-    agent_config: AgentRuntimeConfig,
+    agent_build_context: AgentBuildContext,
     run_tools: crate::builder::RunToolFactory,
+    /// The one run this factory streams.
+    run_id: RunId,
+    stream_claim: crate::streaming::StreamClaim,
 }
 
 /// A run's cancellation, and the signal that its task ended.
@@ -64,10 +67,15 @@ fn final_response(
 }
 
 impl OrchestratorFactory {
-    pub fn new(agent_config: AgentRuntimeConfig) -> Self {
+    /// A factory for the run `agent_build_context.run_id`, or for a fresh run when
+    /// the build context names none. The orchestration it spawns sees the same id.
+    pub fn new(mut agent_build_context: AgentBuildContext) -> Self {
+        let run_id = *agent_build_context.run_id.get_or_insert_with(RunId::mint);
         Self {
-            agent_config,
+            agent_build_context,
             run_tools: crate::builder::no_run_tools(),
+            run_id,
+            stream_claim: crate::streaming::StreamClaim::default(),
         }
     }
 
@@ -93,14 +101,14 @@ impl OrchestratorFactory {
         usage_state: crate::UsageState,
         outer_budget: Option<Duration>,
     ) -> BoxStream<'static, Result<StreamItem, StreamError>> {
-        let agent_config = self.agent_config.clone();
+        let agent_build_context = self.agent_build_context.clone();
         let run_tools = std::sync::Arc::clone(&self.run_tools);
 
         // Create channel for orchestrator events
         let (event_tx, event_rx) =
             tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(100);
 
-        let run_id = std::sync::Arc::clone(run.id());
+        let run_id = run.id().to_string();
         let RunTokens { cancel, finished } = tokens;
         let cancel_token_clone = cancel.clone();
         // Marks the run finished on every exit path, which is what lets the
@@ -112,7 +120,7 @@ impl OrchestratorFactory {
         tokio::spawn(tracing::Instrument::instrument(
             crate::run_context::with_run(std::sync::Arc::clone(&run), async move {
                 let _done_guard = done_guard;
-                let mut orchestrator = match Orchestrator::new(agent_config).await {
+                let mut orchestrator = match Orchestrator::new(agent_build_context).await {
                     Ok(o) => o,
                     Err(e) => {
                         let _ = event_tx.send(Err(e)).await;
@@ -134,7 +142,7 @@ impl OrchestratorFactory {
                     mcp_manager
                         .bind_call(
                             std::sync::Arc::clone(&run),
-                            aura_events::AgentContext::coordinator(),
+                            aura_events::EmittingAgent::coordinator(),
                         )
                         .await;
                     let snapshot = mcp_manager.server_status_snapshot();
@@ -174,7 +182,7 @@ impl OrchestratorFactory {
                         tracing::info!("Orchestration cancelled");
                         if let Some(ref mcp_manager) = orchestrator.mcp_manager {
                             let cancelled = mcp_manager
-                                .cancel_and_close_all(run_id.as_ref(), "Client disconnected or timeout")
+                                .cancel_and_close_all(&run_id, "Client disconnected or timeout")
                                 .await;
                             if cancelled > 0 {
                                 tracing::info!("Cancelled {} MCP request(s) during orchestration shutdown", cancelled);
@@ -198,17 +206,21 @@ impl OrchestratorFactory {
 #[async_trait]
 impl StreamingAgent for OrchestratorFactory {
     fn get_provider_info(&self) -> (&str, &str) {
-        self.agent_config.llm.model_info()
+        self.agent_build_context.llm.model_info()
+    }
+
+    fn run_id(&self) -> RunId {
+        self.run_id
     }
 
     /// The coordinator's window: it holds the persistent conversation, so it
     /// is the context a client measures the session against.
     fn context_window(&self) -> Option<u64> {
-        self.agent_config.llm.context_window()
+        self.agent_build_context.llm.context_window()
     }
 
     fn skills(&self) -> &[aura_config::SkillConfig] {
-        &self.agent_config.agent.skills
+        &self.agent_build_context.agent.skills
     }
 
     async fn stream(
@@ -218,6 +230,10 @@ impl StreamingAgent for OrchestratorFactory {
         options: crate::streaming::RunOptions,
         request_id: &str,
     ) -> crate::streaming::AgentRun {
+        let run_id = self.run_id;
+        if let Err(refused) = self.stream_claim.claim(run_id, request_id) {
+            return crate::streaming::AgentRun::refused(refused);
+        }
         let (timeout, cancel) = options.into_parts();
         let cancel_token = cancel.unwrap_or_default();
 
@@ -229,7 +245,7 @@ impl StreamingAgent for OrchestratorFactory {
                 timeout,
                 cancel_token.clone(),
                 finished.clone(),
-                request_id.to_string(),
+                run_id.to_string(),
             );
             finished
         });
@@ -239,7 +255,7 @@ impl StreamingAgent for OrchestratorFactory {
         // all orchestration LLM turns.
         let usage_state = crate::UsageState::new();
         let (run, run_events) =
-            crate::run_context::RunContext::channel_on(request_id, cancel_token.clone());
+            crate::run_context::RunContext::channel_on(run_id, cancel_token.clone());
         let stream = self.spawn_orchestration_stream(
             query.to_string(),
             chat_history,
@@ -256,7 +272,7 @@ impl StreamingAgent for OrchestratorFactory {
         // is attributed there rather than to any worker that fed it.
         let stream = Box::pin(crate::streaming::tee_content(
             run,
-            aura_events::AgentContext::coordinator(),
+            aura_events::EmittingAgent::coordinator(),
             stream,
         ));
 
@@ -272,6 +288,54 @@ impl StreamingAgent for OrchestratorFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+
+    /// A factory's run id is fixed when it is built, and the orchestration it
+    /// spawns carries the same one.
+    #[test]
+    fn a_factory_streams_the_run_it_was_built_for() {
+        let named = crate::run_context::named_run_id("req_a");
+        let build_context = AgentBuildContext {
+            run_id: Some(named),
+            ..AgentBuildContext::default()
+        };
+        let factory = OrchestratorFactory::new(build_context);
+        assert_eq!(factory.run_id(), named);
+        assert_eq!(factory.agent_build_context.run_id, Some(named));
+
+        let unnamed = OrchestratorFactory::new(AgentBuildContext::default());
+        let other = OrchestratorFactory::new(AgentBuildContext::default());
+        assert_eq!(unnamed.agent_build_context.run_id, Some(unnamed.run_id()));
+        assert_ne!(
+            unnamed.run_id(),
+            other.run_id(),
+            "each factory mints its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_factory_refuses_a_stream_naming_another_run() {
+        let factory = OrchestratorFactory::new(AgentBuildContext::default());
+        let items: Vec<_> = factory
+            .stream(
+                "q",
+                Vec::new(),
+                crate::streaming::RunOptions::default(),
+                "req_123",
+            )
+            .await
+            .into_events()
+            .collect()
+            .await;
+
+        let [Err(error)] = items.as_slice() else {
+            panic!("expected one refusal, got {items:?}");
+        };
+        assert!(matches!(
+            error.downcast_ref::<crate::streaming::StreamRefused>(),
+            Some(crate::streaming::StreamRefused::OtherId { run, .. }) if *run == factory.run_id()
+        ));
+    }
 
     /// A reader that finds usage on the response takes the cache split from
     /// there too, so the response carries the run's split with its totals.
