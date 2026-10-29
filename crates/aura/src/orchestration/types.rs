@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::hitl::DecisionId;
+use crate::orchestration::tools::{DecisionRequest, DecisionRequestRef};
 
 /// Maximum nesting depth for step structures.
 /// Depth 0 = top-level steps list, depth 1 = inside a parallel group,
@@ -113,6 +114,9 @@ pub enum StepInput {
         /// Run artifact filenames attached to this task.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         artifacts: Vec<String>,
+        /// Questions and state prepared for a decision-worker task.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision_request: Option<DecisionRequestRef>,
     },
 }
 
@@ -164,6 +168,7 @@ fn flatten_one(
             task,
             worker,
             artifacts,
+            decision_request,
         } => {
             let id = *counter;
             *counter += 1;
@@ -171,6 +176,10 @@ fn flatten_one(
             t.dependencies = frontier.to_vec();
             t.worker = worker.clone();
             t.artifacts = artifacts.clone();
+            t.decision_request = decision_request
+                .as_ref()
+                .and_then(DecisionRequestRef::resolved)
+                .cloned();
             tasks.push(t);
             Ok(vec![id])
         }
@@ -366,6 +375,10 @@ pub struct Task {
     pub structured_output: Option<StructuredTaskOutput>,
     /// Run artifact filenames attached to this task.
     pub artifacts: Vec<String>,
+    /// Questions and state the coordinator prepared for a decision worker.
+    pub decision_request: Option<DecisionRequest>,
+    /// Artifact holding this task's full result.
+    pub result_artifact: Option<String>,
 }
 
 impl Serialize for Task {
@@ -399,6 +412,12 @@ impl Serialize for Task {
         if !self.artifacts.is_empty() {
             map.serialize_entry("artifacts", &self.artifacts)?;
         }
+        if let Some(ref request) = self.decision_request {
+            map.serialize_entry("decision_request", request)?;
+        }
+        if let Some(ref artifact) = self.result_artifact {
+            map.serialize_entry("result_artifact", artifact)?;
+        }
         map.end()
     }
 }
@@ -426,6 +445,10 @@ impl<'de> Deserialize<'de> for Task {
             structured_output: Option<StructuredTaskOutput>,
             #[serde(default)]
             artifacts: Vec<String>,
+            #[serde(default)]
+            decision_request: Option<DecisionRequest>,
+            #[serde(default)]
+            result_artifact: Option<String>,
         }
         let h = TaskHelper::deserialize(deserializer)?;
         let state = match h.status {
@@ -451,6 +474,8 @@ impl<'de> Deserialize<'de> for Task {
             rationale: h.rationale,
             structured_output: h.structured_output,
             artifacts: h.artifacts,
+            decision_request: h.decision_request,
+            result_artifact: h.result_artifact,
         })
     }
 }
@@ -475,6 +500,8 @@ impl Task {
             rationale: rationale.into(),
             structured_output: None,
             artifacts: Vec::new(),
+            decision_request: None,
+            result_artifact: None,
         }
     }
 
@@ -2307,6 +2334,7 @@ mod tests {
                 task: "t".to_string(),
                 worker: None,
                 artifacts: Vec::new(),
+                decision_request: None,
             }],
             routing_rationale: "reason_o".to_string(),
             planning_summary: "summary".to_string(),
@@ -2329,6 +2357,7 @@ mod tests {
                 task: "Do thing".to_string(),
                 worker: None,
                 artifacts: Vec::new(),
+                decision_request: None,
             }],
             routing_rationale: "Needs tool".to_string(),
             planning_summary: "Just do it".to_string(),
@@ -2350,11 +2379,13 @@ mod tests {
                 task: "Compute mean of [10,20,30]".into(),
                 worker: Some("statistics".into()),
                 artifacts: Vec::new(),
+                decision_request: None,
             },
             StepInput::LeafTask {
                 task: "Multiply the result by 3".into(),
                 worker: Some("arithmetic".into()),
                 artifacts: Vec::new(),
+                decision_request: None,
             },
         ];
         let tasks = flatten_steps(&steps).unwrap();
@@ -2376,11 +2407,13 @@ mod tests {
                         task: "Compute median".into(),
                         worker: Some("statistics".into()),
                         artifacts: Vec::new(),
+                        decision_request: None,
                     },
                     StepInput::LeafTask {
                         task: "Compute sin(45)".into(),
                         worker: Some("trigonometry".into()),
                         artifacts: Vec::new(),
+                        decision_request: None,
                     },
                 ],
             },
@@ -2388,6 +2421,7 @@ mod tests {
                 task: "Multiply the two results".into(),
                 worker: Some("arithmetic".into()),
                 artifacts: Vec::new(),
+                decision_request: None,
             },
         ];
         let tasks = flatten_steps(&steps).unwrap();
@@ -2411,11 +2445,13 @@ mod tests {
                                 task: "Get A".into(),
                                 worker: Some("ops".into()),
                                 artifacts: Vec::new(),
+                                decision_request: None,
                             },
                             StepInput::LeafTask {
                                 task: "Transform A".into(),
                                 worker: Some("ops".into()),
                                 artifacts: Vec::new(),
+                                decision_request: None,
                             },
                         ],
                     },
@@ -2423,6 +2459,7 @@ mod tests {
                         task: "Get B".into(),
                         worker: Some("ops".into()),
                         artifacts: Vec::new(),
+                        decision_request: None,
                     },
                 ],
             },
@@ -2430,6 +2467,7 @@ mod tests {
                 task: "Combine".into(),
                 worker: Some("ops".into()),
                 artifacts: Vec::new(),
+                decision_request: None,
             },
         ];
         let tasks = flatten_steps(&steps).unwrap();
@@ -2474,6 +2512,7 @@ mod tests {
                         task: "too deep".into(),
                         worker: None,
                         artifacts: Vec::new(),
+                        decision_request: None,
                     }],
                 }],
             }],
@@ -2489,6 +2528,7 @@ mod tests {
             task: "Just one thing".into(),
             worker: None,
             artifacts: Vec::new(),
+            decision_request: None,
         }];
         let tasks = flatten_steps(&steps).unwrap();
         assert_eq!(tasks.len(), 1);
@@ -2570,11 +2610,13 @@ mod tests {
                     task: "Step 1".into(),
                     worker: Some("w1".into()),
                     artifacts: Vec::new(),
+                    decision_request: None,
                 },
                 StepInput::LeafTask {
                     task: "Step 2".into(),
                     worker: Some("w2".into()),
                     artifacts: Vec::new(),
+                    decision_request: None,
                 },
             ],
             routing_rationale: "Needs orchestration".into(),

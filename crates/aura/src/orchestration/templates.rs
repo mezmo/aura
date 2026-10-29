@@ -351,7 +351,9 @@ mod tests {
     /// Then: `open /tmp/aura-prompt-rendering-qa.txt`
     #[test]
     fn prompt_rendering_qa() {
-        use crate::orchestration::config::{ArtifactsConfig, OrchestrationConfig, WorkerConfig};
+        use crate::orchestration::config::{
+            ArtifactsConfig, LlmWorkerConfig, OrchestrationConfig, WorkerConfig,
+        };
         use std::collections::HashMap;
         use std::fmt::Write;
 
@@ -362,7 +364,7 @@ mod tests {
         let mut workers = HashMap::new();
         workers.insert(
             "arithmetic".to_string(),
-            WorkerConfig {
+            WorkerConfig::Llm(LlmWorkerConfig {
                 description:
                     "Arithmetic operations: addition, subtraction, multiplication, division"
                         .to_string(),
@@ -386,11 +388,11 @@ Always verify your calculations before reporting results."
                 llm: None,
                 scratchpad: None,
                 skills: None,
-            },
+            }),
         );
         workers.insert(
             "data".to_string(),
-            WorkerConfig {
+            WorkerConfig::Llm(LlmWorkerConfig {
                 description: "Data operations: listing files, multi-step data processing chains"
                     .to_string(),
                 preamble: "\
@@ -412,7 +414,7 @@ TOOL USAGE:
                 llm: None,
                 scratchpad: None,
                 skills: None,
-            },
+            }),
         );
 
         let config = OrchestrationConfig {
@@ -527,12 +529,30 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
         let _ = writeln!(out, "\n{separator}");
         let _ = writeln!(out, "PHASE: ARITHMETIC WORKER SYSTEM PROMPT (specialized)");
         let _ = writeln!(out, "{separator}\n");
-        let _ = writeln!(out, "{}", config.get_worker("arithmetic").unwrap().preamble);
+        let _ = writeln!(
+            out,
+            "{}",
+            config
+                .get_worker("arithmetic")
+                .unwrap()
+                .as_llm()
+                .unwrap()
+                .preamble
+        );
 
         let _ = writeln!(out, "\n{separator}");
         let _ = writeln!(out, "PHASE: DATA WORKER SYSTEM PROMPT (specialized)");
         let _ = writeln!(out, "{separator}\n");
-        let _ = writeln!(out, "{}", config.get_worker("data").unwrap().preamble);
+        let _ = writeln!(
+            out,
+            "{}",
+            config
+                .get_worker("data")
+                .unwrap()
+                .as_llm()
+                .unwrap()
+                .preamble
+        );
 
         // ================================================================
         // 4. Generic worker system prompt (fallback)

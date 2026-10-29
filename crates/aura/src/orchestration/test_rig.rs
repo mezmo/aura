@@ -692,7 +692,7 @@ pub(crate) fn worker_definition(
 ) -> (String, super::WorkerConfig) {
     (
         name.to_string(),
-        super::WorkerConfig {
+        super::WorkerConfig::Llm(super::LlmWorkerConfig {
             description: description.to_string(),
             preamble: preamble.to_string(),
             mcp_filter: Some(vec![]),
@@ -701,7 +701,7 @@ pub(crate) fn worker_definition(
             llm: None,
             scratchpad: None,
             skills: None,
-        },
+        }),
     )
 }
 

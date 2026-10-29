@@ -4,6 +4,7 @@
 //! inspection of available tools during planning, and to make structured
 //! routing decisions (respond directly, create plan, or request clarification).
 
+pub mod decision;
 mod inspect_tool_params;
 mod list_prior_runs;
 mod list_tools;
@@ -13,6 +14,7 @@ pub mod submit_result;
 pub mod wait_for;
 pub(crate) mod write_artifact;
 
+pub use decision::{DecisionRequest, DecisionRequestRef, DecisionRequestStore, DecisionToolset};
 pub use inspect_tool_params::InspectToolParamsTool;
 pub use list_prior_runs::ListPriorRunsTool;
 pub use list_tools::ListToolsTool;
@@ -23,3 +25,22 @@ pub use routing_tools::{
 pub use submit_result::{Confidence, SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 pub use wait_for::{StopReason, WaitForArgs, WaitForError, WaitForOutput, WaitForTool};
 pub use write_artifact::WriteArtifactTool;
+
+/// Parse the JSON value a model wrapped in a string argument.
+///
+/// Models routinely send a nested array or object argument as a string, at
+/// times with markup or prose around it. Slicing from the first `open` to the
+/// last `close` delimiter ignores whatever surrounds the value without having
+/// to recognise it.
+pub(crate) fn json_in_str<T: serde::de::DeserializeOwned>(
+    raw: &str,
+    open: char,
+    close: char,
+) -> Option<T> {
+    let start = raw.find(open)?;
+    let end = raw.rfind(close)?;
+    if end < start {
+        return None;
+    }
+    serde_json::from_str(&raw[start..end + close.len_utf8()]).ok()
+}

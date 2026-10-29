@@ -111,7 +111,9 @@ async-stream = "0.3.6"
 schemars = "1.0.4"
 reqwest = { version = "0.12", default-features = false, features = ["charset", "http2", "system-proxy", "json", "stream", "rustls-tls"] }
 http = "1.0"
+jev-driver = { version = "0.1", default-features = false, features = ["rustls-tls"] }
 
 # Patch rig-core to use the fork with streaming hook + span propagation fix
 [patch.crates-io]
 rig-core = { git = "https://github.com/mezmo/rig.git", rev = "097d08d6188c76debabedddd2ac65ca5bffd2863" }
+jev-driver = { git = "https://github.com/Shearerbeard/jev-driver.git", rev = "ad9e72aebc7b31d730faaf9684bf32ccfa40fdd3" }

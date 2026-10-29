@@ -7,7 +7,8 @@
 //! vector-store context strings.
 
 pub use aura_config::orchestration::{
-    ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,
+    ArtifactsConfig, JevQuestion, JevWorkerConfig, LlmWorkerConfig, OrchestrationConfig,
+    TimeoutsConfig, ToolVisibility, WorkerConfig,
 };
 
 use aura_config::VectorStoreConfig;

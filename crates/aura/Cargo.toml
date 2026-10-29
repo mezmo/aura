@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 # Internal crates
 aura-config = { path = "../aura-config" }
+jev-driver = { workspace = true }
 
 # Rig dependencies
 rig-core = { workspace = true }
@@ -81,6 +82,7 @@ integration = ["integration-stdio"]
 integration-stdio = []
 
 [dev-dependencies]
+jev-driver = { workspace = true, features = ["test-support"] }
 tempfile = "3.23.0"
 toml = "0.8"
 tokio = { version = "1.45", features = ["test-util", "macros", "rt"] }

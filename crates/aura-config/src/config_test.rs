@@ -1562,6 +1562,84 @@ random_field = "should not be accepted"
         );
     }
 
+    fn jev_worker_config(questions: &str) -> String {
+        format!(
+            r#"
+[agent]
+name = "Orchestrator"
+system_prompt = "You coordinate."
+
+[agent.llm]
+provider = "openai"
+api_key = "coordinator_key"
+model = "gpt-5.1"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.triage]
+type = "jev"
+description = "Scores severity"
+api_key = "jev_key"
+
+{questions}
+"#
+        )
+    }
+
+    #[test]
+    fn test_jev_worker_loads_beside_llm_agent() {
+        let config = load_config_from_str(&jev_worker_config(
+            r#"
+[[orchestration.worker.triage.questions]]
+instruction = "How severe?"
+criteria = ["low", "high"]
+"#,
+        ))
+        .expect("jev worker config must load");
+        let orch = config.orchestration.expect("orchestration");
+        let jev = orch.workers["triage"].as_jev().expect("jev worker");
+        assert_eq!(jev.questions.len(), 1);
+    }
+
+    #[test]
+    fn test_example_jev_orchestration_config_loads() {
+        let _env = crate::test_env_lock::lock();
+        // SAFETY: serialized by the env lock; the example resolves these.
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "test");
+            std::env::set_var("TYPESAFE_API_KEY", "test");
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../configs/example-jev-orchestration.toml");
+        let contents = std::fs::read_to_string(&path).expect("example config exists");
+        let config = load_config_from_str(&contents).expect("example config loads");
+        let orch = config.orchestration.expect("orchestration");
+        let jev = orch.workers["triage"]
+            .as_jev()
+            .expect("triage is a jev worker");
+        assert_eq!(jev.questions.len(), 3);
+        assert!(orch.workers["analyst"].as_llm().is_some());
+    }
+
+    #[test]
+    fn test_jev_worker_questions_are_validated_at_load() {
+        let err = load_config_from_str(&jev_worker_config(
+            r#"
+[[orchestration.worker.triage.questions]]
+instruction = "How severe?"
+criteria = ["only one level"]
+"#,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("orchestration.worker.triage.questions"),
+            "{err}"
+        );
+        assert!(err.contains("2-10 levels"), "{err}");
+    }
+
     #[test]
     fn test_worker_without_llm_inherits_from_agent() {
         let config_str = r#"
@@ -1584,7 +1662,12 @@ preamble = "You do math."
 "#;
         let config = load_config_from_str(config_str).expect("Failed to parse config");
         let orch = config.orchestration.expect("orchestration should be set");
-        let worker = orch.workers.get("math").expect("math worker should exist");
+        let worker = orch
+            .workers
+            .get("math")
+            .expect("math worker should exist")
+            .as_llm()
+            .expect("llm worker");
         assert!(
             worker.llm.is_none(),
             "worker without [llm] override should have llm = None"
@@ -1622,7 +1705,9 @@ context_window = 200000
         let worker = orch
             .workers
             .get("formatter")
-            .expect("formatter worker should exist");
+            .expect("formatter worker should exist")
+            .as_llm()
+            .expect("llm worker");
         let worker_llm = worker
             .llm
             .as_ref()
@@ -1667,6 +1752,7 @@ context_window = 200000
             std::env::set_var("GITHUB_PERSONAL_ACCESS_TOKEN", "test-github");
             std::env::set_var("MCP_TOKEN", "test-mcp");
             std::env::set_var("OPENROUTER_API_KEY", "test-openrouter");
+            std::env::set_var("TYPESAFE_API_KEY", "test-typesafe");
         }
 
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1909,7 +1995,9 @@ turn_depth_bonus = 3
             .expect("orchestration present")
             .workers
             .get("tight")
-            .expect("tight worker present");
+            .expect("tight worker present")
+            .as_llm()
+            .expect("llm worker");
         let wsp = worker
             .scratchpad
             .as_ref()
@@ -2218,9 +2306,9 @@ max_extraction_tokens = 4000
     // ========================================================================
 
     fn orch_with_workers(names: &[&str]) -> crate::OrchestrationConfig {
-        use crate::{OrchestrationConfig, WorkerConfig};
+        use crate::{LlmWorkerConfig, OrchestrationConfig, WorkerConfig};
         // Only the map keys matter to validate_worker_names; values are minimal.
-        let worker = WorkerConfig {
+        let worker = WorkerConfig::Llm(LlmWorkerConfig {
             description: "d".to_string(),
             preamble: "p".to_string(),
             mcp_filter: None,
@@ -2229,7 +2317,7 @@ max_extraction_tokens = 4000
             llm: None,
             scratchpad: None,
             skills: None,
-        };
+        });
         let mut orch = OrchestrationConfig::default();
         for name in names {
             orch.workers.insert((*name).to_string(), worker.clone());

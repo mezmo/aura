@@ -97,6 +97,26 @@ struct TaskExecutionParams<'a> {
     task_description: &'a str,
     task_context: &'a Option<String>,
     worker_name: Option<&'a str>,
+    jev_input: Option<&'a JevTaskInput>,
+}
+
+/// What a Jev task judges beside its description.
+#[derive(Debug, Clone, Default)]
+struct JevTaskInput {
+    upstream: Vec<UpstreamResult>,
+    /// Run artifact filenames attached to the task.
+    artifacts: Vec<String>,
+    request: Option<crate::orchestration::tools::DecisionRequest>,
+}
+
+/// A completed dependency's result.
+#[derive(Debug, Clone)]
+struct UpstreamResult {
+    task_id: usize,
+    description: String,
+    result: String,
+    /// Artifact holding the full result.
+    result_artifact: Option<String>,
 }
 
 /// Result from `execute_task` including structured output from `submit_result`.
@@ -165,6 +185,7 @@ struct CoordinatorTools {
     list_prior_runs: Option<super::tools::ListPriorRunsTool>,
     skill_tools: Option<crate::skill_tool::SkillToolset>,
     scratchpad: Option<scratchpad::ScratchpadToolsConfig>,
+    decision_tools: Option<crate::orchestration::tools::DecisionToolset>,
 }
 
 impl CoordinatorTools {
@@ -217,6 +238,9 @@ impl CoordinatorTools {
         if let Some(t) = &self.skill_tools {
             defs.push(t.load.definition(String::new()).await);
             defs.push(t.read_file.definition(String::new()).await);
+        }
+        if let Some(t) = &self.decision_tools {
+            defs.extend(t.definitions().await);
         }
         let read_tools = self
             .scratchpad
@@ -557,6 +581,12 @@ pub struct Orchestrator {
     park_guard: Option<Arc<ParkGuard>>,
 
     pub(super) run_tools: crate::builder::RunToolFactory,
+
+    /// Clients for the configured Jev workers, by name.
+    pub(super) jev_workers: crate::orchestration::jev::JevWorkers,
+
+    /// Decision requests the coordinator prepared this run, by name.
+    decision_requests: crate::orchestration::tools::DecisionRequestStore,
 }
 
 /// The task and worker a stream's reasoning is attributed to.
@@ -649,6 +679,55 @@ struct ForwardedRun {
     last_turn: rig::completion::Usage,
 }
 
+/// How to plan with decision (Jev) workers; added to the worker inventory
+/// when any are configured.
+const DECISION_WORKER_GUIDE: &str = "
+
+DECISION WORKERS:
+A decision worker answers typed questions with probabilities instead of doing work: a choice \
+(which option), a score (where on a rubric), or yes/no (how likely a statement is). It cannot \
+query systems, use tools, or write prose. It judges what it is handed: the task text, the \
+results of the tasks it depends on, the task's artifacts, and state staged with \
+prepare_decision.
+- To judge data you already have, call evaluate_decision and use the answers now.
+- To judge data a task will produce, put a decision-worker task after it and stage any extra \
+  questions or state with prepare_decision, naming the request in the task's `decision_request`.
+- Write questions with a few clear, bounded options or levels, and give each an `id`.";
+
+/// One Jev worker's entry in the planner's worker inventory: what it is and
+/// the questions it asks on every task.
+fn jev_worker_section(name: &str, jev: &aura_config::JevWorkerConfig) -> String {
+    let questions = if jev.questions.is_empty() {
+        "Configured questions: none — every task needs questions staged with prepare_decision."
+            .to_string()
+    } else {
+        let lines: Vec<String> = jev
+            .questions
+            .iter()
+            .enumerate()
+            .map(|(index, q)| {
+                let id = q.id().map_or_else(|| format!("q{index}"), str::to_owned);
+                let shape = match q {
+                    aura_config::JevQuestion::Choice { criteria, .. } => format!(
+                        "choice: {}",
+                        criteria.keys().cloned().collect::<Vec<_>>().join(" | ")
+                    ),
+                    aura_config::JevQuestion::Score { criteria, .. } => {
+                        format!("score: {}", criteria.join(" < "))
+                    }
+                    aura_config::JevQuestion::Noul { .. } => "yes/no".to_string(),
+                };
+                format!("  - {id} ({shape}): {}", q.instruction())
+            })
+            .collect();
+        format!("Configured questions:\n{}", lines.join("\n"))
+    };
+    format!(
+        "## {name}\n{}\nType: decision worker (answers questions with probabilities; no tools)\n{questions}",
+        jev.description
+    )
+}
+
 const EMPTY_WORKER_RESULT: &str = "The worker produced no output and did not call submit_result.";
 
 /// The failure text for a worker that finished without calling `submit_result`.
@@ -736,6 +815,9 @@ impl Orchestrator {
             Arc::new(Mutex::new(ExecutionPersistence::disabled()))
         };
 
+        let jev_workers = crate::orchestration::jev::JevWorker::all_from(&orchestration_config)
+            .map_err(|e| format!("Failed to initialize Jev workers: {e}"))?;
+
         let orchestrator_id = uuid::Uuid::new_v4().to_string();
 
         // Persistence names the run by an id of its own, which the park
@@ -779,6 +861,8 @@ impl Orchestrator {
             outer_budget: None,
             park_guard,
             run_tools: crate::builder::no_run_tools(),
+            jev_workers,
+            decision_requests: Default::default(),
         })
     }
 
@@ -811,7 +895,7 @@ impl Orchestrator {
     /// worker preamble and the schemas of the MCP tools its filter admits.
     fn worker_fixed_overhead(
         &self,
-        worker_cfg: Option<&super::config::WorkerConfig>,
+        worker_cfg: Option<&aura_config::LlmWorkerConfig>,
         counter: &dyn scratchpad::TokenCounter,
     ) -> usize {
         let worker_preamble = worker_cfg.map(|w| w.preamble.as_str()).unwrap_or("");
@@ -897,7 +981,9 @@ impl Orchestrator {
 
         // Create a modified config for workers with extension fields
         let mut worker_build_context = self.agent_build_context.clone();
-        let worker_cfg = worker_name.and_then(|name| self.config.workers.get(name));
+        let worker_cfg = worker_name
+            .and_then(|name| self.config.workers.get(name))
+            .and_then(super::config::WorkerConfig::as_llm);
 
         // Named workers report their own agent name (Rig stamps it on turn
         // spans as `gen_ai.agent.name`); the generic worker keeps the base
@@ -1028,6 +1114,7 @@ impl Orchestrator {
         // Scratchpad bonus only applies when scratchpad was actually wired up.
         let base_depth = worker_name
             .and_then(|name| self.config.workers.get(name))
+            .and_then(super::config::WorkerConfig::as_llm)
             .and_then(|w| w.turn_depth)
             .or(self.agent_build_context.agent.turn_depth)
             .unwrap_or(crate::builder::DEFAULT_MAX_DEPTH);
@@ -1146,12 +1233,16 @@ impl Orchestrator {
 
         // Configure worker based on assignment
         if let Some(name) = worker_name {
-            let worker = self.config.get_worker(name).ok_or_else(|| {
-                format!(
-                    "Worker '{}' not found in configuration (task {})",
-                    name, task_id
-                )
-            })?;
+            let worker = self
+                .config
+                .get_worker(name)
+                .and_then(super::config::WorkerConfig::as_llm)
+                .ok_or_else(|| {
+                    format!(
+                        "LLM worker '{}' not found in configuration (task {})",
+                        name, task_id
+                    )
+                })?;
             tracing::info!("Creating worker '{}' for task {}", name, task_id);
             let full_preamble = super::config::WORKER_PREAMBLE_TEMPLATE
                 .replace("{{worker_system_prompt}}", &worker.preamble);
@@ -2360,6 +2451,7 @@ impl Orchestrator {
                 task: format!("Execute: {}", truncate_query(query, 100)),
                 worker: None,
                 artifacts: Vec::new(),
+                decision_request: None,
             }],
             routing_rationale: "Fallback: all routing attempts failed".to_string(),
             planning_summary: String::new(),
@@ -2403,6 +2495,7 @@ impl Orchestrator {
                         task: format!("Answer the user's query: {}", truncate_query(query, 80)),
                         worker: None,
                         artifacts: Vec::new(),
+                        decision_request: None,
                     }],
                     routing_rationale: format!(
                         "Config override (allow_direct_answers=false). Original rationale: {} | Original answer: {}",
@@ -2429,6 +2522,7 @@ impl Orchestrator {
                         ),
                         worker: None,
                         artifacts: Vec::new(),
+                        decision_request: None,
                     }],
                     routing_rationale: format!(
                         "Config override (allow_clarification=false). Original rationale: {} | Original question: {}",
@@ -2457,11 +2551,14 @@ impl Orchestrator {
                 worker_names.iter().map(|n| format!("\"{}\"", n)).collect();
 
             // Build worker section based on visibility setting
-            let section = match &self.config.tools_in_planning {
+            let mut section = match &self.config.tools_in_planning {
                 ToolVisibility::None => self.build_workers_section_no_tools(),
                 ToolVisibility::Summary => self.build_workers_section_with_tools(),
                 ToolVisibility::Full => self.build_workers_section_with_full_tools(),
             };
+            if !self.jev_workers.is_empty() {
+                section.push_str(DECISION_WORKER_GUIDE);
+            }
 
             let field = r#",
       "worker": "worker_name""#
@@ -2483,7 +2580,13 @@ impl Orchestrator {
 
     /// Build worker section without tool information (ToolVisibility::None).
     fn build_workers_section_no_tools(&self) -> String {
-        let workers_list = self.config.format_workers_for_prompt();
+        let mut workers_list = self.config.format_workers_for_prompt();
+        for (name, config) in &self.config.workers {
+            if let Some(jev) = config.as_jev() {
+                workers_list.push_str("\n\n");
+                workers_list.push_str(&jev_worker_section(name, jev));
+            }
+        }
         format!(
             r#"
 
@@ -2502,16 +2605,26 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
         let mut sections = Vec::new();
 
         for (name, config) in &self.config.workers {
+            if let Some(jev) = config.as_jev() {
+                sections.push(jev_worker_section(name, jev));
+                continue;
+            }
             let tools = worker_tools.get(name).cloned().unwrap_or_default();
             let tool_list = self.format_tool_list(&tools, max_tools);
 
             let section = if tool_list.is_empty() {
                 format!(
                     "## {}\n{}\nTools: (none configured — this worker cannot query external systems)",
-                    name, config.description
+                    name,
+                    config.description()
                 )
             } else {
-                format!("## {}\n{}\nTools: {}", name, config.description, tool_list)
+                format!(
+                    "## {}\n{}\nTools: {}",
+                    name,
+                    config.description(),
+                    tool_list
+                )
             };
             sections.push(section);
         }
@@ -2537,6 +2650,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let mut sections = Vec::new();
 
         for (name, config) in &self.config.workers {
+            if let Some(jev) = config.as_jev() {
+                sections.push(jev_worker_section(name, jev));
+                continue;
+            }
             let tools = worker_tools.get(name).cloned().unwrap_or_default();
 
             let tool_details: Vec<String> = tools
@@ -2561,11 +2678,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
             };
 
             let section = if tool_section.is_empty() {
-                format!("## {}\n{}", name, config.description)
+                format!("## {}\n{}", name, config.description())
             } else {
                 format!(
                     "## {}\n{}\nTools:\n{}",
-                    name, config.description, tool_section
+                    name,
+                    config.description(),
+                    tool_section
                 )
             };
             sections.push(section);
@@ -2683,6 +2802,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let run_tool_names = self.run_tool_names();
 
         for (worker_name, worker_config) in &self.config.workers {
+            let Some(worker_config) = worker_config.as_llm() else {
+                worker_tools.insert(worker_name.clone(), Vec::new());
+                continue;
+            };
             // Omitted filter = every MCP tool (backwards compatibility);
             // `mcp_filter = []` = none. Matching is namespace-aware — see
             // `AuraTool::is_match` — so a worker's `mcp_filter` can scope to
@@ -2796,6 +2919,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
         if let Some(toolset) = tools.skill_tools {
             state = state.add_tool(toolset.load);
             state = state.add_tool(toolset.read_file);
+        }
+        if let Some(toolset) = tools.decision_tools {
+            state = state.add_tool(toolset.evaluate);
+            state = state.add_tool(toolset.prepare);
         }
         if let Some(sp) = tools.scratchpad {
             use crate::scratchpad::{
@@ -3051,6 +3178,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 Some(Arc::clone(&run)),
             ),
             scratchpad: artifacts.scratchpad,
+            decision_tools: crate::orchestration::tools::DecisionToolset::new(
+                self.jev_workers.clone(),
+                self.decision_requests.clone(),
+                Some(Arc::clone(&run)),
+                self.usage_state.clone(),
+            ),
         };
 
         // The budget's fixed overhead is everything each call carries
@@ -3685,13 +3818,27 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let mut park_records: ParkedTaskRecords = ParkedTaskRecords::new();
         while !plan.is_finished() {
             // Collect ready tasks with their context and worker assignment
-            // Tuple: (task_id, description, context, worker_name)
-            let ready_tasks: Vec<(usize, String, Option<String>, Option<String>)> = plan
+            // Tuple: (task_id, description, context, worker_name, jev_input)
+            #[allow(clippy::type_complexity)]
+            let ready_tasks: Vec<(
+                usize,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<JevTaskInput>,
+            )> = plan
                 .ready_tasks()
                 .iter()
                 .map(|t| {
                     let context = self.build_task_context(plan, t.id);
-                    (t.id, t.description.clone(), context, t.worker.clone())
+                    let jev_input = self.jev_task_input(plan, t);
+                    (
+                        t.id,
+                        t.description.clone(),
+                        context,
+                        t.worker.clone(),
+                        jev_input,
+                    )
                 })
                 .collect();
 
@@ -3726,7 +3873,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             );
 
             // Mark all ready tasks as running and emit TaskStarted events
-            for (task_id, task_desc, _context, worker_name) in &ready_tasks {
+            for (task_id, task_desc, _context, worker_name, _jev_input) in &ready_tasks {
                 if let Some(task) = plan.get_task_mut(*task_id) {
                     task.start();
                 }
@@ -3746,12 +3893,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
             let mut futures: FuturesUnordered<_> = ready_tasks
                 .into_iter()
                 .map(
-                    |(task_id, task_desc, task_context, worker_name)| async move {
+                    |(task_id, task_desc, task_context, worker_name, jev_input)| async move {
                         let start_time = Instant::now();
                         let params = TaskExecutionParams {
                             task_description: &task_desc,
                             task_context: &task_context,
                             worker_name: worker_name.as_deref(),
+                            jev_input: jev_input.as_ref(),
                         };
                         let result = self
                             .execute_task(task_id, &params, Some(event_tx), None, None)
@@ -3769,8 +3917,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 task_compute_ms += duration_ms;
                 match result {
                     Ok(TaskOutcome::Completed(exec_result)) => {
-                        let final_result = self
-                            .maybe_create_artifact(
+                        let (final_result, result_artifact) = self
+                            .maybe_create_artifact_named(
                                 task_id,
                                 worker_name.as_deref(),
                                 exec_result.result,
@@ -3788,6 +3936,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 );
                             }
                             t.structured_output = exec_result.structured_output;
+                            t.result_artifact = result_artifact;
                         }
                         let _ = event_tx
                             .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
@@ -3907,9 +4056,22 @@ Assign tasks to the worker whose tools best match the required operations."#,
         worker_name: Option<&str>,
         result: String,
     ) -> String {
+        self.maybe_create_artifact_named(task_id, worker_name, result)
+            .await
+            .0
+    }
+
+    /// [`Self::maybe_create_artifact`], also returning the artifact's filename
+    /// when the result was written to one.
+    async fn maybe_create_artifact_named(
+        &self,
+        task_id: usize,
+        worker_name: Option<&str>,
+        result: String,
+    ) -> (String, Option<String>) {
         let threshold = self.config.result_artifact_threshold();
         if result.len() <= threshold {
-            return result;
+            return (result, None);
         }
 
         let summary_len = self.config.result_summary_length();
@@ -3922,12 +4084,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
         {
             Ok(filename) => {
                 let (truncated, _) = safe_truncate(&result, summary_len);
-                format!(
+                let summary = format!(
                     "{}\n\n[Full result ({} chars) saved to artifact: {}]",
                     truncated,
                     result.len(),
                     filename,
-                )
+                );
+                (summary, Some(filename))
             }
             Err(e) => {
                 tracing::warn!(
@@ -3935,9 +4098,188 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     task_id,
                     e
                 );
-                result
+                (result, None)
             }
         }
+    }
+
+    /// What a Jev task judges beside its description: its completed
+    /// dependencies' results, its attached artifacts, and the request the
+    /// coordinator prepared. `None` for a task not assigned to a Jev worker.
+    fn jev_task_input(&self, plan: &Plan, task: &super::types::Task) -> Option<JevTaskInput> {
+        let worker = task.worker.as_deref()?;
+        if !self.jev_workers.contains_key(worker) {
+            return None;
+        }
+        let upstream = task
+            .dependencies
+            .iter()
+            .filter_map(|dep_id| plan.tasks.iter().find(|t| t.id == *dep_id))
+            .filter_map(|dep| match &dep.state {
+                TaskState::Complete { result } => Some(UpstreamResult {
+                    task_id: dep.id,
+                    description: dep.description.clone(),
+                    result: result.clone(),
+                    result_artifact: dep.result_artifact.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        Some(JevTaskInput {
+            upstream,
+            artifacts: task.artifacts.clone(),
+            request: task.decision_request.clone(),
+        })
+    }
+
+    /// Run a task on a Jev worker: one evaluation of the worker's configured
+    /// questions plus the prepared ones against the task's state, returned as
+    /// the answers (JSON) with a one-line-per-answer summary.
+    ///
+    /// The state is the task description, each completed dependency's full
+    /// result (read back from its artifact when the plan holds only a
+    /// summary), the coordinator's prepared state, and the attached
+    /// artifacts, capped at [`JEV_MAX_STATE_CHARS`].
+    async fn execute_jev_task(
+        &self,
+        task_id: usize,
+        task_description: &str,
+        jev: &crate::orchestration::jev::JevWorker,
+        input: &JevTaskInput,
+    ) -> Result<TaskOutcome, StreamError> {
+        let span = tracing::Span::current();
+        let (task_preview, _) = safe_truncate(task_description, 200);
+        span.record("orchestration.task", task_preview);
+        span.record("orchestration.worker", jev.name.as_str());
+        crate::logging::set_llm_identifiers(&span, "jev", &jev.model);
+
+        let mut upstream = Vec::with_capacity(input.upstream.len());
+        let mut artifacts = Vec::with_capacity(input.artifacts.len());
+        {
+            let persistence = self.persistence.lock().await;
+            for dep in &input.upstream {
+                let result = match &dep.result_artifact {
+                    Some(file) => persistence.read_artifact(file).await.unwrap_or_else(|e| {
+                        tracing::warn!(
+                            "Task {task_id}: could not read dependency {}'s result artifact {file}: {e}",
+                            dep.task_id
+                        );
+                        dep.result.clone()
+                    }),
+                    None => dep.result.clone(),
+                };
+                upstream.push((dep, result));
+            }
+            for file in &input.artifacts {
+                let content = persistence
+                    .read_artifact(file)
+                    .await
+                    .unwrap_or_else(|e| format!("[artifact {file} could not be read: {e}]"));
+                artifacts.push((file, content));
+            }
+        }
+
+        use crate::orchestration::jev::{
+            JEV_MAX_STAGED_STATE_CHARS, JEV_MAX_STATE_CHARS, JEV_MAX_TASK_CHARS,
+            JEV_MIN_PART_CHARS, truncate_marked,
+        };
+
+        // The task description and the staged state are capped first, so
+        // together they take at most a few thousand characters and the
+        // dependency data always keeps most of the budget. A staged state
+        // over its cap — possible only from an inline request a create_plan
+        // step carried — is sent as cut text rather than JSON.
+        let task_text = truncate_marked(task_description, JEV_MAX_TASK_CHARS);
+        let staged = input
+            .request
+            .as_ref()
+            .and_then(|r| r.state.clone())
+            .map(|state| {
+                let text = state.to_string();
+                if text.len() > JEV_MAX_STAGED_STATE_CHARS {
+                    serde_json::Value::String(truncate_marked(&text, JEV_MAX_STAGED_STATE_CHARS))
+                } else {
+                    state
+                }
+            });
+        let staged_len = staged.as_ref().map_or(0, |s| s.to_string().len());
+
+        // The rest is shared evenly among the upstream results and attached
+        // artifacts, so no one of them crowds out the others, and each keeps
+        // at least JEV_MIN_PART_CHARS however many there are.
+        let parts = (upstream.len() + artifacts.len()).max(1);
+        let parts_budget = JEV_MAX_STATE_CHARS.saturating_sub(task_text.len() + staged_len);
+        let per_part = (parts_budget / parts).max(JEV_MIN_PART_CHARS);
+        let cap = |text: &str| truncate_marked(text, per_part);
+
+        let mut state = serde_json::Map::new();
+        state.insert("task".into(), task_text.into());
+        if !upstream.is_empty() {
+            state.insert(
+                "upstream".into(),
+                upstream
+                    .iter()
+                    .map(|(dep, result)| {
+                        serde_json::json!({
+                            "task_id": dep.task_id,
+                            "description": dep.description,
+                            "result": cap(result),
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        if let Some(staged) = staged {
+            state.insert("coordinator".into(), staged);
+        }
+        if !artifacts.is_empty() {
+            state.insert(
+                "artifacts".into(),
+                artifacts
+                    .iter()
+                    .map(|(file, content)| ((*file).clone(), cap(content).into()))
+                    .collect::<serde_json::Map<_, _>>()
+                    .into(),
+            );
+        }
+
+        let added = input
+            .request
+            .as_ref()
+            .map_or(&[][..], |r| r.questions.as_slice());
+        let questions = jev.questions_with(added);
+        let cancel = self.orchestration_run().cancel_token().clone();
+        let start = Instant::now();
+        let answers = jev
+            .evaluate(serde_json::Value::Object(state), &questions, &cancel)
+            .await
+            .map_err(|e| format!("Jev worker '{}' failed on task {task_id}: {e}", jev.name))?;
+        self.usage_state
+            .accumulate_usage(answers.usage.input_tokens, answers.usage.output_tokens);
+        tracing::info!(
+            task_id,
+            worker = %jev.name,
+            model = %answers.model,
+            input_tokens = answers.usage.input_tokens,
+            output_tokens = answers.usage.output_tokens,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "Jev task answered"
+        );
+
+        let confidence = match answers.min_certainty() {
+            Some(c) if c >= 0.8 => super::tools::Confidence::High,
+            Some(c) if c >= 0.5 => super::tools::Confidence::Medium,
+            _ => super::tools::Confidence::Low,
+        };
+        let result = serde_json::to_string_pretty(&answers)
+            .map_err(|e| format!("Jev answers for task {task_id} do not serialize: {e}"))?;
+        Ok(TaskOutcome::Completed(TaskExecutionResult {
+            result,
+            structured_output: Some(super::types::StructuredTaskOutput {
+                summary: answers.summary(),
+                confidence,
+            }),
+        }))
     }
 
     /// Build context for a task from its completed dependencies and the plan goal.
@@ -4022,7 +4364,22 @@ Assign tasks to the worker whose tools best match the required operations."#,
             task_description,
             task_context,
             worker_name,
+            jev_input,
         } = params;
+
+        if let Some(jev) = worker_name.and_then(|name| self.jev_workers.get(name)) {
+            if continuation.is_some() || resume.is_some() {
+                return Err(format!(
+                    "task {task_id} for Jev worker '{}' cannot resume: Jev tasks never park",
+                    jev.name
+                )
+                .into());
+            }
+            let input = jev_input.cloned().unwrap_or_default();
+            return self
+                .execute_jev_task(task_id, task_description, jev, &input)
+                .await;
+        }
 
         // The resume path: the checkpointed conversation drives everything,
         // so the live prompt-building and retry loop below do not apply.
@@ -4046,7 +4403,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
             // Same effective-LLM resolution as `create_worker`; recorded here
             // (not there) so retries don't append duplicate attributes.
-            let worker_cfg = worker_name.and_then(|name| self.config.workers.get(name));
+            let worker_cfg = worker_name
+                .and_then(|name| self.config.workers.get(name))
+                .and_then(super::config::WorkerConfig::as_llm);
             let effective_llm = worker_cfg
                 .and_then(|w| w.llm.as_ref())
                 .unwrap_or(&self.agent_build_context.llm);
@@ -4861,7 +5220,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // Recon tools registered unconditionally — the persistent conversation
         // means we can't vary the tool set between calls, and the conversation
         // context guides usage (coordinator won't call list_tools on continuation).
-        let routing_toolset = RoutingToolSet::new().with_persistence(self.persistence.clone());
+        let mut routing_toolset = RoutingToolSet::new().with_persistence(self.persistence.clone());
+        if !self.jev_workers.is_empty() {
+            routing_toolset = routing_toolset
+                .with_decision_requests(self.decision_requests.clone(), self.jev_workers.clone());
+        }
         let routing_decision = routing_toolset.decision.clone();
         let AgentWithPreamble {
             agent: coordinator,
@@ -6117,6 +6480,9 @@ mod tests {
     /// for.
     #[tokio::test]
     async fn a_plain_worker_budget_starts_from_the_fixed_overhead() {
+        // Building a worker pops the process-global override queue, so this
+        // must not run while an override test has queued one.
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
         let temp = tempfile::TempDir::new().unwrap();
         let mut build_context = crate::config::AgentBuildContext {
             memory_dir: Some(temp.path().join("memory").to_string_lossy().into_owned()),
@@ -6556,13 +6922,13 @@ mod tests {
     // ========================================================================
 
     fn create_config_with_vector_stores() -> OrchestrationConfig {
-        use super::super::config::WorkerConfig;
+        use super::super::config::{LlmWorkerConfig, WorkerConfig};
         use std::collections::HashMap;
 
         let mut workers = HashMap::new();
         workers.insert(
             "operations".to_string(),
-            WorkerConfig {
+            WorkerConfig::Llm(LlmWorkerConfig {
                 description: "For logs and pipelines".to_string(),
                 preamble: "Operations specialist.".to_string(),
                 mcp_filter: Some(vec!["mezmo_*".into()]),
@@ -6571,11 +6937,11 @@ mod tests {
                 llm: None,
                 scratchpad: None,
                 skills: None,
-            },
+            }),
         );
         workers.insert(
             "knowledge".to_string(),
-            WorkerConfig {
+            WorkerConfig::Llm(LlmWorkerConfig {
                 description: "For documentation".to_string(),
                 preamble: "Knowledge specialist.".to_string(),
                 mcp_filter: Some(vec![]), // No MCP tools
@@ -6584,7 +6950,7 @@ mod tests {
                 llm: None,
                 scratchpad: None,
                 skills: None,
-            },
+            }),
         );
 
         OrchestrationConfig {
@@ -6601,11 +6967,11 @@ mod tests {
         let config = create_config_with_vector_stores();
 
         // Knowledge worker should have vector_search_mezmo_docs
-        let knowledge = config.workers.get("knowledge").unwrap();
+        let knowledge = config.workers.get("knowledge").unwrap().as_llm().unwrap();
         assert_eq!(knowledge.vector_stores, vec!["mezmo_docs".to_string()]);
 
         // Operations worker should have no vector stores
-        let operations = config.workers.get("operations").unwrap();
+        let operations = config.workers.get("operations").unwrap().as_llm().unwrap();
         assert!(operations.vector_stores.is_empty());
 
         // The tool name format is: vector_search_{store_name}
@@ -6632,7 +6998,7 @@ mod tests {
     /// Helper to create a config with multiple vector stores in global config
     /// and workers with selective access.
     fn create_config_with_filtered_vector_stores() -> OrchestrationConfig {
-        use super::super::config::WorkerConfig;
+        use super::super::config::{LlmWorkerConfig, WorkerConfig};
         use std::collections::HashMap;
 
         let mut workers = HashMap::new();
@@ -6640,7 +7006,7 @@ mod tests {
         // Worker with vector store access to "docs"
         workers.insert(
             "documentation".to_string(),
-            WorkerConfig {
+            WorkerConfig::Llm(LlmWorkerConfig {
                 description: "For documentation queries".to_string(),
                 preamble: "Documentation specialist.".to_string(),
                 mcp_filter: Some(vec![]),
@@ -6649,13 +7015,13 @@ mod tests {
                 llm: None,
                 scratchpad: None,
                 skills: None,
-            },
+            }),
         );
 
         // Worker with vector store access to "kb" and "runbooks"
         workers.insert(
             "knowledge".to_string(),
-            WorkerConfig {
+            WorkerConfig::Llm(LlmWorkerConfig {
                 description: "For knowledge base queries".to_string(),
                 preamble: "Knowledge specialist.".to_string(),
                 mcp_filter: Some(vec![]),
@@ -6664,13 +7030,13 @@ mod tests {
                 llm: None,
                 scratchpad: None,
                 skills: None,
-            },
+            }),
         );
 
         // Worker with NO vector store access
         workers.insert(
             "operations".to_string(),
-            WorkerConfig {
+            WorkerConfig::Llm(LlmWorkerConfig {
                 description: "For operational tasks".to_string(),
                 preamble: "Operations specialist.".to_string(),
                 mcp_filter: Some(vec!["mezmo_*".into()]),
@@ -6679,7 +7045,7 @@ mod tests {
                 llm: None,
                 scratchpad: None,
                 skills: None,
-            },
+            }),
         );
 
         OrchestrationConfig {
@@ -6698,13 +7064,18 @@ mod tests {
         let config = create_config_with_filtered_vector_stores();
 
         // Documentation worker should only have access to "docs"
-        let doc_worker = config.workers.get("documentation").unwrap();
+        let doc_worker = config
+            .workers
+            .get("documentation")
+            .unwrap()
+            .as_llm()
+            .unwrap();
         assert_eq!(doc_worker.vector_stores, vec!["docs".to_string()]);
         assert!(!doc_worker.vector_stores.contains(&"kb".to_string()));
         assert!(!doc_worker.vector_stores.contains(&"runbooks".to_string()));
 
         // Knowledge worker should have access to "kb" and "runbooks"
-        let knowledge_worker = config.workers.get("knowledge").unwrap();
+        let knowledge_worker = config.workers.get("knowledge").unwrap().as_llm().unwrap();
         assert_eq!(knowledge_worker.vector_stores.len(), 2);
         assert!(knowledge_worker.vector_stores.contains(&"kb".to_string()));
         assert!(
@@ -6715,7 +7086,7 @@ mod tests {
         assert!(!knowledge_worker.vector_stores.contains(&"docs".to_string()));
 
         // Operations worker should have NO vector store access
-        let ops_worker = config.workers.get("operations").unwrap();
+        let ops_worker = config.workers.get("operations").unwrap().as_llm().unwrap();
         assert!(ops_worker.vector_stores.is_empty());
     }
 
@@ -6728,7 +7099,12 @@ mod tests {
 
         // Simulate the logic from resolve_worker_tools()
         // Documentation worker with vector_stores = ["docs"]
-        let doc_worker = config.workers.get("documentation").unwrap();
+        let doc_worker = config
+            .workers
+            .get("documentation")
+            .unwrap()
+            .as_llm()
+            .unwrap();
         let mut doc_tools: Vec<String> = vec![]; // Start with no MCP tools (empty mcp_filter)
 
         // Add vector store tools based on explicit vector_stores assignment
@@ -6741,7 +7117,7 @@ mod tests {
         assert!(!doc_tools.contains(&"vector_search_kb".to_string()));
 
         // Knowledge worker with vector_stores = ["kb", "runbooks"]
-        let knowledge_worker = config.workers.get("knowledge").unwrap();
+        let knowledge_worker = config.workers.get("knowledge").unwrap().as_llm().unwrap();
         let mut knowledge_tools: Vec<String> = vec![];
 
         for store_name in &knowledge_worker.vector_stores {
@@ -6754,7 +7130,7 @@ mod tests {
         assert!(!knowledge_tools.contains(&"vector_search_docs".to_string()));
 
         // Operations worker with no vector stores
-        let ops_worker = config.workers.get("operations").unwrap();
+        let ops_worker = config.workers.get("operations").unwrap().as_llm().unwrap();
         let mut ops_tools: Vec<String> = vec![];
 
         for store_name in &ops_worker.vector_stores {
@@ -6798,13 +7174,13 @@ mod tests {
         // This test verifies that when coordinator_vector_stores is set,
         // the coordinator gets those vector store tools.
 
-        use super::super::config::WorkerConfig;
+        use super::super::config::{LlmWorkerConfig, WorkerConfig};
         use std::collections::HashMap;
 
         let mut workers = HashMap::new();
         workers.insert(
             "test_worker".to_string(),
-            WorkerConfig {
+            WorkerConfig::Llm(LlmWorkerConfig {
                 description: "Test".to_string(),
                 preamble: "Test".to_string(),
                 mcp_filter: Some(vec![]),
@@ -6813,7 +7189,7 @@ mod tests {
                 llm: None,
                 scratchpad: None,
                 skills: None,
-            },
+            }),
         );
 
         let config = OrchestrationConfig {
@@ -7009,6 +7385,7 @@ mod tests {
                 task: "compute mean of 1,2,3".to_string(),
                 worker: Some("statistics".to_string()),
                 artifacts: Vec::new(),
+                decision_request: None,
             }],
             routing_rationale: "needs tool".to_string(),
             planning_summary: "single step".to_string(),
@@ -7053,6 +7430,7 @@ mod tests {
                 task: "do it".to_string(),
                 worker: None,
                 artifacts: Vec::new(),
+                decision_request: None,
             }],
             routing_rationale: "complex".to_string(),
             planning_summary: "A plan to do it".to_string(),
@@ -8845,7 +9223,7 @@ mod tests {
         );
         let workers = std::collections::HashMap::from([(
             "operations".to_string(),
-            crate::orchestration::WorkerConfig {
+            crate::orchestration::WorkerConfig::Llm(crate::orchestration::LlmWorkerConfig {
                 description: "Runs the scripted tool".to_string(),
                 preamble: "You apply changes with the echo tool.".to_string(),
                 mcp_filter: Some(vec![]),
@@ -8854,7 +9232,7 @@ mod tests {
                 llm: None,
                 scratchpad: None,
                 skills: None,
-            },
+            }),
         )]);
         let run_id = aura_events::RunId::mint();
         let request_id = run_id.to_string();
@@ -9015,6 +9393,7 @@ mod tests {
             task_description: "apply the manifest",
             task_context: &None,
             worker_name: Some("operations"),
+            jev_input: None,
         };
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
         // The orchestrator's own body runs inside the run; these call it
@@ -9060,6 +9439,7 @@ mod tests {
             task_description: "apply the manifest",
             task_context: &None,
             worker_name: Some("operations"),
+            jev_input: None,
         };
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
         // The orchestrator's own body runs inside the run; these call it
@@ -9140,7 +9520,7 @@ mod tests {
     ) -> (Orchestrator, String) {
         let workers = std::collections::HashMap::from([(
             "operations".to_string(),
-            crate::orchestration::WorkerConfig {
+            crate::orchestration::WorkerConfig::Llm(crate::orchestration::LlmWorkerConfig {
                 description: "Runs the scripted tool".to_string(),
                 preamble: "You apply changes with the echo tool.".to_string(),
                 mcp_filter: Some(vec![]),
@@ -9149,7 +9529,7 @@ mod tests {
                 llm: None,
                 scratchpad: None,
                 skills: None,
-            },
+            }),
         )]);
         let build_context = AgentBuildContext {
             hitl: Some(crate::hitl::HitlPolicy {
@@ -9364,6 +9744,7 @@ mod tests {
             task_description: "apply the manifest",
             task_context: &None,
             worker_name: Some("operations"),
+            jev_input: None,
         };
         let (event_tx2, _event_rx2) = tokio::sync::mpsc::channel(64);
         let outcome = orchestrator2
@@ -9914,5 +10295,348 @@ mod coordinator_artifact_tests {
         assert!(coordinator.agent.scratchpad_budget().is_some());
         assert_eq!(coordinator.agent.max_depth(), base);
         assert!(!coordinator.preamble.contains("Scratchpad Tools"));
+    }
+}
+
+#[cfg(test)]
+mod jev_worker_tests {
+    use super::*;
+    use crate::config::AgentBuildContext;
+    use crate::orchestration::jev::fake::FakeTransport;
+    use crate::orchestration::tools::DecisionRequest;
+    use crate::orchestration::types::Task;
+    use aura_config::JevQuestion;
+    use jev_driver::client::{JevClient, RetryConfig};
+    use serde_json::json;
+
+    fn jev_orchestration(questions: &str) -> OrchestrationConfig {
+        let toml = format!(
+            r#"
+            enabled = true
+
+            [worker.triage]
+            type = "jev"
+            description = "Scores alert severity"
+            preamble = "Alerts from pipeline monitors."
+            {questions}
+        "#
+        );
+        toml::from_str(&toml).unwrap()
+    }
+
+    const SEVERITY: &str = r#"
+            [[worker.triage.questions]]
+            id = "severity"
+            instruction = "How severe is it?"
+            criteria = ["minor", "major"]
+    "#;
+
+    async fn orchestrator(
+        memory: &std::path::Path,
+        config: OrchestrationConfig,
+        fake: Arc<FakeTransport>,
+    ) -> Orchestrator {
+        let build_context = AgentBuildContext {
+            memory_dir: Some(memory.to_string_lossy().into_owned()),
+            orchestration: Some(config),
+            ..AgentBuildContext::default()
+        };
+        let mut orchestrator = Orchestrator::new(build_context).await.unwrap();
+        let mut workers = (*orchestrator.jev_workers).clone();
+        for worker in workers.values_mut() {
+            worker.client =
+                JevClient::with_transport(fake.clone(), "jev-test", RetryConfig::default());
+        }
+        orchestrator.jev_workers = Arc::new(workers);
+        orchestrator
+    }
+
+    fn answers(answers: serde_json::Value) -> serde_json::Value {
+        json!({
+            "model": "jev-test",
+            "answers": answers,
+            "usage": {"input_tokens": 12, "output_tokens": 2}
+        })
+    }
+
+    fn severity_answer() -> serde_json::Value {
+        json!({
+            "type": "score", "score": 0.9,
+            "legend": {"0": "minor", "1": "major"},
+            "probabilities": {"0": 0.1, "1": 0.9},
+            "confidence": 0.85
+        })
+    }
+
+    #[tokio::test]
+    async fn orchestrator_builds_a_client_per_jev_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let orchestrator = orchestrator(
+            dir.path(),
+            jev_orchestration(SEVERITY),
+            FakeTransport::new([]),
+        )
+        .await;
+        assert_eq!(
+            orchestrator.jev_workers.keys().collect::<Vec<_>>(),
+            ["triage"]
+        );
+    }
+
+    /// The wave loop runs a Jev task without an LLM, feeds it the full
+    /// result of an upstream task whose result moved into an artifact, adds
+    /// the prepared questions after the configured ones, and records the
+    /// task complete with its answers.
+    #[tokio::test]
+    async fn jev_task_judges_full_upstream_results_and_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::new([Ok(answers(json!({
+            "severity": severity_answer(),
+            "real": {"type": "noul", "noul": 0.9},
+        })))]);
+        let orchestrator =
+            orchestrator(dir.path(), jev_orchestration(SEVERITY), fake.clone()).await;
+
+        let full_result = "disk usage at 97% on ingest-3 ".repeat(20);
+        let artifact = orchestrator
+            .persistence
+            .lock()
+            .await
+            .write_result_artifact(0, Some("ops"), 1, &full_result)
+            .await
+            .unwrap();
+
+        let mut plan = Plan::new("Triage the alert");
+        let mut gather = Task::new(0, "Gather alert data", "r").with_worker("ops");
+        gather.complete("disk usage at 97%… [Full result saved to artifact]");
+        gather.result_artifact = Some(artifact);
+        plan.add_task(gather);
+        let mut judge = Task::new(1, "Score the alert", "r")
+            .with_worker("triage")
+            .with_dependencies([0]);
+        judge.decision_request = Some(DecisionRequest {
+            name: "extra".to_string(),
+            worker: "triage".to_string(),
+            questions: vec![JevQuestion::Noul {
+                id: Some("real".to_string()),
+                instruction: "The alert reflects a real problem".to_string(),
+                yes: None,
+                no: None,
+            }],
+            state: Some(json!({"customer_tier": "enterprise"})),
+        });
+        plan.add_task(judge);
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+        orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+
+        let task = plan.tasks.iter().find(|t| t.id == 1).unwrap();
+        let TaskState::Complete { result } = &task.state else {
+            panic!("jev task must complete, got {:?}", task.state);
+        };
+        assert!(result.contains("\"severity\""), "{result}");
+        let summary = &task.structured_output.as_ref().unwrap().summary;
+        assert!(
+            summary.contains("severity: How severe is it? → 0.90 — major"),
+            "{summary}"
+        );
+        assert!(summary.contains("real: The alert reflects a real problem → P(yes)=0.90"));
+
+        let sent: serde_json::Value = serde_json::from_str(&fake.requests()[0]).unwrap();
+        let questions = sent["questions"].as_object().unwrap();
+        assert_eq!(questions.len(), 2);
+        assert_eq!(sent["questions"]["severity"]["type"], "score");
+        assert_eq!(sent["questions"]["real"]["type"], "noul");
+        assert_eq!(sent["state"]["context"], "Alerts from pipeline monitors.");
+        let state = &sent["state"]["state"];
+        assert_eq!(state["task"], "Score the alert");
+        assert_eq!(state["upstream"][0]["result"], full_result.as_str());
+        assert_eq!(state["coordinator"]["customer_tier"], "enterprise");
+    }
+
+    fn real_answer() -> serde_json::Value {
+        answers(json!({
+            "severity": severity_answer(),
+            "real": {"type": "noul", "noul": 0.9},
+        }))
+    }
+
+    fn task_with_request(description: &str, state: Option<serde_json::Value>) -> Task {
+        let mut task = Task::new(1, description, "r")
+            .with_worker("triage")
+            .with_dependencies([0]);
+        task.decision_request = Some(DecisionRequest {
+            name: "extra".to_string(),
+            worker: "triage".to_string(),
+            questions: vec![JevQuestion::Noul {
+                id: Some("real".to_string()),
+                instruction: "Real?".to_string(),
+                yes: None,
+                no: None,
+            }],
+            state,
+        });
+        task
+    }
+
+    fn completed_dependency(result: &str) -> Task {
+        let mut gather = Task::new(0, "Gather alert data", "r").with_worker("ops");
+        gather.complete(result);
+        gather
+    }
+
+    /// An oversized staged state cannot crowd the dependency data out: it is
+    /// cut to its own cap and the upstream result keeps its share.
+    #[tokio::test]
+    async fn oversized_staged_state_leaves_room_for_upstream_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::new([Ok(real_answer())]);
+        let orchestrator =
+            orchestrator(dir.path(), jev_orchestration(SEVERITY), fake.clone()).await;
+
+        let upstream = "u".repeat(20_000);
+        let mut plan = Plan::new("Triage");
+        plan.add_task(completed_dependency(&upstream));
+        plan.add_task(task_with_request(
+            "Score the alert",
+            Some(json!({"blob": "s".repeat(32_000)})),
+        ));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+        orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+
+        let sent: serde_json::Value = serde_json::from_str(&fake.requests()[0]).unwrap();
+        let state = &sent["state"]["state"];
+        let result = state["upstream"][0]["result"].as_str().unwrap();
+        assert!(
+            result.starts_with(&"u".repeat(crate::orchestration::jev::JEV_MIN_PART_CHARS)),
+            "upstream result was crowded out: {} chars",
+            result.len()
+        );
+        let staged = state["coordinator"].as_str().expect("cut to text");
+        assert!(
+            staged.ends_with("… [truncated]"),
+            "{}",
+            &staged[staged.len() - 20..]
+        );
+        assert!(staged.len() <= crate::orchestration::jev::JEV_MAX_STAGED_STATE_CHARS + 20);
+    }
+
+    #[tokio::test]
+    async fn long_task_description_is_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::new([Ok(real_answer())]);
+        let orchestrator =
+            orchestrator(dir.path(), jev_orchestration(SEVERITY), fake.clone()).await;
+
+        let mut plan = Plan::new("Triage");
+        plan.add_task(completed_dependency("disk at 97%"));
+        plan.add_task(task_with_request(&"d".repeat(10_000), None));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+        orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+
+        let sent: serde_json::Value = serde_json::from_str(&fake.requests()[0]).unwrap();
+        let task = sent["state"]["state"]["task"].as_str().unwrap();
+        assert!(task.ends_with("… [truncated]"));
+        assert!(task.len() <= crate::orchestration::jev::JEV_MAX_TASK_CHARS + 20);
+        assert_eq!(
+            sent["state"]["state"]["upstream"][0]["result"],
+            "disk at 97%"
+        );
+    }
+
+    /// A Jev task's tokens join the run's billed totals, which `aura.usage`
+    /// reports.
+    #[tokio::test]
+    async fn jev_task_tokens_count_toward_billed_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::new([Ok(real_answer())]);
+        let orchestrator = orchestrator(dir.path(), jev_orchestration(SEVERITY), fake).await;
+
+        let mut plan = Plan::new("Triage");
+        plan.add_task(completed_dependency("disk at 97%"));
+        plan.add_task(task_with_request("Score it", None));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+        orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+
+        assert_eq!(orchestrator.usage_state.get_final_usage(), (12, 2, 14));
+    }
+
+    #[tokio::test]
+    async fn jev_failure_fails_the_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::new([Err(401)]);
+        let orchestrator = orchestrator(dir.path(), jev_orchestration(SEVERITY), fake).await;
+        let mut plan = Plan::new("Triage");
+        plan.add_task(Task::new(0, "Score it", "r").with_worker("triage"));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+        orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+        let TaskState::Failed { error, .. } = &plan.tasks[0].state else {
+            panic!("expected a failed task, got {:?}", plan.tasks[0].state);
+        };
+        assert!(error.contains("unauthorized"), "{error}");
+        assert_eq!(orchestrator.usage_state.get_final_usage(), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn planner_inventory_describes_jev_workers_and_the_decision_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let orchestrator = orchestrator(
+            dir.path(),
+            jev_orchestration(SEVERITY),
+            FakeTransport::new([]),
+        )
+        .await;
+        let (section, _, _) = orchestrator.build_worker_prompt_sections();
+        assert!(section.contains("## triage"), "{section}");
+        assert!(section.contains("Type: decision worker"), "{section}");
+        assert!(
+            section.contains("  - severity (score: minor < major): How severe is it?"),
+            "{section}"
+        );
+        assert!(section.contains("DECISION WORKERS:"), "{section}");
+        assert!(section.contains("prepare_decision"), "{section}");
+        assert!(orchestrator.resolve_worker_tools()["triage"].is_empty());
+    }
+
+    #[test]
+    fn jev_section_without_configured_questions_says_to_stage_some() {
+        let config = jev_orchestration("");
+        let jev = config.workers["triage"].as_jev().unwrap();
+        let section = jev_worker_section("triage", jev);
+        assert!(section.contains("Configured questions: none"), "{section}");
+    }
+
+    #[tokio::test]
+    async fn coordinator_gets_decision_tools_only_with_jev_workers() {
+        use rig::tool::Tool;
+        let dir = tempfile::tempdir().unwrap();
+        let orchestrator = orchestrator(
+            dir.path(),
+            jev_orchestration(SEVERITY),
+            FakeTransport::new([]),
+        )
+        .await;
+        let toolset = crate::orchestration::tools::DecisionToolset::new(
+            orchestrator.jev_workers.clone(),
+            orchestrator.decision_requests.clone(),
+            None,
+            crate::UsageState::new(),
+        )
+        .expect("jev workers yield decision tools");
+        let def = toolset.evaluate.definition(String::new()).await;
+        assert!(def.description.contains("'triage' (Scores alert severity)"));
+
+        let plain = Orchestrator::new(AgentBuildContext::default())
+            .await
+            .unwrap();
+        assert!(
+            crate::orchestration::tools::DecisionToolset::new(
+                plain.jev_workers.clone(),
+                plain.decision_requests.clone(),
+                None,
+                crate::UsageState::new()
+            )
+            .is_none()
+        );
     }
 }
