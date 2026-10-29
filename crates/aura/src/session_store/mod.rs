@@ -1,6 +1,6 @@
 //! Pluggable cross-instance session-state capabilities: a durable store for parked
 //! HITL approvals, a per-session, per-agent skill-invocation store, a per-session
-//! event journal, and a pub/sub event bus.
+//! event journal, a store of each run's facts, and a pub/sub event bus.
 //!
 //! The in-memory implementations are the default; file-backed approval and
 //! skill-invocation stores survive a process restart on a single host, and a
@@ -15,6 +15,7 @@ pub(crate) mod fault_store;
 mod file;
 mod memory;
 mod record;
+mod run_record;
 mod skill_record;
 
 use std::pin::Pin;
@@ -34,10 +35,12 @@ use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 pub(crate) use fault_store::FaultInjectingStore;
 pub use file::{FileApprovalStore, FileSkillInvocationStore};
 pub use memory::{
-    DEFAULT_MAX_JOURNAL_ENTRIES_PER_SESSION, DEFAULT_MAX_JOURNAL_SESSIONS, InMemoryApprovalStore,
-    InMemoryEventBus, InMemoryJournalStore, InMemorySkillInvocationStore,
+    DEFAULT_MAX_JOURNAL_ENTRIES_PER_SESSION, DEFAULT_MAX_JOURNAL_SESSIONS, DEFAULT_MAX_RUNS,
+    InMemoryApprovalStore, InMemoryEventBus, InMemoryJournalStore, InMemoryRunStore,
+    InMemorySkillInvocationStore,
 };
 pub use record::{DecisionRecord, InvalidRecord, OriginRecord, ParkedApprovalRecord, ScopeRecord};
+pub use run_record::{DEFAULT_RUN_LIST_LIMIT, RunFacts, RunFilter, RunStatus};
 pub use skill_record::{
     SKILL_INVOCATION_RECORD_VERSION, SkillInvocation, SkillInvocationRecord, SkillRecordDecodeError,
 };
@@ -240,6 +243,38 @@ pub trait JournalStore: Send + Sync {
         &self,
         session: &SessionId,
     ) -> Result<Option<SequenceNumber>, SessionStoreError>;
+}
+
+/// Storage of each run's [`RunFacts`], keyed by run.
+#[async_trait]
+pub trait RunStore: Send + Sync {
+    /// Stores `facts` for the run, replacing what the store held for it.
+    ///
+    /// Each store bounds what it keeps, by count or by TTL, and drops ended
+    /// runs before live ones.
+    async fn put(&self, facts: &RunFacts) -> Result<(), SessionStoreError>;
+
+    /// The run's record, or `None` for a run the store does not hold.
+    async fn get(&self, run: &RunId) -> Result<Option<RunFacts>, SessionStoreError>;
+
+    /// The first [`RunFilter::limit`] runs the filter selects, in run-id
+    /// order, which for minted ids is the order the runs were started in.
+    /// When [`RunFilter::after`] is set, only runs after that id are listed,
+    /// so the last id of one page gets the next page.
+    async fn list(&self, filter: &RunFilter) -> Result<Vec<RunFacts>, SessionStoreError>;
+
+    /// Stores the facts of a run that has ended. `terminal` is the run's last
+    /// journal event, already appended and numbered.
+    ///
+    /// The journal append and this write go to two stores, so a crash
+    /// between them leaves the journal ahead of the run's facts. A backend
+    /// that holds both behind one connection may make them durable together.
+    /// In memory this is [`put`](Self::put).
+    async fn finish(
+        &self,
+        terminal: &SessionEvent,
+        facts: &RunFacts,
+    ) -> Result<(), SessionStoreError>;
 }
 
 /// The payload stream returned by [`EventBus::subscribe`].

@@ -342,7 +342,10 @@ impl PreparedAgent {
     ///
     /// `client_tools` registers passthrough tools — the LLM sees them as callable,
     /// but the streaming layer terminates the stream when one is invoked so the
-    /// client can execute the tool locally. Pass `None` to disable.
+    /// client can execute the tool locally. Pass `None` to disable. They are
+    /// attached only when the config sets `[agent].enable_client_tools`, and
+    /// only the ones its `client_tool_filter` matches. Every single-agent
+    /// build comes through here, so this is the one place that rule lives.
     ///
     /// Nothing here depends on a request: the HITL gate, turn nudge, and
     /// scratchpad wrappers composed below reach the run they serve through
@@ -353,6 +356,21 @@ impl PreparedAgent {
         client_tools: Option<Vec<ClientTool>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let run = Arc::new(BoundRun::default());
+
+        let client_tools = client_tools
+            .filter(|_| build_context.agent.enable_client_tools)
+            .map(|tools| {
+                tools
+                    .into_iter()
+                    .filter(|tool| {
+                        let allowed = build_context.client_tool_matches_filter(&tool.name);
+                        if !allowed {
+                            tracing::debug!(tool = %tool.name, "client tool left out by client_tool_filter");
+                        }
+                        allowed
+                    })
+                    .collect::<Vec<_>>()
+            });
 
         // Initialize MCP manager first (shared across all providers)
         let mcp_manager = if let Some(mcp_config) = &build_context.mcp {
@@ -2149,8 +2167,8 @@ pub async fn build_streaming_agent_with_tools(
         let factory = OrchestratorFactory::new(build_context.clone()).with_run_tools(run_tools);
         Ok(Arc::new(factory))
     } else {
-        // Standard single-agent mode: gate client tools on the agent's TOML opt-in
-        // and apply its client_tool_filter.
+        // Standard single-agent mode. `PreparedAgent::prepare` decides which
+        // client tools the agent gets.
         tracing::info!("Building Agent (orchestration.enabled = false)");
         if build_context.hitl.is_some() {
             tracing::info!(
@@ -2158,17 +2176,7 @@ pub async fn build_streaming_agent_with_tools(
                  globs will require approval via the configured route"
             );
         }
-        let attached = if build_context.agent.enable_client_tools {
-            client_tools.map(|tools| {
-                tools
-                    .into_iter()
-                    .filter(|t| build_context.client_tool_matches_filter(&t.name))
-                    .collect::<Vec<_>>()
-            })
-        } else {
-            None
-        };
-        let agent = Agent::new(build_context, run_tools(), attached).await?;
+        let agent = Agent::new(build_context, run_tools(), client_tools).await?;
         Ok(Arc::new(agent))
     }
 }
@@ -2350,15 +2358,64 @@ impl AgentBuilder {
     }
 }
 
+/// Prepared agents over a scripted model, for tests anywhere in the crate.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use crate::scratchpad::TiktokenCounter;
 
-    fn budget() -> scratchpad::ContextBudget {
+    /// A prepared agent over `inner`, with `hitl_gate` as its HITL gate, a
+    /// scratchpad budget, and a turn nudge that fires on the second turn, so
+    /// a run has per-run state to own. Tests may change its fields before
+    /// wrapping it in an `Arc`.
+    pub(crate) fn prepared_agent(
+        inner: ProviderAgent,
+        forwarded_headers: ForwardedHeaders,
+        hitl_gate: Option<Arc<crate::hitl::HitlApprovalWrapper>>,
+    ) -> PreparedAgent {
+        PreparedAgent {
+            inner,
+            model: "scripted".to_owned(),
+            max_depth: 1,
+            mcp_manager: None,
+            fallback_tool_parsing: false,
+            fallback_tool_names: Vec::new(),
+            fallback_mcp_filter: None,
+            context_window: None,
+            scratchpad_budget: Some(budget()),
+            client_tool_names: HashSet::new(),
+            turn_nudge: TurnNudgeState::new(true, None, 1),
+            system_prompt: String::new(),
+            invocation_parameters: None,
+            skills: Vec::new(),
+            forwarded_headers,
+            hitl_gate,
+            hitl_approval_tool: None,
+            run: Arc::new(BoundRun::default()),
+            active: Mutex::new(Weak::new()),
+        }
+    }
+
+    /// [`prepared_agent`] in an `Arc`.
+    pub(crate) fn prepared_over(
+        inner: ProviderAgent,
+        forwarded_headers: ForwardedHeaders,
+        hitl_gate: Option<Arc<crate::hitl::HitlApprovalWrapper>>,
+    ) -> Arc<PreparedAgent> {
+        Arc::new(prepared_agent(inner, forwarded_headers, hitl_gate))
+    }
+
+    /// A scratchpad budget of 128k tokens with a fifth of it reserved.
+    pub(crate) fn budget() -> scratchpad::ContextBudget {
         let counter = Arc::new(TiktokenCounter::default_counter());
         scratchpad::ContextBudget::new(128_000, 0.20, 0, counter)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::budget;
+    use super::*;
 
     /// Tool composition is where each MCP adaptor learns which transport it fronts. Both the single-agent path and the orchestration worker path reach it through `add_all_tools`, so what that function tags decides whether a gated call can deliver approver identity or must refuse.
     mod transport_tagging {
@@ -3126,6 +3183,7 @@ mod tests {
     /// serve two at once.
     mod prepared_runs {
         use super::*;
+        use crate::builder::test_support::prepared_over;
         use crate::orchestration::{ScriptedCompletionModel, ScriptedTurn};
         use crate::streaming::StreamRefused;
 
@@ -3306,35 +3364,6 @@ mod tests {
                 forwarded_headers,
                 None,
             )
-        }
-
-        /// Like [`prepared`], over `inner` with its HITL gate `hitl_gate`.
-        fn prepared_over(
-            inner: ProviderAgent,
-            forwarded_headers: ForwardedHeaders,
-            hitl_gate: Option<Arc<crate::hitl::HitlApprovalWrapper>>,
-        ) -> Arc<PreparedAgent> {
-            Arc::new(PreparedAgent {
-                inner,
-                model: "scripted".to_owned(),
-                max_depth: 1,
-                mcp_manager: None,
-                fallback_tool_parsing: false,
-                fallback_tool_names: Vec::new(),
-                fallback_mcp_filter: None,
-                context_window: None,
-                scratchpad_budget: Some(budget()),
-                client_tool_names: HashSet::new(),
-                turn_nudge: TurnNudgeState::new(true, None, 1),
-                system_prompt: String::new(),
-                invocation_parameters: None,
-                skills: Vec::new(),
-                forwarded_headers,
-                hitl_gate,
-                hitl_approval_tool: None,
-                run: Arc::new(BoundRun::default()),
-                active: Mutex::new(Weak::new()),
-            })
         }
 
         /// A web request's approvals are released by its request id when the
