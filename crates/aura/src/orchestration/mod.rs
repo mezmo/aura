@@ -51,6 +51,7 @@ mod duplicate_call_guard;
 mod factory;
 #[cfg(test)]
 mod frame_validation_tests;
+pub mod jev;
 mod observer_wrapper;
 mod orchestrator;
 mod overview;

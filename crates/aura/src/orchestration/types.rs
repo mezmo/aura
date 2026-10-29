@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::hitl::DecisionId;
-use crate::models::jev::{DecisionRequest, DecisionRequestRef};
+use crate::orchestration::tools::{DecisionRequest, DecisionRequestRef};
 
 /// Maximum nesting depth for step structures.
 /// Depth 0 = top-level steps list, depth 1 = inside a parallel group,
