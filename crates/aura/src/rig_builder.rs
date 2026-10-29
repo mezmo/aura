@@ -131,7 +131,7 @@ impl RigBuilder {
         // without a skills key inherits `[agent.skills]` and stays out of the map.
         if let Some(orch) = &self.config.orchestration {
             for (name, worker) in &orch.workers {
-                if let Some(worker_skills) = &worker.skills {
+                if let Some(worker_skills) = worker.as_llm().and_then(|w| w.skills.as_ref()) {
                     let discovered = aura_config::skills::discover_skills(&worker_skills.local)?;
                     let override_skills = if discovered.is_empty() {
                         WorkerSkills::Disable

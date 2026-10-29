@@ -9,7 +9,8 @@ use crate::GlobPattern;
 use crate::config::{LlmConfig, SkillsConfig};
 use crate::scratchpad::ScratchpadConfig;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::num::NonZero;
 
 // ============================================================================
 // Tool Visibility Configuration
@@ -51,7 +52,7 @@ pub enum ToolVisibility {
 /// mcp_filter = ["mezmo_*"]
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerConfig {
+pub struct LlmWorkerConfig {
     /// Short description of this worker's purpose (for planning prompt).
     ///
     /// This is shown to the LLM during planning so it can assign tasks appropriately.
@@ -113,6 +114,364 @@ pub struct WorkerConfig {
     /// (no merging).
     #[serde(default)]
     pub skills: Option<SkillsConfig>,
+}
+
+/// Fewest levels a score question's rubric may have.
+pub const JEV_SCORE_MIN_LEVELS: usize = 2;
+/// Most levels a score question's rubric may have.
+pub const JEV_SCORE_MAX_LEVELS: usize = 10;
+/// Most options a choice question may have.
+pub const JEV_CHOICE_MAX_OPTIONS: usize = 255;
+
+/// One typed question put to a Jev worker.
+///
+/// ```toml
+/// [[orchestration.worker.triage.questions]]
+/// id = "owner"
+/// instruction = "Which team owns this alert?"
+/// criteria = { platform = "Infra and k8s", pipeline = "Pipeline processors" }
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum JevQuestion {
+    /// Pick one option. `criteria` maps option key → what that option means.
+    Choice {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        instruction: String,
+        criteria: BTreeMap<String, String>,
+    },
+    /// Rate against an ordered rubric, lowest level first.
+    Score {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        instruction: String,
+        criteria: Vec<String>,
+    },
+    /// Probability that the instruction's statement is true.
+    Noul {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        instruction: String,
+        /// What a yes means.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        yes: Option<String>,
+        /// What a no means.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        no: Option<String>,
+    },
+}
+
+impl JevQuestion {
+    /// The caller-chosen id, if one was given.
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            Self::Choice { id, .. } | Self::Score { id, .. } | Self::Noul { id, .. } => {
+                id.as_deref()
+            }
+        }
+    }
+
+    /// The question text.
+    pub fn instruction(&self) -> &str {
+        match self {
+            Self::Choice { instruction, .. }
+            | Self::Score { instruction, .. }
+            | Self::Noul { instruction, .. } => instruction,
+        }
+    }
+
+    /// The question type's wire name.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Choice { .. } => "choice",
+            Self::Score { .. } => "score",
+            Self::Noul { .. } => "noul",
+        }
+    }
+
+    /// Check the limits the Jev API enforces, so a bad question is reported
+    /// at config load or tool call rather than as an HTTP 422.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.id().is_some_and(|id| id.trim().is_empty()) {
+            return Err("question `id` must not be blank".to_string());
+        }
+        if self.instruction().trim().is_empty() {
+            return Err("question `instruction` must not be blank".to_string());
+        }
+        match self {
+            Self::Choice { criteria, .. } => {
+                if criteria.is_empty() || criteria.len() > JEV_CHOICE_MAX_OPTIONS {
+                    return Err(format!(
+                        "choice question `{}` needs 1-{JEV_CHOICE_MAX_OPTIONS} options in \
+                         `criteria`, got {}",
+                        self.instruction(),
+                        criteria.len()
+                    ));
+                }
+                if let Some(key) = criteria.keys().find(|k| k.trim().is_empty()) {
+                    return Err(format!(
+                        "choice question `{}` has a blank option key {key:?}",
+                        self.instruction()
+                    ));
+                }
+            }
+            Self::Score { criteria, .. } => {
+                if !(JEV_SCORE_MIN_LEVELS..=JEV_SCORE_MAX_LEVELS).contains(&criteria.len()) {
+                    return Err(format!(
+                        "score question `{}` needs {JEV_SCORE_MIN_LEVELS}-{JEV_SCORE_MAX_LEVELS} \
+                         levels in `criteria`, got {}",
+                        self.instruction(),
+                        criteria.len()
+                    ));
+                }
+                if criteria.iter().any(|level| level.trim().is_empty()) {
+                    return Err(format!(
+                        "score question `{}` has a blank level in `criteria`",
+                        self.instruction()
+                    ));
+                }
+            }
+            Self::Noul { yes, no, .. } => {
+                if yes.is_some() != no.is_some() {
+                    return Err(format!(
+                        "noul question `{}` must give both `yes` and `no`, or neither",
+                        self.instruction()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate every question and reject duplicate explicit ids.
+    pub fn validate_all(questions: &[JevQuestion]) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for question in questions {
+            question.validate()?;
+            if let Some(id) = question.id()
+                && !seen.insert(id)
+            {
+                return Err(format!("duplicate question id `{id}`"));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for JevQuestion {
+    /// Dispatch on the shape of `criteria` — a table is a choice, an array a
+    /// score, and none a noul — then parse that variant strictly, so a
+    /// misspelled field is named in the error instead of the question quietly
+    /// matching a looser variant.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Choice {
+            #[serde(default)]
+            id: Option<String>,
+            instruction: String,
+            criteria: BTreeMap<String, String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Score {
+            #[serde(default)]
+            id: Option<String>,
+            instruction: String,
+            criteria: Vec<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Noul {
+            #[serde(default)]
+            id: Option<String>,
+            instruction: String,
+            #[serde(default)]
+            yes: Option<String>,
+            #[serde(default)]
+            no: Option<String>,
+        }
+
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let Some(map) = value.as_object() else {
+            return Err(D::Error::custom(
+                "a question must be a table with `instruction` and optional `criteria`",
+            ));
+        };
+        let parsed = match map.get("criteria") {
+            Some(serde_json::Value::Object(_)) => {
+                serde_json::from_value::<Choice>(value).map(|q| Self::Choice {
+                    id: q.id,
+                    instruction: q.instruction,
+                    criteria: q.criteria,
+                })
+            }
+            Some(serde_json::Value::Array(_)) => {
+                serde_json::from_value::<Score>(value).map(|q| Self::Score {
+                    id: q.id,
+                    instruction: q.instruction,
+                    criteria: q.criteria,
+                })
+            }
+            None => serde_json::from_value::<Noul>(value).map(|q| Self::Noul {
+                id: q.id,
+                instruction: q.instruction,
+                yes: q.yes,
+                no: q.no,
+            }),
+            Some(_) => {
+                return Err(D::Error::custom(
+                    "question `criteria` must be a table (choice) or an array (score); \
+                     omit it for a yes/no (noul) question",
+                ));
+            }
+        };
+        parsed.map_err(D::Error::custom)
+    }
+}
+
+/// A worker backed by TypeSafe's Jev (System One) decision model instead of
+/// an LLM.
+///
+/// ```toml
+/// [orchestration.worker.triage]
+/// type = "jev"
+/// description = "Scores alert severity and picks the owning team"
+/// api_key = "{{ env.TYPESAFE_API_KEY }}"
+/// ```
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JevWorkerConfig {
+    /// Short description of this worker's purpose (for planning prompt).
+    pub description: String,
+    /// Base URL or full endpoint of a System One-compatible API.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Bearer token.
+    #[serde(default)]
+    pub api_key: String,
+    /// Jev model id.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Background on the states this worker judges.
+    #[serde(default)]
+    pub preamble: Option<String>,
+    /// HTTP request timeout, in seconds.
+    #[serde(
+        default,
+        deserialize_with = "crate::lenient_int::deserialize_option_u64"
+    )]
+    pub timeout_secs: Option<u64>,
+    /// Questions this worker always asks.
+    #[serde(default)]
+    pub questions: Vec<JevQuestion>,
+}
+
+impl std::fmt::Debug for JevWorkerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JevWorkerConfig")
+            .field("description", &self.description)
+            .field("base_url", &self.base_url)
+            .field(
+                "api_key",
+                &(!self.api_key.is_empty()).then_some("<redacted>"),
+            )
+            .field("model", &self.model)
+            .field("preamble", &self.preamble)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("questions", &self.questions)
+            .finish()
+    }
+}
+
+/// One `[orchestration.worker.<name>]` entry.
+// An LLM worker serializes untagged, exactly as its `LlmWorkerConfig`, which
+// keeps fingerprints taken over serialized workers stable.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum WorkerConfig {
+    Jev(JevWorkerConfig),
+    #[serde(untagged)]
+    Llm(LlmWorkerConfig),
+}
+
+impl WorkerConfig {
+    /// Short description of this worker's purpose (for planning prompt).
+    pub fn description(&self) -> &str {
+        match self {
+            Self::Jev(w) => &w.description,
+            Self::Llm(w) => &w.description,
+        }
+    }
+
+    pub fn as_llm(&self) -> Option<&LlmWorkerConfig> {
+        match self {
+            Self::Llm(w) => Some(w),
+            Self::Jev(_) => None,
+        }
+    }
+
+    pub fn as_jev(&self) -> Option<&JevWorkerConfig> {
+        match self {
+            Self::Jev(w) => Some(w),
+            Self::Llm(_) => None,
+        }
+    }
+}
+
+impl From<LlmWorkerConfig> for WorkerConfig {
+    fn from(worker: LlmWorkerConfig) -> Self {
+        Self::Llm(worker)
+    }
+}
+
+impl From<JevWorkerConfig> for WorkerConfig {
+    fn from(worker: JevWorkerConfig) -> Self {
+        Self::Jev(worker)
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkerConfig {
+    /// Read `type` and parse the rest as that worker kind. A missing `type`
+    /// is an LLM worker, parsed leniently so existing configs keep loading;
+    /// an unrecognised `type` is an error rather than a silent LLM worker.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let Some(map) = value.as_object_mut() else {
+            return Err(D::Error::custom("a worker must be a table"));
+        };
+        let kind = match map.remove("type") {
+            None => None,
+            Some(serde_json::Value::String(kind)) => Some(kind),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "worker `type` must be a string, got {other}"
+                )));
+            }
+        };
+        match kind.as_deref() {
+            None | Some("llm") => serde_json::from_value(value)
+                .map(Self::Llm)
+                .map_err(D::Error::custom),
+            Some("jev") => serde_json::from_value(value)
+                .map(Self::Jev)
+                .map_err(D::Error::custom),
+            Some(other) => Err(D::Error::custom(format!(
+                "unknown worker type \"{other}\"; expected \"jev\" or \"llm\""
+            ))),
+        }
+    }
 }
 
 // ============================================================================
@@ -520,7 +879,7 @@ impl OrchestrationConfig {
 
         self.workers
             .iter()
-            .map(|(name, config)| format!("- {}: {}", name, config.description))
+            .map(|(name, config)| format!("- {}: {}", name, config.description()))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -718,6 +1077,13 @@ fn default_tool_output_duration_threshold_ms() -> u64 {
 mod tests {
     use super::*;
 
+    fn llm_worker(toml: &str) -> LlmWorkerConfig {
+        match toml::from_str::<WorkerConfig>(toml).unwrap() {
+            WorkerConfig::Llm(worker) => worker,
+            other => panic!("expected an LLM worker, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_default_values() {
         let config = OrchestrationConfig::default();
@@ -769,7 +1135,7 @@ mod tests {
             preamble = "You are an Operations Specialist."
             mcp_filter = ["mezmo_*"]
         "#;
-        let config: WorkerConfig = toml::from_str(toml).unwrap();
+        let config = llm_worker(toml);
         assert_eq!(config.description, "For operations");
         assert_eq!(config.preamble, "You are an Operations Specialist.");
         assert_eq!(config.mcp_filter, Some(vec!["mezmo_*".into()]));
@@ -781,7 +1147,7 @@ mod tests {
             description = "Generic tasks"
             preamble = "Generic worker."
         "#;
-        let config: WorkerConfig = toml::from_str(toml).unwrap();
+        let config = llm_worker(toml);
         assert_eq!(config.preamble, "Generic worker.");
         assert_eq!(config.mcp_filter, None);
     }
@@ -793,7 +1159,7 @@ mod tests {
             preamble = "Tool-free worker."
             mcp_filter = []
         "#;
-        let config: WorkerConfig = toml::from_str(toml).unwrap();
+        let config = llm_worker(toml);
         assert_eq!(config.mcp_filter, Some(vec![]));
     }
 
@@ -804,7 +1170,7 @@ mod tests {
             preamble = "Knowledge worker."
             mcp_filter = ["ListKnowledgeBases", "QueryKnowledgeBases"]
         "#;
-        let config: WorkerConfig = toml::from_str(toml).unwrap();
+        let config = llm_worker(toml);
         let filter = config.mcp_filter.expect("filter present");
         assert_eq!(filter.len(), 2);
         assert!(filter.contains(&"ListKnowledgeBases".into()));
@@ -832,12 +1198,12 @@ mod tests {
         assert!(config.has_workers());
         assert_eq!(config.workers.len(), 2);
 
-        let ops = config.get_worker("operations").unwrap();
+        let ops = config.get_worker("operations").unwrap().as_llm().unwrap();
         assert_eq!(ops.description, "For logs and pipelines");
         assert_eq!(ops.preamble, "Operations specialist.");
         assert_eq!(ops.mcp_filter, Some(vec!["mezmo_*".into()]));
 
-        let kb = config.get_worker("knowledge").unwrap();
+        let kb = config.get_worker("knowledge").unwrap().as_llm().unwrap();
         assert_eq!(kb.description, "For documentation");
         assert_eq!(kb.preamble, "Knowledge specialist.");
         assert_eq!(kb.mcp_filter.as_ref().map(Vec::len), Some(2));
@@ -986,7 +1352,7 @@ mod tests {
         "#;
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();
 
-        let worker = config.get_worker("knowledge").unwrap();
+        let worker = config.get_worker("knowledge").unwrap().as_llm().unwrap();
         assert_eq!(worker.vector_stores.len(), 2);
         assert!(worker.vector_stores.contains(&"mezmo_docs".to_string()));
         assert!(worker.vector_stores.contains(&"customer_kb".to_string()));
@@ -1004,7 +1370,7 @@ mod tests {
         "#;
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();
 
-        let worker = config.get_worker("operations").unwrap();
+        let worker = config.get_worker("operations").unwrap().as_llm().unwrap();
         assert!(worker.vector_stores.is_empty());
     }
 
@@ -1231,5 +1597,242 @@ mod tests {
         };
         // The cap wins even on the first retry.
         assert_eq!(config.delay_for_retry(1), Duration::from_millis(200));
+    }
+
+    // ------------------------------------------------------------------
+    // Worker types
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn worker_without_type_is_llm_and_keeps_unknown_keys_lenient() {
+        let worker: WorkerConfig = toml::from_str(
+            r#"
+            description = "Ops"
+            preamble = "You are ops."
+            retired_setting = "still here from an old config"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(worker.as_llm().unwrap().preamble, "You are ops.");
+    }
+
+    #[test]
+    fn worker_type_llm_is_accepted() {
+        let worker: WorkerConfig = toml::from_str(
+            r#"
+            type = "llm"
+            description = "Ops"
+            preamble = "You are ops."
+        "#,
+        )
+        .unwrap();
+        assert!(worker.as_llm().is_some());
+    }
+
+    #[test]
+    fn worker_type_jev_parses_every_question_kind() {
+        let worker: WorkerConfig = toml::from_str(
+            r#"
+            type = "jev"
+            description = "Triage"
+            api_key = "secret"
+            model = "jev-1.13.0"
+            preamble = "Alerts from pipeline monitors."
+            timeout_secs = 45.0
+
+            [[questions]]
+            id = "owner"
+            instruction = "Which team owns this?"
+            criteria = { platform = "Infra", pipeline = "Processors" }
+
+            [[questions]]
+            instruction = "How severe is it?"
+            criteria = ["minor", "major", "critical"]
+
+            [[questions]]
+            instruction = "A human must act on this alert"
+            yes = "Needs a person"
+            no = "Self-resolving"
+        "#,
+        )
+        .unwrap();
+        let jev = worker.as_jev().expect("jev worker");
+        assert_eq!(worker.description(), "Triage");
+        assert_eq!(jev.model.as_deref(), Some("jev-1.13.0"));
+        assert_eq!(jev.timeout_secs, Some(45));
+        assert!(matches!(
+            &jev.questions[0],
+            JevQuestion::Choice { id: Some(id), criteria, .. }
+                if id == "owner" && criteria.len() == 2
+        ));
+        assert!(matches!(
+            &jev.questions[1],
+            JevQuestion::Score { id: None, criteria, .. } if criteria.len() == 3
+        ));
+        assert!(matches!(
+            &jev.questions[2],
+            JevQuestion::Noul {
+                yes: Some(_),
+                no: Some(_),
+                ..
+            }
+        ));
+        assert!(JevQuestion::validate_all(&jev.questions).is_ok());
+    }
+
+    #[test]
+    fn unknown_worker_type_is_rejected() {
+        let err = toml::from_str::<WorkerConfig>(
+            r#"
+            type = "jevv"
+            description = "Triage"
+            preamble = "p"
+        "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown worker type \"jevv\""), "{err}");
+    }
+
+    #[test]
+    fn jev_worker_rejects_llm_only_fields() {
+        let err = toml::from_str::<WorkerConfig>(
+            r#"
+            type = "jev"
+            description = "Triage"
+            mcp_filter = ["mezmo_*"]
+        "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("mcp_filter"), "{err}");
+    }
+
+    #[test]
+    fn misspelled_question_field_is_named_not_turned_into_a_noul() {
+        let err = toml::from_str::<WorkerConfig>(
+            r#"
+            type = "jev"
+            description = "Triage"
+
+            [[questions]]
+            instruction = "How severe is it?"
+            critera = ["minor", "major"]
+        "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("critera"), "{err}");
+    }
+
+    #[test]
+    fn question_criteria_of_the_wrong_shape_is_rejected() {
+        let err = serde_json::from_value::<JevQuestion>(serde_json::json!({
+            "instruction": "Is it real?",
+            "criteria": "yes or no",
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("must be a table (choice) or an array (score)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn question_validation_enforces_api_limits() {
+        let score = |levels: usize| JevQuestion::Score {
+            id: None,
+            instruction: "Rate it".to_string(),
+            criteria: (0..levels).map(|i| format!("level {i}")).collect(),
+        };
+        assert!(score(1).validate().is_err());
+        assert!(score(2).validate().is_ok());
+        assert!(score(10).validate().is_ok());
+        assert!(score(11).validate().is_err());
+
+        let empty_choice = JevQuestion::Choice {
+            id: None,
+            instruction: "Pick".to_string(),
+            criteria: BTreeMap::new(),
+        };
+        assert!(empty_choice.validate().is_err());
+
+        let blank = JevQuestion::Noul {
+            id: None,
+            instruction: "  ".to_string(),
+            yes: None,
+            no: None,
+        };
+        assert!(blank.validate().is_err());
+
+        let one_pole = JevQuestion::Noul {
+            id: None,
+            instruction: "Is it real?".to_string(),
+            yes: Some("It is".to_string()),
+            no: None,
+        };
+        assert!(one_pole.validate().is_err());
+
+        let noul = |id: &str| JevQuestion::Noul {
+            id: Some(id.to_string()),
+            instruction: "Is it real?".to_string(),
+            yes: None,
+            no: None,
+        };
+        let err = JevQuestion::validate_all(&[noul("real"), noul("real")]).unwrap_err();
+        assert!(err.contains("duplicate question id `real`"), "{err}");
+    }
+
+    #[test]
+    fn worker_serialization_round_trips_and_llm_has_no_tag() {
+        let llm: WorkerConfig = toml::from_str(
+            r#"
+            description = "Ops"
+            preamble = "You are ops."
+            mcp_filter = ["mezmo_*"]
+        "#,
+        )
+        .unwrap();
+        // An LLM worker serializes exactly as the bare struct, which keeps
+        // fingerprints taken over serialized workers stable.
+        assert_eq!(
+            serde_json::to_value(&llm).unwrap(),
+            serde_json::to_value(llm.as_llm().unwrap()).unwrap()
+        );
+        let back: WorkerConfig =
+            serde_json::from_value(serde_json::to_value(&llm).unwrap()).unwrap();
+        assert!(back.as_llm().is_some());
+
+        let jev: WorkerConfig = toml::from_str(
+            r#"
+            type = "jev"
+            description = "Triage"
+            api_key = "secret"
+
+            [[questions]]
+            instruction = "Is it real?"
+        "#,
+        )
+        .unwrap();
+        let value = serde_json::to_value(&jev).unwrap();
+        assert_eq!(value["type"], "jev");
+        let back: WorkerConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(back.as_jev().unwrap().questions.len(), 1);
+    }
+
+    #[test]
+    fn jev_worker_debug_redacts_the_api_key() {
+        let jev: WorkerConfig = toml::from_str(
+            r#"
+            type = "jev"
+            description = "Triage"
+            api_key = "super-secret-key"
+        "#,
+        )
+        .unwrap();
+        let debug = format!("{jev:?}");
+        assert!(!debug.contains("super-secret-key"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
     }
 }

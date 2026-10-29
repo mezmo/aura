@@ -67,8 +67,9 @@ mod types;
 
 pub use aura_events::orchestration::RoutingMode;
 pub use config::{
-    ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,
-    build_coordinator_preamble, build_vector_store_context, build_worker_preamble,
+    ArtifactsConfig, JevQuestion, JevWorkerConfig, LlmWorkerConfig, OrchestrationConfig,
+    TimeoutsConfig, ToolVisibility, WorkerConfig, build_coordinator_preamble,
+    build_vector_store_context, build_worker_preamble,
 };
 pub use factory::OrchestratorFactory;
 pub use observer_wrapper::ObserverWrapper;

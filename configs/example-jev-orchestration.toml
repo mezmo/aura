@@ -1,0 +1,77 @@
+# Example: Alert Triage with a Jev Decision Worker
+#
+# An LLM worker reads the alert and pulls out the facts; a Jev (TypeSafe
+# System One) worker then scores it. A Jev worker answers typed questions
+# with probabilities — choice, score, or yes/no — and has no tools, no MCP
+# and no prose output.
+#
+# This exercises:
+#   - A `type = "jev"` worker beside an LLM worker
+#   - Configured questions asked on every Jev task
+#   - Coordinator-written questions and state (prepare_decision /
+#     decision_request) and ad hoc evaluation (evaluate_decision)
+#
+# Usage:
+#   CONFIG_PATH=configs/example-jev-orchestration.toml \
+#   AURA_CUSTOM_EVENTS=true \
+#   OPENAI_API_KEY=... TYPESAFE_API_KEY=... \
+#   cargo run --bin aura -- webserver
+#
+# Test queries:
+#   "Triage this alert: ingest-3 disk at 97% and climbing 2%/hour, customer
+#    tier enterprise, two prior incidents this month."
+#   "Is 'CPU at 40% on web-1' worth paging anyone for?"   (evaluate_decision)
+
+[agent]
+name = "Alert Triage"
+system_prompt = """
+You triage infrastructure alerts. Have the analyst extract the facts from an
+alert, then have the triage worker score it. Report the triage worker's
+answers with their probabilities, and say plainly when confidence is low.
+"""
+turn_depth = 5
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-4o-mini"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.analyst]
+description = "Reads an alert and lists its facts: service, host, metric, trend, customer impact"
+preamble = """
+You extract facts from infrastructure alerts. List the affected service and
+host, the metric and its trend, and any customer impact. Do not judge
+severity; another worker does that.
+"""
+mcp_filter = []
+
+[orchestration.worker.triage]
+type = "jev"
+description = "Scores an alert's severity, picks the owning team, and judges whether a human must act"
+api_key = "{{ env.TYPESAFE_API_KEY }}"
+# model defaults to the pinned jev-1.13.0; base_url to the TypeSafe cloud.
+preamble = "Alerts come from Mezmo pipeline and infrastructure monitors."
+
+[[orchestration.worker.triage.questions]]
+id = "severity"
+instruction = "How severe is this alert?"
+criteria = [
+  "Informational: no action needed",
+  "Minor: fix during working hours",
+  "Major: degraded service, act today",
+  "Critical: outage or data loss, page now",
+]
+
+[[orchestration.worker.triage.questions]]
+id = "owner"
+instruction = "Which team owns the affected system?"
+criteria = { platform = "Kubernetes, hosts, disks, networking", pipeline = "Pipeline processors and routing", web = "Web UI and API" }
+
+[[orchestration.worker.triage.questions]]
+id = "needs_human"
+instruction = "A person must act on this alert"
+yes = "Will not resolve on its own"
+no = "Self-resolving or expected"

@@ -6,6 +6,7 @@
 //! The coordinator calls exactly one of these tools during the planning phase.
 //! A shared `RoutingDecision` captures the decision for the orchestrator to read.
 
+use crate::models::jev::{DecisionRequestRef, DecisionRequestStore, JevWorkers};
 use crate::orchestration::persistence::ExecutionPersistence;
 use crate::orchestration::types::{PlanningResponse, StepInput, flatten_steps};
 use rig::completion::ToolDefinition;
@@ -39,6 +40,7 @@ impl RoutingToolSet {
             create_plan: CreatePlanTool {
                 decision: decision.clone(),
                 persistence: None,
+                decisions: None,
             },
             request_clarification: RequestClarificationTool {
                 decision: decision.clone(),
@@ -53,6 +55,18 @@ impl RoutingToolSet {
     /// artifacts. Without it, any plan that attaches artifacts is rejected.
     pub fn with_persistence(mut self, persistence: Arc<Mutex<ExecutionPersistence>>) -> Self {
         self.create_plan.persistence = Some(persistence);
+        self
+    }
+
+    /// Let `create_plan` resolve task `decision_request` names against the
+    /// requests `prepare_decision` stored. Without it, any plan that names a
+    /// decision request is rejected.
+    pub fn with_decision_requests(
+        mut self,
+        store: DecisionRequestStore,
+        workers: JevWorkers,
+    ) -> Self {
+        self.create_plan.decisions = Some((store, workers));
         self
     }
 }
@@ -159,6 +173,8 @@ impl Tool for RespondDirectlyTool {
 pub struct CreatePlanTool {
     pub(crate) decision: RoutingDecision,
     pub(crate) persistence: Option<Arc<Mutex<ExecutionPersistence>>>,
+    /// The run's prepared decision requests and the workers they are for.
+    pub(crate) decisions: Option<(DecisionRequestStore, JevWorkers)>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -195,7 +211,7 @@ impl Tool for CreatePlanTool {
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         // Tagged step schema — "type" discriminator helps models declare intent.
-        let step_schema = serde_json::json!({
+        let mut step_schema = serde_json::json!({
             "type": "object",
             "required": ["type"],
             "properties": {
@@ -229,6 +245,13 @@ impl Tool for CreatePlanTool {
                 }
             }
         });
+
+        if self.decisions.is_some() {
+            step_schema["properties"]["decision_request"] = serde_json::json!({
+                "type": "string",
+                "description": "For a task assigned to a decision worker: the name of a request staged with prepare_decision. Optional, type=task only."
+            });
+        }
 
         ToolDefinition {
             name: Self::NAME.to_string(),
@@ -265,7 +288,7 @@ impl Tool for CreatePlanTool {
         }
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, mut args: Self::Args) -> Result<Self::Output, Self::Error> {
         let mut guard = self.decision.lock().await;
         if guard.is_some() {
             return Ok(CreatePlanOutput {
@@ -293,6 +316,12 @@ impl Tool for CreatePlanTool {
         if let Err(e) = self.validate_artifacts(&args.steps).await {
             return Ok(CreatePlanOutput {
                 status: format!("Error: {e} Fix the task `artifacts` and call create_plan again."),
+            });
+        }
+
+        if let Err(e) = self.resolve_decision_requests(&mut args.steps) {
+            return Ok(CreatePlanOutput {
+                status: format!("Error: {e} Fix the task and call create_plan again."),
             });
         }
 
@@ -362,6 +391,85 @@ impl CreatePlanTool {
     }
 }
 
+impl CreatePlanTool {
+    /// Check every task's decision request and replace each name with the
+    /// request it names, so the plan carries the questions and state itself.
+    ///
+    /// A task for a decision worker must end up with at least one question,
+    /// configured or prepared; a task for any other worker takes no request.
+    fn resolve_decision_requests(&self, steps: &mut [StepInput]) -> Result<(), String> {
+        for step in steps {
+            match step {
+                StepInput::ParallelGroup { items } => self.resolve_decision_requests(items)?,
+                StepInput::SubChain { steps } => self.resolve_decision_requests(steps)?,
+                StepInput::LeafTask {
+                    worker,
+                    decision_request,
+                    ..
+                } => {
+                    let workers = self.decisions.as_ref().map(|(_, workers)| workers);
+                    let jev = worker
+                        .as_deref()
+                        .and_then(|name| workers.and_then(|w| w.get(name)));
+                    let Some(jev) = jev else {
+                        if decision_request.is_some() {
+                            return Err(format!(
+                                "`decision_request` is only for tasks assigned to a decision \
+                                 worker, and worker {} is not one.",
+                                worker
+                                    .as_deref()
+                                    .map_or("(none)".to_string(), |w| format!("'{w}'"))
+                            ));
+                        }
+                        continue;
+                    };
+                    let request = match decision_request.take() {
+                        None => None,
+                        Some(DecisionRequestRef::Resolved(request)) => Some(request),
+                        Some(DecisionRequestRef::Named(name)) => {
+                            let (store, _) = self.decisions.as_ref().expect("workers imply store");
+                            let stored = store
+                                .lock()
+                                .expect("decision request store poisoned")
+                                .get(&name)
+                                .cloned();
+                            Some(stored.ok_or_else(|| {
+                                format!(
+                                    "No decision request named '{name}'. Stage it with \
+                                     prepare_decision first."
+                                )
+                            })?)
+                        }
+                    };
+                    if let Some(request) = &request
+                        && request.worker != jev.name
+                    {
+                        return Err(format!(
+                            "Decision request '{}' was prepared for worker '{}' but the task is \
+                             assigned to '{}'.",
+                            request.name, request.worker, jev.name
+                        ));
+                    }
+                    let added = request.as_ref().map_or(&[][..], |r| r.questions.as_slice());
+                    crate::models::jev::Decision::new(
+                        serde_json::Value::Null,
+                        &jev.questions_with(added),
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "Task for decision worker '{}' cannot run: {e}. Stage questions \
+                                 with prepare_decision and name them in `decision_request`.",
+                            jev.name
+                        )
+                    })?;
+                    *decision_request = request.map(DecisionRequestRef::Resolved);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Collect the artifact filenames attached to every leaf task, in step order.
 fn collect_artifacts<'a>(steps: &'a [StepInput], out: &mut Vec<&'a str>) {
     for step in steps {
@@ -428,16 +536,8 @@ where
 }
 
 /// Parse a JSON array of steps out of a string argument.
-///
-/// Slices from the first `[` to the last `]`, so prose or markup around the array does
-/// not have to be recognised to be ignored.
 fn parse_steps_str(raw: &str) -> Option<Vec<StepInput>> {
-    let start = raw.find('[')?;
-    let end = raw.rfind(']')?;
-    if end < start {
-        return None;
-    }
-    serde_json::from_str(&raw[start..=end]).ok()
+    super::json_in_str(raw, '[', ']')
 }
 
 /// Count the number of leaf tasks in a step tree (for status messages).
@@ -663,6 +763,7 @@ mod tests {
             task: task.to_string(),
             worker: Some("operations".to_string()),
             artifacts: Vec::new(),
+            decision_request: None,
         };
         // chain > chain > parallel: one level deeper than flatten_steps allows.
         let result = toolset
@@ -704,12 +805,14 @@ mod tests {
                     task: "Gather context".to_string(),
                     worker: Some("operations".to_string()),
                     artifacts: Vec::new(),
+                    decision_request: None,
                 },
                 StepInput::ParallelGroup {
                     items: vec![StepInput::LeafTask {
                         task: "Review the draft".to_string(),
                         worker: Some("reviewer".to_string()),
                         artifacts: artifacts.iter().map(|a| a.to_string()).collect(),
+                        decision_request: None,
                     }],
                 },
             ],
@@ -838,6 +941,7 @@ mod tests {
                     task: "Fetch recent logs".to_string(),
                     worker: Some("operations".to_string()),
                     artifacts: Vec::new(),
+                    decision_request: None,
                 }],
                 routing_rationale: "Requires tool execution".to_string(),
                 planning_summary: "Fetch and analyze recent logs".to_string(),
@@ -971,5 +1075,171 @@ mod tests {
             .await;
         assert_eq!(def.name, "request_clarification");
         assert!(def.description.contains("clarification"));
+    }
+
+    // ------------------------------------------------------------------
+    // Decision requests
+    // ------------------------------------------------------------------
+
+    fn decision_toolset(configured_questions: usize) -> (RoutingToolSet, DecisionRequestStore) {
+        use crate::models::jev::JevWorker;
+        let mut toml = "type = \"jev\"\ndescription = \"Scores\"\n".to_string();
+        for i in 0..configured_questions {
+            toml.push_str(&format!(
+                "[[questions]]\nid = \"c{i}\"\ninstruction = \"C{i}?\"\n"
+            ));
+        }
+        let config: aura_config::WorkerConfig = toml::from_str(&toml).unwrap();
+        let workers: JevWorkers = Arc::new(
+            [(
+                "triage".to_string(),
+                JevWorker::new("triage", config.as_jev().unwrap().clone()).unwrap(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let store = DecisionRequestStore::default();
+        (
+            RoutingToolSet::new().with_decision_requests(store.clone(), workers),
+            store,
+        )
+    }
+
+    fn plan_args(steps: serde_json::Value) -> CreatePlanArgs {
+        serde_json::from_value(serde_json::json!({
+            "goal": "Triage",
+            "steps": steps,
+            "routing_rationale": "r",
+            "planning_summary": "s",
+        }))
+        .unwrap()
+    }
+
+    async fn plan_tasks(toolset: &RoutingToolSet) -> Vec<crate::orchestration::types::Task> {
+        let guard = toolset.decision.lock().await;
+        match guard.as_ref().expect("plan recorded") {
+            PlanningResponse::StepsPlan { steps, .. } => flatten_steps(steps).unwrap(),
+            other => panic!("unexpected decision {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn named_decision_request_is_resolved_into_the_task() {
+        use crate::models::jev::DecisionRequest;
+        let (toolset, store) = decision_toolset(0);
+        store.lock().unwrap().insert(
+            "sev".to_string(),
+            DecisionRequest {
+                name: "sev".to_string(),
+                worker: "triage".to_string(),
+                questions: vec![aura_config::JevQuestion::Noul {
+                    id: Some("real".to_string()),
+                    instruction: "Real?".to_string(),
+                    yes: None,
+                    no: None,
+                }],
+                state: Some(serde_json::json!({"k": 1})),
+            },
+        );
+        let result = toolset
+            .create_plan
+            .call(plan_args(serde_json::json!([
+                {"type": "task", "worker": "triage", "task": "Score it", "decision_request": "sev"}
+            ])))
+            .await
+            .unwrap();
+        assert!(
+            result.status.starts_with("Plan created"),
+            "{}",
+            result.status
+        );
+        let tasks = plan_tasks(&toolset).await;
+        let request = tasks[0]
+            .decision_request
+            .as_ref()
+            .expect("resolved request");
+        assert_eq!(request.questions.len(), 1);
+        assert_eq!(request.state, Some(serde_json::json!({"k": 1})));
+    }
+
+    #[tokio::test]
+    async fn decision_request_errors_reach_the_model() {
+        use crate::models::jev::DecisionRequest;
+        let (toolset, store) = decision_toolset(1);
+        store.lock().unwrap().insert(
+            "other".to_string(),
+            DecisionRequest {
+                name: "other".to_string(),
+                worker: "someone-else".to_string(),
+                questions: Vec::new(),
+                state: None,
+            },
+        );
+        let cases = [
+            (
+                serde_json::json!([{"type": "task", "worker": "triage", "task": "t", "decision_request": "missing"}]),
+                "No decision request named 'missing'",
+            ),
+            (
+                serde_json::json!([{"type": "task", "worker": "triage", "task": "t", "decision_request": "other"}]),
+                "prepared for worker 'someone-else'",
+            ),
+            (
+                serde_json::json!([{"type": "task", "worker": "ops", "task": "t", "decision_request": "other"}]),
+                "only for tasks assigned to a decision worker",
+            ),
+        ];
+        for (steps, expected) in cases {
+            let result = toolset.create_plan.call(plan_args(steps)).await.unwrap();
+            assert!(result.status.contains(expected), "{}", result.status);
+            assert!(toolset.decision.lock().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn decision_task_without_any_question_is_rejected() {
+        let (toolset, _) = decision_toolset(0);
+        let result = toolset
+            .create_plan
+            .call(plan_args(serde_json::json!([
+                {"type": "task", "worker": "triage", "task": "Score it"}
+            ])))
+            .await
+            .unwrap();
+        assert!(
+            result.status.contains("no questions to ask"),
+            "{}",
+            result.status
+        );
+    }
+
+    #[tokio::test]
+    async fn decision_task_with_configured_questions_needs_no_request() {
+        let (toolset, _) = decision_toolset(1);
+        let result = toolset
+            .create_plan
+            .call(plan_args(serde_json::json!([
+                {"type": "task", "worker": "triage", "task": "Score it"}
+            ])))
+            .await
+            .unwrap();
+        assert!(
+            result.status.starts_with("Plan created"),
+            "{}",
+            result.status
+        );
+        assert!(plan_tasks(&toolset).await[0].decision_request.is_none());
+    }
+
+    #[tokio::test]
+    async fn decision_request_field_is_advertised_only_with_decision_workers() {
+        let plain = RoutingToolSet::new()
+            .create_plan
+            .definition(String::new())
+            .await;
+        assert!(!plain.parameters.to_string().contains("decision_request"));
+        let (toolset, _) = decision_toolset(1);
+        let def = toolset.create_plan.definition(String::new()).await;
+        assert!(def.parameters.to_string().contains("decision_request"));
     }
 }

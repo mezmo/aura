@@ -62,6 +62,15 @@ pub fn append_worker_mcp_filter_in_str(
                 "no [orchestration.worker.{worker}] table in the config"
             ))
         })?;
+    if worker_table
+        .get("type")
+        .and_then(toml_edit::Item::as_str)
+        .is_some_and(|kind| kind != "llm")
+    {
+        return Err(ConfigError::Validation(format!(
+            "worker `{worker}` is not an LLM worker and takes no `mcp_filter`"
+        )));
+    }
     if worker_table.get("mcp_filter").is_none() {
         worker_table.insert(
             "mcp_filter",
@@ -568,7 +577,11 @@ preamble = "You write"
         let config = load_config_from_str(&updated).expect("config must parse");
         let orch = config.orchestration.expect("orchestration table");
         assert_eq!(
-            orch.workers["operations"].mcp_filter.as_deref(),
+            orch.workers["operations"]
+                .as_llm()
+                .unwrap()
+                .mcp_filter
+                .as_deref(),
             Some(["logs_*".into(), "mezmo_*".into()].as_slice())
         );
     }
@@ -581,6 +594,8 @@ preamble = "You write"
         let config = load_config_from_str(&updated).expect("config must parse");
         assert_eq!(
             config.orchestration.expect("orchestration table").workers["writer"]
+                .as_llm()
+                .unwrap()
                 .mcp_filter
                 .as_deref(),
             Some(["k8s_*".into()].as_slice())
@@ -593,7 +608,10 @@ preamble = "You write"
         assert!(updated.contains("mcp_filter = []"), "{updated}");
         let config = load_config_from_str(&updated).expect("config must parse");
         assert_eq!(
-            config.orchestration.expect("orchestration table").workers["writer"].mcp_filter,
+            config.orchestration.expect("orchestration table").workers["writer"]
+                .as_llm()
+                .unwrap()
+                .mcp_filter,
             Some(vec![])
         );
     }

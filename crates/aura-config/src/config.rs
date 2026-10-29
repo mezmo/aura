@@ -362,6 +362,19 @@ impl Config {
 
         if let Some(orch) = &self.orchestration {
             for (name, worker) in &orch.workers {
+                let worker = match worker {
+                    crate::orchestration::WorkerConfig::Llm(worker) => worker,
+                    crate::orchestration::WorkerConfig::Jev(jev) => {
+                        crate::orchestration::JevQuestion::validate_all(&jev.questions).map_err(
+                            |e| {
+                                crate::ConfigError::Validation(format!(
+                                    "orchestration.worker.{name}.questions: {e}"
+                                ))
+                            },
+                        )?;
+                        continue;
+                    }
+                };
                 if let Some(worker_llm) = &worker.llm {
                     validate_llm_api_key(worker_llm, &format!("orchestration.worker.{name}.llm"))?;
                 }
@@ -472,14 +485,19 @@ impl Config {
         let agent_sp_enabled = self.agent.scratchpad.as_ref().is_some_and(|sp| sp.enabled);
         let orch = self.orchestration.as_ref().filter(|o| o.enabled);
 
-        let worker_sp_enabled = |w: &crate::orchestration::WorkerConfig| {
+        let worker_sp_enabled = |w: &crate::orchestration::LlmWorkerConfig| {
             w.scratchpad
                 .as_ref()
                 .map(|sp| sp.enabled)
                 .unwrap_or(agent_sp_enabled)
         };
         let any_worker_enabled = orch
-            .map(|o| o.workers.values().any(worker_sp_enabled))
+            .map(|o| {
+                o.workers
+                    .values()
+                    .filter_map(crate::orchestration::WorkerConfig::as_llm)
+                    .any(worker_sp_enabled)
+            })
             .unwrap_or(false);
 
         if !agent_sp_enabled && !any_worker_enabled {
@@ -500,7 +518,9 @@ impl Config {
         }
         if let Some(o) = orch {
             for (name, worker) in &o.workers {
-                if worker_sp_enabled(worker) {
+                if let Some(worker) = worker.as_llm()
+                    && worker_sp_enabled(worker)
+                {
                     let effective_llm = worker.llm.as_ref().unwrap_or(&self.agent.llm);
                     if effective_llm.context_window().is_none() {
                         return Err(crate::ConfigError::Validation(format!(
