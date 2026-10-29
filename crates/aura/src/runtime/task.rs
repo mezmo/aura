@@ -123,6 +123,7 @@ fn fail_without_ending(session: &SessionRecord, record: &RunRecord) {
             facts.ended_at = Some(aura_events::Timestamp::now());
         }
     });
+    record.unbind_context();
 }
 
 /// When the run's timeout expires, and the timeout itself.
@@ -241,18 +242,33 @@ async fn execute(
         at: Instant::now() + after,
         after,
     });
+    // The run starts with the session's current attendance. Once the agent
+    // hands over its context, attaches and detaches keep it current (see
+    // `RunRecord::mirror`).
+    let attendance = session.lock().observers.attendance();
     let mut run = agent
         .stream(
             &prompt,
             history,
-            RunOptions::bounded(timeout).cancelled_by(&record.cancel),
+            RunOptions::bounded(timeout)
+                .cancelled_by(&record.cancel)
+                .attended(attendance),
             &record.id.to_string(),
         )
         .await;
     record.track_usage(run.usage().clone());
+    if let Some(context) = run.run_context() {
+        // Under the session lock, so no attach or detach lands between
+        // reading the attendance and binding the context.
+        let state = session.lock();
+        record.bind_context(Arc::clone(context), state.observers.attendance());
+    }
     let events = run.take_agent_events();
     let items = run.into_events();
 
+    // An observer attach or detach still being written goes on the stream
+    // first, so `Started` follows it.
+    session.observer_writes_done().await;
     let journal = &session.journal;
     let started = LifecycleEvent::Started {
         agent: agent_id,
@@ -656,6 +672,9 @@ async fn write_ending(
         LifecycleEvent::Parked { checkpoint, .. } => Some(checkpoint.clone()),
         _ => None,
     };
+    // An observer detach still being written goes on the stream first, so a
+    // claim that went while the run was live shows before the run's ending.
+    session.observer_writes_done().await;
     let stamped = session
         .journal
         .append(Some(record.id), SessionEventPayload::Lifecycle(terminal))
@@ -713,6 +732,7 @@ async fn release(
         state.retained += 1;
     }
     record.update(|current| *current = facts);
+    record.unbind_context();
 }
 
 fn failed(error: String, usage: TokenUsage) -> (LifecycleEvent, RunStatus) {
