@@ -119,9 +119,6 @@ struct UpstreamResult {
     result_artifact: Option<String>,
 }
 
-/// Most characters of state sent to Jev for one task.
-const JEV_MAX_STATE_CHARS: usize = 32_000;
-
 /// Result from `execute_task` including structured output from `submit_result`.
 struct TaskExecutionResult {
     result: String,
@@ -3185,6 +3182,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 self.jev_workers.clone(),
                 self.decision_requests.clone(),
                 Some(Arc::clone(&run)),
+                self.usage_state.clone(),
             ),
         };
 
@@ -4181,27 +4179,41 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
         }
 
-        // Share the budget evenly among the large parts, so no one result or
-        // artifact crowds out the rest.
-        let parts = (upstream.len() + artifacts.len()).max(1);
-        let fixed = task_description.len()
-            + input
-                .request
-                .as_ref()
-                .and_then(|r| r.state.as_ref())
-                .map_or(0, |state| state.to_string().len());
-        let per_part = JEV_MAX_STATE_CHARS.saturating_sub(fixed) / parts;
-        let cap = |text: &str| -> String {
-            let (kept, truncated) = safe_truncate(text, per_part);
-            if truncated {
-                format!("{kept}… [truncated]")
-            } else {
-                kept.to_string()
-            }
+        use crate::orchestration::jev::{
+            JEV_MAX_STAGED_STATE_CHARS, JEV_MAX_STATE_CHARS, JEV_MAX_TASK_CHARS,
+            JEV_MIN_PART_CHARS, truncate_marked,
         };
 
+        // The task description and the staged state are capped first, so
+        // together they take at most a few thousand characters and the
+        // dependency data always keeps most of the budget. A staged state
+        // over its cap — possible only from an inline request a create_plan
+        // step carried — is sent as cut text rather than JSON.
+        let task_text = truncate_marked(task_description, JEV_MAX_TASK_CHARS);
+        let staged = input
+            .request
+            .as_ref()
+            .and_then(|r| r.state.clone())
+            .map(|state| {
+                let text = state.to_string();
+                if text.len() > JEV_MAX_STAGED_STATE_CHARS {
+                    serde_json::Value::String(truncate_marked(&text, JEV_MAX_STAGED_STATE_CHARS))
+                } else {
+                    state
+                }
+            });
+        let staged_len = staged.as_ref().map_or(0, |s| s.to_string().len());
+
+        // The rest is shared evenly among the upstream results and attached
+        // artifacts, so no one of them crowds out the others, and each keeps
+        // at least JEV_MIN_PART_CHARS however many there are.
+        let parts = (upstream.len() + artifacts.len()).max(1);
+        let parts_budget = JEV_MAX_STATE_CHARS.saturating_sub(task_text.len() + staged_len);
+        let per_part = (parts_budget / parts).max(JEV_MIN_PART_CHARS);
+        let cap = |text: &str| truncate_marked(text, per_part);
+
         let mut state = serde_json::Map::new();
-        state.insert("task".into(), task_description.into());
+        state.insert("task".into(), task_text.into());
         if !upstream.is_empty() {
             state.insert(
                 "upstream".into(),
@@ -4217,8 +4229,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .collect(),
             );
         }
-        if let Some(extra) = input.request.as_ref().and_then(|r| r.state.clone()) {
-            state.insert("coordinator".into(), extra);
+        if let Some(staged) = staged {
+            state.insert("coordinator".into(), staged);
         }
         if !artifacts.is_empty() {
             state.insert(
@@ -4242,6 +4254,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .evaluate(serde_json::Value::Object(state), &questions, &cancel)
             .await
             .map_err(|e| format!("Jev worker '{}' failed on task {task_id}: {e}", jev.name))?;
+        self.usage_state
+            .accumulate_usage(answers.usage.input_tokens, answers.usage.output_tokens);
         tracing::info!(
             task_id,
             worker = %jev.name,
@@ -10437,6 +10451,113 @@ mod jev_worker_tests {
         assert_eq!(state["coordinator"]["customer_tier"], "enterprise");
     }
 
+    fn real_answer() -> serde_json::Value {
+        answers(json!({
+            "severity": severity_answer(),
+            "real": {"type": "noul", "noul": 0.9},
+        }))
+    }
+
+    fn task_with_request(description: &str, state: Option<serde_json::Value>) -> Task {
+        let mut task = Task::new(1, description, "r")
+            .with_worker("triage")
+            .with_dependencies([0]);
+        task.decision_request = Some(DecisionRequest {
+            name: "extra".to_string(),
+            worker: "triage".to_string(),
+            questions: vec![JevQuestion::Noul {
+                id: Some("real".to_string()),
+                instruction: "Real?".to_string(),
+                yes: None,
+                no: None,
+            }],
+            state,
+        });
+        task
+    }
+
+    fn completed_dependency(result: &str) -> Task {
+        let mut gather = Task::new(0, "Gather alert data", "r").with_worker("ops");
+        gather.complete(result);
+        gather
+    }
+
+    /// An oversized staged state cannot crowd the dependency data out: it is
+    /// cut to its own cap and the upstream result keeps its share.
+    #[tokio::test]
+    async fn oversized_staged_state_leaves_room_for_upstream_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::new([Ok(real_answer())]);
+        let orchestrator =
+            orchestrator(dir.path(), jev_orchestration(SEVERITY), fake.clone()).await;
+
+        let upstream = "u".repeat(20_000);
+        let mut plan = Plan::new("Triage");
+        plan.add_task(completed_dependency(&upstream));
+        plan.add_task(task_with_request(
+            "Score the alert",
+            Some(json!({"blob": "s".repeat(32_000)})),
+        ));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+        orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+
+        let sent: serde_json::Value = serde_json::from_str(&fake.requests()[0]).unwrap();
+        let state = &sent["state"]["state"];
+        let result = state["upstream"][0]["result"].as_str().unwrap();
+        assert!(
+            result.starts_with(&"u".repeat(crate::orchestration::jev::JEV_MIN_PART_CHARS)),
+            "upstream result was crowded out: {} chars",
+            result.len()
+        );
+        let staged = state["coordinator"].as_str().expect("cut to text");
+        assert!(
+            staged.ends_with("… [truncated]"),
+            "{}",
+            &staged[staged.len() - 20..]
+        );
+        assert!(staged.len() <= crate::orchestration::jev::JEV_MAX_STAGED_STATE_CHARS + 20);
+    }
+
+    #[tokio::test]
+    async fn long_task_description_is_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::new([Ok(real_answer())]);
+        let orchestrator =
+            orchestrator(dir.path(), jev_orchestration(SEVERITY), fake.clone()).await;
+
+        let mut plan = Plan::new("Triage");
+        plan.add_task(completed_dependency("disk at 97%"));
+        plan.add_task(task_with_request(&"d".repeat(10_000), None));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+        orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+
+        let sent: serde_json::Value = serde_json::from_str(&fake.requests()[0]).unwrap();
+        let task = sent["state"]["state"]["task"].as_str().unwrap();
+        assert!(task.ends_with("… [truncated]"));
+        assert!(task.len() <= crate::orchestration::jev::JEV_MAX_TASK_CHARS + 20);
+        assert_eq!(
+            sent["state"]["state"]["upstream"][0]["result"],
+            "disk at 97%"
+        );
+    }
+
+    /// A Jev task's tokens join the run's billed totals, which `aura.usage`
+    /// reports.
+    #[tokio::test]
+    async fn jev_task_tokens_count_toward_billed_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeTransport::new([Ok(real_answer())]);
+        let orchestrator = orchestrator(dir.path(), jev_orchestration(SEVERITY), fake).await;
+
+        let mut plan = Plan::new("Triage");
+        plan.add_task(completed_dependency("disk at 97%"));
+        plan.add_task(task_with_request("Score it", None));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+        orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+
+        assert_eq!(orchestrator.usage_state.get_final_usage(), (12, 2, 14));
+    }
+
     #[tokio::test]
     async fn jev_failure_fails_the_task() {
         let dir = tempfile::tempdir().unwrap();
@@ -10450,6 +10571,7 @@ mod jev_worker_tests {
             panic!("expected a failed task, got {:?}", plan.tasks[0].state);
         };
         assert!(error.contains("unauthorized"), "{error}");
+        assert_eq!(orchestrator.usage_state.get_final_usage(), (0, 0, 0));
     }
 
     #[tokio::test]
@@ -10495,6 +10617,7 @@ mod jev_worker_tests {
             orchestrator.jev_workers.clone(),
             orchestrator.decision_requests.clone(),
             None,
+            crate::UsageState::new(),
         )
         .expect("jev workers yield decision tools");
         let def = toolset.evaluate.definition(String::new()).await;
@@ -10507,7 +10630,8 @@ mod jev_worker_tests {
             crate::orchestration::tools::DecisionToolset::new(
                 plain.jev_workers.clone(),
                 plain.decision_requests.clone(),
-                None
+                None,
+                crate::UsageState::new()
             )
             .is_none()
         );

@@ -10,7 +10,6 @@ use crate::config::{LlmConfig, SkillsConfig};
 use crate::scratchpad::ScratchpadConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::num::NonZero;
 
 // ============================================================================
 // Tool Visibility Configuration
