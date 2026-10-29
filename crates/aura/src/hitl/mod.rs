@@ -45,6 +45,7 @@ pub use decision::{
     DecisionId, Timestamp,
 };
 pub(crate) use events::completed_cancelled_event;
+pub(crate) use gate::DENIAL_PREFIX;
 pub use gate::HitlApprovalWrapper;
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 pub use registry::{ParkedApproval, PendingApprovals, ResolveError};

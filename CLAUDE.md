@@ -179,6 +179,12 @@ export AWS_REGION="your-region"       # For Knowledge Base
 
 Confirmed sequential as of Rig 0.28: the streaming handler `.await`s each tool call inline. See `docs/rig-fork-changes.md`.
 
+### Critical Assumption: Rig Tool Result Encoding
+
+`provider_agent::read_tool_result` tells a tool's output from a call's error by how rig carries them. Rig JSON-encodes a tool's `Ok` output and passes an `Err` as its plain display text, which is never JSON.
+
+**If upgrading Rig**, verify that `ToolDyn::call` still JSON-encodes output and that the streaming loop still passes a tool error as its display text. `rig_carries_output_as_json_and_an_error_as_plain_text` (`provider_agent.rs`) runs real tools through rig's tool server to catch a change.
+
 ## CI/CD
 
 **Status**: Jenkins/Makefile complete, Helm charts and K8s manifests in `deployment/`

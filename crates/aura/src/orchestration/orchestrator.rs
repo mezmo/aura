@@ -339,28 +339,19 @@ fn tool_event_to_orchestrator_event(event: crate::tool_call_observer::ToolEvent)
             tool_initiator_id,
             result,
             duration_ms,
-        } => {
-            let success = result.is_success();
-            let result_str = match result {
-                crate::tool_call_observer::ToolOutcome::Success(content) => content,
-                crate::tool_call_observer::ToolOutcome::Error { message, .. } => message,
-            };
-            by_worker(
-                &tool_initiator_id,
-                AgentEventPayload::ToolComplete {
-                    task_id: extract_task_id(&tool_call_id),
-                    tool_call_id: tool_call_id.into(),
-                    tool_name: tool_name.into(),
-                    duration_ms,
-                    outcome: outcome_of(success, result_str),
-                },
-            )
-        }
+        } => by_worker(
+            &tool_initiator_id,
+            AgentEventPayload::ToolComplete {
+                task_id: extract_task_id(&tool_call_id),
+                tool_call_id: tool_call_id.into(),
+                tool_name: tool_name.into(),
+                duration_ms,
+                outcome: result,
+            },
+        ),
     }
 }
 
-/// The schema distinguishes success from failure by variant; the observer
-/// reports one string either way.
 fn outcome_of(success: bool, message: String) -> aura_events::agent::ToolOutcome {
     if success {
         aura_events::agent::ToolOutcome::Success { result: message }
@@ -442,27 +433,30 @@ fn redact_internal_tool_arguments(tool_name: &str, arguments: &mut serde_json::V
 async fn forward_internal_tool_completed(
     event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
     task_id: Option<usize>,
-    tool_call_id: &str,
-    result: &str,
+    result: &crate::provider_agent::ToolResult,
     starts: &mut std::collections::HashMap<String, InternalToolStart>,
 ) {
-    let Some(start) = starts.remove(tool_call_id) else {
+    let Some(start) = starts.remove(&result.id) else {
         return;
     };
     let Some(tx) = event_tx else { return };
-    let success = matches!(
-        crate::tool_error_detection::detect_tool_error(result),
-        crate::tool_error_detection::ToolResultStatus::Success
-    );
+    let outcome = match result.failure() {
+        Some(error) => aura_events::agent::ToolOutcome::Failure {
+            error: error.to_string(),
+        },
+        None => aura_events::agent::ToolOutcome::Success {
+            result: result.result.clone(),
+        },
+    };
     let _ = tx
         .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
             &start.worker_id,
             AgentEventPayload::ToolComplete {
                 task_id,
-                tool_call_id: tool_call_id.into(),
+                tool_call_id: result.id.clone().into(),
                 tool_name: start.tool_name.into(),
                 duration_ms: start.at.elapsed().as_millis() as u64,
-                outcome: outcome_of(success, result.to_string()),
+                outcome,
             },
         )))))
         .await;
@@ -1571,8 +1565,7 @@ impl Orchestrator {
                         forward_internal_tool_completed(
                             event_tx,
                             stream_context.as_ref().map(|w| w.task_id),
-                            &tr.id,
-                            &tr.result,
+                            tr,
                             &mut internal_tool_starts,
                         )
                         .await;
@@ -1829,8 +1822,7 @@ impl Orchestrator {
                             forward_internal_tool_completed(
                                 event_tx,
                                 None,
-                                &tr.id,
-                                &tr.result,
+                                tr,
                                 &mut internal_tool_starts,
                             )
                             .await;
@@ -6098,6 +6090,69 @@ fn context_overflow_suggestion(phase: &str) -> String {
 mod tests {
     use super::*;
 
+    mod internal_tool_completions {
+        use super::super::{InternalToolStart, forward_internal_tool_completed};
+        use crate::provider_agent::{StreamItem, ToolResult, ToolResultKind};
+        use aura_events::agent::{AgentEventPayload, ToolOutcome};
+
+        async fn outcome_of(result: &str, kind: ToolResultKind) -> ToolOutcome {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let mut starts = std::collections::HashMap::from([(
+                "call_1".to_string(),
+                InternalToolStart {
+                    at: std::time::Instant::now(),
+                    tool_name: "load_skill".into(),
+                    worker_id: "sre".into(),
+                },
+            )]);
+            let result = ToolResult {
+                id: "call_1".into(),
+                call_id: None,
+                result: result.into(),
+                kind,
+            };
+            forward_internal_tool_completed(Some(&tx), Some(0), &result, &mut starts).await;
+            match rx.recv().await {
+                Some(Ok(StreamItem::AgentEvent(event))) => match event.payload {
+                    AgentEventPayload::ToolComplete { outcome, .. } => outcome,
+                    other => panic!("expected a ToolComplete, got {other:?}"),
+                },
+                _ => panic!("expected an agent event"),
+            }
+        }
+
+        #[tokio::test]
+        async fn an_error_completes_as_a_failure_without_rigs_wrapping() {
+            let outcome = outcome_of(
+                "Toolset error: ToolCallError: JsonError: missing field `skill`",
+                ToolResultKind::Error,
+            )
+            .await;
+            assert!(
+                matches!(&outcome, ToolOutcome::Failure { error } if error == "JsonError: missing field `skill`"),
+                "{outcome:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn output_completes_as_a_success_with_its_text() {
+            let outcome = outcome_of("Step 1\nStep 2", ToolResultKind::Text).await;
+            assert!(
+                matches!(&outcome, ToolOutcome::Success { result } if result == "Step 1\nStep 2"),
+                "{outcome:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn output_that_reads_like_a_failure_completes_as_a_success() {
+            let outcome = outcome_of("Tool not found: kubectl in PATH", ToolResultKind::Text).await;
+            assert!(
+                matches!(outcome, ToolOutcome::Success { .. }),
+                "{outcome:?}"
+            );
+        }
+    }
+
     /// Set the context window on whichever provider `llm` is.
     pub(super) fn set_context_window(llm: &mut crate::config::LlmConfig, window: u64) {
         use crate::config::LlmConfig;
@@ -6377,6 +6432,7 @@ mod tests {
                     id: id.to_string(),
                     call_id: Some(id.to_string()),
                     result: "ok".to_string(),
+                    kind: crate::provider_agent::ToolResultKind::Text,
                 },
             ),
         ))
@@ -7675,6 +7731,7 @@ mod tests {
                 id: "t1".into(),
                 call_id: None,
                 result: String::new(),
+                kind: crate::provider_agent::ToolResultKind::Text,
             }),
         ));
         assert!(matches!(liveness_of(&tool_result), Liveness::ToolFinished));
@@ -9100,7 +9157,8 @@ mod tests {
     /// denial arm in `gate.rs` verbatim.
     fn denial_feedback_wire(reason: &str) -> String {
         serde_json::to_string(&format!(
-            "Tool call blocked by human approval denial: {reason}. Do not execute this action."
+            "{}{reason}. Do not execute this action.",
+            crate::hitl::DENIAL_PREFIX
         ))
         .expect("a plain string serializes")
     }
