@@ -426,7 +426,18 @@ impl CreatePlanTool {
                     };
                     let request = match decision_request.take() {
                         None => None,
-                        Some(DecisionRequestRef::Resolved(request)) => Some(request),
+                        Some(DecisionRequestRef::Resolved(request)) => {
+                            // An inline request skips prepare_decision, so its
+                            // state is checked here instead.
+                            if let Some(state) = &request.state {
+                                crate::orchestration::jev::check_state_size(
+                                    state,
+                                    crate::orchestration::jev::JEV_MAX_STAGED_STATE_CHARS,
+                                )
+                                .map_err(|e| format!("Decision request '{}': {e}", request.name))?;
+                            }
+                            Some(request)
+                        }
                         Some(DecisionRequestRef::Named(name)) => {
                             let (store, _) = self.decisions.as_ref().expect("workers imply store");
                             let stored = store
@@ -1195,6 +1206,32 @@ mod tests {
             assert!(result.status.contains(expected), "{}", result.status);
             assert!(toolset.decision.lock().await.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn inline_decision_request_with_oversized_state_is_rejected() {
+        let (toolset, _) = decision_toolset(1);
+        let result = toolset
+            .create_plan
+            .call(plan_args(serde_json::json!([{
+                "type": "task",
+                "worker": "triage",
+                "task": "Score it",
+                "decision_request": {
+                    "name": "inline",
+                    "worker": "triage",
+                    "state": {"blob": "x".repeat(crate::orchestration::jev::JEV_MAX_STAGED_STATE_CHARS)}
+                }
+            }])))
+            .await
+            .unwrap();
+        assert!(
+            result.status.contains("Decision request 'inline'"),
+            "{}",
+            result.status
+        );
+        assert!(result.status.contains("keep it under"), "{}", result.status);
+        assert!(toolset.decision.lock().await.is_none());
     }
 
     #[tokio::test]

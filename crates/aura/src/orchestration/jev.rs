@@ -282,6 +282,42 @@ impl Answers {
 }
 
 // ============================================================================
+// State limits
+// ============================================================================
+
+/// Most characters of state sent to Jev in one evaluation.
+pub(crate) const JEV_MAX_STATE_CHARS: usize = 32_000;
+/// Most characters of coordinator-staged state in one task's state.
+pub(crate) const JEV_MAX_STAGED_STATE_CHARS: usize = 8_000;
+/// Most characters of task description in one task's state.
+pub(crate) const JEV_MAX_TASK_CHARS: usize = 4_000;
+/// Fewest characters kept of each upstream result or attached artifact.
+pub(crate) const JEV_MIN_PART_CHARS: usize = 1_000;
+
+/// `text` cut to at most `max` bytes on a char boundary, marked when cut.
+pub(crate) fn truncate_marked(text: &str, max: usize) -> String {
+    let (kept, truncated) = crate::string_utils::safe_truncate(text, max);
+    if truncated {
+        format!("{kept}… [truncated]")
+    } else {
+        kept.to_string()
+    }
+}
+
+/// Reject a state whose serialized form is longer than `max` characters,
+/// with an error a model can act on.
+pub(crate) fn check_state_size(state: &Value, max: usize) -> Result<(), String> {
+    let len = state.to_string().len();
+    if len > max {
+        return Err(format!(
+            "`state` is {len} characters; keep it under {max}. Put bulk data in an \
+             artifact (write_artifact) and attach it to the task instead."
+        ));
+    }
+    Ok(())
+}
+
+// ============================================================================
 // Worker: a configured Jev worker and its client
 // ============================================================================
 

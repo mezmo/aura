@@ -17,7 +17,10 @@ use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::orchestration::jev::{Answers, Decision, JevWorker, JevWorkers};
+use crate::orchestration::jev::{
+    Answers, Decision, JEV_MAX_STAGED_STATE_CHARS, JEV_MAX_STATE_CHARS, JevWorker, JevWorkers,
+    check_state_size,
+};
 use crate::run_context::BoundRun;
 
 /// Questions and state the coordinator prepared for one planned Jev task.
@@ -65,11 +68,13 @@ pub struct DecisionToolset {
 impl DecisionToolset {
     /// The tool pair over `workers`, or `None` when there are no Jev workers
     /// to stand behind it. `run` is the coordinator's run slot, read at call
-    /// time for the cancellation token.
+    /// time for the cancellation token; `usage` is the run's billed-usage
+    /// totals, which every successful `evaluate_decision` adds its tokens to.
     pub fn new(
         workers: JevWorkers,
         store: DecisionRequestStore,
         run: Option<Arc<BoundRun>>,
+        usage: crate::UsageState,
     ) -> Option<Self> {
         if workers.is_empty() {
             return None;
@@ -78,6 +83,7 @@ impl DecisionToolset {
             evaluate: EvaluateDecisionTool {
                 workers: workers.clone(),
                 run,
+                usage,
             },
             prepare: PrepareDecisionTool { workers, store },
         })
@@ -236,6 +242,7 @@ fn worker_list(workers: &JevWorkers) -> String {
 pub struct EvaluateDecisionTool {
     workers: JevWorkers,
     run: Option<Arc<BoundRun>>,
+    usage: crate::UsageState,
 }
 
 #[derive(Debug, Deserialize)]
@@ -338,6 +345,9 @@ impl Tool for EvaluateDecisionTool {
                 "`state` is required: the data the questions are about",
             ));
         };
+        if let Err(e) = check_state_size(&state, JEV_MAX_STATE_CHARS) {
+            return Ok(EvaluateDecisionOutput::error(e));
+        }
         let cancel = self
             .run
             .as_ref()
@@ -345,11 +355,15 @@ impl Tool for EvaluateDecisionTool {
             .map(|run| run.cancel_token().clone())
             .unwrap_or_default();
         match worker.evaluate(state, &questions, &cancel).await {
-            Ok(answers) => Ok(EvaluateDecisionOutput {
-                summary: Some(answers.summary()),
-                answers: Some(answers),
-                error: None,
-            }),
+            Ok(answers) => {
+                self.usage
+                    .accumulate_usage(answers.usage.input_tokens, answers.usage.output_tokens);
+                Ok(EvaluateDecisionOutput {
+                    summary: Some(answers.summary()),
+                    answers: Some(answers),
+                    error: None,
+                })
+            }
             Err(e) => Ok(EvaluateDecisionOutput::error(e.to_string())),
         }
     }
@@ -456,6 +470,12 @@ impl Tool for PrepareDecisionTool {
             Ok(questions) => questions,
             Err(e) => return Ok(PrepareDecisionOutput::error(e)),
         };
+        let state = parse_state(args.state);
+        if let Some(state) = &state
+            && let Err(e) = check_state_size(state, JEV_MAX_STAGED_STATE_CHARS)
+        {
+            return Ok(PrepareDecisionOutput::error(e));
+        }
         // Build the decision the task will send, so a bad or clashing
         // question is reported now rather than when the task runs.
         let decision = match Decision::new(Value::Null, &worker.questions_with(&questions)) {
@@ -473,7 +493,7 @@ impl Tool for PrepareDecisionTool {
             name: name.clone(),
             worker: worker.name.clone(),
             questions,
-            state: parse_state(args.state),
+            state,
         };
         let replaced = self
             .store
@@ -532,17 +552,29 @@ mod tests {
     }
 
     fn toolset(workers: JevWorkers) -> (DecisionToolset, DecisionRequestStore) {
+        let (tools, store, _) = toolset_with_usage(workers);
+        (tools, store)
+    }
+
+    fn toolset_with_usage(
+        workers: JevWorkers,
+    ) -> (DecisionToolset, DecisionRequestStore, crate::UsageState) {
         let store = DecisionRequestStore::default();
-        (
-            DecisionToolset::new(workers, store.clone(), None).unwrap(),
-            store,
-        )
+        let usage = crate::UsageState::new();
+        let tools = DecisionToolset::new(workers, store.clone(), None, usage.clone()).unwrap();
+        (tools, store, usage)
     }
 
     #[test]
     fn no_workers_means_no_tools() {
         assert!(
-            DecisionToolset::new(Arc::new(BTreeMap::new()), Default::default(), None).is_none()
+            DecisionToolset::new(
+                Arc::new(BTreeMap::new()),
+                Default::default(),
+                None,
+                crate::UsageState::new()
+            )
+            .is_none()
         );
     }
 
@@ -729,5 +761,68 @@ mod tests {
             .await
             .unwrap();
         assert!(out.status.contains("no questions to ask"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn evaluate_adds_its_tokens_to_the_run_usage() {
+        let fake = FakeTransport::new([
+            Ok(json!({
+                "model": "jev-test",
+                "answers": {"real": {"type": "noul", "noul": 0.8}},
+                "usage": {"input_tokens": 40, "output_tokens": 3}
+            })),
+            Err(401),
+        ]);
+        let (tools, _, usage) = toolset_with_usage(with_fake(&workers(&["triage"], 0), fake));
+        let args = || EvaluateDecisionArgs {
+            worker: None,
+            questions: Some(json!([{"id": "real", "instruction": "Is it real?"}])),
+            state: Some(json!("disk full")),
+        };
+        let ok = tools.evaluate.call(args()).await.unwrap();
+        assert!(ok.error.is_none(), "{ok}");
+        let failed = tools.evaluate.call(args()).await.unwrap();
+        assert!(failed.error.is_some(), "{failed}");
+        assert_eq!(usage.get_final_usage(), (40, 3, 43));
+    }
+
+    #[tokio::test]
+    async fn evaluate_rejects_state_over_the_budget_without_calling_jev() {
+        let fake = FakeTransport::new([]);
+        let (tools, _, usage) =
+            toolset_with_usage(with_fake(&workers(&["triage"], 0), fake.clone()));
+        let out = tools
+            .evaluate
+            .call(EvaluateDecisionArgs {
+                worker: None,
+                questions: Some(json!([{"instruction": "Real?"}])),
+                state: Some(
+                    json!({"blob": "x".repeat(crate::orchestration::jev::JEV_MAX_STATE_CHARS)}),
+                ),
+            })
+            .await
+            .unwrap();
+        assert!(out.to_string().contains("keep it under"), "{out}");
+        assert!(fake.requests().is_empty());
+        assert_eq!(usage.get_final_usage(), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn prepare_rejects_oversized_state_without_storing_it() {
+        let (tools, store) = toolset(workers(&["triage"], 1));
+        let out = tools
+            .prepare
+            .call(PrepareDecisionArgs {
+                name: "big".to_string(),
+                worker: None,
+                questions: None,
+                state: Some(json!({
+                    "blob": "x".repeat(crate::orchestration::jev::JEV_MAX_STAGED_STATE_CHARS)
+                })),
+            })
+            .await
+            .unwrap();
+        assert!(out.status.contains("keep it under"), "{out}");
+        assert!(store.lock().unwrap().is_empty());
     }
 }
