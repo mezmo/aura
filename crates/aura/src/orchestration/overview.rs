@@ -216,15 +216,23 @@ pub fn worker_overview(config: &Config) -> Vec<WorkerOverview> {
         .workers
         .iter()
         .map(|(name, worker)| {
-            let worker_model = worker
-                .llm
-                .as_ref()
-                .unwrap_or(&config.agent.llm)
-                .model_info()
-                .1;
+            let worker_model = match worker {
+                aura_config::WorkerConfig::Llm(worker) => {
+                    worker
+                        .llm
+                        .as_ref()
+                        .unwrap_or(&config.agent.llm)
+                        .model_info()
+                        .1
+                }
+                aura_config::WorkerConfig::Jev(jev) => jev
+                    .model
+                    .as_deref()
+                    .unwrap_or(crate::models::jev::DEFAULT_MODEL),
+            };
             WorkerOverview {
                 name: name.clone(),
-                description: worker.description.clone(),
+                description: worker.description().to_string(),
                 model: (worker_model != coordinator_model).then(|| worker_model.to_owned()),
             }
         })
