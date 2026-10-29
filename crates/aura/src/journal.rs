@@ -126,6 +126,12 @@ impl SessionJournal {
         SequenceNumber::try_from(self.latest.load(Ordering::Acquire)).ok()
     }
 
+    /// Whether a conflicting append has fenced the journal. A fenced journal
+    /// refuses every append.
+    pub fn is_fenced(&self) -> bool {
+        self.fenced.get().is_some()
+    }
+
     /// The one append path for the session's events, whose numbers the store
     /// mints. `run_id` is the run the event belongs to, or `None` for an event
     /// of the session itself.

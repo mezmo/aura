@@ -1,7 +1,7 @@
 //! The session-store factory: one backend handing out the capability handles
 //! for cross-instance session state ([`ApprovalStore`], [`SkillInvocationStore`],
-//! [`JournalStore`] and [`EventBus`] from `aura::session_store`, plus the
-//! upstream `a2a_server::TaskStore`).
+//! [`JournalStore`], [`RunStore`] and [`EventBus`] from `aura::session_store`,
+//! plus the upstream `a2a_server::TaskStore`).
 //!
 //! See `docs/design/session-storage.md` and
 //! `docs/adr/2026-07-08-session-storage.md`.
@@ -15,8 +15,8 @@ use a2a_server::{InMemoryTaskStore, TaskStore};
 use async_trait::async_trait;
 use aura::session_store::{
     ApprovalStore, EventBus, FileApprovalStore, FileSkillInvocationStore, InMemoryApprovalStore,
-    InMemoryEventBus, InMemoryJournalStore, InMemorySkillInvocationStore, JournalStore,
-    SessionStoreError, SkillInvocationStore,
+    InMemoryEventBus, InMemoryJournalStore, InMemoryRunStore, InMemorySkillInvocationStore,
+    JournalStore, RunStore, SessionStoreError, SkillInvocationStore,
 };
 use aura_config::{FileSessionStoreConfig, SessionStoreBackend, SessionStoreConfig};
 
@@ -42,6 +42,9 @@ pub trait SessionStore: Send + Sync {
     /// Per-session event journals.
     fn journals(&self) -> Arc<dyn JournalStore>;
 
+    /// Each run's facts.
+    fn runs(&self) -> Arc<dyn RunStore>;
+
     /// Cross-instance pub/sub.
     fn bus(&self) -> Arc<dyn EventBus>;
 
@@ -58,7 +61,8 @@ pub async fn build_session_store(
     match config {
         SessionStoreConfig::Memory => Ok(Arc::new(InMemorySessionStore::new())),
         SessionStoreConfig::File(file_config) => {
-            // File-backed approvals and skill logs; tasks and bus stay in memory.
+            // File-backed approvals and skill logs; tasks, journals, runs and
+            // the bus stay in memory.
             Ok(Arc::new(FileSessionStore::new(file_config)?))
         }
         #[cfg(feature = "session-store-redis")]
@@ -79,6 +83,7 @@ pub struct InMemorySessionStore {
     tasks: Arc<InMemoryTaskStore>,
     skills: Arc<InMemorySkillInvocationStore>,
     journals: Arc<InMemoryJournalStore>,
+    runs: Arc<InMemoryRunStore>,
     bus: Arc<InMemoryEventBus>,
 }
 
@@ -90,6 +95,7 @@ impl InMemorySessionStore {
             tasks: Arc::new(InMemoryTaskStore::new()),
             skills: Arc::new(InMemorySkillInvocationStore::new()),
             journals: Arc::new(InMemoryJournalStore::new()),
+            runs: Arc::new(InMemoryRunStore::new()),
             bus: Arc::new(InMemoryEventBus::new()),
         }
     }
@@ -123,6 +129,10 @@ impl SessionStore for InMemorySessionStore {
         self.journals.clone()
     }
 
+    fn runs(&self) -> Arc<dyn RunStore> {
+        self.runs.clone()
+    }
+
     fn bus(&self) -> Arc<dyn EventBus> {
         self.bus.clone()
     }
@@ -138,12 +148,14 @@ pub struct FileSessionStore {
     tasks: Arc<InMemoryTaskStore>,
     skills: Arc<FileSkillInvocationStore>,
     journals: Arc<InMemoryJournalStore>,
+    runs: Arc<InMemoryRunStore>,
     bus: Arc<InMemoryEventBus>,
 }
 
 impl FileSessionStore {
     /// Open the approval and skill stores under the configured path, failing
-    /// fast when either cannot. Tasks, journals and the bus stay in memory.
+    /// fast when either cannot. Tasks, journals, runs and the bus stay in
+    /// memory.
     pub fn new(config: &FileSessionStoreConfig) -> Result<Self, SessionStoreError> {
         Ok(Self {
             approvals: Arc::new(FileApprovalStore::open(&config.path)?),
@@ -153,6 +165,7 @@ impl FileSessionStore {
                 config.skills_ttl_secs,
             )?),
             journals: Arc::new(InMemoryJournalStore::new()),
+            runs: Arc::new(InMemoryRunStore::new()),
             bus: Arc::new(InMemoryEventBus::new()),
         })
     }
@@ -177,6 +190,10 @@ impl SessionStore for FileSessionStore {
 
     fn journals(&self) -> Arc<dyn JournalStore> {
         self.journals.clone()
+    }
+
+    fn runs(&self) -> Arc<dyn RunStore> {
+        self.runs.clone()
     }
 
     fn bus(&self) -> Arc<dyn EventBus> {

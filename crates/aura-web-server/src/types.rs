@@ -281,9 +281,8 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub user: Option<String>,
 
-    /// Client-side tool definitions. Per-agent opt-in via
-    /// `[agent].enable_client_tools` and `[orchestration.worker.<name>].enable_client_tools`
-    /// in TOML; tools are filtered with the matching `client_tool_filter`.
+    /// The client-side tool definitions the client offers.
+    /// `PreparedAgent::prepare` decides which of them the agent gets.
     #[serde(default)]
     pub tools: Option<Vec<ClientToolDefinition>>,
 }
