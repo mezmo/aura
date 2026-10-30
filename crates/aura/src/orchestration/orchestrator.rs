@@ -109,6 +109,11 @@ struct TaskExecutionResult {
 #[allow(clippy::large_enum_variant)]
 enum TaskOutcome {
     Completed(TaskExecutionResult),
+    /// A timeout cut the worker before it called `submit_result`.
+    TimedOut {
+        /// The timeout reason and the worker's partial output.
+        message: String,
+    },
     /// The worker parked gated calls and its snapshot was captured.
     Blocked {
         pending: Vec<PendingCall>,
@@ -647,6 +652,115 @@ struct ForwardedRun {
     /// Provider-reported usage of the loop's last turn — context-window
     /// occupancy, as opposed to `response.usage`'s loop total.
     last_turn: rig::completion::Usage,
+}
+
+/// How one agent loop's stream ended.
+enum ForwardOutcome {
+    Finished(ForwardedRun),
+    TimedOut {
+        reason: String,
+        /// Text and tool results streamed before the cut.
+        partial: String,
+        /// Provider-reported usage of the last turn before the cut.
+        last_turn: Option<rig::completion::Usage>,
+    },
+}
+
+/// The per-call budget of one agent loop: its end and its length.
+#[derive(Clone, Copy)]
+struct CallDeadline {
+    at: tokio::time::Instant,
+    secs: u64,
+}
+
+impl CallDeadline {
+    /// `None` when `secs` is 0, which disables the budget.
+    fn after(secs: u64) -> Option<Self> {
+        (secs > 0).then(|| Self {
+            at: tokio::time::Instant::now() + Duration::from_secs(secs),
+            secs,
+        })
+    }
+
+    fn reason(&self, phase: &str) -> String {
+        tracing::warn!(
+            "{phase} timed out after {}s (per_call_timeout_secs={})",
+            self.secs,
+            self.secs
+        );
+        format!("{phase} timed out after {}s", self.secs)
+    }
+}
+
+/// Resolves with `deadline` once it passes; pending forever without one.
+async fn call_expired(deadline: Option<CallDeadline>) -> CallDeadline {
+    match deadline {
+        Some(d) => {
+            tokio::time::sleep_until(d.at).await;
+            d
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Tool call names and results one agent loop has streamed.
+struct PartialOutput {
+    tool_names: std::collections::HashMap<String, String>,
+    tool_results: Vec<String>,
+    result_cap: usize,
+}
+
+impl PartialOutput {
+    fn new(result_cap: usize) -> Self {
+        Self {
+            tool_names: std::collections::HashMap::new(),
+            tool_results: Vec::new(),
+            result_cap,
+        }
+    }
+
+    /// Note a call's name, or keep a result as `name: result`, cut to
+    /// `result_cap` bytes so a large result does not crowd out the rest.
+    fn observe(&mut self, item: &Result<StreamItem, StreamError>) {
+        use crate::provider_agent::{StreamedAssistantContent, StreamedUserContent};
+        match item {
+            Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(tc))) => {
+                self.tool_names.insert(tc.id.clone(), tc.name.clone());
+            }
+            Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(tr))) => {
+                let name = self.tool_names.get(&tr.id).map_or("tool", String::as_str);
+                let (result, cut) = safe_truncate(&tr.result, self.result_cap);
+                let suffix = if cut { " [truncated]" } else { "" };
+                self.tool_results.push(format!("{name}: {result}{suffix}"));
+            }
+            _ => {}
+        }
+    }
+
+    /// The streamed `text` and kept tool results; empty when there are none.
+    fn render(&self, text: &str) -> String {
+        let mut out = text.trim().to_string();
+        if !self.tool_results.is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str("Tool results so far:");
+            for r in &self.tool_results {
+                out.push_str("\n- ");
+                out.push_str(r);
+            }
+        }
+        out
+    }
+}
+
+/// The failure text of a timed-out worker: the reason, then any partial output.
+fn timed_out_message(reason: &str, partial: &str) -> String {
+    if partial.is_empty() {
+        format!("{reason} before any output")
+    } else {
+        format!("{reason} before calling submit_result. Partial output so far:\n{partial}")
+    }
 }
 
 const EMPTY_WORKER_RESULT: &str = "The worker produced no output and did not call submit_result.";
@@ -1410,6 +1524,10 @@ impl Orchestrator {
     /// Split from [`Self::stream_and_forward`] so tests can drive the arms with
     /// a scripted stream; every exit path here must record turns through
     /// [`TurnTally::record`].
+    ///
+    /// The inactivity window and `call_deadline` both cut the loop the same
+    /// way: [`ForwardOutcome::TimedOut`] with the text and tool results
+    /// streamed so far, each result cut to `tool_result_cap` bytes.
     #[allow(clippy::too_many_arguments)]
     async fn drive_forward_loop(
         mut stream: std::pin::Pin<
@@ -1417,12 +1535,14 @@ impl Orchestrator {
         >,
         usage_state: &crate::UsageState,
         inactivity_secs: u64,
+        call_deadline: Option<CallDeadline>,
+        tool_result_cap: usize,
         scratchpad_budget: Option<&scratchpad::ContextBudget>,
         phase: &str,
         event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
         stream_context: Option<StreamContext<'_>>,
         decision_ready: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
-    ) -> Result<ForwardedRun, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<ForwardOutcome, Box<dyn std::error::Error + Send + Sync>> {
         use crate::provider_agent::{
             CompletionResponse, StreamedAssistantContent, StreamedUserContent,
         };
@@ -1442,6 +1562,7 @@ impl Orchestrator {
         // only IDs we started get completed, so MCP tools (covered by
         // ObserverWrapper) are never double-emitted.
         let mut internal_tool_starts: HashMap<String, InternalToolStart> = HashMap::new();
+        let mut partial = PartialOutput::new(tool_result_cap);
 
         // Two guarded phases per iteration, so the body (its sends and the
         // decision-ready branch's inner `next()`) runs under the deadline
@@ -1455,17 +1576,17 @@ impl Orchestrator {
         let mut deadline = crate::inactivity::InactivityDeadline::new_disarmed(
             Duration::from_secs(inactivity_secs),
         );
-        loop {
+        let cut = loop {
             let item = tokio::select! {
                 biased;
-                _ = deadline.expired() => {
-                    return Err(deadline.stall_error(phase));
-                }
+                _ = deadline.expired() => break Some(deadline.stall_error(phase).to_string()),
+                d = call_expired(call_deadline) => break Some(d.reason(phase)),
                 item = stream.next() => item,
             };
             let Some(item) = item else {
-                break;
+                break None;
             };
+            partial.observe(&item);
             let liveness = liveness_of(&item);
             match liveness {
                 // `touch` is ignored while suspended, so a finished tool
@@ -1598,26 +1719,32 @@ impl Orchestrator {
             };
             let step = tokio::select! {
                 biased;
-                _ = deadline.expired() => {
-                    return Err(deadline.stall_error(phase));
-                }
+                _ = deadline.expired() => break Some(deadline.stall_error(phase).to_string()),
+                d = call_expired(call_deadline) => break Some(d.reason(phase)),
                 step = body => step?,
             };
             if matches!(step, LoopStep::End) {
-                break;
+                break None;
             }
             if matches!(liveness, Liveness::ToolStarted) {
                 deadline.suspend();
             }
-        }
+        };
 
-        Ok(ForwardedRun {
+        if let Some(reason) = cut {
+            return Ok(ForwardOutcome::TimedOut {
+                reason,
+                partial: partial.render(&content),
+                last_turn: tally.first.map(|_| tally.last),
+            });
+        }
+        Ok(ForwardOutcome::Finished(ForwardedRun {
             response: CompletionResponse {
                 content,
                 usage: final_total.unwrap_or(tally.total),
             },
             last_turn: tally.last,
-        })
+        }))
     }
 
     /// Stream a full ReAct chat, forwarding reasoning events and collecting the final response.
@@ -1629,11 +1756,12 @@ impl Orchestrator {
     /// - Uses `agent.stream_chat()` which respects the agent's configured `max_depth`
     /// - Forwards `ReasoningDelta`/`Reasoning` items through `event_tx`
     /// - No early-exit — runs the complete ReAct loop
-    /// - Timeout wrapping via `per_call_timeout_secs`
+    /// - `per_call_timeout_secs` bounds the stream open and the loop, one
+    ///   instant for both; a cut loop returns [`ForwardOutcome::TimedOut`]
     ///
     /// `park_key` routes a park-mode worker through the hook-carrying stream
     /// so the park-aware hook runs; the hook's own deadline is disabled because
-    /// the per-call wrap below is the single wall-clock authority.
+    /// the per-call deadline here is the single wall-clock authority.
     async fn stream_and_forward(
         &self,
         agent: &Agent,
@@ -1641,7 +1769,7 @@ impl Orchestrator {
         stream_context: Option<StreamContext<'_>>,
         decision_ready: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
         park_key: Option<&str>,
-    ) -> Result<ForwardedRun, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<ForwardOutcome, Box<dyn std::error::Error + Send + Sync>> {
         let StreamCallParams {
             prompt,
             history,
@@ -1649,9 +1777,9 @@ impl Orchestrator {
             event_tx,
             ..
         } = params;
-        let timeout_secs = self.config.per_call_timeout_secs();
-        let stream_future = async {
-            let stream = match park_key {
+        let call_deadline = CallDeadline::after(self.config.per_call_timeout_secs());
+        let open = async {
+            match park_key {
                 Some(key) => agent
                     .stream_chat_with_timeout(
                         prompt,
@@ -1662,40 +1790,34 @@ impl Orchestrator {
                     .await
                     .into_events(),
                 None => agent.stream_chat(prompt, history).await,
-            };
-            Self::drive_forward_loop(
-                stream,
-                &self.usage_state,
-                self.config.stream_inactivity_timeout_secs(),
-                agent.scratchpad_budget(),
-                phase,
-                event_tx,
-                stream_context,
-                decision_ready,
-            )
-            .await
-        };
-
-        if timeout_secs == 0 {
-            stream_future.await
-        } else {
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), stream_future).await {
-                Ok(result) => result,
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        "{} timed out after {}s (per_call_timeout_secs={})",
-                        phase,
-                        timeout_secs,
-                        timeout_secs,
-                    );
-                    Err(format!(
-                        "{} timed out after {}s — the LLM provider did not respond in time",
-                        phase, timeout_secs
-                    )
-                    .into())
-                }
             }
-        }
+        };
+        let stream = match call_deadline {
+            Some(d) => match tokio::time::timeout_at(d.at, open).await {
+                Ok(stream) => stream,
+                Err(_elapsed) => {
+                    return Ok(ForwardOutcome::TimedOut {
+                        reason: d.reason(phase),
+                        partial: String::new(),
+                        last_turn: None,
+                    });
+                }
+            },
+            None => open.await,
+        };
+        Self::drive_forward_loop(
+            stream,
+            &self.usage_state,
+            self.config.stream_inactivity_timeout_secs(),
+            call_deadline,
+            self.config.result_summary_length(),
+            agent.scratchpad_budget(),
+            phase,
+            event_tx,
+            stream_context,
+            decision_ready,
+        )
+        .await
     }
 
     /// Stream a coordinator call with early exit and optional reasoning forwarding.
@@ -3810,6 +3932,28 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             );
                         }
                     }
+                    // The partial output goes through the artifact flow
+                    // like a result, but the task fails as a timeout.
+                    Ok(TaskOutcome::TimedOut { message }) => {
+                        let final_result = self
+                            .maybe_create_artifact(task_id, worker_name.as_deref(), message)
+                            .await;
+                        if let Some(t) = plan.get_task_mut(task_id) {
+                            t.fail(final_result.clone(), FailureCategory::AgentTimeout);
+                        }
+                        let _ = event_tx
+                            .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                                &worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
+                                AgentEventPayload::TaskCompleted {
+                                    task_id,
+                                    duration_ms,
+                                    orchestrator_id: self.orchestrator_id.clone(),
+                                    outcome: outcome_of(false, final_result),
+                                },
+                            )))))
+                            .await;
+                        tracing::warn!("Task {} timed out after {}ms", task_id, duration_ms);
+                    }
                     Ok(TaskOutcome::Blocked {
                         pending,
                         attempt,
@@ -4210,7 +4354,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             .await;
                         let underlying = match stream_result.as_ref() {
                             Err(e) => format!(" Underlying error: {e}"),
-                            Ok(_) => String::new(),
+                            Ok(ForwardOutcome::TimedOut { reason, .. }) => {
+                                format!(" Underlying error: {reason}")
+                            }
+                            Ok(ForwardOutcome::Finished(_)) => String::new(),
                         };
                         stream_result = Err(format!(
                             "Worker stream ended before the parked approval snapshot \
@@ -4235,24 +4382,53 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
 
             // Emit this agent's context-window occupancy from its final
-            // response turn — provider-reported, no local tokenizer.
-            if let (Ok(run), Some(tx)) = (&stream_result, event_tx) {
+            // response turn — provider-reported, no local tokenizer. A
+            // timed-out run reports its last turn before the cut, if any.
+            let last_turn = match &stream_result {
+                Ok(ForwardOutcome::Finished(run)) => Some(run.last_turn),
+                Ok(ForwardOutcome::TimedOut { last_turn, .. }) => *last_turn,
+                Err(_) => None,
+            };
+            if let (Some(last_turn), Some(tx)) = (last_turn, event_tx) {
                 let agent_id = worker_name
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| self.orchestrator_id.clone());
                 let _ = tx
                     .send(Ok(StreamItem::ContextUsage {
                         agent_id,
-                        context_tokens: run.last_turn.input_tokens,
-                        response_tokens: run.last_turn.output_tokens,
+                        context_tokens: last_turn.input_tokens,
+                        response_tokens: last_turn.output_tokens,
                         context_window: worker.context_window,
                     }))
                     .await;
             }
 
+            let submitted = submit_result_decision.lock().await.is_some();
             // Detect context overflow and other errors — don't retry hard errors
             let result = match stream_result {
-                Ok(r) => Ok(r.response.content),
+                Ok(ForwardOutcome::Finished(r)) => Ok(r.response.content),
+                // A timeout after submit_result does not undo the result.
+                Ok(ForwardOutcome::TimedOut { .. }) if submitted => Ok(String::new()),
+                // A timeout is not retried: the task fails with what the
+                // worker streamed before the cut.
+                Ok(ForwardOutcome::TimedOut {
+                    reason, partial, ..
+                }) => {
+                    let message = timed_out_message(&reason, &partial);
+                    let duration_ms = start_time.elapsed().as_millis() as u64;
+                    let error: StreamError = message.clone().into();
+                    self.persist_worker_execution(
+                        task_id,
+                        task_description,
+                        attempt,
+                        duration_ms,
+                        Err(error.as_ref()),
+                        None,
+                        &prompt,
+                    )
+                    .await;
+                    return Ok(TaskOutcome::TimedOut { message });
+                }
                 Err(e) if is_context_overflow_error(e.as_ref()) => {
                     let suggestion = context_overflow_suggestion("worker");
                     Err(format!(
@@ -4477,6 +4653,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
             stream,
             &self.usage_state,
             self.config.stream_inactivity_timeout_secs(),
+            None,
+            self.config.result_summary_length(),
             worker.scratchpad_budget(),
             "Worker resume",
             event_tx,
@@ -4511,7 +4689,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .await;
                 let underlying = match stream_result.as_ref() {
                     Err(e) => format!(" Underlying error: {e}"),
-                    Ok(_) => String::new(),
+                    Ok(ForwardOutcome::TimedOut { reason, .. }) => {
+                        format!(" Underlying error: {reason}")
+                    }
+                    Ok(ForwardOutcome::Finished(_)) => String::new(),
                 };
                 return Err(format!(
                     "Worker resume stream ended before the parked approval snapshot \
@@ -4524,13 +4705,24 @@ Assign tasks to the worker whose tools best match the required operations."#,
             CellOutcome::Normal => {}
         }
 
+        let structured = submit_result_decision.lock().await.take();
         let raw_response = match stream_result {
-            Ok(run) => run.response.content,
+            Ok(ForwardOutcome::Finished(run)) => run.response.content,
+            // A timeout after submit_result does not undo the result.
+            Ok(ForwardOutcome::TimedOut { .. }) if structured.is_some() => String::new(),
+            // Like an error, a timeout returns before the consumed
+            // decisions leave the store.
+            Ok(ForwardOutcome::TimedOut {
+                reason, partial, ..
+            }) => {
+                return Ok(TaskOutcome::TimedOut {
+                    message: timed_out_message(&reason, &partial),
+                });
+            }
             Err(e) => {
                 return Err(format!("Worker resume failed for task {task_id}: {e}").into());
             }
         };
-        let structured = submit_result_decision.lock().await.take();
         let (result, structured_output) = match structured {
             Some(output) => (
                 output.result,
@@ -6397,10 +6589,12 @@ mod tests {
         usage_state: &crate::UsageState,
         decision_ready: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
     ) -> ForwardedRun {
-        Orchestrator::drive_forward_loop(
+        let outcome = Orchestrator::drive_forward_loop(
             scripted(items),
             usage_state,
             0,
+            None,
+            2000,
             None,
             "test",
             None,
@@ -6408,7 +6602,120 @@ mod tests {
             decision_ready,
         )
         .await
-        .expect("scripted stream should drive to completion")
+        .expect("scripted stream should drive to completion");
+        let ForwardOutcome::Finished(run) = outcome else {
+            panic!("a loop with no deadline cannot time out");
+        };
+        run
+    }
+
+    fn text_item(text: &str) -> Result<StreamItem, StreamError> {
+        Ok(StreamItem::StreamAssistantItem(
+            crate::provider_agent::StreamedAssistantContent::Text(text.into()),
+        ))
+    }
+
+    fn tool_call(id: &str, name: &str) -> Result<StreamItem, StreamError> {
+        Ok(StreamItem::StreamAssistantItem(
+            crate::provider_agent::StreamedAssistantContent::ToolCall(
+                crate::provider_agent::ToolCall {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    arguments: "{}".to_string(),
+                },
+            ),
+        ))
+    }
+
+    /// Drive `items`, then a stream that never ends, until a deadline cuts it.
+    async fn drive_until_cut(
+        items: Vec<Result<StreamItem, StreamError>>,
+        inactivity_secs: u64,
+        call_deadline: Option<CallDeadline>,
+    ) -> (String, String, Option<rig::completion::Usage>) {
+        use futures::StreamExt;
+        let usage_state = crate::UsageState::new();
+        let stream = scripted(items).chain(futures::stream::pending());
+        let outcome = Orchestrator::drive_forward_loop(
+            Box::pin(stream),
+            &usage_state,
+            inactivity_secs,
+            call_deadline,
+            2000,
+            None,
+            "Worker task",
+            None,
+            None,
+            never_ready(),
+        )
+        .await
+        .expect("a cut loop is not an error");
+        match outcome {
+            ForwardOutcome::TimedOut {
+                reason,
+                partial,
+                last_turn,
+            } => (reason, partial, last_turn),
+            ForwardOutcome::Finished(_) => panic!("the pending stream must be cut"),
+        }
+    }
+
+    /// The per-call deadline cuts the loop and hands back the text, each
+    /// tool result under its call's name, and the last turn's usage.
+    #[tokio::test(start_paused = true)]
+    async fn test_call_deadline_returns_the_partial_output() {
+        let (reason, partial, last_turn) = drive_until_cut(
+            vec![
+                text_item("checked the pool"),
+                turn(100, 20),
+                tool_call("t1", "lookup"),
+                tool_result("t1"),
+            ],
+            0,
+            CallDeadline::after(7),
+        )
+        .await;
+        assert_eq!(reason, "Worker task timed out after 7s");
+        assert_eq!(last_turn.map(|u| u.input_tokens), Some(100));
+        let text = timed_out_message(&reason, &partial);
+        assert!(
+            text.starts_with("Worker task timed out after 7s before calling submit_result"),
+            "{text}"
+        );
+        assert!(text.contains("checked the pool"), "{text}");
+        assert!(
+            text.ends_with("Tool results so far:\n- lookup: ok"),
+            "{text}"
+        );
+    }
+
+    /// The inactivity window cuts the loop the same way, keeping what
+    /// streamed before the silence.
+    #[tokio::test(start_paused = true)]
+    async fn test_inactivity_stall_returns_the_partial_output() {
+        let (reason, partial, last_turn) = drive_until_cut(
+            vec![text_item("checked the pool")],
+            5,
+            CallDeadline::after(60),
+        )
+        .await;
+        assert!(
+            reason.contains(crate::inactivity::STALL_MESSAGE),
+            "{reason}"
+        );
+        assert_eq!(partial, "checked the pool");
+        assert_eq!(last_turn, None);
+    }
+
+    /// A cut before any item says so instead of listing nothing.
+    #[tokio::test(start_paused = true)]
+    async fn test_cut_before_any_output_names_no_partial_output() {
+        let (reason, partial, _) = drive_until_cut(vec![], 0, CallDeadline::after(7)).await;
+        assert_eq!(partial, "");
+        assert_eq!(
+            timed_out_message(&reason, &partial),
+            "Worker task timed out after 7s before any output"
+        );
     }
 
     /// Turn figures are Bedrock invocation-log records for one `arithmetic`
@@ -9081,6 +9388,179 @@ mod tests {
         assert!(
             gated_invocations.lock().unwrap().is_empty(),
             "the parked call must never have reached the inner tool"
+        );
+    }
+
+    // ====================================================================
+    // Worker timeouts through execute: a cut worker fails as agent_timeout
+    // and keeps what it streamed.
+    // ====================================================================
+
+    /// A worker that streams text and one echo result, then makes `last`
+    /// its second turn. Holds the override lock for the run.
+    async fn run_cut_worker(
+        timeouts: crate::orchestration::TimeoutsConfig,
+        result_summary_length: usize,
+        last: ScriptedTurn,
+    ) -> (
+        TaskState,
+        usize,
+        tokio::sync::mpsc::Receiver<Result<StreamItem, StreamError>>,
+    ) {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let workers = std::collections::HashMap::from([(
+            "operations".to_string(),
+            crate::orchestration::WorkerConfig {
+                description: "Runs the scripted tools".to_string(),
+                preamble: "You inspect the pool.".to_string(),
+                mcp_filter: Some(vec![]),
+                vector_stores: vec![],
+                turn_depth: None,
+                llm: None,
+                scratchpad: None,
+                skills: None,
+            },
+        )]);
+        let build_context = AgentBuildContext {
+            memory_dir: Some(dir.path().to_string_lossy().into_owned()),
+            orchestration: Some(OrchestrationConfig {
+                enabled: true,
+                workers,
+                timeouts,
+                artifacts: crate::orchestration::ArtifactsConfig {
+                    result_summary_length,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..AgentBuildContext::default()
+        };
+        let orchestrator = Orchestrator::new(build_context).await.unwrap();
+
+        let model = test_rig::ScriptedCompletionModel::new(vec![
+            ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                "call_0",
+                test_rig::ECHO_TOOL_NAME,
+                serde_json::json!({"pool": "web"}),
+            )])
+            .with_text("checked the pool"),
+            last,
+        ]);
+        let echo = test_rig::RecordingTool::new(Arc::default());
+        // Never released: a call to it hangs until the task is cut.
+        let slow = test_rig::RecordingTool::new(Arc::default())
+            .with_name("slow_tool")
+            .with_stall(test_rig::StallHook::new());
+        test_rig::install_worker_overrides(vec![WorkerOverride {
+            model: model.clone(),
+            extra_tools: vec![Box::new(echo), Box::new(slow)],
+        }]);
+
+        let mut plan = Plan::new("Inspect");
+        plan.add_task(Task::new(0, "Inspect the pool", "r").with_worker("operations"));
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
+        orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+        let requests = model.requests().lock().unwrap().len();
+        (plan.tasks[0].state.clone(), requests, event_rx)
+    }
+
+    fn timeouts(per_call: u64, inactivity: u64) -> crate::orchestration::TimeoutsConfig {
+        crate::orchestration::TimeoutsConfig {
+            per_call_timeout_secs: per_call,
+            stream_inactivity_timeout_secs: inactivity,
+        }
+    }
+
+    /// The failure a cut task records.
+    fn timed_out_failure(state: &TaskState) -> &str {
+        match state {
+            TaskState::Failed { error, category } => {
+                assert_eq!(*category, FailureCategory::AgentTimeout, "{error}");
+                error
+            }
+            other => panic!("the cut task must fail, got {other:?}"),
+        }
+    }
+
+    /// `per_call_timeout_secs` cuts a worker whose tool hangs: one attempt,
+    /// failed as agent_timeout, with the text and the named tool result it
+    /// streamed, and its last turn still reported as context usage.
+    #[tokio::test(start_paused = true)]
+    async fn per_call_timeout_fails_the_task_as_agent_timeout() {
+        let (state, requests, mut events) = run_cut_worker(
+            timeouts(5, 0),
+            2000,
+            ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                "call_1",
+                "slow_tool",
+                serde_json::json!({}),
+            )]),
+        )
+        .await;
+
+        let error = timed_out_failure(&state);
+        assert_eq!(requests, 2, "one attempt: no retry turn");
+        assert!(error.contains("timed out after 5s"), "{error}");
+        assert!(error.contains("checked the pool"), "{error}");
+        let tool_line = format!("- echo_tool: {}", test_rig::echo_tool_result_wire());
+        assert!(
+            error.ends_with(&format!("Tool results so far:\n{tool_line}")),
+            "{error}"
+        );
+        let mut context_usage = None;
+        while let Ok(item) = events.try_recv() {
+            if let Ok(StreamItem::ContextUsage {
+                agent_id,
+                context_tokens,
+                ..
+            }) = item
+            {
+                context_usage = Some((agent_id, context_tokens));
+            }
+        }
+        assert_eq!(context_usage, Some(("operations".to_string(), 10)));
+    }
+
+    /// The inactivity window cuts a provider gone silent mid-turn: failed as
+    /// agent_timeout, keeping the text of both turns and the tool result.
+    #[tokio::test(start_paused = true)]
+    async fn inactivity_stall_keeps_the_partial_output() {
+        let (state, requests, _events) = run_cut_worker(
+            timeouts(60, 5),
+            2000,
+            ScriptedTurn::text_then_stall("found two idle nodes"),
+        )
+        .await;
+
+        let error = timed_out_failure(&state);
+        assert_eq!(requests, 2, "one attempt: no retry turn");
+        assert!(error.contains(crate::inactivity::STALL_MESSAGE), "{error}");
+        assert!(error.contains("checked the pool"), "{error}");
+        assert!(error.contains("found two idle nodes"), "{error}");
+        let tool_line = format!("- echo_tool: {}", test_rig::echo_tool_result_wire());
+        assert!(error.contains(&tool_line), "{error}");
+    }
+
+    /// Each kept tool result is capped at `result_summary_length`.
+    #[tokio::test(start_paused = true)]
+    async fn partial_output_caps_each_tool_result() {
+        let (state, _requests, _events) = run_cut_worker(
+            timeouts(5, 0),
+            7,
+            ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                "call_1",
+                "slow_tool",
+                serde_json::json!({}),
+            )]),
+        )
+        .await;
+
+        // The wire form is quoted, so seven bytes keep `"applie`.
+        let error = timed_out_failure(&state);
+        assert!(
+            error.ends_with("- echo_tool: \"applie [truncated]"),
+            "{error}"
         );
     }
 
