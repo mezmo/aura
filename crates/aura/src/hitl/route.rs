@@ -992,8 +992,34 @@ mod tests {
         let wire = ApprovalDecisionWire {
             approved: true,
             reason: None,
+            decisions: None,
         };
         assert_eq!(ApprovalDecision::from(wire), ApprovalDecision::Approved);
+    }
+
+    /// A receiver that decides per item (the Mezmo governance service does)
+    /// answers an approval with a `decisions` array beside `approved`.
+    #[test]
+    fn wire_accepts_per_item_decisions() {
+        let body = r#"{"approved":true,"reason":null,"decisions":[{"id":0,"approved":true,"reason":null}]}"#;
+        let wire: ApprovalDecisionWire = serde_json::from_str(body).expect("decisions parse");
+        assert_eq!(
+            ApprovalDecision::from(wire.clone()),
+            ApprovalDecision::Approved
+        );
+        let decisions = wire.decisions.expect("decisions present");
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].id, 0);
+        assert!(decisions[0].approved);
+
+        let body = r#"{"approved":false,"reason":"held","decisions":[{"id":0,"approved":false,"reason":"held"}]}"#;
+        let wire: ApprovalDecisionWire = serde_json::from_str(body).expect("denied parse");
+        assert_eq!(
+            ApprovalDecision::from(wire),
+            ApprovalDecision::Denied {
+                reason: Some("held".to_string())
+            }
+        );
     }
 
     #[test]
@@ -1001,6 +1027,7 @@ mod tests {
         let wire = ApprovalDecisionWire {
             approved: false,
             reason: Some("x".into()),
+            decisions: None,
         };
         assert_eq!(
             ApprovalDecision::from(wire),
