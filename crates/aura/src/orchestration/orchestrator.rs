@@ -9560,7 +9560,7 @@ mod tests {
         assert_eq!(requests, 2, "one attempt: no retry turn");
         assert!(error.contains("timed out after 5s"), "{error}");
         assert!(error.contains("checked the pool"), "{error}");
-        let tool_line = format!("- echo_tool: {}", test_rig::echo_tool_result_wire());
+        let tool_line = format!("- echo_tool: {}", test_rig::ECHO_TOOL_RESULT);
         assert!(
             error.ends_with(&format!("Tool results so far:\n{tool_line}")),
             "{error}"
@@ -9595,7 +9595,7 @@ mod tests {
         assert!(error.contains(crate::inactivity::STALL_MESSAGE), "{error}");
         assert!(error.contains("checked the pool"), "{error}");
         assert!(error.contains("found two idle nodes"), "{error}");
-        let tool_line = format!("- echo_tool: {}", test_rig::echo_tool_result_wire());
+        let tool_line = format!("- echo_tool: {}", test_rig::ECHO_TOOL_RESULT);
         assert!(error.contains(&tool_line), "{error}");
     }
 
@@ -9613,10 +9613,10 @@ mod tests {
         )
         .await;
 
-        // The wire form is quoted, so seven bytes keep `"applie`.
+        // Seven bytes of `applied successfully` keep `applied`.
         let error = timed_out_failure(&state);
         assert!(
-            error.ends_with("- echo_tool: \"applie [truncated]"),
+            error.ends_with("- echo_tool: applied [truncated]"),
             "{error}"
         );
     }
