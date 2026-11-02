@@ -88,8 +88,7 @@ pub(crate) struct ScriptedTurn {
     /// stream without another `on_completion_call`, which is the
     /// provider-error orphan window.
     stream_failed: bool,
-    /// Hold the provider stream open after this turn's text, never
-    /// finishing the turn: a provider gone silent mid-stream.
+    /// The turn stalls after its text: a provider gone silent mid-stream.
     stalled: bool,
 }
 
@@ -251,6 +250,8 @@ impl ScriptedCompletionModel {
         }
         let items = futures::stream::iter(items);
         if turn.stalled {
+            // Hold the stream open after the text, with no FinalResponse,
+            // so the turn never finishes.
             return StreamingCompletionResponse::stream(Box::pin(
                 items.chain(futures::stream::pending()),
             ));
