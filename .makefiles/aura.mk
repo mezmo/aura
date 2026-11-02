@@ -12,12 +12,25 @@ COMPOSE_BUILD ?= --build
 test-integration: $(REPORT_DIR) ## run CI test suite via docker compose
 	docker compose -p aura-test-$(BUILD_SLUG) -f compose/base.yml -f compose/test.yml up --remove-orphans --exit-code-from aura-integration-test $(COMPOSE_BUILD)
 
+# CI keeps the test runner alive (compose/test-ci.yml) and execs each step
+# into it, so build, clippy and the tests share one cargo target dir.
+TEST_CI_COMPOSE = docker compose -p aura-test-$(BUILD_SLUG) \
+	-f compose/base.yml \
+	-f compose/test.yml \
+	-f compose/test-ci.yml
+TEST_CI_EXEC = $(TEST_CI_COMPOSE) exec -T aura-integration-test
+
+.PHONY:test-integration-up
+test-integration-up: $(REPORT_DIR) ## Start the CI test environment with an idle test runner
+	$(TEST_CI_COMPOSE) up -d --wait --remove-orphans $(COMPOSE_BUILD)
+
+.PHONY:test-integration-ci
+test-integration-ci: $(REPORT_DIR) ## Run the CI test suite inside the running test container
+	$(TEST_CI_EXEC) make coverage
+
 .PHONY:test-integration-down
 test-integration-down:  ## Cleanup integration test containers
-	-docker compose -p aura-test-$(BUILD_SLUG) \
-		-f compose/base.yml \
-		-f compose/test.yml \
-		down --remove-orphans --volumes --rmi=local 2>/dev/null || true
+	-$(TEST_CI_COMPOSE) down --remove-orphans --volumes --rmi=local 2>/dev/null || true
 	@$(MAKE) clean-preloaded-images
 
 # Hooked into clean:: because a build that fails before the integration lane

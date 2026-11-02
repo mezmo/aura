@@ -118,7 +118,7 @@ pipeline {
     } // end setup
 
     stage('Build Images') {
-      // Preloaded tags are consumed by the Test Suite stage.
+      // Preloaded tags are consumed by the Build, Lint and Test stage.
       when {
         beforeAgent true
         not {
@@ -210,27 +210,6 @@ pipeline {
           }
         } // end rustfmt
 
-        stage("Rust Lint") {
-          steps {
-            withChecks('clippy') {
-              sh script: "make lint-rust-ci", returnStatus: true
-              recordIssues( // needs to be in same block as withChecks
-                tool: cargo(pattern: 'report/ci/clippy.json'),
-                id: 'clippy',
-                name: 'clippy lint',
-                enabledForFailure: true,
-                sourceDirectories: [[path: '.']],
-                checksAnnotationScope: 'ALL',
-                qualityGates: [[
-                  threshold: 1,
-                  type: 'TOTAL',
-                  criticality: 'FAILURE'
-                ]]
-              )
-            }
-          }
-        } // End Clippy
-
         stage("Docker Lint") {
           steps {
             withChecks('hadolint') {
@@ -254,7 +233,10 @@ pipeline {
       } // End Parallel
     } // End Validate
 
-    stage('Test Suite') {
+    // Build, clippy and the integration tests run one after another in a
+    // single long-lived test container, so each step reuses the target dir
+    // the previous one filled. Each step still reports its own check.
+    stage('Build, Lint and Test') {
       when {
         beforeAgent true
         not {
@@ -262,21 +244,22 @@ pipeline {
         }
       }
 
-      parallel {
-        stage('Integration Tests') {
-          environment {
-            MOCK_MCP_IMAGE = 'mezmo/aura-mock-mcp:latest'
-            // The plain daemon cannot read the S3 layer cache, so a rebuild
-            // would be a silent ~30min uncached build. --no-build consumes
-            // the Build Images tags and fails fast if one is missing.
-            COMPOSE_BUILD = '--no-build'
-            // sccache for the in-container coverage compile; compose maps
-            // this AURA_ toggle onto the cargo wrapper.
-            AURA_RUSTC_WORKSPACE_WRAPPER = 'sccache'
-            SCCACHE_BUCKET = "${BUILD_CACHE_BUCKET}"
-            SCCACHE_REGION = "${BUILD_CACHE_REGION}"
-            SCCACHE_S3_KEY_PREFIX = 'aura/sccache/'
-          }
+      environment {
+        MOCK_MCP_IMAGE = 'mezmo/aura-mock-mcp:latest'
+        // The plain daemon cannot read the S3 layer cache, so a rebuild
+        // would be a silent ~30min uncached build. --no-build consumes
+        // the Build Images tags and fails fast if one is missing.
+        COMPOSE_BUILD = '--no-build'
+        // sccache for the in-container compiles; compose maps this AURA_
+        // toggle onto the cargo wrapper.
+        AURA_RUSTC_WORKSPACE_WRAPPER = 'sccache'
+        SCCACHE_BUCKET = "${BUILD_CACHE_BUCKET}"
+        SCCACHE_REGION = "${BUILD_CACHE_REGION}"
+        SCCACHE_S3_KEY_PREFIX = 'aura/sccache/'
+      }
+
+      stages {
+        stage('Start Test Environment') {
           steps {
             sh 'mkdir -p report'
             script {
@@ -285,6 +268,8 @@ pipeline {
                   'https://index.docker.io/v1/',
                   'dockerhub-token-mezmo'
               ) {
+                // Containers capture their environment at creation, so the
+                // credentials only need binding while the project starts.
                 withCredentials([
                   string(credentialsId: 'openai-api-key', variable: 'OPENAI_API_KEY'),
                   aws(
@@ -293,21 +278,58 @@ pipeline {
                     secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                   )
                 ]) {
-                  withReport('coverage', 'make test-integration') {
-                    junit testResults: 'report/ci/junit.xml', allowEmptyResults: true
-                    sh 'make clean-profile'
-                    recordCoverage(
-                      tools: [[parser: 'COBERTURA', pattern: 'report/ci/cobertura.xml']],
-                      checksAnnotationScope: 'MODIFIED_LINES',
-                      sourceDirectories: [[path: '.']],
-                      enabledForFailure: true,
-                      ignoreParsingErrors: true,
-                      id: 'coverage',
-                      name: 'coverage'
-                      // qualityGates: [[threshold: 80.0, metric: 'LINE', baseline: 'PROJECT', unstable: false]]
-                    )
-                  }
+                  sh 'make test-integration-up'
                 }
+              }
+            }
+          }
+        }
+
+        stage('Rust Build') {
+          steps {
+            script {
+              withReport('build', 'make build-rust-ci')
+            }
+          }
+        }
+
+        stage('Rust Lint') {
+          steps {
+            withChecks('clippy') {
+              sh script: "make lint-rust-ci", returnStatus: true
+              recordIssues( // needs to be in same block as withChecks
+                tool: cargo(pattern: 'report/ci/clippy.json'),
+                id: 'clippy',
+                name: 'clippy lint',
+                enabledForFailure: true,
+                sourceDirectories: [[path: '.']],
+                checksAnnotationScope: 'ALL',
+                qualityGates: [[
+                  threshold: 1,
+                  type: 'TOTAL',
+                  criticality: 'FAILURE'
+                ]]
+              )
+            }
+          }
+        } // End Clippy
+
+        stage('Integration Tests') {
+          steps {
+            script {
+              withReport('coverage', 'make test-integration-ci') {
+                junit testResults: 'report/ci/junit.xml', allowEmptyResults: true
+                sh 'make clean-profile'
+                recordCoverage(
+                  tools: [[parser: 'COBERTURA', pattern: 'report/ci/cobertura.xml']],
+                  checksAnnotationScope: 'MODIFIED_LINES',
+                  sourceDirectories: [[path: '.']],
+                  enabledForFailure: true,
+                  ignoreParsingErrors: true,
+                  id: 'coverage',
+                  name: 'coverage'
+                  // qualityGates: [[threshold: 80.0, metric: 'LINE', baseline: 'PROJECT', unstable: false]]
+                )
               }
             }
           }
@@ -324,7 +346,6 @@ pipeline {
             }
           }
         }
-
       }
 
       post {
