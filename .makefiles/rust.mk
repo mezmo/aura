@@ -33,12 +33,14 @@ build-coverage: $(DOCKER_ENV) $(NEXTEST_BIN) $(REPORT_DIR) ## Build every target
 	@# Instrumented proc-macros and build scripts write profiles while rustc
 	@# runs them; those go to a bounded pool under the target dir, not into
 	@# the coverage report.
+	@date +'build-coverage started %T'
 	RUSTFLAGS="$(COVERAGE_RUSTFLAGS)" \
 		LLVM_PROFILE_FILE=$(abspath $(TARGET_DIR))/build-profraw/build-%4m.profraw \
 		cargo nextest run $(NEXTEST_ARGS) --no-run --frozen
 
 .PHONY:coverage
 coverage: $(DOCKER_ENV) $(REPORT_DIR) $(GRCOV_BIN) ## Run the local test suite with code coverage
+	@date +'coverage started %T'
 	-$(MAKE) debug-PROJECT_ROOT
 	$(MAKE) build-coverage
 	@# nextest runs every test in its own process; %8m merges the processes
@@ -87,6 +89,9 @@ lint-rust: | $(DOCKER_ENV) $(REPORT_DIR)  ## lint rust code via clippy
 
 .PHONY:build-rust-ci
 build-rust-ci: ## Build every target inside the CI test container (needs `make test-integration-up` first)
+	@# Paired with the in-container timestamps, this shows how long the
+	@# exec and make startup take before cargo runs.
+	@date +'build-rust-ci exec at %T'
 	$(TEST_CI_EXEC) make build-coverage
 
 .PHONY:lint-rust-ci
