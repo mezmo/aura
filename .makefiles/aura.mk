@@ -37,6 +37,7 @@ test-integration-server-up: ## Start the CI web server on the runner's aura bina
 
 .PHONY:test-integration-ci
 test-integration-ci: $(REPORT_DIR) ## Run the CI test suite inside the running test container
+	@date +'test-integration-ci exec at %T'
 	$(TEST_CI_EXEC) make coverage
 
 .PHONY:test-integration-down
