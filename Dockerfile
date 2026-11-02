@@ -349,10 +349,15 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 CMD ["./aura", "webserver"]
 
 ### 013 Server
-# Integration-lane server image (debug profile).
+# Local integration-lane server image (debug profile).
 FROM runtime AS server
 
 COPY --from=debug-build /usr/src/app/target/debug/aura /app/
+
+### 013b Server-ci
+# CI integration-lane server image: the runtime alone. CI mounts the aura
+# binary its test container already built, so this stage compiles nothing.
+FROM runtime AS server-ci
 
 ### 014 Release
 # Published image. Must stay the final stage: the feature-build and

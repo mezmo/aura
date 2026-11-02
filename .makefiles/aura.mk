@@ -22,7 +22,18 @@ TEST_CI_EXEC = $(TEST_CI_COMPOSE) exec -T aura-integration-test
 
 .PHONY:test-integration-up
 test-integration-up: $(REPORT_DIR) ## Start the CI test environment with an idle test runner
-	$(TEST_CI_COMPOSE) up -d --wait --remove-orphans $(COMPOSE_BUILD)
+	@# --no-deps: the runner's dependency on the web server is skipped,
+	@# since the server waits for the binary the runner builds.
+	$(TEST_CI_COMPOSE) up -d --wait --remove-orphans --no-deps $(COMPOSE_BUILD) \
+		mock-mcp aura-integration-test
+
+CI_BIN_DIR := .ci-bin
+
+.PHONY:test-integration-server-up
+test-integration-server-up: ## Start the CI web server on the runner's aura binary (needs build-rust-ci first)
+	@mkdir -p $(CI_BIN_DIR)
+	$(TEST_CI_COMPOSE) cp aura-integration-test:/usr/src/app/target/debug/aura $(CI_BIN_DIR)/aura
+	$(TEST_CI_COMPOSE) up -d --wait --no-deps $(COMPOSE_BUILD) aura-web-server
 
 .PHONY:test-integration-ci
 test-integration-ci: $(REPORT_DIR) ## Run the CI test suite inside the running test container
@@ -31,6 +42,7 @@ test-integration-ci: $(REPORT_DIR) ## Run the CI test suite inside the running t
 .PHONY:test-integration-down
 test-integration-down:  ## Cleanup integration test containers
 	-$(TEST_CI_COMPOSE) down --remove-orphans --volumes --rmi=local 2>/dev/null || true
+	rm -rf $(CI_BIN_DIR)
 	@$(MAKE) clean-preloaded-images
 
 # Hooked into clean:: because a build that fails before the integration lane

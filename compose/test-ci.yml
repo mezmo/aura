@@ -5,12 +5,21 @@
 # suite, so CI can exec build, clippy and the integration tests into one
 # container and reuse its cargo target dir between steps.
 #
+# The web server runs the aura binary the runner builds, mounted from the
+# workspace, so it starts only after that build: make
+# test-integration-server-up copies the binary out and starts it.
+#
 # Usage:
 #   make test-integration-up
-#   make build-rust-ci lint-rust-ci test-integration-ci
+#   make build-rust-ci test-integration-server-up
+#   make lint-rust-ci test-integration-ci
 #   make test-integration-down
 
 services:
   aura-integration-test:
     init: true
     command: ["sleep", "infinity"]
+
+  aura-web-server:
+    volumes:
+      - $PWD/.ci-bin/aura:/app/aura:ro

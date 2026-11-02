@@ -238,9 +238,9 @@ pipeline {
       }
     }
 
-    // Build, clippy and the integration tests run one after another in a
-    // single long-lived test container, so each step reuses the target dir
-    // the previous one filled. Each step still reports its own check.
+    // Build, clippy and the integration tests run in a single long-lived
+    // test container, so each step reuses the target dir the build filled.
+    // Each step still reports its own check.
     stage('Build, Lint and Test') {
       when {
         beforeAgent true
@@ -298,6 +298,18 @@ pipeline {
           steps {
             script {
               withReport('build', 'make build-rust-ci')
+            }
+          }
+        }
+
+        // The web server runs the aura binary Rust Build just produced, so
+        // the server image compiles nothing.
+        stage('Start Server') {
+          steps {
+            withCredentials([
+              string(credentialsId: 'openai-api-key', variable: 'OPENAI_API_KEY')
+            ]) {
+              sh 'make test-integration-server-up'
             }
           }
         }
