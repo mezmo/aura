@@ -226,7 +226,6 @@ impl UsageState {
     /// prompt + completion.
     pub fn store_usage(&self, prompt: u64, completion: u64, _total: u64, is_tool_turn: bool) {
         self.initialized.store(true, Ordering::Release);
-        self.llm_turns.fetch_add(1, Ordering::AcqRel);
 
         // Cumulative billed input across every turn.
         self.billed_prompt_tokens
@@ -255,10 +254,15 @@ impl UsageState {
         }
     }
 
-    /// LLM turns recorded so far, every path counted (`store_usage` and
-    /// `accumulate_usage` alike).
+    /// LLM turns recorded so far: one per `TurnUsage` item of the run's
+    /// stream (`PreparedAgent::meter_turn_usage`) or per `accumulate_usage`
+    /// call, whichever path feeds this state.
     pub fn llm_turns(&self) -> u64 {
         self.llm_turns.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_turn(&self) {
+        self.llm_turns.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Tool calls the model issued so far, as the hook saw them.
@@ -480,10 +484,8 @@ pub struct StreamingRequestHook {
     /// LLM-reported per-turn input/output tokens into the budget as ground
     /// truth so `remaining()` reflects actual context pressure.
     scratchpad_budget: Option<ContextBudget>,
-    /// The agent and model behind this run's LLM turns.
-    inference_labels: Option<crate::metrics::InferenceLabels>,
-    /// When the LLM call in flight began.
-    turn_started: Arc<Mutex<Option<std::time::Instant>>>,
+    /// When the tool call in flight began.
+    tool_started: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 impl StreamingRequestHook {
@@ -516,18 +518,9 @@ impl StreamingRequestHook {
             request_id: request_id.into(),
             usage_state: usage_state.clone(),
             scratchpad_budget,
-            inference_labels: None,
-            turn_started: Arc::new(Mutex::new(None)),
+            tool_started: Arc::new(Mutex::new(None)),
         };
         (hook, cancel, usage_state)
-    }
-
-    /// Label this run's LLM turns for the inference metrics. Without labels
-    /// the hook records no inference metrics.
-    #[must_use]
-    pub fn with_inference_labels(mut self, labels: crate::metrics::InferenceLabels) -> Self {
-        self.inference_labels = Some(labels);
-        self
     }
 
     /// Registers another observer for this run, alongside the deadline and
@@ -629,8 +622,6 @@ where
                 return;
             }
             self.check_and_cancel(cancel_sig, "completion call");
-            // The call goes out once this returns without cancelling.
-            *self.turn_started.lock().unwrap() = Some(std::time::Instant::now());
         }
     }
 
@@ -676,6 +667,10 @@ where
         // is still checked.
         let publish_event = Self::should_publish_tool_event(&tool_name);
         self.usage_state.count_tool_call();
+        // One slot, not a map: rig runs a turn's tools one after another
+        // (the FIFO assumption `RunContext` documents), so the result that
+        // arrives next is this call's.
+        *self.tool_started.lock().unwrap() = Some(std::time::Instant::now());
         async move {
             // Stash the call id so the park arm can record it on the cell entry.
             if let Some(cell) = park_cell_for(&request_id) {
@@ -728,7 +723,7 @@ where
         tool_name: &str,
         id: Option<String>,
         _args: &str,
-        _result: &str,
+        result: &str,
         cancel_sig: CancelSignal,
     ) -> impl Future<Output = ()> + Send {
         let tool_name = tool_name.to_string();
@@ -736,6 +731,21 @@ where
         let tool_call_id = id.clone();
         let had_tool_call_id = id.is_some();
         let usage_state = self.usage_state.clone();
+        // The tool as the agent saw it, middleware and approval waits
+        // included; a call's error and an output that reports one are both
+        // failed calls. A suppressed tool never set the slot, so it records
+        // nothing here.
+        if let Some(started) = self.tool_started.lock().unwrap().take() {
+            let (output, kind) = crate::provider_agent::read_tool_result(&rig::OneOrMany::one(
+                rig::message::ToolResultContent::text(result),
+            ));
+            let error_type = match kind {
+                crate::provider_agent::ToolResultKind::Error => Some("tool_call_error"),
+                _ if crate::tool_error_detection::is_reported_error(&output) => Some("tool_error"),
+                _ => None,
+            };
+            crate::metrics::record_tool_execution(&tool_name, error_type, started.elapsed());
+        }
         // Mirror the suppression in `on_tool_call`: skip pop + pending-id
         // tracking for scratchpad tools so the FIFO queue stays symmetric
         // and these tools don't surface in `aura.tool_usage` correlations.
@@ -794,36 +804,11 @@ where
         let usage_state = self.usage_state.clone();
         let request_id = self.request_id.clone();
         let scratchpad_budget = self.scratchpad_budget.clone();
-        let turn_duration = self
-            .turn_started
-            .lock()
-            .unwrap()
-            .take()
-            .map(|t| t.elapsed());
 
         // Extract usage if the response type supports it
         // StreamingResponse implements GetTokenUsage which has token_usage()
         let usage = response.token_usage();
         let cache_usage = response.cache_token_usage();
-
-        if let Some(labels) = &self.inference_labels {
-            if let Some(duration) = turn_duration {
-                crate::metrics::record_inference(labels, None, duration);
-            }
-            if let Some(usage) = &usage {
-                crate::metrics::record_token_usage(
-                    labels,
-                    crate::metrics::TokenMeasure {
-                        input: usage.input_tokens,
-                        output: usage.output_tokens,
-                        cache_read: cache_usage.map(|c| c.cache_read_input_tokens).unwrap_or(0),
-                        cache_write: cache_usage
-                            .map(|c| c.cache_creation_input_tokens)
-                            .unwrap_or(0),
-                    },
-                );
-            }
-        }
 
         async move {
             if let Some(usage) = usage {
@@ -1541,7 +1526,13 @@ mod usage_counter_tests {
         let usage = UsageState::new();
         assert_eq!((usage.llm_turns(), usage.tool_calls()), (0, 0));
         usage.store_usage(10, 5, 15, false);
-        usage.store_usage(20, 5, 25, true);
+        assert_eq!(
+            usage.llm_turns(),
+            0,
+            "the final-turn snapshot is not a turn count"
+        );
+        usage.count_turn();
+        usage.count_turn();
         usage.accumulate_usage(30, 5);
         usage.count_tool_call();
         assert_eq!((usage.llm_turns(), usage.tool_calls()), (3, 1));

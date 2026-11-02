@@ -96,25 +96,6 @@ pub struct TokenMeasure {
     pub cache_write: u64,
 }
 
-/// Kind of tool behind a `gen_ai.execute_tool` measurement
-/// (`gen_ai.tool.type`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolType {
-    /// A tool executed in-process (native and scratchpad tools).
-    Function,
-    /// A tool served by an MCP server.
-    Extension,
-}
-
-impl ToolType {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ToolType::Function => "function",
-            ToolType::Extension => "extension",
-        }
-    }
-}
-
 /// Content type of the Prometheus text exposition `render_prometheus`
 /// produces.
 pub const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
@@ -162,9 +143,7 @@ mod imp {
     use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
     use prometheus::Encoder;
 
-    use super::{
-        InferenceLabels, Ingress, MetricsError, RunMeasure, TokenMeasure, ToolType, provider_name,
-    };
+    use super::{InferenceLabels, Ingress, MetricsError, RunMeasure, TokenMeasure, provider_name};
 
     const METER_NAME: &str = "aura";
 
@@ -175,7 +154,6 @@ mod imp {
     const GEN_AI_AGENT_NAME: &str = "gen_ai.agent.name";
     const GEN_AI_TOKEN_MODALITY: &str = "gen_ai.token.modality";
     const GEN_AI_TOOL_NAME: &str = "gen_ai.tool.name";
-    const GEN_AI_TOOL_TYPE: &str = "gen_ai.tool.type";
     const ERROR_TYPE: &str = "error.type";
     const MCP_METHOD_NAME: &str = "mcp.method.name";
     const HTTP_ROUTE: &str = "http.route";
@@ -605,17 +583,9 @@ mod imp {
             .record(duration.as_secs_f64(), &attrs);
     }
 
-    pub fn record_tool_execution(
-        tool: &str,
-        tool_type: ToolType,
-        error_type: Option<&str>,
-        duration: Duration,
-    ) {
+    pub fn record_tool_execution(tool: &str, error_type: Option<&str>, duration: Duration) {
         let Some(i) = instruments() else { return };
-        let mut attrs = vec![
-            kv(GEN_AI_TOOL_NAME, tool),
-            kv(GEN_AI_TOOL_TYPE, tool_type.as_str()),
-        ];
+        let mut attrs = vec![kv(GEN_AI_TOOL_NAME, tool)];
         push_error(&mut attrs, error_type);
         i.execute_tool_duration
             .record(duration.as_secs_f64(), &attrs);
@@ -676,7 +646,7 @@ pub use stub::*;
 mod stub {
     use std::time::Duration;
 
-    use super::{InferenceLabels, Ingress, MetricsError, RunMeasure, TokenMeasure, ToolType};
+    use super::{InferenceLabels, Ingress, MetricsError, RunMeasure, TokenMeasure};
 
     pub fn init() -> Result<(), MetricsError> {
         Err(MetricsError::Disabled)
@@ -691,7 +661,7 @@ mod stub {
     pub fn record_inference(_: &InferenceLabels, _: Option<&str>, _: Duration) {}
     pub fn record_token_usage(_: &InferenceLabels, _: TokenMeasure) {}
     pub fn record_mcp_operation(_: &str, _: &str, _: Option<&str>, _: Duration) {}
-    pub fn record_tool_execution(_: &str, _: ToolType, _: Option<&str>, _: Duration) {}
+    pub fn record_tool_execution(_: &str, _: Option<&str>, _: Duration) {}
     pub fn set_mcp_server_status(_: &str, _: &str, _: bool, _: u64) {}
     pub fn record_routing_decision(_: &str, _: &str) {}
     pub fn record_planning_cycles(_: &str, _: u64) {}
@@ -753,12 +723,7 @@ mod tests {
             Some("tool_error"),
             Duration::from_secs(1),
         );
-        record_tool_execution(
-            "search_logs",
-            ToolType::Extension,
-            None,
-            Duration::from_secs(1),
-        );
+        record_tool_execution("search_logs", None, Duration::from_secs(1));
         set_mcp_server_status("demo", "mezmo", true, 17);
         record_routing_decision("demo", "orchestrated");
         record_planning_cycles("demo", 2);
@@ -778,7 +743,7 @@ mod tests {
             r#"gen_ai_client_inference_usage_cache_read_input_tokens_total{gen_ai_agent_name="demo",gen_ai_operation_name="chat",gen_ai_provider_name="aws.bedrock",gen_ai_request_model="claude",gen_ai_token_modality="text"} 40"#,
             r#"gen_ai_client_inference_operation_input_tokens_sum{gen_ai_agent_name="demo",gen_ai_operation_name="chat",gen_ai_provider_name="aws.bedrock",gen_ai_request_model="claude"} 100"#,
             r#"mcp_client_operation_duration_seconds_count{aura_mcp_server="mezmo",error_type="tool_error",gen_ai_tool_name="search_logs",mcp_method_name="tools/call"} 1"#,
-            r#"gen_ai_execute_tool_duration_seconds_count{gen_ai_tool_name="search_logs",gen_ai_tool_type="extension"} 1"#,
+            r#"gen_ai_execute_tool_duration_seconds_count{gen_ai_tool_name="search_logs"} 1"#,
             r#"aura_mcp_server_connected{aura_mcp_server="mezmo",gen_ai_agent_name="demo"} 1"#,
             r#"aura_mcp_server_tools{aura_mcp_server="mezmo",gen_ai_agent_name="demo"} 17"#,
             r#"aura_orchestration_routing_total{aura_decision="orchestrated",gen_ai_agent_name="demo"} 1"#,

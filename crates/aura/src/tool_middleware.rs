@@ -728,11 +728,6 @@ where
         tracing::Span::current(),
     ));
 
-    let tool_type = if ctx.tool_namespace.is_some() {
-        crate::metrics::ToolType::Extension
-    } else {
-        crate::metrics::ToolType::Function
-    };
     let result = match onion.await {
         Ok(result) => result,
         Err(join_error) => {
@@ -741,16 +736,6 @@ where
             Err(error)
         }
     };
-    // Measured from the caller's side, so a rejected, short-circuited or
-    // abandoned call counts like any other; a reply that reports an error
-    // is a failed call even though it is `Ok`.
-    let error_type = match &result {
-        Ok(output) if crate::tool_error_detection::is_reported_error(output) => Some("tool_error"),
-        Ok(_) => None,
-        Err(ToolError::ToolCallError(_)) => Some("tool_call_error"),
-        Err(ToolError::JsonError(_)) => Some("json_error"),
-    };
-    crate::metrics::record_tool_execution(&tool_name, tool_type, error_type, start.elapsed());
     drop(guard);
     result
 }
@@ -1539,66 +1524,5 @@ mod parity {
         settle().await;
         let done = entries(&log).pop().unwrap();
         assert!(done.contains("corr=a|"), "got: {done}");
-    }
-}
-
-#[cfg(all(test, feature = "otel"))]
-mod metrics_tests {
-    use super::*;
-
-    #[derive(Clone)]
-    struct Answer(&'static str);
-
-    impl RigTool for Answer {
-        const NAME: &'static str = "answer";
-        type Error = ToolError;
-        type Args = Value;
-        type Output = String;
-
-        async fn definition(&self, _prompt: String) -> ToolDefinition {
-            ToolDefinition {
-                name: Self::NAME.to_string(),
-                description: String::new(),
-                parameters: serde_json::json!({ "type": "object" }),
-            }
-        }
-
-        async fn call(&self, _args: Value) -> Result<String, ToolError> {
-            Ok(self.0.to_string())
-        }
-    }
-
-    /// Every call through the stack lands in `gen_ai.execute_tool.duration`,
-    /// typed by whether a namespace names an MCP server and marked failed
-    /// when the reply reads as an error.
-    #[tokio::test]
-    async fn a_wrapped_call_records_its_execution() {
-        crate::metrics::init().unwrap();
-        let plain = MiddlewareTool::new(Answer("fine"), MiddlewareStack::new(Vec::new()));
-        plain.call(serde_json::json!({})).await.unwrap();
-        let mcp = MiddlewareTool::new(
-            Answer("Tool returned an error: nope"),
-            MiddlewareStack::new(Vec::new()),
-        )
-        .with_context_factory(|name| {
-            let mut ctx = ToolCallContext::new(name);
-            ctx.tool_namespace = Some("mezmo".to_string());
-            ctx
-        });
-        mcp.call(serde_json::json!({})).await.unwrap();
-
-        let text = crate::metrics::render_prometheus().unwrap();
-        assert!(
-            text.contains(
-                r#"gen_ai_execute_tool_duration_seconds_count{gen_ai_tool_name="answer",gen_ai_tool_type="function"} 1"#
-            ),
-            "{text}"
-        );
-        assert!(
-            text.contains(
-                r#"gen_ai_execute_tool_duration_seconds_count{error_type="tool_error",gen_ai_tool_name="answer",gen_ai_tool_type="extension"} 1"#
-            ),
-            "{text}"
-        );
     }
 }

@@ -4773,7 +4773,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let srd = submit_result_decision.clone();
         let park_registration =
             crate::streaming_request_hook::ParkCellRegistration::new(&park.key, park.cell.clone());
-        let stream = worker
+        let run = worker
             .inner
             .stream_chat_message_with_timeout(
                 current_prompt,
@@ -4783,9 +4783,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 &park.key,
                 worker.scratchpad_budget().cloned(),
                 worker.client_tool_names.clone(),
-                worker.inference_labels(),
             )
-            .await
+            .await;
+        let worker_usage = run.usage().clone();
+        let stream = run
+            .map_stream(|stream| worker.meter_turn_usage(stream, Some(worker_usage)))
             .into_events();
         let stream_result = Self::drive_forward_loop(
             stream,

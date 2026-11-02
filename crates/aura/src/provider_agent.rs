@@ -111,7 +111,6 @@ impl ProviderAgent {
         request_id: &str,
         scratchpad_budget: Option<ContextBudget>,
         client_tool_names: HashSet<String>,
-        labels: crate::metrics::InferenceLabels,
     ) -> crate::streaming::AgentRun {
         let (hook, cancel_tx, usage_state) = StreamingRequestHook::with_scratchpad_budget(
             options,
@@ -119,7 +118,6 @@ impl ProviderAgent {
             scratchpad_budget,
             client_tool_names,
         );
-        let hook = hook.with_inference_labels(labels);
 
         match self {
             Self::OpenAI(agent) => {
@@ -325,7 +323,6 @@ impl ProviderAgent {
         request_id: &str,
         scratchpad_budget: Option<ContextBudget>,
         client_tool_names: HashSet<String>,
-        labels: crate::metrics::InferenceLabels,
     ) -> crate::streaming::AgentRun {
         let (hook, cancel_tx, usage_state) = StreamingRequestHook::with_scratchpad_budget(
             options,
@@ -333,7 +330,6 @@ impl ProviderAgent {
             scratchpad_budget,
             client_tool_names,
         );
-        let hook = hook.with_inference_labels(labels);
 
         match self {
             Self::OpenAI(agent) => {
@@ -437,7 +433,6 @@ impl ProviderAgent {
         request_id: &str,
         scratchpad_budget: Option<ContextBudget>,
         client_tool_names: HashSet<String>,
-        labels: crate::metrics::InferenceLabels,
     ) -> crate::streaming::AgentRun {
         let (hook, cancel_tx, usage_state) = StreamingRequestHook::with_scratchpad_budget(
             options,
@@ -445,7 +440,6 @@ impl ProviderAgent {
             scratchpad_budget,
             client_tool_names,
         );
-        let hook = hook.with_inference_labels(labels);
 
         match self {
             Self::OpenAI(agent) => {
@@ -787,7 +781,9 @@ fn map_stream_item<R: rig::completion::GetTokenUsage>(
 /// Rig JSON-encodes a tool's output and passes a call's error as its plain
 /// display text, which is never JSON. A string output is decoded to its text;
 /// any other JSON output is kept as it is.
-fn read_tool_result(content: &rig::OneOrMany<ToolResultContent>) -> (String, ToolResultKind) {
+pub(crate) fn read_tool_result(
+    content: &rig::OneOrMany<ToolResultContent>,
+) -> (String, ToolResultKind) {
     let mut kind = ToolResultKind::Text;
     let text = content
         .iter()

@@ -967,6 +967,52 @@ impl PreparedAgent {
         )
     }
 
+    /// Record every LLM turn of `stream` in the inference metrics and, when
+    /// `usage` is the run's, count it there. A turn is one `TurnUsage` item,
+    /// which the provider stream yields for tool-call turns and text turns
+    /// alike; its duration runs from the stream's creation, or from the last
+    /// tool result rig yielded, to that item. The duration therefore spans
+    /// the provider call and the streaming of its response, with tool
+    /// execution between turns excluded.
+    pub(crate) fn meter_turn_usage(
+        &self,
+        stream: Pin<
+            Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>,
+        >,
+        usage: Option<crate::UsageState>,
+    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
+        use futures::StreamExt;
+
+        let labels = self.inference_labels();
+        let mut turn_started = std::time::Instant::now();
+        Box::pin(stream.map(move |item| {
+            match &item {
+                Ok(StreamItem::TurnUsage(turn, cache)) => {
+                    crate::metrics::record_inference(&labels, None, turn_started.elapsed());
+                    crate::metrics::record_token_usage(
+                        &labels,
+                        crate::metrics::TokenMeasure {
+                            input: turn.input_tokens,
+                            output: turn.output_tokens,
+                            cache_read: cache.map(|c| c.cache_read_input_tokens).unwrap_or(0),
+                            cache_write: cache.map(|c| c.cache_creation_input_tokens).unwrap_or(0),
+                        },
+                    );
+                    if let Some(usage) = &usage {
+                        usage.count_turn();
+                    }
+                }
+                Ok(StreamItem::StreamUserItem(
+                    crate::provider_agent::StreamedUserContent::ToolResult(_),
+                )) => {
+                    turn_started = std::time::Instant::now();
+                }
+                _ => {}
+            }
+            item
+        }))
+    }
+
     /// Begin the run `run_id` of this agent, for a request whose headers are
     /// `req_headers`.
     ///
@@ -1759,8 +1805,10 @@ impl Agent {
             .stream_prompt(query, self.prepared.max_depth)
             .await;
         self.hold_run(
-            self.prepared
-                .maybe_wrap_with_fallback(self.count_turns(self.meter_turn_usage(stream)), None),
+            self.prepared.maybe_wrap_with_fallback(
+                self.count_turns(self.meter_turn_usage(stream, None)),
+                None,
+            ),
         )
     }
 
@@ -1776,8 +1824,10 @@ impl Agent {
             .stream_chat(query, chat_history, self.prepared.max_depth)
             .await;
         self.hold_run(
-            self.prepared
-                .maybe_wrap_with_fallback(self.count_turns(self.meter_turn_usage(stream)), None),
+            self.prepared.maybe_wrap_with_fallback(
+                self.count_turns(self.meter_turn_usage(stream, None)),
+                None,
+            ),
         )
     }
 
@@ -1800,38 +1850,11 @@ impl Agent {
             .stream_chat(query, chat_history, max_depth)
             .await;
         self.hold_run(
-            self.prepared
-                .maybe_wrap_with_fallback(self.count_turns(self.meter_turn_usage(stream)), None),
+            self.prepared.maybe_wrap_with_fallback(
+                self.count_turns(self.meter_turn_usage(stream, None)),
+                None,
+            ),
         )
-    }
-
-    /// Record the token metrics of a stream that carries no hook: its
-    /// `TurnUsage` items are the only per-turn signal, so tokens are counted
-    /// from them here and these turns report no inference duration. Streams
-    /// with a hook record both in the hook instead.
-    fn meter_turn_usage(
-        &self,
-        stream: Pin<
-            Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>,
-        >,
-    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
-        use futures::StreamExt;
-
-        let labels = self.prepared.inference_labels();
-        Box::pin(stream.map(move |item| {
-            if let Ok(StreamItem::TurnUsage(usage, cache)) = &item {
-                crate::metrics::record_token_usage(
-                    &labels,
-                    crate::metrics::TokenMeasure {
-                        input: usage.input_tokens,
-                        output: usage.output_tokens,
-                        cache_read: cache.map(|c| c.cache_read_input_tokens).unwrap_or(0),
-                        cache_write: cache.map(|c| c.cache_creation_input_tokens).unwrap_or(0),
-                    },
-                );
-            }
-            item
-        }))
     }
 
     /// Keep this run leased for as long as `stream` is alive, so a stream
@@ -1925,7 +1948,8 @@ impl Agent {
         request_id: &str,
     ) -> crate::streaming::AgentRun {
         self.seed_scratchpad_request_input(query, &[]);
-        self.prepared
+        let run = self
+            .prepared
             .inner
             .stream_prompt_with_timeout(
                 query,
@@ -1934,17 +1958,17 @@ impl Agent {
                 request_id,
                 self.scratchpad_budget().cloned(),
                 self.prepared.client_tool_names.clone(),
-                self.prepared.inference_labels(),
             )
-            .await
-            .map_stream(|stream| {
-                self.hold_run(
-                    self.append_scratchpad_usage(
-                        self.prepared
-                            .maybe_wrap_with_fallback(self.count_turns(stream), Some(request_id)),
-                    ),
-                )
-            })
+            .await;
+        let usage = run.usage().clone();
+        run.map_stream(|stream| {
+            self.hold_run(
+                self.append_scratchpad_usage(self.prepared.maybe_wrap_with_fallback(
+                    self.count_turns(self.meter_turn_usage(stream, Some(usage))),
+                    Some(request_id),
+                )),
+            )
+        })
     }
 
     /// Stream a chat query with timeout and cancellation support.
@@ -1966,7 +1990,8 @@ impl Agent {
         request_id: &str,
     ) -> crate::streaming::AgentRun {
         self.seed_scratchpad_request_input(query, &chat_history);
-        self.prepared
+        let run = self
+            .prepared
             .inner
             .stream_chat_with_timeout(
                 query,
@@ -1976,17 +2001,17 @@ impl Agent {
                 request_id,
                 self.scratchpad_budget().cloned(),
                 self.prepared.client_tool_names.clone(),
-                self.prepared.inference_labels(),
             )
-            .await
-            .map_stream(|stream| {
-                self.hold_run(
-                    self.append_scratchpad_usage(
-                        self.prepared
-                            .maybe_wrap_with_fallback(self.count_turns(stream), Some(request_id)),
-                    ),
-                )
-            })
+            .await;
+        let usage = run.usage().clone();
+        run.map_stream(|stream| {
+            self.hold_run(
+                self.append_scratchpad_usage(self.prepared.maybe_wrap_with_fallback(
+                    self.count_turns(self.meter_turn_usage(stream, Some(usage))),
+                    Some(request_id),
+                )),
+            )
+        })
     }
 
     /// Seed the scratchpad budget's running estimate with the user query +
