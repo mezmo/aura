@@ -86,6 +86,12 @@ RUN cargo chef prepare --recipe-path recipe.json
 # The single dependency cook behind every CI compile on change requests.
 FROM core AS cook-debug
 WORKDIR /usr/src/app
+# The test image runs as uid 1000 and writes into this target dir, so the
+# cook runs as that uid rather than being chowned afterwards: a recursive
+# chown would copy the whole cooked target into a second layer. The base
+# image leaves CARGO_HOME and RUSTUP_HOME world-writable.
+RUN chown 1000:1000 /usr/src/app
+USER 1000:1000
 COPY --from=planner /usr/src/app/recipe.json recipe.json
 ENV RUSTFLAGS="--allow=warnings -Cinstrument-coverage"
 ENV CARGO_TARGET_DIR=/usr/src/app/target
@@ -202,13 +208,8 @@ EOR
 # Install tools before source COPY so source changes keep this layer cached.
 FROM cook-debug AS test-tools
 
-USER 0
-# cook-debug writes these paths as root.
-RUN chown -R 1000:1000 /usr/local/cargo /usr/src/app
-
 COPY --from=sccache-dl /usr/local/bin/sccache /usr/local/bin/sccache
 
-USER 1000
 # Prebuilt tool binaries — nothing compiles from source in the PR image.
 # ARG defaults cover direct docker builds; make build-images passes the
 # pins from .makefiles/rust.mk, the source of truth.
