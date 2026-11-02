@@ -95,10 +95,13 @@ USER 1000:1000
 COPY --from=planner /usr/src/app/recipe.json recipe.json
 ENV RUSTFLAGS="--allow=warnings -Cinstrument-coverage"
 ENV CARGO_TARGET_DIR=/usr/src/app/target
-# cargo metadata (which nextest runs) wants every lockfile package,
-# optional ones included; fetching them against the cook's skeleton
-# manifests keeps that from downloading on every test run.
+# The --check cook gives clippy its metadata-only dependency builds, so CI
+# lint compiles only the workspace crates. cargo metadata (which nextest
+# runs) wants every lockfile package, optional ones included; fetching them
+# against the cook's skeleton manifests keeps that from downloading on
+# every test run.
 RUN cargo chef cook --workspace --all-targets --features integration --recipe-path recipe.json \
+ && cargo chef cook --check --workspace --all-targets --features integration --recipe-path recipe.json \
  && cargo fetch --locked
 
 ### 005 Runner
