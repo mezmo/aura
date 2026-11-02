@@ -42,3 +42,8 @@ To learn more about the release, try:
 {{- else }}
    - No secrets configured. Set secrets.existingSecret or provide API keys in values.yaml
 {{- end }}
+
+5. Metrics:
+   - Prometheus text at GET /metrics on port {{ include "aura.metricsPort" . }}
+   - Pod annotations prometheus.io/*: {{ ternary "on" "off" .Values.metrics.podAnnotations.enabled }}; ServiceMonitor: {{ ternary "created" "off (metrics.serviceMonitor.enabled)" .Values.metrics.serviceMonitor.enabled }}
+   - Grafana starter dashboard: deployment/grafana/aura-overview.json in the aura repo

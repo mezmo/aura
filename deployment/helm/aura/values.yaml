@@ -82,6 +82,38 @@ streaming:
   # -- Streaming timeout in seconds
   timeoutSecs: 900
 
+# Metrics. The server serves Prometheus text at GET /metrics on the API port
+# (OpenTelemetry GenAI and MCP instruments; see DEVELOPMENT.md). These values
+# choose where that endpoint listens and what scrapes it.
+metrics:
+  # -- Serve /metrics on this container port instead of the API port
+  # (AURA_METRICS_LISTEN). Empty keeps it on server.httpPort. A separate port
+  # keeps scrapes off the API Service and lets a NetworkPolicy treat them apart.
+  port: ""
+  # -- Push the same instruments over OTLP when OTEL_EXPORTER_OTLP_ENDPOINT is
+  # set (AURA_METRICS_OTLP). Turn off for a traces-only endpoint such as Phoenix.
+  otlpPush: true
+  podAnnotations:
+    # -- Add prometheus.io/scrape, prometheus.io/path and prometheus.io/port to
+    # the pod, for annotation-based discovery (Prometheus kubernetes_sd
+    # relabeling, the Sysdig agent).
+    enabled: true
+  serviceMonitor:
+    # -- Create a ServiceMonitor for the Prometheus Operator (needs its CRDs).
+    enabled: false
+    # -- Scrape interval
+    interval: 30s
+    # -- Scrape timeout
+    scrapeTimeout: 10s
+    # -- Extra labels, such as the `release` label the operator selects on
+    labels: {}
+    # -- Namespace for the ServiceMonitor (the release namespace when empty)
+    namespace: ""
+    # -- Target relabelings applied before the scrape
+    relabelings: []
+    # -- Metric relabelings applied to scraped samples
+    metricRelabelings: []
+
 # Aura TOML configuration
 # Config files are mounted in /etc/aura/ and CONFIG_PATH points to the directory.
 #
