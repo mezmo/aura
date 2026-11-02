@@ -32,9 +32,9 @@ lint-docker: | $(REPORT_DIR)
 	sed ${SED_INPLACE} 's/"file":"-"/"file":"Dockerfile"/g' report/ci/hadolint.json ; \
 	exit $$ret
 
-# The server image reads the test cache for the cook-debug layers and
-# exports only its own final layers (mode=min): debug-build changes with
-# every source edit, so a mode=max export of it is never reused.
+# The server image is the server-ci target, the runtime without a binary:
+# CI mounts the binary its test container builds, so no compile happens
+# here and the small runtime layers are all its cache needs (mode=min).
 .PHONY: build-images
 build-images: | $(REPORT_DIR) ## Build server+test images via buildx with an S3 layer cache
 	@set -euo pipefail; \
@@ -120,7 +120,7 @@ build-images: | $(REPORT_DIR) ## Build server+test images via buildx with an S3 
 	}; \
 	build_target test test-amd64 "$${AURA_TEST_IMAGE}" \
 		"--build-arg NEXTEST_VERSION=$(NEXTEST_VERSION) --build-arg GRCOV_VERSION=$(GRCOV_VERSION)"; \
-	build_target server server-amd64 "$${AURA_SERVER_IMAGE}" "" min test-amd64; \
+	build_target server-ci server-amd64 "$${AURA_SERVER_IMAGE}" "" min; \
 	docker image ls --format '{{.Repository}}:{{.Tag}} {{.Size}}' \
 		| grep -F -e "$${AURA_SERVER_IMAGE}" -e "$${AURA_TEST_IMAGE}" || true
 
