@@ -314,56 +314,62 @@ pipeline {
           }
         }
 
-        stage('Rust Lint') {
-          steps {
-            withChecks('clippy') {
-              sh script: "make lint-rust-ci", returnStatus: true
-              recordIssues( // needs to be in same block as withChecks
-                tool: cargo(pattern: 'report/ci/clippy.json'),
-                id: 'clippy',
-                name: 'clippy lint',
-                enabledForFailure: true,
-                sourceDirectories: [[path: '.']],
-                checksAnnotationScope: 'ALL',
-                qualityGates: [[
-                  threshold: 1,
-                  type: 'TOTAL',
-                  criticality: 'FAILURE'
-                ]]
-              )
-            }
-          }
-        } // End Clippy
-
-        stage('Integration Tests') {
-          steps {
-            script {
-              withReport('coverage', 'make test-integration-ci') {
-                junit testResults: 'report/ci/junit.xml', allowEmptyResults: true
-                sh 'make clean-profile'
-                recordCoverage(
-                  tools: [[parser: 'COBERTURA', pattern: 'report/ci/cobertura.xml']],
-                  checksAnnotationScope: 'MODIFIED_LINES',
-                  sourceDirectories: [[path: '.']],
-                  enabledForFailure: true,
-                  ignoreParsingErrors: true,
-                  id: 'coverage',
-                  name: 'coverage'
-                  // qualityGates: [[threshold: 80.0, metric: 'LINE', baseline: 'PROJECT', unstable: false]]
-                )
+        // Clippy and the tests share no cargo lock once the build is done:
+        // nextest's own build is a no-op, then it only runs test binaries.
+        stage('Lint and Test') {
+          parallel {
+            stage('Rust Lint') {
+              steps {
+                withChecks('clippy') {
+                  sh script: "make lint-rust-ci", returnStatus: true
+                  recordIssues( // needs to be in same block as withChecks
+                    tool: cargo(pattern: 'report/ci/clippy.json'),
+                    id: 'clippy',
+                    name: 'clippy lint',
+                    enabledForFailure: true,
+                    sourceDirectories: [[path: '.']],
+                    checksAnnotationScope: 'ALL',
+                    qualityGates: [[
+                      threshold: 1,
+                      type: 'TOTAL',
+                      criticality: 'FAILURE'
+                    ]]
+                  )
+                }
               }
-            }
-          }
-          post {
-            always {
-              publishHTML target: [
-                allowMissing: false,
-                alwaysLinkToLastBuild: false,
-                keepAll: true,
-                reportDir: 'report/ci/html',
-                reportFiles: '*.html',
-                reportName: "coverage-${BUILD_TAG}"
-              ]
+            } // End Clippy
+
+            stage('Integration Tests') {
+              steps {
+                script {
+                  withReport('coverage', 'make test-integration-ci') {
+                    junit testResults: 'report/ci/junit.xml', allowEmptyResults: true
+                    sh 'make clean-profile'
+                    recordCoverage(
+                      tools: [[parser: 'COBERTURA', pattern: 'report/ci/cobertura.xml']],
+                      checksAnnotationScope: 'MODIFIED_LINES',
+                      sourceDirectories: [[path: '.']],
+                      enabledForFailure: true,
+                      ignoreParsingErrors: true,
+                      id: 'coverage',
+                      name: 'coverage'
+                      // qualityGates: [[threshold: 80.0, metric: 'LINE', baseline: 'PROJECT', unstable: false]]
+                    )
+                  }
+                }
+              }
+              post {
+                always {
+                  publishHTML target: [
+                    allowMissing: false,
+                    alwaysLinkToLastBuild: false,
+                    keepAll: true,
+                    reportDir: 'report/ci/html',
+                    reportFiles: '*.html',
+                    reportName: "coverage-${BUILD_TAG}"
+                  ]
+                }
+              }
             }
           }
         }
