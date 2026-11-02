@@ -153,6 +153,21 @@ pub struct ServerArgs {
     #[arg(long, env = "AURA_METRICS_LISTEN")]
     pub metrics_listen: Option<std::net::SocketAddr>,
 
+    /// Push metrics over OTLP as well, when an OTLP endpoint is configured
+    /// (`OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`,
+    /// as the OTLP spec resolves them). Set false when that endpoint takes
+    /// traces only (Phoenix, for one), which otherwise fails an export every
+    /// interval. `/metrics` is served either way.
+    /// Accepts the canonical boolean vocabulary (1/0, true/false, yes/no, on/off, t/f, y/n).
+    #[arg(
+        long,
+        env = "AURA_METRICS_OTLP",
+        default_value = "true",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
+    pub metrics_otlp: bool,
+
     /// Graceful shutdown timeout in seconds.
     /// On SIGTERM/SIGINT, new requests are rejected immediately (503), but in-flight
     /// streaming requests are given this long to finish naturally before being terminated.
@@ -374,7 +389,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
     // Before any agent is built: instruments bind to the provider that is
     // global when they are first used, and MCP connection status is
     // recorded as agents come up.
-    match aura::metrics::init() {
+    match aura::metrics::init(args.metrics_otlp) {
         Ok(()) => {}
         Err(aura::metrics::MetricsError::Disabled) => {
             warn!("built without the `otel` feature: /metrics is not served")
@@ -793,6 +808,27 @@ mod parse_args_tests {
         );
         assert_eq!(args.config, "agents.toml");
         assert_eq!(args.port, 9999);
+    }
+
+    #[test]
+    fn metrics_flags_default_to_the_api_port_and_otlp_push() {
+        let args = parse_args(["aura"], "aura", "aura webserver");
+        assert!(args.metrics_listen.is_none());
+        assert!(args.metrics_otlp);
+
+        let args = parse_args(
+            [
+                "aura",
+                "--metrics-listen",
+                "0.0.0.0:9464",
+                "--metrics-otlp",
+                "off",
+            ],
+            "aura",
+            "aura webserver",
+        );
+        assert_eq!(args.metrics_listen.map(|a| a.port()), Some(9464));
+        assert!(!args.metrics_otlp);
     }
 
     #[test]

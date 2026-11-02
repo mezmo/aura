@@ -224,7 +224,7 @@ Ingress paths into the web server (all end in the same `StreamingAgent::stream` 
 
 Operational metrics (`crates/aura/src/metrics.rs`, `crates/aura-web-server/src/metrics.rs`):
 
-- OpenTelemetry instruments, named by the GenAI and MCP semantic conventions where one exists and `aura.*` otherwise, behind the `otel` feature. A Prometheus reader serves them at `GET /metrics` on the API port (or on `--metrics-listen` / `AURA_METRICS_LISTEN` alone); when `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is set a periodic OTLP reader pushes the same instruments.
+- OpenTelemetry instruments, named by the GenAI and MCP semantic conventions where one exists and `aura.*` otherwise, behind the `otel` feature. A Prometheus reader serves them at `GET /metrics` on the API port (or on `--metrics-listen` / `AURA_METRICS_LISTEN` alone); when `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is set a periodic OTLP reader pushes the same instruments, unless `--metrics-otlp false` / `AURA_METRICS_OTLP=false` turns the push off (for an endpoint that takes traces only, such as Phoenix).
 - Prometheus names are the dotted names with dots as underscores, `_seconds` for `s` units and `_total` on counters: `gen_ai.client.inference.usage.input_tokens` scrapes as `gen_ai_client_inference_usage_input_tokens_total`.
 - Every recording site goes through the functions in `aura::metrics`, which own the attribute vocabulary; labels are config-bounded (agent, provider, model, MCP server key, tool name, ingress, outcome) and never a session, request, run or user id.
 - Local check: `cargo run --bin aura -- webserver`, send one chat completion, then `curl -s localhost:8080/metrics`.

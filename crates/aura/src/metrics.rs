@@ -358,16 +358,17 @@ mod imp {
         STATE.get().map(|s| &s.instruments)
     }
 
-    /// Install the meter provider: a Prometheus reader always, plus an OTLP
-    /// periodic reader when `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` or
-    /// `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Must run inside a Tokio runtime
-    /// (the OTLP reader spawns its export task on it) and before the first
-    /// recording, since instruments bind to whichever provider is global
-    /// when they are created. A second call is a no-op.
+    /// Install the meter provider: a Prometheus reader always, plus, when
+    /// `otlp_push` is set, an OTLP periodic reader if
+    /// `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT`
+    /// is set. Must run inside a Tokio runtime (the OTLP reader spawns its
+    /// export task on it) and before the first recording, since instruments
+    /// bind to whichever provider is global when they are created. A second
+    /// call is a no-op.
     ///
     /// An OTLP exporter that fails to build is reported and skipped, so a
     /// bad collector address costs the push, not the scrape.
-    pub fn init() -> Result<(), MetricsError> {
+    pub fn init(otlp_push: bool) -> Result<(), MetricsError> {
         if STATE.get().is_some() {
             return Ok(());
         }
@@ -385,13 +386,23 @@ mod imp {
                 KeyValue::new("service.name", service_name),
                 KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
             ]));
-        match otlp_reader() {
-            Ok(Some(reader)) => builder = builder.with_reader(reader),
-            Ok(None) => {}
-            Err(e) => tracing::warn!(
-                "OTLP metrics endpoint is set but the exporter failed to initialize: {e}. \
-                 Metrics stay available on the Prometheus endpoint only."
+        match otlp_endpoint() {
+            None => {}
+            Some(endpoint) if !otlp_push => tracing::info!(
+                "OTLP metrics push disabled (AURA_METRICS_OTLP=false); {endpoint} receives traces only"
             ),
+            Some(endpoint) => match otlp_reader(&endpoint) {
+                Ok(reader) => {
+                    tracing::info!(
+                        "Pushing metrics over OTLP to {endpoint} as well as serving /metrics"
+                    );
+                    builder = builder.with_reader(reader);
+                }
+                Err(e) => tracing::warn!(
+                    "OTLP metrics endpoint {endpoint} is set but the exporter failed to initialize: {e}. \
+                     Metrics stay available on the Prometheus endpoint only."
+                ),
+            },
         }
         let provider = builder.build();
         global::set_meter_provider(provider.clone());
@@ -404,24 +415,27 @@ mod imp {
         Ok(())
     }
 
-    /// The OTLP metrics reader, `None` when no OTLP endpoint is configured.
-    /// The signal-specific endpoint and protocol variables win over the
-    /// generic ones, matching the span exporter.
-    fn otlp_reader() -> Result<Option<PeriodicReader>, MetricsError> {
+    /// The OTLP endpoint metrics would push to: the signal-specific variable
+    /// wins over the generic one, as the OTLP spec and the span exporter
+    /// have it.
+    fn otlp_endpoint() -> Option<String> {
+        std::env::var("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
+            .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT"))
+            .ok()
+    }
+
+    /// The OTLP metrics reader for `endpoint`. The exporter reads the
+    /// endpoint itself; `endpoint` only decides TLS. The protocol follows
+    /// `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL`, then the generic variable.
+    fn otlp_reader(endpoint: &str) -> Result<PeriodicReader, MetricsError> {
         use opentelemetry_otlp::{MetricExporter, WithTonicConfig};
 
-        let endpoint = std::env::var("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
-            .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT"))
-            .ok();
-        let Some(endpoint) = endpoint else {
-            return Ok(None);
-        };
         let protocol =
             crate::logging::resolve_otlp_protocol_from("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL");
         let exporter = match protocol {
             crate::logging::OtlpProtocol::Grpc => {
                 let mut builder = MetricExporter::builder().with_tonic();
-                if crate::logging::endpoint_uses_tls(&endpoint) {
+                if crate::logging::endpoint_uses_tls(endpoint) {
                     builder = builder.with_tls_config(
                         tonic::transport::ClientTlsConfig::new().with_native_roots(),
                     );
@@ -432,9 +446,7 @@ mod imp {
                 MetricExporter::builder().with_http().build()?
             }
         };
-        Ok(Some(
-            PeriodicReader::builder(exporter, opentelemetry_sdk::runtime::Tokio).build(),
-        ))
+        Ok(PeriodicReader::builder(exporter, opentelemetry_sdk::runtime::Tokio).build())
     }
 
     /// The Prometheus text exposition of every instrument, collected now.
@@ -648,7 +660,7 @@ mod stub {
 
     use super::{InferenceLabels, Ingress, MetricsError, RunMeasure, TokenMeasure};
 
-    pub fn init() -> Result<(), MetricsError> {
+    pub fn init(_: bool) -> Result<(), MetricsError> {
         Err(MetricsError::Disabled)
     }
     pub fn render_prometheus() -> Result<String, MetricsError> {
@@ -686,8 +698,8 @@ mod tests {
     /// exposition lives in this test.
     #[tokio::test]
     async fn renders_recorded_instruments_in_prometheus_text() {
-        init().expect("metrics init");
-        init().expect("second init is a no-op");
+        init(false).expect("metrics init");
+        init(false).expect("second init is a no-op");
 
         record_http_request(
             "/v1/chat/completions",

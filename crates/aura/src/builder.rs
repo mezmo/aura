@@ -3630,7 +3630,7 @@ timeout_secs = 60
         #[cfg(feature = "otel")]
         #[tokio::test]
         async fn a_streamed_run_records_its_inference_metrics() {
-            crate::metrics::init().unwrap();
+            crate::metrics::init(false).unwrap();
             let (prepared, _requests) = prepared_scripted(vec![ScriptedTurn::text("done")]);
             let agent = prepared.begin_run(RunId::mint(), None, None).unwrap();
             let id = agent.run_id().to_string();

@@ -45,6 +45,9 @@ impl Server {
             .env("HOST", "127.0.0.1")
             .env("PORT", port.to_string())
             .env("RUST_LOG", "warn")
+            // The server loads the repo's `.env`, which may name an OTLP
+            // endpoint; the test must push nowhere.
+            .env("AURA_METRICS_OTLP", "false")
             .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
             .env_remove("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
             .stdout(Stdio::null())

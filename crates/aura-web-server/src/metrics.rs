@@ -106,7 +106,7 @@ mod tests {
 
     #[tokio::test]
     async fn scrape_serves_prometheus_text_and_the_request_metric() {
-        aura::metrics::init().unwrap();
+        aura::metrics::init(false).unwrap();
         let app = router::<()>().layer(axum::middleware::from_fn(record_request));
 
         let first = app
