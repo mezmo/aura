@@ -818,7 +818,8 @@
           "mode": "multi",
           "sort": "desc"
         }
-      }
+      },
+      "description": "Time to the response headers. A streaming completion returns them before the run starts, so its whole run is in Run duration, not here."
     },
     {
       "type": "row",

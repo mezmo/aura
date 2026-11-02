@@ -29,16 +29,33 @@ declared=$(awk '
   }
 ' "$source" | sort -u)
 
-# A metric name in PromQL is the identifier a label selector follows.
-queried=$(jq -r '.. | objects | select(has("expr")) | .expr' "$dashboard" \
-  | grep -oE '\b(aura|gen_ai|mcp|http)_[a-z0-9_]+\{' \
-  | sed -E 's/\{$//; s/_(bucket|sum|count)$//' \
-  | sort -u)
+# Attribute keys the module declares, as Prometheus label names, plus the
+# labels Prometheus itself adds. These are the identifiers in an expression
+# that look like metric names but are not.
+labels=$(awk '
+  match($0, /const [A-Z_]+: &str = "[a-z0-9_.]+"/) {
+    name = substr($0, RSTART, RLENGTH); sub(/^[^"]*"/, "", name); sub(/".*/, "", name)
+    gsub(/\./, "_", name); print name
+  }
+' "$source"; printf 'le\ninstance\njob\n')
 
-missing=$(comm -23 <(printf '%s\n' "$queried") <(printf '%s\n' "$declared"))
+# Every metric-shaped identifier in every expression, minus the label names.
+# A histogram or summary suffix is tried as part of the name first, then
+# folded back onto the declared name.
+missing=$(jq -r '.. | objects | select(has("expr")) | .expr' "$dashboard" \
+  | grep -oE '\b(aura|gen_ai|mcp|http)_[a-z0-9_]+' \
+  | sort -u \
+  | comm -23 - <(printf '%s\n' "$labels" | sort -u) \
+  | while read -r name; do
+      stem=$(sed -E 's/_(bucket|sum|count)$//' <<<"$name")
+      grep -qxF "$name" <<<"$declared" || grep -qxF "$stem" <<<"$declared" || echo "$name"
+    done)
 if [[ -n $missing ]]; then
   echo "metric names queried by $dashboard that $source does not declare:" >&2
   printf '  %s\n' $missing >&2
   exit 1
 fi
-echo "ok: $(printf '%s\n' "$queried" | wc -l) metric names in $dashboard, all declared in $source ($(printf '%s\n' "$declared" | wc -l) instruments)"
+queried=$(jq -r '.. | objects | select(has("expr")) | .expr' "$dashboard" \
+  | grep -oE '\b(aura|gen_ai|mcp|http)_[a-z0-9_]+' | sed -E 's/_(bucket|sum|count)$//' | sort -u \
+  | comm -23 - <(printf '%s\n' "$labels" | sort -u) | wc -l)
+echo "ok: $queried metric names in $dashboard, all declared in $source ($(printf '%s\n' "$declared" | wc -l) instruments)"
