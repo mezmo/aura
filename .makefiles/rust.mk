@@ -21,22 +21,33 @@ build-rust: $(DOCKER_ENV) ## Build all rust targets
 	$(RUN) cargo build --workspace $(if $(AURA_RELEASE),--release,) $(if $(IS_CI),--quiet,)
 
 COVERAGE_RUSTFLAGS := --allow=warnings -Cinstrument-coverage
+NEXTEST_ARGS := --workspace --all-targets --features integration
 
 .PHONY:build-coverage
-build-coverage: $(DOCKER_ENV) $(REPORT_DIR) ## Build every target with coverage instrumentation
-	@# Flags and features match the cook-debug recipe and nextest, so the
-	@# baked dependencies and this build are reused rather than recompiled.
+build-coverage: $(DOCKER_ENV) $(NEXTEST_BIN) $(REPORT_DIR) ## Build every target with coverage instrumentation
+	@# Built through nextest itself rather than cargo build: cargo build
+	@# compiles a workspace proc-macro as a root target with debuginfo, while
+	@# the test build nextest runs needs it only as a dependency, built
+	@# without, so the two disagree on aura-telemetry-derive and everything
+	@# depending on it. Flags and features match the cook-debug recipe.
+	@# Instrumented proc-macros and build scripts write profiles while rustc
+	@# runs them; those go to a bounded pool under the target dir, not into
+	@# the coverage report.
 	RUSTFLAGS="$(COVERAGE_RUSTFLAGS)" \
-		LLVM_PROFILE_FILE=$(PROJECT_ROOT)/$(COVERAGE_DIR)/build-%p-%m.profraw \
-		cargo build --all-targets --workspace --features integration --frozen
+		LLVM_PROFILE_FILE=$(abspath $(TARGET_DIR))/build-profraw/build-%4m.profraw \
+		cargo nextest run $(NEXTEST_ARGS) --no-run --frozen
 
 .PHONY:coverage
 coverage: $(DOCKER_ENV) $(REPORT_DIR) $(GRCOV_BIN) ## Run the local test suite with code coverage
 	-$(MAKE) debug-PROJECT_ROOT
 	$(MAKE) build-coverage
+	@# nextest runs every test in its own process; %8m merges the processes
+	@# of one test binary into at most eight profiles instead of one each.
 	export RUSTFLAGS="$(COVERAGE_RUSTFLAGS)"; \
-		export LLVM_PROFILE_FILE=$(PROJECT_ROOT)/$(COVERAGE_DIR)/profile-%p-%m.profraw; \
+		export LLVM_PROFILE_FILE=$(PROJECT_ROOT)/$(COVERAGE_DIR)/profile-%8m.profraw; \
 		$(MAKE) nextest || touch $(TARGET_DIR)/.nextest-failed
+	@echo "Coverage input: $$(ls $(COVERAGE_DIR)/*.profraw 2>/dev/null | wc -l) profraw files, $$(du -ch $(COVERAGE_DIR)/*.profraw 2>/dev/null | tail -1 | cut -f1)"
+	started=$$(date +%s); \
 	$(RUN) grcov $(COVERAGE_DIR) . \
 		--binary-path $(TARGET_DIR)/debug \
 		--ignore-not-existing \
@@ -49,7 +60,8 @@ coverage: $(DOCKER_ENV) $(REPORT_DIR) $(GRCOV_BIN) ## Run the local test suite w
 		--llvm \
 		--branch \
 		--source-dir . \
-		|| touch $(TARGET_DIR)/.grcov-failed
+		|| touch $(TARGET_DIR)/.grcov-failed; \
+	echo "grcov took $$(( $$(date +%s) - started ))s"
 
 	@# Hit/miss/non-cacheable counters land in the lane log when the
 	@# coverage compile ran through sccache.
@@ -63,7 +75,7 @@ coverage: $(DOCKER_ENV) $(REPORT_DIR) $(GRCOV_BIN) ## Run the local test suite w
 
 .PHONY:nextest
 nextest: $(DOCKER_ENV) $(NEXTEST_BIN) $(REPORT_DIR)
-	$(RUN) cargo nextest run --workspace --all-targets --features integration $(if $(IS_CI),-P ci,)
+	$(RUN) cargo nextest run $(NEXTEST_ARGS) $(if $(IS_CI),-P ci,)
 
 .PHONY:test-loom
 test-loom: $(DOCKER_ENV) ## Run the loom interleaving models (not part of `test`; they explore, so they are slow)
