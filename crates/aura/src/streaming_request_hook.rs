@@ -154,6 +154,10 @@ pub struct UsageState {
     last_output_tokens: Arc<AtomicU64>,
     /// Tool IDs completed since the last usage event (for aura.tool_usage correlation)
     pending_tool_ids: Arc<Mutex<Vec<ToolCallId>>>,
+    /// LLM turns recorded.
+    llm_turns: Arc<AtomicU64>,
+    /// Tool calls the model issued.
+    tool_calls: Arc<AtomicU64>,
 }
 
 impl UsageState {
@@ -222,6 +226,7 @@ impl UsageState {
     /// prompt + completion.
     pub fn store_usage(&self, prompt: u64, completion: u64, _total: u64, is_tool_turn: bool) {
         self.initialized.store(true, Ordering::Release);
+        self.llm_turns.fetch_add(1, Ordering::AcqRel);
 
         // Cumulative billed input across every turn.
         self.billed_prompt_tokens
@@ -250,6 +255,21 @@ impl UsageState {
         }
     }
 
+    /// LLM turns recorded so far, every path counted (`store_usage` and
+    /// `accumulate_usage` alike).
+    pub fn llm_turns(&self) -> u64 {
+        self.llm_turns.load(Ordering::Acquire)
+    }
+
+    /// Tool calls the model issued so far, as the hook saw them.
+    pub fn tool_calls(&self) -> u64 {
+        self.tool_calls.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_tool_call(&self) {
+        self.tool_calls.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Accumulate billed usage across independent LLM calls (orchestration path).
     ///
     /// Adds to the billed counters like [`store_usage`](Self::store_usage) but
@@ -259,6 +279,7 @@ impl UsageState {
     /// emitted from each agent's final response instead.
     pub fn accumulate_usage(&self, prompt: u64, completion: u64) {
         self.initialized.store(true, Ordering::Release);
+        self.llm_turns.fetch_add(1, Ordering::AcqRel);
         self.billed_prompt_tokens
             .fetch_add(prompt, Ordering::AcqRel);
         self.accumulated_completion_tokens
@@ -459,6 +480,10 @@ pub struct StreamingRequestHook {
     /// LLM-reported per-turn input/output tokens into the budget as ground
     /// truth so `remaining()` reflects actual context pressure.
     scratchpad_budget: Option<ContextBudget>,
+    /// The agent and model behind this run's LLM turns.
+    inference_labels: Option<crate::metrics::InferenceLabels>,
+    /// When the LLM call in flight began.
+    turn_started: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 impl StreamingRequestHook {
@@ -491,8 +516,18 @@ impl StreamingRequestHook {
             request_id: request_id.into(),
             usage_state: usage_state.clone(),
             scratchpad_budget,
+            inference_labels: None,
+            turn_started: Arc::new(Mutex::new(None)),
         };
         (hook, cancel, usage_state)
+    }
+
+    /// Label this run's LLM turns for the inference metrics. Without labels
+    /// the hook records no inference metrics.
+    #[must_use]
+    pub fn with_inference_labels(mut self, labels: crate::metrics::InferenceLabels) -> Self {
+        self.inference_labels = Some(labels);
+        self
     }
 
     /// Registers another observer for this run, alongside the deadline and
@@ -594,6 +629,8 @@ where
                 return;
             }
             self.check_and_cancel(cancel_sig, "completion call");
+            // The call goes out once this returns without cancelling.
+            *self.turn_started.lock().unwrap() = Some(std::time::Instant::now());
         }
     }
 
@@ -638,6 +675,7 @@ where
         // makes the matching skip so push/pop stay symmetric. Cancellation
         // is still checked.
         let publish_event = Self::should_publish_tool_event(&tool_name);
+        self.usage_state.count_tool_call();
         async move {
             // Stash the call id so the park arm can record it on the cell entry.
             if let Some(cell) = park_cell_for(&request_id) {
@@ -756,11 +794,36 @@ where
         let usage_state = self.usage_state.clone();
         let request_id = self.request_id.clone();
         let scratchpad_budget = self.scratchpad_budget.clone();
+        let turn_duration = self
+            .turn_started
+            .lock()
+            .unwrap()
+            .take()
+            .map(|t| t.elapsed());
 
         // Extract usage if the response type supports it
         // StreamingResponse implements GetTokenUsage which has token_usage()
         let usage = response.token_usage();
         let cache_usage = response.cache_token_usage();
+
+        if let Some(labels) = &self.inference_labels {
+            if let Some(duration) = turn_duration {
+                crate::metrics::record_inference(labels, None, duration);
+            }
+            if let Some(usage) = &usage {
+                crate::metrics::record_token_usage(
+                    labels,
+                    crate::metrics::TokenMeasure {
+                        input: usage.input_tokens,
+                        output: usage.output_tokens,
+                        cache_read: cache_usage.map(|c| c.cache_read_input_tokens).unwrap_or(0),
+                        cache_write: cache_usage
+                            .map(|c| c.cache_creation_input_tokens)
+                            .unwrap_or(0),
+                    },
+                );
+            }
+        }
 
         async move {
             if let Some(usage) = usage {
@@ -1466,5 +1529,21 @@ mod tests {
                 "the response's own split, even when it reports none"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod usage_counter_tests {
+    use super::UsageState;
+
+    #[test]
+    fn every_usage_path_counts_a_turn_and_tool_calls_count_separately() {
+        let usage = UsageState::new();
+        assert_eq!((usage.llm_turns(), usage.tool_calls()), (0, 0));
+        usage.store_usage(10, 5, 15, false);
+        usage.store_usage(20, 5, 25, true);
+        usage.accumulate_usage(30, 5);
+        usage.count_tool_call();
+        assert_eq!((usage.llm_turns(), usage.tool_calls()), (3, 1));
     }
 }

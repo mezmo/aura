@@ -1407,6 +1407,7 @@ impl Orchestrator {
             hitl_approval_tool: None,
             inner: provider_agent,
             model: model_name,
+            agent_name: worker_name.unwrap_or("worker").to_owned(),
             max_depth: resolved_depth,
             mcp_manager: self.mcp_manager.clone(),
             fallback_tool_parsing: false,
@@ -3232,6 +3233,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let prepared = Arc::new(PreparedAgent {
             inner: provider_agent,
             model: model_name,
+            agent_name: self.agent_build_context.agent.name.clone(),
             max_depth,
             mcp_manager: None, // Coordinator doesn't have MCP tools
             fallback_tool_parsing: false,
@@ -4748,6 +4750,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 &park.key,
                 worker.scratchpad_budget().cloned(),
                 worker.client_tool_names.clone(),
+                worker.inference_labels(),
             )
             .await
             .into_events();

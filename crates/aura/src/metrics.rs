@@ -12,6 +12,7 @@
 //! Without the `otel` feature the functions compile to nothing and
 //! [`render_prometheus`] reports [`MetricsError::Disabled`].
 
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Where a run entered the server.
@@ -63,6 +64,27 @@ pub struct RunMeasure<'a> {
     pub duration: Duration,
     pub inference_calls: Option<u64>,
     pub tool_calls: Option<u64>,
+}
+
+/// The agent and model behind a run's LLM turns, as the inference metrics
+/// label them.
+#[derive(Debug, Clone)]
+pub struct InferenceLabels {
+    agent: Arc<str>,
+    provider: Arc<str>,
+    model: Arc<str>,
+}
+
+impl InferenceLabels {
+    /// `provider` is aura's provider identifier; the semconv spelling is
+    /// applied when the labels are recorded.
+    pub fn new(agent: &str, provider: &str, model: &str) -> Self {
+        Self {
+            agent: agent.into(),
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
 }
 
 /// Provider-billed tokens of one LLM turn, for [`record_token_usage`].
@@ -140,7 +162,9 @@ mod imp {
     use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
     use prometheus::Encoder;
 
-    use super::{Ingress, MetricsError, RunMeasure, TokenMeasure, ToolType, provider_name};
+    use super::{
+        InferenceLabels, Ingress, MetricsError, RunMeasure, TokenMeasure, ToolType, provider_name,
+    };
 
     const METER_NAME: &str = "aura";
 
@@ -525,31 +549,29 @@ mod imp {
         }
     }
 
-    fn inference_attrs(provider: &str, model: &str, agent: &str) -> Vec<KeyValue> {
+    fn inference_attrs(labels: &InferenceLabels) -> Vec<KeyValue> {
         vec![
             kv(GEN_AI_OPERATION_NAME, "chat"),
-            kv(GEN_AI_PROVIDER_NAME, provider_name(provider)),
-            kv(GEN_AI_REQUEST_MODEL, model),
-            kv(GEN_AI_AGENT_NAME, agent),
+            kv(GEN_AI_PROVIDER_NAME, provider_name(&labels.provider)),
+            kv(GEN_AI_REQUEST_MODEL, &labels.model),
+            kv(GEN_AI_AGENT_NAME, &labels.agent),
         ]
     }
 
     pub fn record_inference(
-        provider: &str,
-        model: &str,
-        agent: &str,
+        labels: &InferenceLabels,
         error_type: Option<&str>,
         duration: Duration,
     ) {
         let Some(i) = instruments() else { return };
-        let mut attrs = inference_attrs(provider, model, agent);
+        let mut attrs = inference_attrs(labels);
         push_error(&mut attrs, error_type);
         i.inference_duration.record(duration.as_secs_f64(), &attrs);
     }
 
-    pub fn record_token_usage(provider: &str, model: &str, agent: &str, tokens: TokenMeasure) {
+    pub fn record_token_usage(labels: &InferenceLabels, tokens: TokenMeasure) {
         let Some(i) = instruments() else { return };
-        let attrs = inference_attrs(provider, model, agent);
+        let attrs = inference_attrs(labels);
         i.operation_input_tokens.record(tokens.input, &attrs);
         i.operation_output_tokens.record(tokens.output, &attrs);
         let mut usage_attrs = attrs;
@@ -656,7 +678,7 @@ pub use stub::*;
 mod stub {
     use std::time::Duration;
 
-    use super::{Ingress, MetricsError, RunMeasure, TokenMeasure, ToolType};
+    use super::{InferenceLabels, Ingress, MetricsError, RunMeasure, TokenMeasure, ToolType};
 
     pub fn init() -> Result<(), MetricsError> {
         Err(MetricsError::Disabled)
@@ -668,8 +690,8 @@ mod stub {
     pub fn record_http_request(_: &str, _: &str, _: u16, _: Duration) {}
     pub fn runs_active_add(_: Ingress, _: i64) {}
     pub fn record_run(_: RunMeasure<'_>) {}
-    pub fn record_inference(_: &str, _: &str, _: &str, _: Option<&str>, _: Duration) {}
-    pub fn record_token_usage(_: &str, _: &str, _: &str, _: TokenMeasure) {}
+    pub fn record_inference(_: &InferenceLabels, _: Option<&str>, _: Duration) {}
+    pub fn record_token_usage(_: &InferenceLabels, _: TokenMeasure) {}
     pub fn record_mcp_operation(_: &str, _: &str, _: Option<&str>, _: Duration) {}
     pub fn record_tool_execution(_: &str, _: &str, _: ToolType, _: Option<&str>, _: Duration) {}
     pub fn set_mcp_server_status(_: &str, _: &str, _: bool, _: u64) {}
@@ -716,17 +738,10 @@ mod tests {
             inference_calls: Some(2),
             tool_calls: Some(1),
         });
-        record_inference(
-            "bedrock",
-            "claude",
-            "demo",
-            None,
-            Duration::from_millis(800),
-        );
+        let labels = InferenceLabels::new("demo", "bedrock", "claude");
+        record_inference(&labels, None, Duration::from_millis(800));
         record_token_usage(
-            "bedrock",
-            "claude",
-            "demo",
+            &labels,
             TokenMeasure {
                 input: 100,
                 output: 20,

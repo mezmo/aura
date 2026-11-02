@@ -76,6 +76,19 @@ pub enum StreamTermination {
     Shutdown,
 }
 
+impl StreamTermination {
+    /// `error.type` for the run metric; `None` for a normal end.
+    pub fn error_type(&self) -> Option<&'static str> {
+        match self {
+            Self::Complete => None,
+            Self::StreamError(_) => Some("stream_error"),
+            Self::Disconnected => Some("client_disconnect"),
+            Self::Timeout => Some("timeout"),
+            Self::Shutdown => Some("shutdown"),
+        }
+    }
+}
+
 /// User-facing message when context overflow is detected.
 const CONTEXT_OVERFLOW_MESSAGE: &str = "My tools returned more data than I can work with at once.\n\n\
     **To help me out, try:**\n\

@@ -134,6 +134,8 @@ pub(crate) fn scratchpad_usage_event(
 pub struct PreparedAgent {
     pub(crate) inner: ProviderAgent,
     pub(crate) model: String,
+    /// `[agent].name`, or the worker's name under orchestration.
+    pub(crate) agent_name: String,
     pub(crate) max_depth: usize,
     pub(crate) mcp_manager: Option<Arc<crate::mcp::McpManager>>,
     /// Whether Ollama text-to-tool parsing is on.
@@ -930,6 +932,7 @@ impl PreparedAgent {
         Ok(PreparedAgent {
             inner: provider_agent,
             model: model_name,
+            agent_name: build_context.agent.name.clone(),
             max_depth,
             mcp_manager,
             fallback_tool_parsing,
@@ -953,6 +956,15 @@ impl PreparedAgent {
     /// The request headers forwarded when this agent was prepared.
     pub fn forwarded_headers(&self) -> &ForwardedHeaders {
         &self.forwarded_headers
+    }
+
+    /// How this agent's LLM turns are labelled in the inference metrics.
+    pub fn inference_labels(&self) -> crate::metrics::InferenceLabels {
+        crate::metrics::InferenceLabels::new(
+            &self.agent_name,
+            self.inner.provider_name(),
+            &self.model,
+        )
     }
 
     /// Begin the run `run_id` of this agent, for a request whose headers are
@@ -1748,7 +1760,7 @@ impl Agent {
             .await;
         self.hold_run(
             self.prepared
-                .maybe_wrap_with_fallback(self.count_turns(stream), None),
+                .maybe_wrap_with_fallback(self.count_turns(self.meter_turn_usage(stream)), None),
         )
     }
 
@@ -1765,7 +1777,7 @@ impl Agent {
             .await;
         self.hold_run(
             self.prepared
-                .maybe_wrap_with_fallback(self.count_turns(stream), None),
+                .maybe_wrap_with_fallback(self.count_turns(self.meter_turn_usage(stream)), None),
         )
     }
 
@@ -1789,8 +1801,37 @@ impl Agent {
             .await;
         self.hold_run(
             self.prepared
-                .maybe_wrap_with_fallback(self.count_turns(stream), None),
+                .maybe_wrap_with_fallback(self.count_turns(self.meter_turn_usage(stream)), None),
         )
+    }
+
+    /// Record the token metrics of a stream that carries no hook: its
+    /// `TurnUsage` items are the only per-turn signal, so tokens are counted
+    /// from them here and these turns report no inference duration. Streams
+    /// with a hook record both in the hook instead.
+    fn meter_turn_usage(
+        &self,
+        stream: Pin<
+            Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>,
+        >,
+    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
+        use futures::StreamExt;
+
+        let labels = self.prepared.inference_labels();
+        Box::pin(stream.map(move |item| {
+            if let Ok(StreamItem::TurnUsage(usage, cache)) = &item {
+                crate::metrics::record_token_usage(
+                    &labels,
+                    crate::metrics::TokenMeasure {
+                        input: usage.input_tokens,
+                        output: usage.output_tokens,
+                        cache_read: cache.map(|c| c.cache_read_input_tokens).unwrap_or(0),
+                        cache_write: cache.map(|c| c.cache_creation_input_tokens).unwrap_or(0),
+                    },
+                );
+            }
+            item
+        }))
     }
 
     /// Keep this run leased for as long as `stream` is alive, so a stream
@@ -1893,6 +1934,7 @@ impl Agent {
                 request_id,
                 self.scratchpad_budget().cloned(),
                 self.prepared.client_tool_names.clone(),
+                self.prepared.inference_labels(),
             )
             .await
             .map_stream(|stream| {
@@ -1934,6 +1976,7 @@ impl Agent {
                 request_id,
                 self.scratchpad_budget().cloned(),
                 self.prepared.client_tool_names.clone(),
+                self.prepared.inference_labels(),
             )
             .await
             .map_stream(|stream| {
@@ -2397,6 +2440,7 @@ pub(crate) mod test_support {
         PreparedAgent {
             inner,
             model: "scripted".to_owned(),
+            agent_name: "scripted".to_owned(),
             max_depth: 1,
             mcp_manager: None,
             fallback_tool_parsing: false,
@@ -3529,6 +3573,44 @@ timeout_secs = 60
                 requests.lock().unwrap().len(),
                 1,
                 "only the first stream reaches the model",
+            );
+        }
+
+        /// One streamed run lands in the metrics: its LLM turn's duration
+        /// and tokens under the agent's own labels.
+        #[cfg(feature = "otel")]
+        #[tokio::test]
+        async fn a_streamed_run_records_its_inference_metrics() {
+            crate::metrics::init().unwrap();
+            let (prepared, _requests) = prepared_scripted(vec![ScriptedTurn::text("done")]);
+            let agent = prepared.begin_run(RunId::mint(), None, None).unwrap();
+            let id = agent.run_id().to_string();
+            let run = StreamingAgent::stream(
+                &agent,
+                "q",
+                Vec::new(),
+                crate::streaming::RunOptions::default(),
+                &id,
+            )
+            .await;
+            let usage = run.usage().clone();
+            let items: Vec<_> = run.into_events().collect().await;
+            assert!(items.iter().all(Result::is_ok), "{items:?}");
+            assert_eq!((usage.llm_turns(), usage.tool_calls()), (1, 0));
+
+            let text = crate::metrics::render_prometheus().unwrap();
+            let labels = r#"gen_ai_agent_name="scripted",gen_ai_operation_name="chat",gen_ai_provider_name="scripted",gen_ai_request_model="scripted""#;
+            assert!(
+                text.contains(&format!(
+                    "gen_ai_client_inference_duration_seconds_count{{{labels}}}"
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "gen_ai_client_inference_usage_input_tokens_total{{{labels},gen_ai_token_modality=\"text\"}}"
+                )),
+                "{text}"
             );
         }
 

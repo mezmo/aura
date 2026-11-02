@@ -111,6 +111,7 @@ impl ProviderAgent {
         request_id: &str,
         scratchpad_budget: Option<ContextBudget>,
         client_tool_names: HashSet<String>,
+        labels: crate::metrics::InferenceLabels,
     ) -> crate::streaming::AgentRun {
         let (hook, cancel_tx, usage_state) = StreamingRequestHook::with_scratchpad_budget(
             options,
@@ -118,6 +119,7 @@ impl ProviderAgent {
             scratchpad_budget,
             client_tool_names,
         );
+        let hook = hook.with_inference_labels(labels);
 
         match self {
             Self::OpenAI(agent) => {
@@ -314,6 +316,7 @@ impl ProviderAgent {
     /// Stream a prompt with timeout and cancellation support.
     ///
     /// Returns the run: its stream, the token that cancels it, and its usage.
+    #[allow(clippy::too_many_arguments)]
     pub async fn stream_prompt_with_timeout(
         &self,
         query: &str,
@@ -322,6 +325,7 @@ impl ProviderAgent {
         request_id: &str,
         scratchpad_budget: Option<ContextBudget>,
         client_tool_names: HashSet<String>,
+        labels: crate::metrics::InferenceLabels,
     ) -> crate::streaming::AgentRun {
         let (hook, cancel_tx, usage_state) = StreamingRequestHook::with_scratchpad_budget(
             options,
@@ -329,6 +333,7 @@ impl ProviderAgent {
             scratchpad_budget,
             client_tool_names,
         );
+        let hook = hook.with_inference_labels(labels);
 
         match self {
             Self::OpenAI(agent) => {
@@ -432,6 +437,7 @@ impl ProviderAgent {
         request_id: &str,
         scratchpad_budget: Option<ContextBudget>,
         client_tool_names: HashSet<String>,
+        labels: crate::metrics::InferenceLabels,
     ) -> crate::streaming::AgentRun {
         let (hook, cancel_tx, usage_state) = StreamingRequestHook::with_scratchpad_budget(
             options,
@@ -439,6 +445,7 @@ impl ProviderAgent {
             scratchpad_budget,
             client_tool_names,
         );
+        let hook = hook.with_inference_labels(labels);
 
         match self {
             Self::OpenAI(agent) => {
