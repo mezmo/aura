@@ -20,13 +20,21 @@ $(REPORT_DIR):
 build-rust: $(DOCKER_ENV) ## Build all rust targets
 	$(RUN) cargo build --workspace $(if $(AURA_RELEASE),--release,) $(if $(IS_CI),--quiet,)
 
+COVERAGE_RUSTFLAGS := --allow=warnings -Cinstrument-coverage
+
+.PHONY:build-coverage
+build-coverage: $(DOCKER_ENV) $(REPORT_DIR) ## Build every target with coverage instrumentation
+	@# Flags and features match the cook-debug recipe and nextest, so the
+	@# baked dependencies and this build are reused rather than recompiled.
+	RUSTFLAGS="$(COVERAGE_RUSTFLAGS)" \
+		LLVM_PROFILE_FILE=$(PROJECT_ROOT)/$(COVERAGE_DIR)/build-%p-%m.profraw \
+		cargo build --all-targets --workspace --features integration --frozen
+
 .PHONY:coverage
 coverage: $(DOCKER_ENV) $(REPORT_DIR) $(GRCOV_BIN) ## Run the local test suite with code coverage
 	-$(MAKE) debug-PROJECT_ROOT
-	@# Terminate the shell on a failed compile: make only sees the last status.
-	export RUSTFLAGS="--allow=warnings -Cinstrument-coverage"; \
-		export LLVM_PROFILE_FILE=$(PROJECT_ROOT)/$(COVERAGE_DIR)/build-%p-%m.profraw; \
-		cargo build --all-targets --workspace --frozen || exit 1; \
+	$(MAKE) build-coverage
+	export RUSTFLAGS="$(COVERAGE_RUSTFLAGS)"; \
 		export LLVM_PROFILE_FILE=$(PROJECT_ROOT)/$(COVERAGE_DIR)/profile-%p-%m.profraw; \
 		$(MAKE) nextest || touch $(TARGET_DIR)/.nextest-failed
 	$(RUN) grcov $(COVERAGE_DIR) . \
@@ -65,10 +73,15 @@ test-loom: $(DOCKER_ENV) ## Run the loom interleaving models (not part of `test`
 lint-rust: | $(DOCKER_ENV) $(REPORT_DIR)  ## lint rust code via clippy
 	$(RUN) cargo clippy $(if $(IS_CI),-q,) --all-targets --all-features $(if $(IS_CI),--message-format=json,) -- -D warnings $(if $(IS_CI),> $(REPORT_DIR)/clippy.json,)
 
+.PHONY:build-rust-ci
+build-rust-ci: ## Build every target inside the CI test container (needs `make test-integration-up` first)
+	$(TEST_CI_EXEC) make build-coverage
+
 .PHONY:lint-rust-ci
-lint-rust-ci: | $(REPORT_DIR)  ## lint rust code via clippy against the prebuilt AURA_TEST_IMAGE (CI only; needs `make build-images` first)
-	$(if $(AURA_TEST_IMAGE),,$(error AURA_TEST_IMAGE is not set; run make build-images first))
-	$(DOCKER) run --rm $(AURA_TEST_IMAGE) cargo clippy -q --all-targets --all-features --message-format=json -- -D warnings > $(REPORT_DIR)/clippy.json
+lint-rust-ci: | $(REPORT_DIR)  ## lint rust code via clippy inside the CI test container (needs `make test-integration-up` first)
+	@# The image's RUSTFLAGS and the build's feature set keep the build
+	@# scripts and proc-macros shared with build-rust-ci.
+	$(TEST_CI_EXEC) cargo clippy -q --workspace --all-targets --features integration --message-format=json -- -D warnings > $(REPORT_DIR)/clippy.json
 
 .PHONY: check-cli-http-only
 check-cli-http-only: $(DOCKER_ENV) ## Verify the HTTP-only (no-default-features) aura-cli still builds

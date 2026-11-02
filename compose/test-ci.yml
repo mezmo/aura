@@ -1,0 +1,16 @@
+# compose/test-ci.yml
+# Long-lived test runner for CI
+#
+# Layered on base.yml + test.yml. The runner idles instead of running the
+# suite, so CI can exec build, clippy and the integration tests into one
+# container and reuse its cargo target dir between steps.
+#
+# Usage:
+#   make test-integration-up
+#   make build-rust-ci lint-rust-ci test-integration-ci
+#   make test-integration-down
+
+services:
+  aura-integration-test:
+    init: true
+    command: ["sleep", "infinity"]
