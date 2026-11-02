@@ -666,11 +666,15 @@ where
         // makes the matching skip so push/pop stay symmetric. Cancellation
         // is still checked.
         let publish_event = Self::should_publish_tool_event(&tool_name);
-        self.usage_state.count_tool_call();
-        // One slot, not a map: rig runs a turn's tools one after another
-        // (the FIFO assumption `RunContext` documents), so the result that
-        // arrives next is this call's.
-        *self.tool_started.lock().unwrap() = Some(std::time::Instant::now());
+        // The tool metrics follow the event surface: a suppressed scratchpad
+        // read is context management, not a tool call the model made.
+        if publish_event {
+            self.usage_state.count_tool_call();
+            // One slot, not a map: rig runs a turn's tools one after another
+            // (the FIFO assumption `RunContext` documents), so the result
+            // that arrives next is this call's.
+            *self.tool_started.lock().unwrap() = Some(std::time::Instant::now());
+        }
         async move {
             // Stash the call id so the park arm can record it on the cell entry.
             if let Some(cell) = park_cell_for(&request_id) {

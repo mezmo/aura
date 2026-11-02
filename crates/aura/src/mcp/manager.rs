@@ -63,7 +63,10 @@ impl McpManager {
     }
 
     /// Record every server's connection state and tool count for `agent`
-    /// in the metrics, as of the last connection attempt.
+    /// in the metrics. The gauges hold the newest attempt: every request
+    /// prepares its agent afresh and connects again (`PreparedAgent::
+    /// prepare`), so a server that drops shows as disconnected from the
+    /// next request on, not only at startup.
     pub fn record_connection_metrics(&self, agent: &str) {
         for (server, info) in &self.server_info {
             crate::metrics::set_mcp_server_status(

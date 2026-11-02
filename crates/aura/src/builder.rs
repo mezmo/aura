@@ -193,6 +193,20 @@ pub struct Agent {
     stream_claim: crate::streaming::StreamClaim,
 }
 
+/// `error.type` of a failed LLM turn, from the stream error's shape: the
+/// cases the orchestrator already tells apart, a cancellation, and the rest.
+fn inference_error_type(error: &(dyn std::error::Error + Send + Sync)) -> &'static str {
+    if crate::orchestration::is_context_overflow_error(error) {
+        "context_overflow"
+    } else if crate::orchestration::is_max_depth_error(error) {
+        "max_depth"
+    } else if error.to_string().to_ascii_lowercase().contains("cancel") {
+        "cancelled"
+    } else {
+        "stream_error"
+    }
+}
+
 /// A run reads its prepared agent's fields and calls its methods directly, so
 /// the orchestrator and the `StreamingAgent` impl need no forwarders.
 impl std::ops::Deref for Agent {
@@ -973,7 +987,9 @@ impl PreparedAgent {
     /// alike; its duration runs from the stream's creation, or from the last
     /// tool result rig yielded, to that item. The duration therefore spans
     /// the provider call and the streaming of its response, with tool
-    /// execution between turns excluded.
+    /// execution between turns excluded. An `Err` item is the turn that
+    /// failed: it is recorded with an `error.type` and no tokens, since the
+    /// provider reported none.
     pub(crate) fn meter_turn_usage(
         &self,
         stream: Pin<
@@ -1005,6 +1021,14 @@ impl PreparedAgent {
                 Ok(StreamItem::StreamUserItem(
                     crate::provider_agent::StreamedUserContent::ToolResult(_),
                 )) => {
+                    turn_started = std::time::Instant::now();
+                }
+                Err(error) => {
+                    crate::metrics::record_inference(
+                        &labels,
+                        Some(inference_error_type(error.as_ref())),
+                        turn_started.elapsed(),
+                    );
                     turn_started = std::time::Instant::now();
                 }
                 _ => {}
@@ -3959,5 +3983,26 @@ timeout_secs = 60
                 .begin_run(crate::run_context::named_run_id("req_b"), None, None)
                 .expect("the slot frees with the stream");
         }
+    }
+}
+
+#[cfg(test)]
+mod inference_error_type_tests {
+    use super::inference_error_type;
+
+    fn err(msg: &str) -> Box<dyn std::error::Error + Send + Sync> {
+        msg.to_string().into()
+    }
+
+    #[test]
+    fn names_the_known_failure_shapes_and_falls_back() {
+        assert_eq!(
+            inference_error_type(err("Request cancelled by client").as_ref()),
+            "cancelled"
+        );
+        assert_eq!(
+            inference_error_type(err("connection reset").as_ref()),
+            "stream_error"
+        );
     }
 }

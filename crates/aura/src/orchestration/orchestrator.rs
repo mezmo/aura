@@ -6464,7 +6464,7 @@ fn park_verdict_lines(plan: &Plan) -> Vec<String> {
 }
 
 /// Check if an error indicates a MaxDepthError from rig's ReAct loop.
-fn is_max_depth_error(error: &(dyn std::error::Error + Send + Sync)) -> bool {
+pub(crate) fn is_max_depth_error(error: &(dyn std::error::Error + Send + Sync)) -> bool {
     let msg = error.to_string();
     msg.contains("MaxDepthError") || msg.contains("reached limit")
 }
@@ -6473,7 +6473,7 @@ fn is_max_depth_error(error: &(dyn std::error::Error + Send + Sync)) -> bool {
 ///
 /// True when the error indicates context window overflow. Delegates to
 /// `categorize_failure_error` so classification stays in one place.
-fn is_context_overflow_error(error: &dyn std::error::Error) -> bool {
+pub(crate) fn is_context_overflow_error(error: &dyn std::error::Error) -> bool {
     matches!(
         Orchestrator::categorize_failure_error(&error.to_string()),
         FailureCategory::ContextOverflow
