@@ -836,9 +836,9 @@ impl Orchestrator {
         // Initialize MCP manager (shared across coordinator and all workers via Arc)
         let mcp_manager = if let Some(ref mcp_config) = agent_build_context.mcp {
             tracing::info!("Orchestrator: initializing MCP connections");
-            Some(Arc::new(
-                McpManager::initialize_from_config(mcp_config).await?,
-            ))
+            let manager = McpManager::initialize_from_config(mcp_config).await?;
+            manager.record_connection_metrics(&agent_build_context.agent.name);
+            Some(Arc::new(manager))
         } else {
             None
         };
