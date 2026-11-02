@@ -359,9 +359,9 @@ impl PreparedAgent {
         // Initialize MCP manager first (shared across all providers)
         let mcp_manager = if let Some(mcp_config) = &build_context.mcp {
             tracing::info!("Initializing MCP tools using dynamic adaptors");
-            Some(Arc::new(
-                McpManager::initialize_from_config(mcp_config).await?,
-            ))
+            let manager = McpManager::initialize_from_config(mcp_config).await?;
+            manager.record_connection_metrics(&build_context.agent.name);
+            Some(Arc::new(manager))
         } else {
             None
         };

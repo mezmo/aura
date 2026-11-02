@@ -222,6 +222,13 @@ Ingress paths into the web server (all end in the same `StreamingAgent::stream` 
 - A2A (`--enable-a2a`): JSON-RPC and REST task endpoints, driven by `a2a::AuraAgentExecutor`.
 - Slack (`--enable-slack`): an outbound Socket Mode WebSocket; `slack::runner` answers channel @mentions in a thread and DMs inline, rebuilding history from the Slack thread or DM on each message. See the `crates/aura-web-server/src/slack/` module docs and the Slack Ingress section of `CLAUDE.md`.
 
+Operational metrics (`crates/aura/src/metrics.rs`, `crates/aura-web-server/src/metrics.rs`):
+
+- OpenTelemetry instruments, named by the GenAI and MCP semantic conventions where one exists and `aura.*` otherwise, behind the `otel` feature. A Prometheus reader serves them at `GET /metrics` on the API port (or on `--metrics-listen` / `AURA_METRICS_LISTEN` alone); when `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` is set a periodic OTLP reader pushes the same instruments.
+- Prometheus names are the dotted names with dots as underscores, `_seconds` for `s` units and `_total` on counters: `gen_ai.client.inference.usage.input_tokens` scrapes as `gen_ai_client_inference_usage_input_tokens_total`.
+- Every recording site goes through the functions in `aura::metrics`, which own the attribute vocabulary; labels are config-bounded (agent, provider, model, MCP server key, tool name, ingress, outcome) and never a session, request, run or user id.
+- Local check: `cargo run --bin aura -- webserver`, send one chat completion, then `curl -s localhost:8080/metrics`.
+
 Orchestrator components and loop:
 
 - Coordinator agent: plans task DAGs and consolidates worker outputs via continuation.
@@ -238,3 +245,4 @@ Worth reading before diving into the code:
 - [docs/rig-fork-changes.md](docs/rig-fork-changes.md): why AURA uses a Rig.rs fork, what changed, and tool execution ordering (important for the tool-call queue on `run_context.rs`).
 - [docs/adr/2026-07-29-release-channels.md](docs/adr/2026-07-29-release-channels.md) and [docs/design/release-channels.md](docs/design/release-channels.md): the `nightly` / `beta` / `main` release channels, what each publishes, and how a release is promoted.
 - [Tracing & Span Layout](https://docs.mezmo.com/aura/tracing-spans): OpenTelemetry span layout and trace parenting.
+- [GenAI metrics](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-metrics.md), [GenAI token metrics](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-token-metrics.md) and [MCP](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/mcp.md) semantic conventions: the instrument names and attributes `aura::metrics` follows.

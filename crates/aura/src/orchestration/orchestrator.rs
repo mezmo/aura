@@ -2148,6 +2148,27 @@ impl Orchestrator {
     /// provider errors are resent the same prompt after an exponential backoff
     /// governed by `[orchestration.retry]`; the conversation is never touched
     /// here because the resent prompt is identical to the failed one. Each
+    /// One worker task's outcome and wall-clock, in the metrics. A task
+    /// without a specialised worker is labelled `generic`.
+    fn record_task_metric(&self, worker_name: Option<&str>, outcome: &str, duration_ms: u64) {
+        crate::metrics::record_task(
+            &self.agent_build_context.agent.name,
+            worker_name.unwrap_or("generic"),
+            outcome,
+            std::time::Duration::from_millis(duration_ms),
+        );
+    }
+
+    /// One routing decision, in the metrics.
+    fn record_routing_metric(&self, response: &PlanningResponse) {
+        let decision = match response {
+            PlanningResponse::Direct { .. } => "direct_answer",
+            PlanningResponse::Clarification { .. } => "clarification",
+            PlanningResponse::StepsPlan { .. } => "orchestrated",
+        };
+        crate::metrics::record_routing_decision(&self.agent_build_context.agent.name, decision);
+    }
+
     /// attempt gets a fresh `per_call_timeout_secs` budget; when that timeout
     /// is nonzero, one coordinator planning call is bounded by
     /// `(max_retries + 1) × per_call_timeout_secs` plus the cumulative
@@ -3922,6 +3943,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             .await;
                         let result_for_event = final_result.clone();
                         let success = exec_result.structured_output.is_some();
+                        self.record_task_metric(
+                            worker_name.as_deref(),
+                            if success { "completed" } else { "soft_failure" },
+                            duration_ms,
+                        );
                         if let Some(t) = plan.get_task_mut(task_id) {
                             if success {
                                 t.complete(final_result);
@@ -3957,6 +3983,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     // The partial output goes through the artifact flow
                     // like a result, but the task fails as a timeout.
                     Ok(TaskOutcome::TimedOut { message }) => {
+                        self.record_task_metric(
+                            worker_name.as_deref(),
+                            "agent_timeout",
+                            duration_ms,
+                        );
                         let final_result = self
                             .maybe_create_artifact(
                                 &wave_persistence,
@@ -4026,6 +4057,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     }) => {
                         // The task awaits human decisions: no artifact, no
                         // completion event; one blocked event per parked call.
+                        self.record_task_metric(worker_name.as_deref(), "blocked", duration_ms);
                         let worker_id = worker_name.clone().unwrap_or(self.orchestrator_id.clone());
                         for call in &pending {
                             emitter
@@ -4055,6 +4087,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     Err(e) => {
                         let err_str = e.to_string();
                         let category = Self::categorize_failure_error(&err_str);
+                        self.record_task_metric(worker_name.as_deref(), "failed", duration_ms);
                         if let Some(t) = plan.get_task_mut(task_id) {
                             t.fail(err_str.clone(), category);
                         }
@@ -5213,6 +5246,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             )
             .await?;
         let initial_planning_ms = planning_start.elapsed().as_millis() as u64;
+        self.record_routing_metric(&response);
 
         let result = match response {
             PlanningResponse::Direct {
@@ -5348,7 +5382,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 )
                 .await?
             {
-                IterationOutcome::FinalResult(s) => break s,
+                IterationOutcome::FinalResult(s) => {
+                    crate::metrics::record_planning_cycles(
+                        &self.agent_build_context.agent.name,
+                        iteration as u64,
+                    );
+                    break s;
+                }
                 IterationOutcome::Continue {
                     new_plan,
                     previous_context: pc,
@@ -5654,6 +5694,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
             )
             .await;
 
+        if let Ok((response, _, _)) = &routing {
+            self.record_routing_metric(response);
+        }
         let decision_elapsed = decision_start.elapsed();
         let decision_latency = decision_elapsed.as_secs_f64();
         // The continuation decision call doubles as the planning step for the

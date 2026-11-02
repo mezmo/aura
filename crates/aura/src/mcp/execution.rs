@@ -149,9 +149,16 @@ pub async fn execute_mcp_tool(
         _ => HashMap::new(),
     };
 
+    let started = std::time::Instant::now();
     let result = client
         .call_tool(tool_name, args_map, approver_overrides)
         .await;
+    crate::metrics::record_mcp_operation(
+        client.namespace().as_ref(),
+        tool_name,
+        mcp_error_type(&result),
+        started.elapsed(),
+    );
 
     // OTel: record result attributes
     record_tool_call_result(&span, &result);
@@ -180,6 +187,23 @@ pub async fn execute_mcp_tool(
                 }
             }
         }
+    }
+}
+
+/// `error.type` of one MCP call for the metrics: a result that reports an
+/// error counts as a failed call (`isError` responses come back as text),
+/// a cancelled call is told apart from a transport failure the same way
+/// the agent-facing error is.
+fn mcp_error_type<E: std::fmt::Display>(result: &Result<String, E>) -> Option<&'static str> {
+    match result {
+        Ok(response) => {
+            crate::tool_error_detection::is_reported_error(response).then_some("tool_error")
+        }
+        Err(e) => Some(if bound_transport_error(&e.to_string()).is_none() {
+            "cancelled"
+        } else {
+            "transport_error"
+        }),
     }
 }
 
@@ -225,6 +249,18 @@ pub(crate) fn preview_response(response: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_error_type_tells_apart_answered_errors_cancellations_and_transport_failures() {
+        let ok: Result<String, String> = Ok("{\"items\": []}".to_string());
+        assert_eq!(mcp_error_type(&ok), None);
+        let answered: Result<String, String> = Ok("Tool returned an error: forbidden".to_string());
+        assert_eq!(mcp_error_type(&answered), Some("tool_error"));
+        let cancelled: Result<String, String> = Err("Request cancelled by client".to_string());
+        assert_eq!(mcp_error_type(&cancelled), Some("cancelled"));
+        let transport: Result<String, String> = Err("connection reset".to_string());
+        assert_eq!(mcp_error_type(&transport), Some("transport_error"));
+    }
 
     #[test]
     fn test_preview_response_short() {

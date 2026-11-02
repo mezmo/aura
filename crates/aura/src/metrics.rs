@@ -607,7 +607,6 @@ mod imp {
 
     pub fn record_tool_execution(
         tool: &str,
-        agent: &str,
         tool_type: ToolType,
         error_type: Option<&str>,
         duration: Duration,
@@ -615,7 +614,6 @@ mod imp {
         let Some(i) = instruments() else { return };
         let mut attrs = vec![
             kv(GEN_AI_TOOL_NAME, tool),
-            kv(GEN_AI_AGENT_NAME, agent),
             kv(GEN_AI_TOOL_TYPE, tool_type.as_str()),
         ];
         push_error(&mut attrs, error_type);
@@ -693,7 +691,7 @@ mod stub {
     pub fn record_inference(_: &InferenceLabels, _: Option<&str>, _: Duration) {}
     pub fn record_token_usage(_: &InferenceLabels, _: TokenMeasure) {}
     pub fn record_mcp_operation(_: &str, _: &str, _: Option<&str>, _: Duration) {}
-    pub fn record_tool_execution(_: &str, _: &str, _: ToolType, _: Option<&str>, _: Duration) {}
+    pub fn record_tool_execution(_: &str, _: ToolType, _: Option<&str>, _: Duration) {}
     pub fn set_mcp_server_status(_: &str, _: &str, _: bool, _: u64) {}
     pub fn record_routing_decision(_: &str, _: &str) {}
     pub fn record_planning_cycles(_: &str, _: u64) {}
@@ -757,7 +755,6 @@ mod tests {
         );
         record_tool_execution(
             "search_logs",
-            "demo",
             ToolType::Extension,
             None,
             Duration::from_secs(1),
@@ -781,7 +778,7 @@ mod tests {
             r#"gen_ai_client_inference_usage_cache_read_input_tokens_total{gen_ai_agent_name="demo",gen_ai_operation_name="chat",gen_ai_provider_name="aws.bedrock",gen_ai_request_model="claude",gen_ai_token_modality="text"} 40"#,
             r#"gen_ai_client_inference_operation_input_tokens_sum{gen_ai_agent_name="demo",gen_ai_operation_name="chat",gen_ai_provider_name="aws.bedrock",gen_ai_request_model="claude"} 100"#,
             r#"mcp_client_operation_duration_seconds_count{aura_mcp_server="mezmo",error_type="tool_error",gen_ai_tool_name="search_logs",mcp_method_name="tools/call"} 1"#,
-            r#"gen_ai_execute_tool_duration_seconds_count{gen_ai_agent_name="demo",gen_ai_tool_name="search_logs",gen_ai_tool_type="extension"} 1"#,
+            r#"gen_ai_execute_tool_duration_seconds_count{gen_ai_tool_name="search_logs",gen_ai_tool_type="extension"} 1"#,
             r#"aura_mcp_server_connected{aura_mcp_server="mezmo",gen_ai_agent_name="demo"} 1"#,
             r#"aura_mcp_server_tools{aura_mcp_server="mezmo",gen_ai_agent_name="demo"} 17"#,
             r#"aura_orchestration_routing_total{aura_decision="orchestrated",gen_ai_agent_name="demo"} 1"#,

@@ -341,6 +341,8 @@ impl ToolWrapper for HitlApprovalWrapper {
             .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
         // `DecisionRoute` emits the lifecycle itself; the scope is how those
         // events find the run, since rig calls this off it.
+        crate::metrics::hitl_pending_add(&self.agent_name, 1);
+        let asked = std::time::Instant::now();
         let decision = match run {
             Some(run) => {
                 crate::run_context::with_run(run, self.route.decide_for_gate(request, &cancel))
@@ -348,7 +350,26 @@ impl ToolWrapper for HitlApprovalWrapper {
             }
             None => self.route.decide_for_gate(request, &cancel).await,
         };
+        crate::metrics::hitl_pending_add(&self.agent_name, -1);
+        crate::metrics::record_hitl_decision(
+            &self.agent_name,
+            decision_metric_label(&decision),
+            asked.elapsed(),
+        );
         approval_result_to_pre_call(decision)
+    }
+}
+
+/// `aura.decision` of a live-route decision for the HITL metrics. Parked
+/// approvals (the orchestration park arm) resolve on resume and are not
+/// measured here.
+fn decision_metric_label(result: &Result<GateDecision, ApprovalError>) -> &'static str {
+    match result {
+        Ok(GateDecision::Approved { .. }) => "approved",
+        Ok(GateDecision::Denied { .. }) => "denied",
+        Ok(GateDecision::TimedOut { .. }) => "timeout",
+        Ok(GateDecision::Cancelled(_)) => "cancelled",
+        Err(_) => "error",
     }
 }
 
@@ -1383,5 +1404,34 @@ mod tests {
                 "an ungated call must not be correlated to any approval",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod decision_metric_label_tests {
+    use super::*;
+
+    #[test]
+    fn every_gate_outcome_has_a_label() {
+        assert_eq!(
+            decision_metric_label(&Ok(GateDecision::Approved { overrides: None })),
+            "approved"
+        );
+        assert_eq!(
+            decision_metric_label(&Ok(GateDecision::Denied { reason: None })),
+            "denied"
+        );
+        assert_eq!(
+            decision_metric_label(&Ok(GateDecision::TimedOut {
+                waited: std::time::Duration::from_secs(1)
+            })),
+            "timeout"
+        );
+        assert_eq!(
+            decision_metric_label(&Ok(GateDecision::Cancelled(
+                super::super::decision::CancelReason::ClientDisconnected
+            ))),
+            "cancelled"
+        );
     }
 }

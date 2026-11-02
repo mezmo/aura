@@ -418,6 +418,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         let id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
         match aura::McpManager::initialize_from_config(mcp_config).await {
             Ok(manager) => {
+                manager.record_connection_metrics(&config.agent.name);
                 for line in manager.collision_report() {
                     warn!("agent '{}': {}", id, line);
                 }
