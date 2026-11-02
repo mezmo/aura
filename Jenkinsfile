@@ -117,52 +117,6 @@ pipeline {
       }
     } // end setup
 
-    stage('Build Images') {
-      // Preloaded tags are consumed by the Build, Lint and Test stage.
-      when {
-        beforeAgent true
-        not {
-          changelog '\\[skip ci\\]'
-        }
-      }
-
-      options {
-        // Seed runs pay two cold dependency cooks plus S3 uploads.
-        timeout(time: 50, unit: 'MINUTES')
-      }
-
-      environment {
-        BUILD_CACHE_PREFIX = 'aura/buildkit/'
-        CACHE_BUILDER = "aura-s3-${BUILD_SLUG}"
-      }
-
-      steps {
-        script {
-          // Authenticated pulls avoid Docker Hub rate limits on shared fleet egress.
-          docker.withRegistry(
-              'https://index.docker.io/v1/',
-              'dockerhub-token-mezmo'
-          ) {
-            withCredentials([
-              aws(
-                credentialsId: 'oss-aws-build-cache',
-                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
-                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
-              )
-            ]) {
-              sh 'make build-images'
-            }
-          }
-        }
-      }
-
-      post {
-        always {
-          sh 'docker buildx rm "$CACHE_BUILDER" >/dev/null 2>&1 || true'
-        }
-      }
-    }
-
     stage('ChangeSet Validation') {
       parallel {
         stage("Conventional Commit Check") {
@@ -233,14 +187,69 @@ pipeline {
       } // End Parallel
     } // End Validate
 
+    stage('Build Images') {
+      // Preloaded tags are consumed by the Build, Lint and Test stage.
+      when {
+        beforeAgent true
+        allOf {
+          not {
+            changelog '\\[skip ci\\]'
+          }
+          // rustfmt and hadolint fail through quality gates, which mark the
+          // build without throwing; this skips the expensive work after them.
+          expression { currentBuild.currentResult == 'SUCCESS' }
+        }
+      }
+
+      options {
+        // Seed runs pay two cold dependency cooks plus S3 uploads.
+        timeout(time: 50, unit: 'MINUTES')
+      }
+
+      environment {
+        BUILD_CACHE_PREFIX = 'aura/buildkit/'
+        CACHE_BUILDER = "aura-s3-${BUILD_SLUG}"
+      }
+
+      steps {
+        script {
+          // Authenticated pulls avoid Docker Hub rate limits on shared fleet egress.
+          docker.withRegistry(
+              'https://index.docker.io/v1/',
+              'dockerhub-token-mezmo'
+          ) {
+            withCredentials([
+              aws(
+                credentialsId: 'oss-aws-build-cache',
+                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+              )
+            ]) {
+              sh 'make build-images'
+            }
+          }
+        }
+      }
+
+      post {
+        always {
+          sh 'docker buildx rm "$CACHE_BUILDER" >/dev/null 2>&1 || true'
+        }
+      }
+    }
+
     // Build, clippy and the integration tests run one after another in a
     // single long-lived test container, so each step reuses the target dir
     // the previous one filled. Each step still reports its own check.
     stage('Build, Lint and Test') {
       when {
         beforeAgent true
-        not {
-          changelog '\\[skip ci\\]'
+        allOf {
+          not {
+            changelog '\\[skip ci\\]'
+          }
+          // Skipped with Build Images, whose tags it consumes.
+          expression { currentBuild.currentResult == 'SUCCESS' }
         }
       }
 
