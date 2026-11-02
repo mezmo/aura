@@ -5,6 +5,7 @@ use crate::a2a::{
     legacy_jsonrpc_router,
 };
 use crate::handlers;
+use crate::metrics;
 use crate::session_store::{SessionStore, build_session_store};
 use crate::streaming::ToolResultMode;
 use crate::types::{ActiveRequestTracker, AppState};
@@ -145,6 +146,12 @@ pub struct ServerArgs {
     /// latency.
     #[arg(long, env = "STREAM_INACTIVITY_TIMEOUT_SECS", default_value = "0")]
     pub stream_inactivity_timeout_secs: u64,
+
+    /// Serve `/metrics` (and `/health`) on this address instead of the API
+    /// port, for deployments where the API port is public. Example:
+    /// `0.0.0.0:9464`. When unset, `/metrics` is served on the API port.
+    #[arg(long, env = "AURA_METRICS_LISTEN")]
+    pub metrics_listen: Option<std::net::SocketAddr>,
 
     /// Graceful shutdown timeout in seconds.
     /// On SIGTERM/SIGINT, new requests are rejected immediately (503), but in-flight
@@ -350,6 +357,7 @@ fn hitl_route_vs_server_window_warning(
 /// Serve until SIGINT/SIGTERM, then drain in-flight streams and flush spans.
 pub async fn serve(args: ServerArgs) -> std::io::Result<()> {
     let result = run(args).await;
+    aura::metrics::shutdown().await;
     aura::logging::shutdown_tracer().await;
     result
 }
@@ -363,6 +371,16 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
 
     // Initialize logging using shared module
     aura::logging::init_logging(args.debug, args.verbose, "aura_web_server");
+    // Before any agent is built: instruments bind to the provider that is
+    // global when they are first used, and MCP connection status is
+    // recorded as agents come up.
+    match aura::metrics::init() {
+        Ok(()) => {}
+        Err(aura::metrics::MetricsError::Disabled) => {
+            warn!("built without the `otel` feature: /metrics is not served")
+        }
+        Err(e) => warn!("metrics disabled: {e}"),
+    }
 
     info!("Starting Aura Web Server v{}", env!("CARGO_PKG_VERSION"));
     info!("Loading configuration from: {}", args.config);
@@ -631,6 +649,24 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         app
     };
 
+    // Scrape routes are merged after the shutdown guard's layer so a
+    // draining server stays scrapable; `--metrics-listen` moves them to
+    // their own port and off the API port entirely.
+    let exit_token = CancellationToken::new();
+    let app = if aura::metrics::is_available() {
+        match args.metrics_listen {
+            None => app.merge(metrics::router()),
+            Some(addr) => {
+                metrics::listener(addr, app_state.clone(), exit_token.clone()).await?;
+                app
+            }
+        }
+    } else {
+        app
+    };
+    // Last, so every mounted route (A2A included) reports its duration.
+    let app = app.layer(middleware::from_fn(metrics::record_request));
+
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", args.host, args.port)).await?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -693,6 +729,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             }
 
             info!(clean_shutdown, unaborted_tasks, "shutdown complete");
+            exit_token.cancel();
             let _ = shutdown_tx.send(());
         }
     });

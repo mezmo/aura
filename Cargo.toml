@@ -69,6 +69,8 @@ opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.27", features = ["tonic", "tls-roots", "http-proto", "reqwest-client"] }
 tracing-opentelemetry = "0.28"
+opentelemetry-prometheus = "0.27"
+prometheus = { version = "0.13", default-features = false }
 # Matches the tonic version opentelemetry-otlp 0.27 resolves to. Direct
 # dependency only for `ClientTlsConfig`, which opentelemetry-otlp takes in
 # its public API without re-exporting.
