@@ -207,6 +207,77 @@ fn inference_error_type(error: &(dyn std::error::Error + Send + Sync)) -> &'stat
     }
 }
 
+/// Record every LLM turn of `stream` in the inference metrics under `labels`
+/// and, when `usage` is the run's, count it there. A turn is one `TurnUsage`
+/// item, which the provider stream yields for tool-call turns and text turns
+/// alike, after the turn's tool calls: rig runs each tool inside the provider
+/// stream, between the `ToolCall` item and its `ToolResult`, and yields the
+/// turn's usage once the provider's response is complete. A turn's duration
+/// therefore runs from the stream's creation, or from the previous turn's
+/// usage item, to its own usage item, less the time between each tool call
+/// and its result, so it spans the provider call and the streaming of its
+/// response and leaves the tool execution out. An `Err` item is the turn
+/// that failed: it is recorded with an `error.type` and no tokens, since the
+/// provider reported none.
+fn meter_turns(
+    labels: crate::metrics::InferenceLabels,
+    stream: Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
+    usage: Option<crate::UsageState>,
+) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
+    use crate::provider_agent::{StreamedAssistantContent, StreamedUserContent};
+    use tokio::time::{Duration, Instant};
+
+    let mut turn_started = Instant::now();
+    let mut tool_started: Option<Instant> = None;
+    let mut tool_time = Duration::ZERO;
+    Box::pin(stream.map(move |item| {
+        match &item {
+            Ok(StreamItem::TurnUsage(turn, cache)) => {
+                let duration = turn_started.elapsed().saturating_sub(tool_time);
+                crate::metrics::record_inference(&labels, None, duration);
+                crate::metrics::record_token_usage(
+                    &labels,
+                    crate::metrics::TokenMeasure {
+                        input: turn.input_tokens,
+                        output: turn.output_tokens,
+                        cache_read: cache.map(|c| c.cache_read_input_tokens).unwrap_or(0),
+                        cache_write: cache.map(|c| c.cache_creation_input_tokens).unwrap_or(0),
+                    },
+                );
+                if let Some(usage) = &usage {
+                    usage.count_turn();
+                }
+                turn_started = Instant::now();
+                tool_started = None;
+                tool_time = Duration::ZERO;
+            }
+            Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(_))) => {
+                tool_started = Some(Instant::now());
+            }
+            Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(_))) => {
+                if let Some(started) = tool_started.take() {
+                    tool_time += started.elapsed();
+                }
+            }
+            Err(error) => {
+                if let Some(started) = tool_started.take() {
+                    tool_time += started.elapsed();
+                }
+                let duration = turn_started.elapsed().saturating_sub(tool_time);
+                crate::metrics::record_inference(
+                    &labels,
+                    Some(inference_error_type(error.as_ref())),
+                    duration,
+                );
+                turn_started = Instant::now();
+                tool_time = Duration::ZERO;
+            }
+            _ => {}
+        }
+        item
+    }))
+}
+
 /// A run reads its prepared agent's fields and calls its methods directly, so
 /// the orchestrator and the `StreamingAgent` impl need no forwarders.
 impl std::ops::Deref for Agent {
@@ -981,15 +1052,9 @@ impl PreparedAgent {
         )
     }
 
-    /// Record every LLM turn of `stream` in the inference metrics and, when
-    /// `usage` is the run's, count it there. A turn is one `TurnUsage` item,
-    /// which the provider stream yields for tool-call turns and text turns
-    /// alike; its duration runs from the stream's creation, or from the last
-    /// tool result rig yielded, to that item. The duration therefore spans
-    /// the provider call and the streaming of its response, with tool
-    /// execution between turns excluded. An `Err` item is the turn that
-    /// failed: it is recorded with an `error.type` and no tokens, since the
-    /// provider reported none.
+    /// Record every LLM turn of `stream` in the inference metrics under this
+    /// agent's labels and, when `usage` is the run's, count it there. See
+    /// [`meter_turns`] for what a turn is and what its duration covers.
     pub(crate) fn meter_turn_usage(
         &self,
         stream: Pin<
@@ -997,44 +1062,7 @@ impl PreparedAgent {
         >,
         usage: Option<crate::UsageState>,
     ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
-        use futures::StreamExt;
-
-        let labels = self.inference_labels();
-        let mut turn_started = std::time::Instant::now();
-        Box::pin(stream.map(move |item| {
-            match &item {
-                Ok(StreamItem::TurnUsage(turn, cache)) => {
-                    crate::metrics::record_inference(&labels, None, turn_started.elapsed());
-                    crate::metrics::record_token_usage(
-                        &labels,
-                        crate::metrics::TokenMeasure {
-                            input: turn.input_tokens,
-                            output: turn.output_tokens,
-                            cache_read: cache.map(|c| c.cache_read_input_tokens).unwrap_or(0),
-                            cache_write: cache.map(|c| c.cache_creation_input_tokens).unwrap_or(0),
-                        },
-                    );
-                    if let Some(usage) = &usage {
-                        usage.count_turn();
-                    }
-                }
-                Ok(StreamItem::StreamUserItem(
-                    crate::provider_agent::StreamedUserContent::ToolResult(_),
-                )) => {
-                    turn_started = std::time::Instant::now();
-                }
-                Err(error) => {
-                    crate::metrics::record_inference(
-                        &labels,
-                        Some(inference_error_type(error.as_ref())),
-                        turn_started.elapsed(),
-                    );
-                    turn_started = std::time::Instant::now();
-                }
-                _ => {}
-            }
-            item
-        }))
+        meter_turns(self.inference_labels(), stream, usage)
     }
 
     /// Begin the run `run_id` of this agent, for a request whose headers are
@@ -3658,6 +3686,79 @@ timeout_secs = 60
             assert!(
                 text.contains(&format!(
                     "gen_ai_client_inference_usage_input_tokens_total{{{labels},gen_ai_token_modality=\"text\"}}"
+                )),
+                "{text}"
+            );
+        }
+
+        /// A tool-call turn is timed as the provider's part of it: rig runs
+        /// the tool inside the provider stream before yielding the turn's
+        /// usage, and that time is left out. A failed turn is timed the same
+        /// way.
+        #[cfg(feature = "otel")]
+        #[tokio::test(start_paused = true)]
+        async fn a_tool_turn_is_timed_without_its_inline_tool_run() {
+            use crate::provider_agent::{
+                StreamedAssistantContent, StreamedUserContent, ToolCall, ToolResult,
+            };
+            use tokio::time::{Duration, sleep};
+
+            crate::metrics::init(false).unwrap();
+            let tool_call =
+                StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(ToolCall {
+                    id: "c1".into(),
+                    name: "t".into(),
+                    arguments: "{}".into(),
+                }));
+            let tool_result =
+                StreamItem::StreamUserItem(StreamedUserContent::ToolResult(ToolResult {
+                    id: "c1".into(),
+                    call_id: None,
+                    result: "ok".into(),
+                    kind: crate::provider_agent::ToolResultKind::Text,
+                }));
+            // Each item arrives `delay` after the previous one.
+            let script: Vec<(Duration, Result<StreamItem, StreamError>)> = vec![
+                (Duration::from_millis(500), Ok(tool_call.clone())),
+                (Duration::from_secs(30), Ok(tool_result.clone())),
+                (
+                    Duration::from_millis(250),
+                    Ok(StreamItem::TurnUsage(Usage::new(), None)),
+                ),
+                (
+                    Duration::from_secs(2),
+                    Ok(StreamItem::TurnUsage(Usage::new(), None)),
+                ),
+                (Duration::from_millis(100), Ok(tool_call)),
+                (Duration::from_secs(10), Err("the provider hung up".into())),
+            ];
+            let stream = futures::stream::iter(script).then(|(delay, item)| async move {
+                sleep(delay).await;
+                item
+            });
+            let labels = crate::metrics::InferenceLabels::new("timed", "scripted", "scripted");
+            let items: Vec<_> = meter_turns(labels, Box::pin(stream), None).collect().await;
+            assert_eq!(items.len(), 6);
+
+            let text = crate::metrics::render_prometheus().unwrap();
+            let labels = r#"gen_ai_agent_name="timed",gen_ai_operation_name="chat",gen_ai_provider_name="scripted",gen_ai_request_model="scripted""#;
+            // 0.5 + 30 + 0.25 less the 30 s tool run, then 2 s of text.
+            assert!(
+                text.contains(&format!(
+                    "gen_ai_client_inference_duration_seconds_sum{{{labels}}} 2.75"
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "gen_ai_client_inference_duration_seconds_count{{{labels}}} 2"
+                )),
+                "{text}"
+            );
+            // 0.1 s before the tool call; the 10 s the tool ran do not count.
+            assert!(
+                text.contains(&format!(
+                    "gen_ai_client_inference_duration_seconds_sum{{error_type=\"stream_error\",{labels}}} 0.1"
                 )),
                 "{text}"
             );
