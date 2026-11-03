@@ -107,6 +107,12 @@ pub struct AgentBuildContext {
     /// The resolved `[hitl]` approval policy.
     pub hitl: Option<HitlPolicy>,
 
+    /// The `[hitl]` config gate as a layer, placed by whoever built it into
+    /// `tool_middleware` as well. Native tools (`add_all_tools`'s additional
+    /// tools) run through this layer alone, so a `[hitl]` pattern naming one
+    /// parks it the way it parks an MCP tool, without the MCP-only layers.
+    pub hitl_gate_layer: Option<Arc<dyn ToolMiddleware>>,
+
     /// The run this build serves.
     pub run_id: Option<RunId>,
 
@@ -150,6 +156,7 @@ impl Clone for AgentBuildContext {
             scratchpad_tools_config: self.scratchpad_tools_config.clone(),
             orchestration_submit_result: self.orchestration_submit_result.clone(),
             hitl: self.hitl.clone(),
+            hitl_gate_layer: self.hitl_gate_layer.clone(),
             run_id: self.run_id,
             forwarded_headers: self.forwarded_headers.clone(),
             instance_id: self.instance_id.clone(),
@@ -199,6 +206,10 @@ impl std::fmt::Debug for AgentBuildContext {
                     .map(|_| "<submit_result>"),
             )
             .field("hitl", &self.hitl.as_ref().map(|_| "<hitl>"))
+            .field(
+                "hitl_gate_layer",
+                &self.hitl_gate_layer.as_ref().map(|_| "<gate>"),
+            )
             .field("run_id", &self.run_id)
             .field("forwarded_headers", &self.forwarded_headers)
             .field("instance_id", &self.instance_id)

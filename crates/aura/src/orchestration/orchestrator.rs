@@ -1238,7 +1238,9 @@ impl Orchestrator {
             if let Some(recorded) = recorded {
                 gate = gate.with_recorded_decisions(Arc::clone(recorded));
             }
-            layers.insert(0, Arc::new(WrapperLayer(Arc::new(gate))));
+            let gate_layer: Arc<dyn ToolMiddleware> = Arc::new(WrapperLayer(Arc::new(gate)));
+            layers.insert(0, Arc::clone(&gate_layer));
+            worker_build_context.hitl_gate_layer = Some(gate_layer);
             worker_build_context.hitl_request_approval_tool = Some(
                 crate::hitl::RequestApprovalTool::new(
                     hitl.route.clone(),

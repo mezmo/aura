@@ -69,14 +69,14 @@ impl RequestApprovalTool {
     /// Keeps the `(namespace, name)` tools a gated pattern matches, by the
     /// rule the config gate uses (`HitlApprovalWrapper::matched_pattern`).
     ///
-    /// Callers pass only tools registered behind the config gate's wrapper.
-    /// The gate wraps MCP tools alone (native tools are not gated yet,
-    /// mezmo/aura#764), and a native tool that matched a pattern here would
-    /// tell the agent to skip approval for a call that never prompts.
+    /// Callers pass only tools registered behind the config gate: MCP tools
+    /// with their namespace, native tools with none. A tool listed here
+    /// that the gate did not wrap would tell the agent to skip approval for
+    /// a call that never prompts.
     #[must_use]
     pub fn with_gated_tools<'a>(
         mut self,
-        tools: impl IntoIterator<Item = (&'a str, &'a str)>,
+        tools: impl IntoIterator<Item = (Option<&'a str>, &'a str)>,
     ) -> Self {
         self.gated_tools = tools
             .into_iter()
@@ -85,7 +85,7 @@ impl RequestApprovalTool {
                     && self
                         .gated_patterns
                         .iter()
-                        .any(|p| p.matches(Some(namespace), name))
+                        .any(|p| p.matches(*namespace, name))
             })
             .map(|(_, name)| name.to_string())
             .collect();
@@ -525,11 +525,12 @@ mod tests {
 
     #[tokio::test]
     async fn definition_names_only_the_gated_tools_it_is_given() {
-        // `slack_post_message` is native, so the builder never passes it in:
-        // a wildcard pattern must not put it, or the pattern itself, in the list.
+        // Only the tools passed in are named: a wildcard pattern must not add
+        // a tool the caller did not pass (`slack_post_message` here), or the
+        // pattern itself.
         let tool = tool_for_definition()
             .with_gated_patterns(Arc::from([GlobPattern::from("*")]))
-            .with_gated_tools([("mezmo", "search_logs")]);
+            .with_gated_tools([(Some("mezmo"), "search_logs")]);
         let description = tool.definition(String::new()).await.description;
         assert!(
             description.contains("first: `search_logs`."),
@@ -544,9 +545,9 @@ mod tests {
         let tool = tool_for_definition()
             .with_gated_patterns(Arc::from([GlobPattern::from("github:*")]))
             .with_gated_tools([
-                ("github", "create_issue"),
-                ("mezmo", "search_logs"),
-                ("github", RequestApprovalTool::NAME),
+                (Some("github"), "create_issue"),
+                (Some("mezmo"), "search_logs"),
+                (Some("github"), RequestApprovalTool::NAME),
             ]);
         let description = tool.definition(String::new()).await.description;
         assert!(
@@ -555,11 +556,31 @@ mod tests {
         );
     }
 
+    /// A native tool carries no namespace, as the gate sees it: a bare
+    /// pattern lists it, and a namespace-scoped one does not.
+    #[tokio::test]
+    async fn definition_lists_a_native_tool_only_under_a_bare_pattern() {
+        let bare = tool_for_definition()
+            .with_gated_patterns(Arc::from([GlobPattern::from("slack_*")]))
+            .with_gated_tools([(None, "slack_post_message")]);
+        let description = bare.definition(String::new()).await.description;
+        assert!(
+            description.contains("first: `slack_post_message`."),
+            "{description}"
+        );
+
+        let scoped = tool_for_definition()
+            .with_gated_patterns(Arc::from([GlobPattern::from("*:slack_*")]))
+            .with_gated_tools([(None, "slack_post_message")]);
+        let description = scoped.definition(String::new()).await.description;
+        assert!(!description.contains("slack_post_message"), "{description}");
+    }
+
     #[tokio::test]
     async fn definition_omits_gated_line_when_no_tool_matches() {
         let tool = tool_for_definition()
             .with_gated_patterns(Arc::from([GlobPattern::from("github:*")]))
-            .with_gated_tools([("mezmo", "search_logs")]);
+            .with_gated_tools([(Some("mezmo"), "search_logs")]);
         let description = tool.definition(String::new()).await.description;
         assert!(
             !description.contains("already prompt for approval"),

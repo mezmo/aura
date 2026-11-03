@@ -524,6 +524,114 @@ where
     }
 }
 
+/// A native tool, which arrives as a boxed [`ToolDyn`], run through a
+/// [`MiddlewareStack`].
+///
+/// [`MiddlewareTool`] needs a `Clone` rig `Tool`, and native tools (the CLI's
+/// local tools, the Slack tools) are registered as `Box<dyn ToolDyn>`. This
+/// implements `ToolDyn` itself rather than `Tool`: rig's blanket `ToolDyn`
+/// impl serializes a `Tool`'s output, which would quote the inner tool's
+/// already-serialized output a second time. The output is returned as the
+/// inner tool produced it.
+///
+/// [`ToolDyn`]: rig::tool::ToolDyn
+pub struct MiddlewareToolDyn {
+    inner: Arc<dyn rig::tool::ToolDyn>,
+    stack: MiddlewareStack,
+    tool: MiddlewareTool<SharedToolDyn>,
+}
+
+impl MiddlewareToolDyn {
+    pub fn new(
+        inner: Box<dyn rig::tool::ToolDyn>,
+        stack: MiddlewareStack,
+        context_factory: Option<ToolContextFactory>,
+    ) -> Self {
+        let inner: Arc<dyn rig::tool::ToolDyn> = Arc::from(inner);
+        let tool = MiddlewareTool {
+            inner: SharedToolDyn(Arc::clone(&inner)),
+            stack: stack.clone(),
+            context_factory,
+        };
+        Self { inner, stack, tool }
+    }
+}
+
+impl rig::tool::ToolDyn for MiddlewareToolDyn {
+    fn name(&self) -> String {
+        self.inner.name()
+    }
+
+    fn definition<'a>(
+        &'a self,
+        prompt: String,
+    ) -> Pin<Box<dyn Future<Output = ToolDefinition> + Send + 'a>> {
+        Box::pin(async move {
+            let mut def = self.inner.definition(prompt).await;
+            def.parameters = self.stack.wrap_schema(def.parameters);
+            def
+        })
+    }
+
+    fn call<'a>(
+        &'a self,
+        args: String,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            let args: Value = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
+            RigTool::call(&self.tool, args).await
+        })
+    }
+}
+
+/// A shared [`ToolDyn`](rig::tool::ToolDyn) as the `Clone` rig `Tool` that
+/// [`run_call`] drives. Its `call` hands the inner tool's output back
+/// unchanged.
+#[derive(Clone)]
+struct SharedToolDyn(Arc<dyn rig::tool::ToolDyn>);
+
+impl RigTool for SharedToolDyn {
+    type Error = ToolError;
+    type Args = Value;
+    type Output = String;
+
+    const NAME: &'static str = "shared_tool_dyn";
+
+    fn name(&self) -> String {
+        self.0.name()
+    }
+
+    /// Unused on the native-tool path: [`MiddlewareToolDyn`] answers
+    /// `definition` from the inner tool itself. `Tool` wants a `Sync` future
+    /// and `ToolDyn`'s is only `Send`, so the inner future is polled under a
+    /// mutex.
+    #[allow(refining_impl_trait)]
+    fn definition(
+        &self,
+        prompt: String,
+    ) -> Pin<Box<dyn Future<Output = ToolDefinition> + Send + Sync + '_>> {
+        let inner = Arc::clone(&self.0);
+        let pending =
+            std::sync::Mutex::new(Box::pin(async move { inner.definition(prompt).await })
+                as Pin<Box<dyn Future<Output = ToolDefinition> + Send>>);
+        Box::pin(std::future::poll_fn(move |cx| {
+            pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+                .poll(cx)
+        }))
+    }
+
+    #[allow(refining_impl_trait)]
+    fn call(
+        &self,
+        args: Self::Args,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send + '_>> {
+        Box::pin(self.0.call(args.to_string()))
+    }
+}
+
 /// What `on_complete` is told about a reply. A reply that reports a failure
 /// completes as `Err`, so no layer has to classify the text again.
 fn reported(output: &str, is_error: bool) -> Result<String, String> {
