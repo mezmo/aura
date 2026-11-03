@@ -1336,6 +1336,7 @@ fn handle_orchestrator_event(
             let (success, result) = match outcome {
                 aura_events::agent::ToolOutcome::Success { result } => (true, result),
                 aura_events::agent::ToolOutcome::Failure { error } => (false, error),
+                aura_events::agent::ToolOutcome::Unknown => (false, String::new()),
             };
             tracing::debug!(
                 "Orchestrator: task {} completed (success={}) in {}ms",
@@ -1479,6 +1480,7 @@ fn handle_orchestrator_event(
             let (success, result) = match outcome {
                 aura_events::agent::ToolOutcome::Success { result } => (true, result),
                 aura_events::agent::ToolOutcome::Failure { error } => (false, error),
+                aura_events::agent::ToolOutcome::Unknown => (false, String::new()),
             };
             tracing::debug!(
                 "Orchestrator: task {:?} tool call completed - {} (success={}) in {}ms",
