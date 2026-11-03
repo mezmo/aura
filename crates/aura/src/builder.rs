@@ -780,6 +780,9 @@ impl PreparedAgent {
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
+                if let Some(max) = build_context.llm.max_tokens() {
+                    agent_builder = agent_builder.max_tokens(max);
+                }
                 if let Some(params) = additional_params {
                     agent_builder = agent_builder.additional_params(params.clone());
                 }
@@ -3589,6 +3592,39 @@ mod tests {
             prepared
                 .begin_run(crate::run_context::named_run_id("req_b"), None, None)
                 .expect("the slot frees with the stream");
+        }
+    }
+
+    /// The Gemini agent must carry the configured `max_tokens` into its requests.
+    mod max_tokens_forwarding {
+        use serde_json::json;
+
+        use super::*;
+
+        async fn prepared_with(llm: serde_json::Value) -> PreparedAgent {
+            let build_context = AgentBuildContext {
+                llm: serde_json::from_value(llm).expect("valid llm config"),
+                ..Default::default()
+            };
+            PreparedAgent::prepare(&build_context, vec![], None)
+                .await
+                .expect("agent prepares")
+        }
+
+        #[tokio::test]
+        async fn gemini_agent_carries_configured_max_tokens() {
+            let prepared = prepared_with(json!({
+                "provider": "gemini",
+                "api_key": "test-key",
+                "model": "gemini-test",
+                "max_tokens": 321,
+            }))
+            .await;
+
+            match &prepared.inner {
+                ProviderAgent::Gemini(agent) => assert_eq!(agent.max_tokens, Some(321)),
+                _ => panic!("expected a Gemini agent"),
+            }
         }
     }
 }
