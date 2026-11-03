@@ -297,6 +297,17 @@ impl AgentBuildContext {
         }
     }
 
+    /// Keeps the client tools that pass `[agent].client_tool_filter`.
+    pub fn filter_client_tools(
+        &self,
+        tools: Vec<crate::builder::ClientTool>,
+    ) -> Vec<crate::builder::ClientTool> {
+        tools
+            .into_iter()
+            .filter(|t| self.client_tool_matches_filter(&t.name))
+            .collect()
+    }
+
     /// Get the effective system prompt for agent building.
     ///
     /// Returns `preamble_override` if set, otherwise `agent.system_prompt`.
@@ -506,5 +517,26 @@ mod tests {
         assert!(build_context.client_tool_matches_filter("Read"));
         assert!(build_context.client_tool_matches_filter("FindFiles"));
         assert!(!build_context.client_tool_matches_filter("Shell"));
+    }
+
+    #[test]
+    fn filter_client_tools_keeps_only_matching_tools() {
+        let build_context = AgentBuildContext {
+            agent: AgentSettings {
+                client_tool_filter: Some(vec!["Read".into()]),
+                ..AgentSettings::default()
+            },
+            ..Default::default()
+        };
+        let tool = |name: &str| crate::builder::ClientTool {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+        };
+
+        let kept = build_context.filter_client_tools(vec![tool("Read"), tool("Shell")]);
+
+        let names: Vec<_> = kept.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["Read"]);
     }
 }

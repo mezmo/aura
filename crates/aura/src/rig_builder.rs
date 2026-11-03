@@ -171,6 +171,7 @@ impl RigBuilder {
         let mut build_context = self.discovered_build_context(req_headers)?;
         resolve_mcp_headers(&mut build_context, req_headers);
         build_context.session_id = session_id;
+        let client_tools = client_tools.map(|tools| build_context.filter_client_tools(tools));
         PreparedAgent::prepare(&build_context, additional_tools, client_tools)
             .await
             .map(Arc::new)
