@@ -32,9 +32,8 @@ lint-docker: | $(REPORT_DIR)
 	sed ${SED_INPLACE} 's/"file":"-"/"file":"Dockerfile"/g' report/ci/hadolint.json ; \
 	exit $$ret
 
-# The server image is the server-ci target, the runtime without a binary:
-# CI mounts the binary its test container builds, so no compile happens
-# here and the small runtime layers are all its cache needs (mode=min).
+# The server image is server-ci (see Dockerfile), the runtime alone, so its
+# small layers are all its cache needs (mode=min).
 .PHONY: build-images
 build-images: | $(REPORT_DIR) ## Build server+test images via buildx with an S3 layer cache
 	@set -euo pipefail; \

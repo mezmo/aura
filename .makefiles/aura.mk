@@ -12,8 +12,7 @@ COMPOSE_BUILD ?= --build
 test-integration: $(REPORT_DIR) ## run CI test suite via docker compose
 	docker compose -p aura-test-$(BUILD_SLUG) -f compose/base.yml -f compose/test.yml up --remove-orphans --exit-code-from aura-integration-test $(COMPOSE_BUILD)
 
-# CI keeps the test runner alive (compose/test-ci.yml) and execs each step
-# into it, so build, clippy and the tests share one cargo target dir.
+# CI runner and its steps; see compose/test-ci.yml.
 TEST_CI_COMPOSE = docker compose -p aura-test-$(BUILD_SLUG) \
 	-f compose/base.yml \
 	-f compose/test.yml \
