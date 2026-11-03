@@ -844,7 +844,7 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
+        "w": 3,
         "x": 0,
         "y": 22
       },
@@ -903,8 +903,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 4,
+        "w": 3,
+        "x": 3,
         "y": 22
       },
       "targets": [
@@ -961,8 +961,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 8,
+        "w": 3,
+        "x": 6,
         "y": 22
       },
       "targets": [
@@ -1020,8 +1020,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 12,
+        "w": 3,
+        "x": 9,
         "y": 22
       },
       "targets": [
@@ -1071,8 +1071,67 @@
     },
     {
       "type": "stat",
-      "title": "LLM calls",
+      "title": "Cache hit ratio",
       "id": 19,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 22
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range])) / sum(increase(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]))",
+          "legendFormat": "cache hit ratio",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "description": "Cache read tokens over input tokens in range; input tokens count cached tokens on every metered provider. Empty until a provider reports cache usage."
+    },
+    {
+      "type": "stat",
+      "title": "LLM calls",
+      "id": 20,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1130,7 +1189,7 @@
     {
       "type": "stat",
       "title": "LLM error ratio",
-      "id": 20,
+      "id": 21,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1196,7 +1255,7 @@
     {
       "type": "timeseries",
       "title": "LLM calls per second",
-      "id": 21,
+      "id": 22,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1248,7 +1307,7 @@
     {
       "type": "timeseries",
       "title": "LLM call duration",
-      "id": 22,
+      "id": 23,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1311,7 +1370,7 @@
     {
       "type": "timeseries",
       "title": "LLM errors per second",
-      "id": 23,
+      "id": 24,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1363,14 +1422,14 @@
     {
       "type": "timeseries",
       "title": "Token throughput",
-      "id": 24,
+      "id": 25,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
+        "w": 6,
         "x": 0,
         "y": 34
       },
@@ -1436,16 +1495,70 @@
     },
     {
       "type": "timeseries",
-      "title": "Input tokens per call",
-      "id": 25,
+      "title": "Cache hit ratio",
+      "id": 26,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 8,
+        "w": 6,
+        "x": 6,
+        "y": 34
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (gen_ai_agent_name, gen_ai_provider_name, gen_ai_request_model) (rate(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])) / sum by (gen_ai_agent_name, gen_ai_provider_name, gen_ai_request_model) (rate(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))",
+          "legendFormat": "{{gen_ai_agent_name}} {{gen_ai_provider_name}}/{{gen_ai_request_model}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "percentunit",
+          "max": 1,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Cache read tokens over input tokens, by agent, provider and model. A ratio that drops with a stable prompt means the cache prefix changed (system prompt, tool list, history edits)."
+    },
+    {
+      "type": "timeseries",
+      "title": "Input tokens per call",
+      "id": 27,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
         "y": 34
       },
       "targets": [
@@ -1500,15 +1613,15 @@
     {
       "type": "timeseries",
       "title": "Output tokens per call",
-      "id": 26,
+      "id": 28,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 16,
+        "w": 6,
+        "x": 18,
         "y": 34
       },
       "targets": [
@@ -1563,7 +1676,7 @@
       "type": "row",
       "title": "Tools and MCP",
       "collapsed": false,
-      "id": 27,
+      "id": 29,
       "gridPos": {
         "h": 1,
         "w": 24,
@@ -1575,7 +1688,7 @@
     {
       "type": "stat",
       "title": "MCP server connections",
-      "id": 28,
+      "id": 30,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1653,7 +1766,7 @@
     {
       "type": "stat",
       "title": "Tools discovered",
-      "id": 29,
+      "id": 31,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1711,7 +1824,7 @@
     {
       "type": "timeseries",
       "title": "MCP calls per second",
-      "id": 30,
+      "id": 32,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1763,7 +1876,7 @@
     {
       "type": "timeseries",
       "title": "MCP call duration",
-      "id": 31,
+      "id": 33,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1826,7 +1939,7 @@
     {
       "type": "timeseries",
       "title": "MCP errors per second",
-      "id": 32,
+      "id": 34,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1878,7 +1991,7 @@
     {
       "type": "timeseries",
       "title": "Tool executions per second",
-      "id": 33,
+      "id": 35,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1930,7 +2043,7 @@
     {
       "type": "timeseries",
       "title": "Tool execution duration",
-      "id": 34,
+      "id": 36,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1992,7 +2105,7 @@
     {
       "type": "timeseries",
       "title": "Tool execution errors per second",
-      "id": 35,
+      "id": 37,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -2045,7 +2158,7 @@
       "type": "row",
       "title": "Orchestration and HITL",
       "collapsed": false,
-      "id": 36,
+      "id": 38,
       "gridPos": {
         "h": 1,
         "w": 24,
@@ -2057,7 +2170,7 @@
     {
       "type": "timeseries",
       "title": "Routing decisions per second",
-      "id": 37,
+      "id": 39,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -2113,7 +2226,7 @@
     {
       "type": "timeseries",
       "title": "Planning cycles per run",
-      "id": 38,
+      "id": 40,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -2164,7 +2277,7 @@
     {
       "type": "timeseries",
       "title": "Worker task outcomes per second",
-      "id": 39,
+      "id": 41,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -2220,7 +2333,7 @@
     {
       "type": "timeseries",
       "title": "Worker task duration",
-      "id": 40,
+      "id": 42,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -2282,7 +2395,7 @@
     {
       "type": "stat",
       "title": "HITL approvals pending",
-      "id": 41,
+      "id": 43,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -2343,7 +2456,7 @@
     {
       "type": "timeseries",
       "title": "HITL decisions per second",
-      "id": 42,
+      "id": 44,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -2399,7 +2512,7 @@
     {
       "type": "timeseries",
       "title": "HITL decision wait",
-      "id": 43,
+      "id": 45,
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
