@@ -406,6 +406,7 @@ CSV
         || { echo "selftest: --period did not narrow the reports:"$'\n'"${got}" >&2; exit 1; }
 
     hogql_retry_selftest "${tmp}"
+    hogql_unavailable_selftest "${tmp}"
 
     echo "selftest: ok"
 }
