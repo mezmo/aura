@@ -4501,6 +4501,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 attempt,
                                 task_id
                             );
+                            // Record this attempt's output now: if the retry
+                            // dies on a hard error, it is what the task falls
+                            // back to, and the run directory should hold it.
+                            let duration_ms = start_time.elapsed().as_millis() as u64;
+                            self.persist_worker_execution(
+                                task_id,
+                                task_description,
+                                attempt,
+                                duration_ms,
+                                Ok(&raw_response),
+                                None,
+                                &prompt,
+                            )
+                            .await;
                             last_raw_response = raw_response;
                             continue;
                         }
@@ -4526,6 +4540,25 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 &base_worker_prompt,
             )
             .await;
+            // An earlier attempt finished with output but no submit_result,
+            // and its retry died on a hard error. That output is what the
+            // final attempt would have kept without submit_result, so keep it
+            // the same way rather than failing the task (mezmo/aura#594).
+            if !last_raw_response.trim().is_empty() {
+                tracing::warn!(
+                    "Worker attempt {} for task {} failed ({}). Keeping attempt {}'s output, \
+                     which did not call submit_result.",
+                    actual_attempts,
+                    task_id,
+                    e,
+                    actual_attempts - 1
+                );
+                crate::logging::set_span_ok(&tracing::Span::current());
+                return Ok(TaskOutcome::Completed(TaskExecutionResult {
+                    result: last_raw_response,
+                    structured_output: None,
+                }));
+            }
             Err(format!(
                 "Worker failed task {} after {} attempts: {}",
                 task_id, actual_attempts, e
@@ -9673,6 +9706,118 @@ mod tests {
         assert!(error.contains("found two idle nodes"), "{error}");
         let tool_line = format!("- echo_tool: {}", test_rig::ECHO_TOOL_RESULT);
         assert!(error.contains(&tool_line), "{error}");
+    }
+
+    // ====================================================================
+    // A retry that dies on a hard error keeps the earlier attempt's output
+    // (mezmo/aura#594).
+    // ====================================================================
+
+    /// Runs one task whose first attempt answers `first` without calling
+    /// submit_result, and whose retry hits a hard error: its scripted model
+    /// has no turns, so the provider call fails. Returns the task's state and
+    /// every `task-0.attempt-1.response.txt` written under the memory dir.
+    async fn run_retry_with_hard_error(first: &str) -> (TaskState, Vec<String>) {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let workers = std::collections::HashMap::from([(
+            "operations".to_string(),
+            crate::orchestration::WorkerConfig {
+                description: "Inspects the pool".to_string(),
+                preamble: "You inspect the pool.".to_string(),
+                mcp_filter: Some(vec![]),
+                vector_stores: vec![],
+                turn_depth: None,
+                llm: None,
+                scratchpad: None,
+                skills: None,
+            },
+        )]);
+        let build_context = AgentBuildContext {
+            memory_dir: Some(dir.path().to_string_lossy().into_owned()),
+            orchestration: Some(OrchestrationConfig {
+                enabled: true,
+                workers,
+                ..Default::default()
+            }),
+            ..AgentBuildContext::default()
+        };
+        let orchestrator = Orchestrator::new(build_context).await.unwrap();
+
+        test_rig::install_worker_overrides(vec![
+            WorkerOverride {
+                model: test_rig::ScriptedCompletionModel::new(vec![ScriptedTurn::text(first)]),
+                extra_tools: vec![],
+            },
+            WorkerOverride {
+                model: test_rig::ScriptedCompletionModel::new(vec![]),
+                extra_tools: vec![],
+            },
+        ]);
+
+        let mut plan = Plan::new("Inspect");
+        plan.add_task(Task::new(0, "Inspect the pool", "r").with_worker("operations"));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(256);
+        orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+
+        // Skips symlinks: the run directory is also reachable as `latest`.
+        fn find(dir: &std::path::Path, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_symlink() {
+                    continue;
+                }
+                if path.is_dir() {
+                    find(&path, out);
+                } else if path.file_name().and_then(|n| n.to_str())
+                    == Some("task-0.attempt-1.response.txt")
+                {
+                    out.push(std::fs::read_to_string(&path).unwrap());
+                }
+            }
+        }
+        let mut responses = Vec::new();
+        find(dir.path(), &mut responses);
+        (plan.tasks[0].state.clone(), responses)
+    }
+
+    /// The first attempt's answer survives its retry failing. The task ends
+    /// as it would had the last attempt returned that output without
+    /// submit_result: a soft failure carrying the output for the coordinator,
+    /// not a hard failure with only the provider's error. The run directory
+    /// holds the output as attempt 1.
+    #[tokio::test]
+    async fn a_hard_error_on_the_retry_keeps_the_first_attempts_output() {
+        let (state, responses) = run_retry_with_hard_error("found two idle nodes").await;
+
+        match &state {
+            TaskState::Failed { error, category } => {
+                assert_eq!(*category, FailureCategory::SoftFailure, "{error}");
+                assert!(error.contains("found two idle nodes"), "{error}");
+            }
+            other => panic!("the task must keep attempt 1's output, got {other:?}"),
+        }
+        assert_eq!(responses.len(), 1, "attempt 1's response is persisted once");
+        assert!(
+            responses[0].contains("found two idle nodes"),
+            "{}",
+            responses[0]
+        );
+    }
+
+    /// With nothing from the first attempt to keep, the retry's hard error
+    /// still fails the task.
+    #[tokio::test]
+    async fn a_hard_error_on_the_retry_fails_when_the_first_attempt_was_empty() {
+        let (state, _responses) = run_retry_with_hard_error("").await;
+
+        match &state {
+            TaskState::Failed { error, category } => {
+                assert_ne!(*category, FailureCategory::SoftFailure, "{error}");
+                assert!(error.contains("after 2 attempts"), "{error}");
+            }
+            other => panic!("the task must fail, got {other:?}"),
+        }
     }
 
     /// Each kept tool result is capped at `result_summary_length`.
