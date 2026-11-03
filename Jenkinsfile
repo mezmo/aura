@@ -238,9 +238,7 @@ pipeline {
       }
     }
 
-    // Build, clippy and the integration tests run in a single long-lived
-    // test container, so each step reuses the target dir the build filled.
-    // Each step still reports its own check.
+    // Steps exec into the CI runner (compose/test-ci.yml); each reports its own check.
     stage('Build, Lint and Test') {
       when {
         beforeAgent true
@@ -302,8 +300,7 @@ pipeline {
           }
         }
 
-        // The web server runs the aura binary Rust Build just produced, so
-        // the server image compiles nothing.
+        // See compose/test-ci.yml for where the server's binary comes from.
         stage('Start Server') {
           steps {
             withCredentials([

@@ -358,8 +358,7 @@ FROM runtime AS server
 COPY --from=debug-build /usr/src/app/target/debug/aura /app/
 
 ### 013b Server-ci
-# CI integration-lane server image: the runtime alone. CI mounts the aura
-# binary its test container already built, so this stage compiles nothing.
+# CI integration-lane server image: the runtime alone (see compose/test-ci.yml).
 FROM runtime AS server-ci
 
 ### 014 Release
