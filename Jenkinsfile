@@ -238,83 +238,69 @@ pipeline {
       }
     }
 
-    // Steps exec into the CI runner (compose/test-ci.yml); each reports its own check.
-    stage('Build, Lint and Test') {
-      when {
-        beforeAgent true
-        allOf {
-          not {
-            changelog '\\[skip ci\\]'
+    stage('Verify') {
+      parallel {
+        // Steps exec into the CI runner (compose/test-ci.yml); each reports its own check.
+        stage('Build, Lint and Test') {
+          when {
+            beforeAgent true
+            allOf {
+              not {
+                changelog '\\[skip ci\\]'
+              }
+              // Skipped with Build Images, whose tags it consumes.
+              expression { currentBuild.currentResult == 'SUCCESS' }
+            }
           }
-          // Skipped with Build Images, whose tags it consumes.
-          expression { currentBuild.currentResult == 'SUCCESS' }
-        }
-      }
 
-      environment {
-        MOCK_MCP_IMAGE = 'mezmo/aura-mock-mcp:latest'
-        // The plain daemon cannot read the S3 layer cache, so a rebuild
-        // would be a silent ~30min uncached build. --no-build consumes
-        // the Build Images tags and fails fast if one is missing.
-        COMPOSE_BUILD = '--no-build'
-        // sccache for the in-container compiles; compose maps this AURA_
-        // toggle onto the cargo wrapper.
-        AURA_RUSTC_WORKSPACE_WRAPPER = 'sccache'
-        SCCACHE_BUCKET = "${BUILD_CACHE_BUCKET}"
-        SCCACHE_REGION = "${BUILD_CACHE_REGION}"
-        SCCACHE_S3_KEY_PREFIX = 'aura/sccache/'
-      }
+          environment {
+            MOCK_MCP_IMAGE = 'mezmo/aura-mock-mcp:latest'
+            // The plain daemon cannot read the S3 layer cache, so a rebuild
+            // would be a silent ~30min uncached build. --no-build consumes
+            // the Build Images tags and fails fast if one is missing.
+            COMPOSE_BUILD = '--no-build'
+            // sccache for the in-container compiles; compose maps this AURA_
+            // toggle onto the cargo wrapper.
+            AURA_RUSTC_WORKSPACE_WRAPPER = 'sccache'
+            SCCACHE_BUCKET = "${BUILD_CACHE_BUCKET}"
+            SCCACHE_REGION = "${BUILD_CACHE_REGION}"
+            SCCACHE_S3_KEY_PREFIX = 'aura/sccache/'
+          }
 
-      stages {
-        stage('Start Test Environment') {
-          steps {
-            sh 'mkdir -p report'
-            script {
-              // Authenticated pulls avoid Docker Hub rate limits on shared fleet egress.
-              docker.withRegistry(
-                  'https://index.docker.io/v1/',
-                  'dockerhub-token-mezmo'
-              ) {
-                // Containers capture their environment at creation, so the
-                // credentials only need binding while the project starts.
-                withCredentials([
-                  string(credentialsId: 'openai-api-key', variable: 'OPENAI_API_KEY'),
-                  aws(
-                    credentialsId: 'oss-aws-build-cache',
-                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
-                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
-                  )
-                ]) {
-                  sh 'make test-integration-up'
+          stages {
+            stage('Start Test Environment') {
+              steps {
+                sh 'mkdir -p report'
+                script {
+                  // Authenticated pulls avoid Docker Hub rate limits on shared fleet egress.
+                  docker.withRegistry(
+                      'https://index.docker.io/v1/',
+                      'dockerhub-token-mezmo'
+                  ) {
+                    // Containers capture their environment at creation, so the
+                    // credentials only need binding while the project starts.
+                    withCredentials([
+                      aws(
+                        credentialsId: 'oss-aws-build-cache',
+                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                      )
+                    ]) {
+                      sh 'make test-integration-up'
+                    }
+                  }
                 }
               }
             }
-          }
-        }
 
-        stage('Rust Build') {
-          steps {
-            script {
-              withReport('build', 'make build-rust-ci')
+            stage('Rust Build') {
+              steps {
+                script {
+                  withReport('build', 'make build-rust-ci')
+                }
+              }
             }
-          }
-        }
 
-        // See compose/test-ci.yml for where the server's binary comes from.
-        stage('Start Server') {
-          steps {
-            withCredentials([
-              string(credentialsId: 'openai-api-key', variable: 'OPENAI_API_KEY')
-            ]) {
-              sh 'make test-integration-server-up'
-            }
-          }
-        }
-
-        // Clippy and the tests share no cargo lock once the build is done:
-        // nextest's own build is a no-op, then it only runs test binaries.
-        stage('Lint and Test') {
-          parallel {
             stage('Rust Lint') {
               steps {
                 withChecks('clippy') {
@@ -335,6 +321,25 @@ pipeline {
                 }
               }
             } // End Clippy
+
+            // See compose/test-ci.yml for where the server's binary comes from.
+            stage('Start Server') {
+              steps {
+                script {
+                  // Pulls mock-mcp; authenticated to avoid Docker Hub rate limits.
+                  docker.withRegistry(
+                      'https://index.docker.io/v1/',
+                      'dockerhub-token-mezmo'
+                  ) {
+                    withCredentials([
+                      string(credentialsId: 'openai-api-key', variable: 'OPENAI_API_KEY')
+                    ]) {
+                      sh 'make test-integration-server-up'
+                    }
+                  }
+                }
+              }
+            }
 
             stage('Integration Tests') {
               steps {
@@ -369,86 +374,86 @@ pipeline {
               }
             }
           }
-        }
-      }
 
-      post {
-        always {
-          sh 'make test-integration-down'
-        }
-      }
-    }
-
-    // Release preview: confirms commits parse, a version computes, and the
-    // package publish authenticates. Sequential, because it rewrites crate
-    // versions in the workspace the test lane also builds in.
-    stage('Release Dry Run') {
-      when {
-        beforeAgent true
-        not {
-          anyOf {
-            changelog '\\[skip ci\\]'
-            expression { RELEASE_BRANCHES.contains(CURRENT_BRANCH) }
+          post {
+            always {
+              sh 'make test-integration-down'
+            }
           }
         }
-      }
 
-      environment {
-        GIT_BRANCH = "${CURRENT_BRANCH}"
-        BRANCH_NAME = "${CURRENT_BRANCH}"
-        SCCACHE_BUCKET = "${BUILD_CACHE_BUCKET}"
-        SCCACHE_REGION = "${BUILD_CACHE_REGION}"
-        SCCACHE_S3_KEY_PREFIX = 'aura/sccache/'
-      }
-
-      steps {
-        script {
-          // This stage commits and rewrites crate versions in the workspace
-          // that later stages build from, so the tree is restored once the dry
-          // run is done with it.
-          def startSha = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
-          try {
-            sh 'git checkout -B "$BRANCH_NAME"'
-
-            // A breaking empty commit guarantees a version is computed, so the
-            // verify path runs on every change request.
-            sh "git commit --allow-empty -m 'feat!: exercise the release dry run' -m 'BREAKING CHANGE: forced bump'"
-
-            def nextVersion = sh(
-              script: "npm run --silent release:version 'file://${env.WORKSPACE}'",
-              returnStdout: true
-            ).trim()
-            if (!nextVersion) {
-              error('Release dry run computed no version')
-            }
-            echo "Release dry run version: ${nextVersion}"
-
-            sh "./scripts/set-version.sh ${nextVersion}"
-
-            // One arch, so verifyReleaseCmd has a real package to dry-run push.
-            withCredentials([
-              aws(
-                credentialsId: 'oss-aws-build-cache',
-                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
-                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
-              )
-            ]) {
-              withEnv(['AURA_RUSTC_WRAPPER=sccache']) {
-                sh 'make build-binary-linux-amd64'
+        // Release preview: confirms commits parse, a version computes, and the
+        // package publish authenticates. The test lane builds from the test
+        // image's copy of the crates, so rewriting versions here cannot reach it.
+        stage('Release Dry Run') {
+          when {
+            beforeAgent true
+            not {
+              anyOf {
+                changelog '\\[skip ci\\]'
+                expression { RELEASE_BRANCHES.contains(CURRENT_BRANCH) }
               }
             }
+          }
 
-            sh "ARCHS=amd64 make build-packages"
+          environment {
+            GIT_BRANCH = "${CURRENT_BRANCH}"
+            BRANCH_NAME = "${CURRENT_BRANCH}"
+            SCCACHE_BUCKET = "${BUILD_CACHE_BUCKET}"
+            SCCACHE_REGION = "${BUILD_CACHE_REGION}"
+            SCCACHE_S3_KEY_PREFIX = 'aura/sccache/'
+          }
 
-            // --branches makes the branch under test releasable. The branch
-            // reaches the shell as a quoted env var, never as interpolated
-            // text: a change request controls its own source branch name, and
-            // git permits ; $() ` and | in one.
-            withCredentials(RELEASE_CREDENTIALS) {
-              withReport('Release Test', 'npm run release:dry -- --repository-url="file://$WORKSPACE" --branches="$BRANCH_NAME" --plugins @semantic-release/commit-analyzer @semantic-release/exec')
+          steps {
+            script {
+              // This stage commits and rewrites crate versions in the workspace
+              // that later stages build from, so the tree is restored once the dry
+              // run is done with it.
+              def startSha = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
+              try {
+                sh 'git checkout -B "$BRANCH_NAME"'
+
+                // A breaking empty commit guarantees a version is computed, so the
+                // verify path runs on every change request.
+                sh "git commit --allow-empty -m 'feat!: exercise the release dry run' -m 'BREAKING CHANGE: forced bump'"
+
+                def nextVersion = sh(
+                  script: "npm run --silent release:version 'file://${env.WORKSPACE}'",
+                  returnStdout: true
+                ).trim()
+                if (!nextVersion) {
+                  error('Release dry run computed no version')
+                }
+                echo "Release dry run version: ${nextVersion}"
+
+                sh "./scripts/set-version.sh ${nextVersion}"
+
+                // One arch, so verifyReleaseCmd has a real package to dry-run push.
+                withCredentials([
+                  aws(
+                    credentialsId: 'oss-aws-build-cache',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                  )
+                ]) {
+                  withEnv(['AURA_RUSTC_WRAPPER=sccache']) {
+                    sh 'make build-binary-linux-amd64'
+                  }
+                }
+
+                sh "ARCHS=amd64 make build-packages"
+
+                // --branches makes the branch under test releasable. The branch
+                // reaches the shell as a quoted env var, never as interpolated
+                // text: a change request controls its own source branch name, and
+                // git permits ; $() ` and | in one.
+                withCredentials(RELEASE_CREDENTIALS) {
+                  withReport('Release Test', 'npm run release:dry -- --repository-url="file://$WORKSPACE" --branches="$BRANCH_NAME" --plugins @semantic-release/commit-analyzer @semantic-release/exec')
+                }
+              } finally {
+                sh "git reset --hard ${startSha}"
+              }
             }
-          } finally {
-            sh "git reset --hard ${startSha}"
           }
         }
       }

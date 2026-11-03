@@ -11,8 +11,8 @@
 #
 # Usage:
 #   make test-integration-up
-#   make build-rust-ci test-integration-server-up
-#   make lint-rust-ci test-integration-ci
+#   make build-rust-ci lint-rust-ci test-integration-server-up
+#   make test-integration-ci
 #   make test-integration-down
 
 services:

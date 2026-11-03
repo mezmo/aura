@@ -21,10 +21,10 @@ TEST_CI_EXEC = $(TEST_CI_COMPOSE) exec -T aura-integration-test
 
 .PHONY:test-integration-up
 test-integration-up: $(REPORT_DIR) ## Start the CI test environment with an idle test runner
-	@# --no-deps: the runner's dependency on the web server is skipped,
-	@# since the server waits for the binary the runner builds.
+	@# --no-deps: the runner starts alone; the server and mock-mcp come up
+	@# in test-integration-server-up, after the build.
 	$(TEST_CI_COMPOSE) up -d --wait --remove-orphans --no-deps $(COMPOSE_BUILD) \
-		mock-mcp aura-integration-test
+		aura-integration-test
 
 CI_BIN_DIR := .ci-bin
 
@@ -32,7 +32,9 @@ CI_BIN_DIR := .ci-bin
 test-integration-server-up: ## Start the CI web server on the runner's aura binary (needs build-rust-ci first)
 	@mkdir -p $(CI_BIN_DIR)
 	$(TEST_CI_COMPOSE) cp aura-integration-test:/usr/src/app/target/debug/aura $(CI_BIN_DIR)/aura
-	$(TEST_CI_COMPOSE) up -d --wait --no-deps $(COMPOSE_BUILD) aura-web-server
+	@# Without --no-deps, compose also starts mock-mcp and waits for it to
+	@# be healthy, as the server's depends_on requires.
+	$(TEST_CI_COMPOSE) up -d --wait $(COMPOSE_BUILD) aura-web-server
 
 .PHONY:test-integration-ci
 test-integration-ci: $(REPORT_DIR) ## Run the CI test suite inside the running test container
