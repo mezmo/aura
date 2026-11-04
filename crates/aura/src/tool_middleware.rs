@@ -527,8 +527,8 @@ where
 /// A native tool, which arrives as a boxed [`ToolDyn`], run through a
 /// [`MiddlewareStack`].
 ///
-/// [`MiddlewareTool`] needs a `Clone` rig `Tool`, and native tools (the CLI's
-/// local tools, the Slack tools) are registered as `Box<dyn ToolDyn>`. This
+/// [`MiddlewareTool`] needs a `Clone` rig `Tool`, and native run tools (the
+/// Slack tools) are registered as `Box<dyn ToolDyn>`. This
 /// implements `ToolDyn` itself rather than `Tool`: rig's blanket `ToolDyn`
 /// impl serializes a `Tool`'s output, which would quote the inner tool's
 /// already-serialized output a second time. The output is returned as the
@@ -536,8 +536,6 @@ where
 ///
 /// [`ToolDyn`]: rig::tool::ToolDyn
 pub struct MiddlewareToolDyn {
-    inner: Arc<dyn rig::tool::ToolDyn>,
-    stack: MiddlewareStack,
     tool: MiddlewareTool<SharedToolDyn>,
 }
 
@@ -547,30 +545,26 @@ impl MiddlewareToolDyn {
         stack: MiddlewareStack,
         context_factory: Option<ToolContextFactory>,
     ) -> Self {
-        let inner: Arc<dyn rig::tool::ToolDyn> = Arc::from(inner);
-        let tool = MiddlewareTool {
-            inner: SharedToolDyn(Arc::clone(&inner)),
-            stack: stack.clone(),
-            context_factory,
-        };
-        Self { inner, stack, tool }
+        Self {
+            tool: MiddlewareTool {
+                inner: SharedToolDyn(Arc::from(inner)),
+                stack,
+                context_factory,
+            },
+        }
     }
 }
 
 impl rig::tool::ToolDyn for MiddlewareToolDyn {
     fn name(&self) -> String {
-        self.inner.name()
+        RigTool::name(&self.tool)
     }
 
     fn definition<'a>(
         &'a self,
         prompt: String,
     ) -> Pin<Box<dyn Future<Output = ToolDefinition> + Send + 'a>> {
-        Box::pin(async move {
-            let mut def = self.inner.definition(prompt).await;
-            def.parameters = self.stack.wrap_schema(def.parameters);
-            def
-        })
+        RigTool::definition(&self.tool, prompt)
     }
 
     fn call<'a>(
@@ -601,10 +595,8 @@ impl RigTool for SharedToolDyn {
         self.0.name()
     }
 
-    /// Unused on the native-tool path: [`MiddlewareToolDyn`] answers
-    /// `definition` from the inner tool itself. `Tool` wants a `Sync` future
-    /// and `ToolDyn`'s is only `Send`, so the inner future is polled under a
-    /// mutex.
+    /// `Tool` wants a `Sync` future and `ToolDyn`'s is only `Send`, so the
+    /// inner future is polled under a mutex.
     #[allow(refining_impl_trait)]
     fn definition(
         &self,

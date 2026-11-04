@@ -107,10 +107,7 @@ pub struct AgentBuildContext {
     /// The resolved `[hitl]` approval policy.
     pub hitl: Option<HitlPolicy>,
 
-    /// The `[hitl]` config gate as a layer, placed by whoever built it into
-    /// `tool_middleware` as well. Native tools (`add_all_tools`'s additional
-    /// tools) run through this layer alone, so a `[hitl]` pattern naming one
-    /// parks it the way it parks an MCP tool, without the MCP-only layers.
+    /// The `[hitl]` config gate as a tool middleware layer.
     pub hitl_gate_layer: Option<Arc<dyn ToolMiddleware>>,
 
     /// The run this build serves.

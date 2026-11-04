@@ -25,8 +25,9 @@
 
 # Presence of the [hitl] table enables gating; there is no `enabled` key.
 [hitl]
-# Glob patterns matched against MCP tool names. A tool is gated if it matches
-# ANY pattern. The built-in `request_approval` tool is never gated.
+# Glob patterns matched against tool names: MCP tools and native run tools
+# such as `slack_post_message`. A tool is gated if it matches ANY pattern.
+# The built-in `request_approval` tool is never gated.
 require_approval = [
   "*_delete",                 # pods_delete, resources_delete, ...
   "pods_exec",
