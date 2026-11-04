@@ -867,6 +867,10 @@ fn test_continuation_all_failure_categories() {
         (FailureCategory::LoopDetected, "loop_detected"),
         (FailureCategory::ProviderOverloaded, "provider_overloaded"),
         (FailureCategory::ProviderAuthError, "provider_auth_error"),
+        (
+            FailureCategory::ProviderQuotaExhausted,
+            "provider_quota_exhausted",
+        ),
         (FailureCategory::DependencyFailed, "dependency_failed"),
         (FailureCategory::AgentError, "agent_error"),
     ];

@@ -4871,6 +4871,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
             // Inactivity stall carries its own sentinel so it cannot collide
             // with provider errors that merely mention a timeout.
             FailureCategory::AgentTimeout
+        } else if crate::provider_error::is_quota_exhausted(error) {
+            // Before the rate-limit arm: OpenAI reports an exhausted quota as
+            // a 429, which would otherwise read as a retryable overload.
+            FailureCategory::ProviderQuotaExhausted
         } else if (lower.contains("context")
             && (lower.contains("limit")
                 || lower.contains("overflow")
@@ -4952,8 +4956,55 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 FailureCategory::ProviderOverloaded
                     | FailureCategory::ProviderAuthError
                     | FailureCategory::ProviderNotFound
+                    | FailureCategory::ProviderQuotaExhausted
             )
         })
+    }
+
+    /// How the run ends when an iteration's failures include an exhausted
+    /// provider quota, or `None` when none do. With no completed task it is
+    /// an error carrying the provider's own text, so the caller can recognize
+    /// the quota and choose how much of it to show. Otherwise it is the
+    /// completed work as raw task results under the plain quota message.
+    fn quota_exhausted_stop(
+        plan: &Plan,
+        failures: &[FailedTaskRecord],
+    ) -> Option<Result<String, String>> {
+        let quota_failure = failures
+            .iter()
+            .find(|f| f.category == FailureCategory::ProviderQuotaExhausted)?;
+        if plan.completed_count() == 0 {
+            return Some(Err(format!(
+                "Provider quota exhausted (not retryable via replan): {}",
+                quota_failure.error
+            )));
+        }
+        Some(Ok(Self::build_raw_task_results(
+            plan,
+            crate::provider_error::QUOTA_EXHAUSTED_MESSAGE,
+        )))
+    }
+
+    /// The note that heads the raw task results when the post-execute
+    /// coordinator call fails before routing. An exhausted quota gets a plain
+    /// explanation without the provider's error, which carries the raw
+    /// response body and its request id.
+    fn post_execute_failure_note(err_str: &str) -> String {
+        match Self::categorize_failure_error(err_str) {
+            FailureCategory::AgentTimeout => {
+                format!("Post-execute coordinator call timed out: {}", err_str)
+            }
+            FailureCategory::DepthExhausted => {
+                format!(
+                    "Post-execute coordinator exhausted its turn budget without routing: {}",
+                    err_str
+                )
+            }
+            FailureCategory::ProviderQuotaExhausted => {
+                crate::provider_error::QUOTA_EXHAUSTED_MESSAGE.to_string()
+            }
+            _ => format!("Post-execute coordinator call failed: {}", err_str),
+        }
     }
 
     /// Send an orchestrator event through the stream channel.
@@ -5418,6 +5469,46 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 blocked_count
             );
 
+            // An exhausted provider quota stops the run here, completed tasks
+            // or not: the post-execute coordinator call would be refused the
+            // same way, after costing another request.
+            if let Some(stop) = Self::quota_exhausted_stop(&plan, this_iteration_failures) {
+                tracing::error!(
+                    "Provider quota exhausted — skipping the post-execute coordinator call \
+                     ({} task(s) completed)",
+                    plan.completed_count(),
+                );
+                let raw = match stop {
+                    Err(error) => {
+                        self.write_run_manifest(&plan, iteration, None).await;
+                        return Err(error.into());
+                    }
+                    Ok(raw) => raw,
+                };
+                let note = crate::provider_error::QUOTA_EXHAUSTED_MESSAGE.to_string();
+                let tool_traces = self.load_tool_traces_for_plan(&plan).await;
+                let timings = Self::iteration_timings(
+                    &tool_traces,
+                    planning_ms,
+                    execution_start,
+                    task_compute_ms,
+                );
+                Self::emit_event(
+                    event_tx,
+                    AgentEventPayload::IterationComplete {
+                        iteration,
+                        will_replan: false,
+                        reasoning: note,
+                        gaps: vec![],
+                        timings,
+                    },
+                )
+                .await;
+                self.write_run_manifest(&plan, iteration, Some(timings))
+                    .await;
+                return Ok(IterationOutcome::FinalResult(raw));
+            }
+
             // Provider error short-circuit: if ALL failures are provider
             // errors, replanning can't fix them. Emit raw results rather
             // than burn a coordinator turn asking the LLM to retry.
@@ -5718,20 +5809,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 tracing::Span::current()
                     .record("orchestration.post_execute_decision", "coordinator_error");
                 let err_str = e.to_string();
-                let category = Self::categorize_failure_error(&err_str);
-                let note = match category {
-                    FailureCategory::AgentTimeout => {
-                        format!("Post-execute coordinator call timed out: {}", err_str)
-                    }
-                    FailureCategory::DepthExhausted => {
-                        format!(
-                            "Post-execute coordinator exhausted its turn budget without routing: {}",
-                            err_str
-                        )
-                    }
-                    _ => format!("Post-execute coordinator call failed: {}", err_str),
-                };
-                tracing::warn!("{}", note);
+                let note = Self::post_execute_failure_note(&err_str);
+                tracing::warn!("Post-execute coordinator call failed: {}", err_str);
                 let raw = Self::build_raw_task_results(&plan, &note);
                 Self::emit_event(
                     event_tx,
@@ -5774,6 +5853,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     out.push_str(&format!(
                         "## Task {}: {}{}\n\n{}\n\n",
                         t.id, t.description, confidence, result
+                    ));
+                }
+                TaskState::Failed {
+                    category: FailureCategory::ProviderQuotaExhausted,
+                    ..
+                } => {
+                    out.push_str(&format!(
+                        "## Task {}: {}\n\nFailed: {}\n\n",
+                        t.id,
+                        t.description,
+                        crate::provider_error::QUOTA_EXHAUSTED_MESSAGE
                     ));
                 }
                 TaskState::Failed { error, .. } => {
@@ -6494,6 +6584,50 @@ mod tests {
         let out = Orchestrator::build_raw_task_results(&plan, "Coordinator timed out");
 
         assert!(out.contains("## Task 0: Search logs (confidence: low)"));
+    }
+
+    /// mezmo/aura#593: raw task results reach the user directly, so a task
+    /// that failed on an exhausted quota shows the plain message instead of
+    /// the provider's body. Completed work and other failures are unchanged.
+    #[test]
+    fn test_raw_task_results_hide_a_quota_failure_body() {
+        use super::super::types::Task;
+
+        let mut plan = Plan::new("Investigate");
+        let mut done = Task::new(0, "Search logs", "Query the log index");
+        done.complete("Found two errors.".to_string());
+        plan.add_task(done);
+        let mut quota = Task::new(1, "Check metrics", "Query metrics");
+        quota.fail(
+            r#"ProviderError: {"error":{"message":"Your credit balance is too low"},"request_id":"req_011secret"}"#,
+            FailureCategory::ProviderQuotaExhausted,
+        );
+        plan.add_task(quota);
+        let mut other = Task::new(2, "Read runbook", "Read it");
+        other.fail(
+            "tool read_file failed: not found",
+            FailureCategory::AgentError,
+        );
+        plan.add_task(other);
+
+        let out = Orchestrator::build_raw_task_results(
+            &plan,
+            crate::provider_error::QUOTA_EXHAUSTED_MESSAGE,
+        );
+
+        assert!(out.contains("Found two errors."), "{out}");
+        assert!(!out.contains("req_011secret"), "{out}");
+        assert!(
+            out.contains(&format!(
+                "## Task 1: Check metrics\n\nFailed: {}",
+                crate::provider_error::QUOTA_EXHAUSTED_MESSAGE
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("Failed: tool read_file failed: not found"),
+            "{out}"
+        );
     }
 
     /// Turn figures are AWS Bedrock invocation-log records for one `arithmetic`
@@ -7654,6 +7788,99 @@ mod tests {
             worker: None,
             category,
         }
+    }
+
+    /// mezmo/aura#593: each provider's out-of-credit error is its own terminal
+    /// category. OpenAI's arrives as a 429 and must not read as an overload,
+    /// which `is_transient_planning_error` would retry.
+    #[test]
+    fn test_categorize_failure_quota_exhausted() {
+        let openai = r#"ProviderError: Invalid status code 429 Too Many Requests with message: {"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota"}}"#;
+        for error in [
+            r#"ProviderError: SSE Error: Invalid status code 400 Bad Request with message: {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}"#,
+            openai,
+            r#"ProviderError: Invalid status code 402 Payment Required with message: {"error":{"message":"Insufficient credits"}}"#,
+        ] {
+            assert_eq!(
+                Orchestrator::categorize_failure_error(error),
+                FailureCategory::ProviderQuotaExhausted,
+                "{error}"
+            );
+        }
+        assert!(!is_transient_planning_error(openai));
+        assert_eq!(
+            Orchestrator::categorize_failure_error("HTTP 429 Too Many Requests"),
+            FailureCategory::ProviderOverloaded,
+            "a plain rate limit is still an overload"
+        );
+    }
+
+    /// An iteration with a quota failure stops before the post-execute
+    /// coordinator call: with nothing completed as an error the web server can
+    /// recognize, otherwise with the completed work under the plain message.
+    #[test]
+    fn test_quota_exhausted_stop() {
+        use super::super::types::Task;
+
+        let quota = make_failure("Your credit balance is too low to access the Anthropic API.");
+        let mut plan = Plan::new("Investigate");
+        let mut failed = Task::new(0, "Check metrics", "Query metrics");
+        failed.fail(quota.error.clone(), quota.category);
+        plan.add_task(failed);
+
+        let unrelated = [make_failure("Request timed out after 30s")];
+        assert!(Orchestrator::quota_exhausted_stop(&plan, &unrelated).is_none());
+
+        let err = Orchestrator::quota_exhausted_stop(&plan, std::slice::from_ref(&quota))
+            .expect("a quota failure stops the run")
+            .expect_err("nothing completed: the run ends in an error");
+        assert!(crate::provider_error::is_quota_exhausted(&err), "{err}");
+
+        let mut done = Task::new(1, "Search logs", "Query the log index");
+        done.complete("Found two errors.".to_string());
+        plan.add_task(done);
+        let raw = Orchestrator::quota_exhausted_stop(&plan, std::slice::from_ref(&quota))
+            .expect("a quota failure stops the run")
+            .expect("completed work is returned");
+        assert!(
+            raw.starts_with(crate::provider_error::QUOTA_EXHAUSTED_MESSAGE),
+            "{raw}"
+        );
+        assert!(raw.contains("Found two errors."), "{raw}");
+        assert!(!raw.contains("credit balance is too low"), "{raw}");
+    }
+
+    /// A quota failure counts as a provider error for the all-failed
+    /// short-circuit, beside the other provider categories.
+    #[test]
+    fn test_should_short_circuit_quota_with_other_provider_errors() {
+        let failures = vec![
+            make_failure("Your credit balance is too low to access the Anthropic API."),
+            make_failure("rate limit exceeded (429)"),
+        ];
+        assert_eq!(
+            failures[0].category,
+            FailureCategory::ProviderQuotaExhausted
+        );
+        assert!(Orchestrator::should_short_circuit_provider_errors(
+            &failures, 0
+        ));
+    }
+
+    /// The post-execute note for an exhausted quota explains the cause and the
+    /// fix, and leaves out the provider's body and request id.
+    #[test]
+    fn test_post_execute_note_for_quota_hides_the_provider_error() {
+        let err = r#"Planning failed: CompletionError: ProviderError: SSE Error: Invalid status code 400 Bad Request with message: {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."},"request_id":"req_011CeNSF5BZ7CQWKKVgGqHv7"}"#;
+        let note = Orchestrator::post_execute_failure_note(err);
+        assert_eq!(note, crate::provider_error::QUOTA_EXHAUSTED_MESSAGE);
+        assert!(!note.contains("req_011"), "{note}");
+
+        let other = Orchestrator::post_execute_failure_note("upstream exploded");
+        assert_eq!(
+            other,
+            "Post-execute coordinator call failed: upstream exploded"
+        );
     }
 
     #[test]

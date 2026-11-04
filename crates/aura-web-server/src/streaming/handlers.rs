@@ -742,6 +742,14 @@ fn process_stream_next(
                 if let Ok(bytes) = format_sse_chunk(&chunk) {
                     return NextItemResult::End(vec![bytes]);
                 }
+            } else if aura::provider_error::is_quota_exhausted(&error_str) {
+                let user_message =
+                    build_quota_exhausted_message(&error_str, config.debug_provider_errors);
+                state.accumulated_content.push_str(&user_message);
+                let chunk = build_text_chunk(ctx, &user_message, state.is_first_chunk);
+                if let Ok(bytes) = format_sse_chunk(&chunk) {
+                    return NextItemResult::End(vec![bytes]);
+                }
             } else {
                 let user_message = build_provider_error_message(
                     &ctx.model_str,
@@ -1561,6 +1569,21 @@ fn build_provider_error_message(model: &str, error_str: &str, debug: bool) -> St
              could not be completed. Please try again or contact support if the \
              issue persists."
         )
+    }
+}
+
+/// The message for a provider account out of credit or quota: what happened
+/// and what to do, which the generic provider message leaves out. The raw
+/// error is appended only when `debug` allows it, as for any provider error.
+fn build_quota_exhausted_message(error_str: &str, debug: bool) -> String {
+    if debug {
+        format!(
+            "{}\n\nProvider error: {}",
+            aura::provider_error::QUOTA_EXHAUSTED_MESSAGE,
+            truncate_error_detail(error_str.trim())
+        )
+    } else {
+        aura::provider_error::QUOTA_EXHAUSTED_MESSAGE.to_string()
     }
 }
 
@@ -2447,6 +2470,28 @@ mod tests {
             !msg.contains("sensitive internal detail"),
             "must not leak provider detail when debug is off: {msg}"
         );
+    }
+
+    const ANTHROPIC_NO_CREDIT: &str = r#"Provider quota exhausted (not retryable via replan): CompletionError: ProviderError: SSE Error: Invalid status code 400 Bad Request with message: {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."},"request_id":"req_011CeNSF5BZ7CQWKKVgGqHv7"}"#;
+
+    /// mezmo/aura#593: an exhausted quota tells the user what to do, and a
+    /// default server keeps the provider's body and request id to itself.
+    #[test]
+    fn quota_exhausted_message_is_actionable_and_hides_detail_by_default() {
+        let msg = build_quota_exhausted_message(ANTHROPIC_NO_CREDIT, false);
+        assert_eq!(msg, aura::provider_error::QUOTA_EXHAUSTED_MESSAGE);
+        assert!(msg.contains("Add credit"), "{msg}");
+        assert!(!msg.contains("req_011"), "request id leaked: {msg}");
+    }
+
+    #[test]
+    fn quota_exhausted_message_includes_detail_in_debug_mode() {
+        let msg = build_quota_exhausted_message(ANTHROPIC_NO_CREDIT, true);
+        assert!(
+            msg.starts_with(aura::provider_error::QUOTA_EXHAUSTED_MESSAGE),
+            "{msg}"
+        );
+        assert!(msg.contains("credit balance is too low"), "{msg}");
     }
 
     #[test]

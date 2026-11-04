@@ -28,6 +28,7 @@ pub mod orchestration;
 pub mod passthrough_tool;
 pub mod prompts;
 mod provider_agent; // Private - internal implementation detail
+pub mod provider_error;
 pub mod rag_tools;
 pub mod request_cancellation;
 pub mod rig_builder;
