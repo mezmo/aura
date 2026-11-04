@@ -9337,6 +9337,80 @@ mod tests {
         );
     }
 
+    /// The gate `create_worker` builds reaches a worker's native run tools.
+    /// Nothing here sets `hitl_gate_layer`, so this fails if `create_worker`
+    /// stops wiring the layer. The run tool takes the gated name, and the
+    /// scripted model calls it on the loop's final turn, as in the depth
+    /// exhaustion test below, so the parked call is cancelled with the task.
+    #[tokio::test]
+    async fn a_worker_run_tool_named_by_hitl_parks_instead_of_running() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut orchestrator, store, _registry, request_id) =
+            override_park_orchestrator(dir.path(), 1).await;
+        let (run, mut events) =
+            crate::run_context::RunContext::channel(request_id.parse().expect("a run id"));
+
+        let run_tool_invocations: Arc<std::sync::Mutex<Vec<test_rig::ToolInvocation>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        orchestrator.run_tools = Arc::new({
+            let invocations = Arc::clone(&run_tool_invocations);
+            move || {
+                vec![
+                    Box::new(test_rig::RecordingTool::new(Arc::clone(&invocations)))
+                        as Box<dyn rig::tool::ToolDyn>,
+                ]
+            }
+        });
+        let setup_tool = Box::new(
+            test_rig::RecordingTool::new(Arc::new(std::sync::Mutex::new(Vec::new())))
+                .with_name("setup_tool"),
+        ) as Box<dyn rig::tool::ToolDyn>;
+        test_rig::install_worker_overrides(vec![WorkerOverride {
+            model: test_rig::ScriptedCompletionModel::new(vec![
+                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_s0",
+                    "setup_tool",
+                    serde_json::json!({"step": 1}),
+                )]),
+                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_s1",
+                    "setup_tool",
+                    serde_json::json!({"step": 2}),
+                )]),
+                ScriptedTurn::tool_calls(vec![
+                    ScriptedToolCall::new(
+                        "call_2",
+                        test_rig::ECHO_TOOL_NAME,
+                        serde_json::json!({"namespace": "prod"}),
+                    )
+                    .with_call_id("call_id_2"),
+                ]),
+            ]),
+            extra_tools: vec![setup_tool],
+        }]);
+
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
+        let params = TaskExecutionParams {
+            task_description: "apply the manifest",
+            task_context: &None,
+            worker_name: Some("operations"),
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let result = crate::run_context::with_run(
+            Arc::clone(&run),
+            orchestrator.execute_task(0, &params, Some(&event_tx), None, None),
+        )
+        .await;
+
+        assert_orphaned(result, &store, &mut events, 1, "MaxDepthError").await;
+        assert!(
+            run_tool_invocations.lock().unwrap().is_empty(),
+            "the gated run tool must never have run"
+        );
+    }
+
     /// Depth exhaustion: the scripted model parks a gated call on the loop's
     /// final turn, so the stream ends at the depth break before the next
     /// `on_completion_call` could snapshot. The task fails and every parked

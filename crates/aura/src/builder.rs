@@ -1353,8 +1353,8 @@ impl PreparedAgent {
             builder_state = builder_state.add_tool(submit_tool);
         }
 
-        // Native tools (the CLI's local tools, the Slack tools) run through the
-        // HITL gate layer alone: a `[hitl]` pattern naming one parks it as it
+        // Native run tools (the Slack tools) run through the HITL gate layer
+        // alone: a `[hitl]` pattern naming one parks it as it
         // would an MCP tool, without the MCP-only layers (scratchpad,
         // persistence) changing what the tool returns. They carry no
         // namespace, so a namespace-scoped pattern never matches them.
@@ -2792,8 +2792,8 @@ mod tests {
             );
         }
 
-        /// A native tool that counts its calls and returns a fixed string, as
-        /// the CLI's local tools and the Slack tools arrive: boxed `ToolDyn`.
+        /// A native tool that counts its calls and returns a fixed string,
+        /// boxed as `ToolDyn` the way the Slack run tools arrive.
         #[derive(Clone)]
         struct CountingNativeTool {
             name: &'static str,
@@ -2930,6 +2930,77 @@ mod tests {
             assert!(
                 raised.is_err(),
                 "a native tool outside the pattern must not be gated, got: {raised:?}",
+            );
+        }
+
+        /// The gate `prepare` builds for a `[hitl]` policy reaches a native run
+        /// tool. Nothing here sets `hitl_gate_layer`, so this fails if
+        /// `prepare` stops wiring the layer.
+        #[tokio::test]
+        async fn prepare_gates_a_native_run_tool_named_by_hitl() {
+            let config = aura_config::load_config_from_str(
+                r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+
+[hitl]
+require_approval = ["slack_post_message"]
+
+[hitl.route]
+mode = "conversational"
+timeout_secs = 60
+"#,
+            )
+            .expect("config parses");
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let tool = CountingNativeTool {
+                name: "slack_post_message",
+                calls: Arc::clone(&calls),
+            };
+            let prepared = crate::rig_builder::RigBuilder::new(config, PendingApprovals::new())
+                .prepare_agent(None, vec![Box::new(tool)], None, None)
+                .await
+                .expect("agent prepares");
+            let agent = prepared
+                .begin_run(
+                    crate::run_context::named_run_id("req_native_prepare"),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let mut events = agent.events.lock().unwrap().take().unwrap();
+
+            // The call waits on a decision; the approval it raises is what this
+            // test reads, so the call is left pending and aborted.
+            let call = tokio::spawn({
+                let prepared = Arc::clone(&prepared);
+                async move {
+                    let _ = prepared.inner.call_tool("slack_post_message", "{}").await;
+                }
+            });
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("the gate raises an approval in time")
+                .expect("the run's event channel is open");
+            call.abort();
+
+            let AgentEventPayload::ApprovalRequested(requested) = event.payload else {
+                panic!(
+                    "the gate must raise Requested first, got {:?}",
+                    event.payload
+                );
+            };
+            assert_eq!(requested.tool_name, "slack_post_message");
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the gated native tool must not run without a decision",
             );
         }
 
