@@ -361,7 +361,11 @@ pipeline {
               }
               post {
                 always {
-                  junit testResults: 'report/ci/junit.xml', allowEmptyResults: true
+                  script {
+                    if (fileExists('report/ci/junit.xml')) {
+                      junit testResults: 'report/ci/junit.xml', allowEmptyResults: true
+                    }
+                  }
                   publishHTML target: [
                     allowMissing: false,
                     alwaysLinkToLastBuild: false,
