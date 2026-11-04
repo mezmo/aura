@@ -6551,6 +6551,7 @@ mod tests {
     /// for.
     #[tokio::test]
     async fn a_plain_worker_budget_starts_from_the_fixed_overhead() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
         let temp = tempfile::TempDir::new().unwrap();
         let mut build_context = crate::config::AgentBuildContext {
             memory_dir: Some(temp.path().join("memory").to_string_lossy().into_owned()),
