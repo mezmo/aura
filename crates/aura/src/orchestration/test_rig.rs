@@ -90,6 +90,8 @@ pub(crate) struct ScriptedTurn {
     stream_failed: bool,
     /// The turn stalls after its text: a provider gone silent mid-stream.
     stalled: bool,
+    /// The provider error a failed stream carries.
+    failure: Option<String>,
 }
 
 impl ScriptedTurn {
@@ -127,6 +129,16 @@ impl ScriptedTurn {
         Self {
             tool_calls: calls,
             stream_failed: true,
+            ..Self::default()
+        }
+    }
+
+    /// A turn whose provider stream fails at once with `message`, as a
+    /// provider refuses a request.
+    pub(crate) fn provider_error(message: impl Into<String>) -> Self {
+        Self {
+            stream_failed: true,
+            failure: Some(message.into()),
             ..Self::default()
         }
     }
@@ -243,7 +255,9 @@ impl ScriptedCompletionModel {
         }
         if turn.stream_failed {
             items.push(Err(CompletionError::ProviderError(
-                "scripted model: provider stream failed mid-turn".to_string(),
+                turn.failure.clone().unwrap_or_else(|| {
+                    "scripted model: provider stream failed mid-turn".to_string()
+                }),
             )));
         } else if !turn.stalled {
             items.push(Ok(RawStreamingChoice::FinalResponse(ScriptedFinalResponse)));

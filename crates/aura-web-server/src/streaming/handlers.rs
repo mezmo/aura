@@ -1352,13 +1352,24 @@ fn handle_orchestrator_event(
                 success,
                 duration_ms
             );
+            // A quota failure carries the provider's raw body and request id,
+            // which reach the client as they do on the stream-error path: only
+            // with `debug_provider_errors`.
+            let result = if !success && aura::provider_error::is_quota_exhausted(result) {
+                std::borrow::Cow::Owned(build_quota_exhausted_message(
+                    result,
+                    config.debug_provider_errors,
+                ))
+            } else {
+                std::borrow::Cow::Borrowed(result.as_str())
+            };
             OrchestrationStreamEvent::task_completed(
                 *task_id,
                 success,
                 *duration_ms,
                 orchestrator_id,
                 worker_id.as_str(),
-                maybe_truncate(result, config.tool_result_max_length),
+                maybe_truncate(&result, config.tool_result_max_length),
                 event_context,
             )
         }
@@ -1931,6 +1942,60 @@ mod tests {
                 "the {label} frame must name the worker, got: {frame}"
             );
         }
+    }
+
+    /// A task that failed on an exhausted quota reaches the client in its
+    /// `task_completed` frame under the plain quota message, with the
+    /// provider's body and request id only when `debug_provider_errors` is on.
+    /// Other task failures pass through unchanged.
+    #[test]
+    fn a_quota_task_failure_hides_the_provider_body_unless_debugging() {
+        use aura_events::agent::{AgentEvent, AgentEventPayload, ToolOutcome};
+
+        let ctx = test_turn_ctx();
+        let failed = |error: &str| {
+            AgentEvent::new(
+                aura_events::EmittingAgent::worker("log-analyst", None, "coordinator"),
+                AgentEventPayload::TaskCompleted {
+                    task_id: 0,
+                    duration_ms: 42,
+                    orchestrator_id: "coordinator".into(),
+                    outcome: ToolOutcome::Failure {
+                        error: error.to_string(),
+                    },
+                },
+            )
+        };
+        let render = |config: &StreamConfig, event: AgentEvent| {
+            handle_orchestrator_event(config, &ctx, &event)
+                .iter()
+                .filter_map(|b| std::str::from_utf8(b).ok().map(str::to_owned))
+                .collect::<String>()
+        };
+        let quota = r#"ProviderError: Invalid status code 400 Bad Request with message: {"error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."},"request_id":"req_011secret"}"#;
+
+        let config = StreamConfig::new(true, false, ToolResultMode::None, 10_000);
+        let frame = render(&config, failed(quota));
+        assert!(
+            frame.contains(aura::provider_error::QUOTA_EXHAUSTED_MESSAGE),
+            "{frame}"
+        );
+        assert!(!frame.contains("req_011secret"), "{frame}");
+
+        let debug = StreamConfig::new(true, false, ToolResultMode::None, 10_000)
+            .with_debug_provider_errors(true);
+        let frame = render(&debug, failed(quota));
+        assert!(
+            frame.contains(aura::provider_error::QUOTA_EXHAUSTED_MESSAGE),
+            "{frame}"
+        );
+        assert!(frame.contains("req_011secret"), "{frame}");
+
+        let frame = render(&config, failed("tool read_file failed: not found"));
+        assert!(
+            frame.contains("tool read_file failed: not found"),
+            "{frame}"
+        );
     }
 
     /// The `arguments` of the result delta OpenWebUI mode sends for `result`.

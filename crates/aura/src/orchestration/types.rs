@@ -557,9 +557,7 @@ pub enum FailureCategory {
     ProviderAuthError,
     /// LLM model not found or invalid model identifier (404).
     ProviderNotFound,
-    /// The provider account is out of credit or quota. Every further call is
-    /// refused the same way, so the run stops instead of retrying or
-    /// replanning. See [`crate::provider_error::is_quota_exhausted`].
+    /// The provider account is out of credit or quota.
     ProviderQuotaExhausted,
     /// Upstream dependency task failed.
     DependencyFailed,
