@@ -25,9 +25,7 @@ SNAPSHOT_DATE="${SNAPSHOT_DATE:-}"
 COUNT_PROPERTY="${COUNT_PROPERTY:-download_count}"
 WORK_DIR=""
 
-# hogql_request's status when PostHog could not answer at all (a 5xx or a
-# timeout after curl's retries), as opposed to a misconfiguration. The
-# read-back polls through it; anything else aborts. EX_TEMPFAIL.
+# hogql_request's status when PostHog could not answer. EX_TEMPFAIL.
 HOGQL_UNAVAILABLE=75
 
 # RFC 4122 version-5 UUID: sha1(namespace bytes || name), with the version and
@@ -103,13 +101,18 @@ hogql_request() {
             "${POSTHOG_API_HOST%/}/api/projects/${POSTHOG_PROJECT_ID}/query/") || rc=$?
     body=$(cat "${out}")
     rm -f "${out}"
-    if [ "${rc}" -eq 28 ]; then
-        echo "error: PostHog query API timed out for project ${POSTHOG_PROJECT_ID}" >&2
-        return "${HOGQL_UNAVAILABLE}"
-    fi
-    if [ "${rc}" -ne 0 ]; then
-        return "${rc}"
-    fi
+    # 28 is a timeout. 7, 35, 52 and 56 are a connection refused, a failed
+    # TLS handshake, an empty reply and a reset, which --retry does not retry.
+    case "${rc}" in
+        0) ;;
+        28)
+            echo "error: PostHog query API timed out for project ${POSTHOG_PROJECT_ID}" >&2
+            return "${HOGQL_UNAVAILABLE}" ;;
+        7 | 35 | 52 | 56)
+            echo "error: PostHog query API could not be reached for project ${POSTHOG_PROJECT_ID} (curl exit ${rc})" >&2
+            return "${HOGQL_UNAVAILABLE}" ;;
+        *) return "${rc}" ;;
+    esac
     if [ "${status}" != 200 ]; then
         echo "error: PostHog query API returned ${status} for project ${POSTHOG_PROJECT_ID}" >&2
         echo "       ${body}" >&2
@@ -236,11 +239,22 @@ PY
         exit 1
     fi
 
-    # The read-back: stub the two queries so the first poll is unavailable and
-    # the second finds everything. State goes through a file because each
-    # query runs in its own command substitution.
+    # The stub server is gone, so its port now refuses the connection.
     rc=0
+    POSTHOG_API_HOST="http://127.0.0.1:${port}" POSTHOG_API_READ_KEY=selftest \
+        hogql_request "SELECT 1" >/dev/null 2>&1 || rc=$?
+    [ "${rc}" -eq "${HOGQL_UNAVAILABLE}" ] \
+        || { echo "selftest: a refused connection returned ${rc}, want ${HOGQL_UNAVAILABLE}" >&2; exit 1; }
+
+    # The read-back cases run under `set -e`, as the scripts call
+    # verify_snapshot. A subshell on the left of `||` would turn it off.
+    # State goes through files because each query runs in its own command
+    # substitution.
+
+    # count_ingested cannot answer on the first poll; the second finds it all.
+    set +e
     (
+        set -e
         WORK_DIR=${tmp}
         : > "${tmp}/uuids"
         echo 0 > "${tmp}/polls"
@@ -254,21 +268,56 @@ PY
         }
         probes_landed() { echo 1; }
         VERIFY_TIMEOUT=60 verify_snapshot 2000-01-01 1 5 1 >/dev/null 2>&1
-    ) || rc=$?
+    )
+    rc=$?
+    set -e
     [ "${rc}" -eq 0 ] && [ "$(cat "${tmp}/polls")" = 2 ] \
-        || { echo "selftest: verify_snapshot returned ${rc} after $(cat "${tmp}/polls") poll(s), want 0 after polling through an unavailable read-back" >&2; exit 1; }
+        || { echo "selftest: verify_snapshot returned ${rc} after $(cat "${tmp}/polls") poll(s), want 0 after polling through an unavailable count" >&2; exit 1; }
 
-    rc=0
+    # probes_landed cannot answer on the first poll; the second finds it all.
+    set +e
     (
+        set -e
         WORK_DIR=${tmp}
         : > "${tmp}/uuids"
+        echo 0 > "${tmp}/polls"
         sleep() { :; }
-        count_ingested() { return 1; }
-        probes_landed() { echo 1; }
+        count_ingested() { printf '1\t5\n'; }
+        probes_landed() {
+            local n
+            n=$(( $(cat "${tmp}/polls") + 1 ))
+            echo "${n}" > "${tmp}/polls"
+            [ "${n}" -gt 1 ] || return "${HOGQL_UNAVAILABLE}"
+            echo 1
+        }
         VERIFY_TIMEOUT=60 verify_snapshot 2000-01-01 1 5 1 >/dev/null 2>&1
-    ) || rc=$?
-    [ "${rc}" -eq 1 ] \
-        || { echo "selftest: verify_snapshot returned ${rc} on a failed read-back, want 1 at once" >&2; exit 1; }
+    )
+    rc=$?
+    set -e
+    [ "${rc}" -eq 0 ] && [ "$(cat "${tmp}/polls")" = 2 ] \
+        || { echo "selftest: verify_snapshot returned ${rc} after $(cat "${tmp}/polls") poll(s), want 0 after polling through unavailable probes" >&2; exit 1; }
+
+    # A read-back query that fails outright aborts at its first query. The real
+    # count_ingested runs, so this also covers it passing the failure on.
+    set +e
+    (
+        set -e
+        WORK_DIR=${tmp}
+        echo 00000000-0000-0000-0000-000000000000 > "${tmp}/uuids"
+        rm -f "${tmp}"/uchunk.*
+        echo 0 > "${tmp}/polls"
+        sleep() { :; }
+        hogql_row() {
+            echo $(( $(cat "${tmp}/polls") + 1 )) > "${tmp}/polls"
+            return 1
+        }
+        probes_landed() { echo 1; }
+        VERIFY_TIMEOUT=2 verify_snapshot 2000-01-01 1 5 1 >/dev/null 2>&1
+    )
+    rc=$?
+    set -e
+    [ "${rc}" -eq 1 ] && [ "$(cat "${tmp}/polls")" = 1 ] \
+        || { echo "selftest: verify_snapshot returned ${rc} after $(cat "${tmp}/polls") quer(ies) on a failed read-back, want 1 after one" >&2; exit 1; }
 }
 
 hogql_scalar() {
@@ -311,8 +360,7 @@ add_probe() {
 }
 
 # The timestamp bound is what keeps this query cheap: without it PostHog
-# scans every probe event ever sent, and the scheduled runs hit its query
-# time limit (mezmo/aura#813, #814). A probe is stamped with the time this
+# scans every probe event ever sent. A probe is stamped with the time this
 # run sent it, so a day back covers it.
 probes_landed() {
     local list
