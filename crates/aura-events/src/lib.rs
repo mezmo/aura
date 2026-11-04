@@ -779,6 +779,9 @@ pub enum WorkerPhase {
     Executing,
     /// Worker is analyzing results
     Analyzing,
+    /// A value this version of the crate does not know.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// Aura-specific streaming events sent via SSE `event:` field.

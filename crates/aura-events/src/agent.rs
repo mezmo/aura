@@ -443,6 +443,52 @@ mod tests {
         assert!(serde_json::to_value(&event).is_err());
     }
 
+    /// A worker phase added by a newer producer keeps the `WorkerPhase` event
+    /// around it, so an older reader does not lose the event.
+    #[test]
+    fn an_unknown_worker_phase_reads_as_unknown_and_keeps_the_event() {
+        let event: AgentEvent = serde_json::from_value(json!({
+            "agent": serde_json::to_value(EmittingAgent::single_agent()).unwrap(),
+            "payload": {"type": "worker_phase", "phase": "reflecting", "task_id": 2}
+        }))
+        .expect("an unknown phase should not fail the event");
+
+        let AgentEventPayload::WorkerPhase { phase, task_id } = &event.payload else {
+            panic!("expected WorkerPhase, got {:?}", event.payload);
+        };
+        assert!(matches!(phase, WorkerPhase::Unknown));
+        assert_eq!(*task_id, Some(2));
+        assert!(serde_json::to_value(&event).is_err());
+    }
+
+    /// A routing mode added by a newer producer keeps the `PlanCreated` event
+    /// around it, so an older reader does not lose the event.
+    #[test]
+    fn an_unknown_routing_mode_reads_as_unknown_and_keeps_the_event() {
+        let event: AgentEvent = serde_json::from_value(json!({
+            "agent": serde_json::to_value(EmittingAgent::single_agent()).unwrap(),
+            "payload": {
+                "type": "plan_created",
+                "goal": "g",
+                "tasks": ["t"],
+                "routing_mode": "speculative",
+                "routing_rationale": "r",
+                "planning_response": "p"
+            }
+        }))
+        .expect("an unknown routing mode should not fail the event");
+
+        let AgentEventPayload::PlanCreated {
+            goal, routing_mode, ..
+        } = &event.payload
+        else {
+            panic!("expected PlanCreated, got {:?}", event.payload);
+        };
+        assert_eq!(goal, "g");
+        assert!(matches!(routing_mode, RoutingMode::Unknown));
+        assert!(serde_json::to_value(&event).is_err());
+    }
+
     /// An outcome kind added by a newer producer keeps the `ToolComplete`
     /// around it, so an older reader does not lose the event.
     #[test]
