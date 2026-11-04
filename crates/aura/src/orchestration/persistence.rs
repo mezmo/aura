@@ -42,7 +42,7 @@ use tokio::fs;
 use tokio::sync::Notify;
 
 use super::park::{PARKED_DOCUMENT_SUFFIX, RESUMING_DOCUMENT_SUFFIX};
-use super::types::{Plan, TaskStatus};
+use super::types::{Plan, TaskStatus, failure_text};
 use aura_events::orchestration::RoutingMode;
 
 // ============================================================================
@@ -1142,7 +1142,8 @@ fn render_task_summary(task: &TaskSummary, out: &mut String) {
             ));
             out.push_str(&format!("    \"{}\"\n", task.description));
             if let Some(error) = &task.error {
-                out.push_str(&format!("    Error: {}\n", error));
+                let category = task.failure_category.unwrap_or_default();
+                out.push_str(&format!("    Error: {}\n", failure_text(error, category)));
             }
             if let Some(ctx) = &task.error_context {
                 if let Some(tool) = &ctx.last_tool_call {
@@ -1193,6 +1194,35 @@ fn render_task_summary(task: &TaskSummary, out: &mut String) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The session context goes into later turns' coordinator prompts, so a
+    /// quota failure reads as the plain message there.
+    #[test]
+    fn test_render_task_summary_hides_a_quota_failure_body() {
+        let body = "Your credit balance is too low, request_id req_011secret";
+        let task = TaskSummary {
+            task_id: 0,
+            description: "Check metrics".to_string(),
+            status: TaskStatus::Failed,
+            worker: Some("operations".to_string()),
+            result_preview: None,
+            confidence: None,
+            failure_category: Some(super::super::types::FailureCategory::ProviderQuotaExhausted),
+            error: Some(body.to_string()),
+            error_context: None,
+            tool_trace: vec![],
+            artifacts: vec![],
+        };
+
+        let mut out = String::new();
+        render_task_summary(&task, &mut out);
+
+        assert!(!out.contains("req_011secret"), "{out}");
+        assert!(
+            out.contains(crate::provider_error::QUOTA_EXHAUSTED_MESSAGE),
+            "{out}"
+        );
+    }
 
     #[tokio::test]
     async fn test_persistence_creation() {

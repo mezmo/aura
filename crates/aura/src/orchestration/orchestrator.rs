@@ -74,7 +74,7 @@ use super::persistence::ExecutionPersistence;
 use super::types::{
     BlockedCell, CellOutcome, FailedTaskRecord, FailureCategory, FailureSummary, IterationContext,
     IterationOutcome, IterationTimings, ParkSnapshot, PendingCall, Plan, PlanningResponse,
-    TaskState, TaskStatus,
+    TaskState, TaskStatus, failure_text,
 };
 
 // ============================================================================
@@ -4832,9 +4832,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     TaskState::Complete { result } => {
                         format!("✓ complete ({} chars)", result.len())
                     }
-                    TaskState::Failed { error, .. } => {
-                        let (truncated, was_truncated) =
-                            safe_truncate(error, self.config.result_summary_length());
+                    TaskState::Failed { error, category } => {
+                        let (truncated, was_truncated) = safe_truncate(
+                            failure_text(error, *category),
+                            self.config.result_summary_length(),
+                        );
                         let suffix = if was_truncated { " [truncated]" } else { "" };
                         format!("✗ failed: {}{}", truncated, suffix)
                     }
@@ -5926,21 +5928,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         t.id, t.description, confidence, result
                     ));
                 }
-                TaskState::Failed {
-                    category: FailureCategory::ProviderQuotaExhausted,
-                    ..
-                } => {
+                TaskState::Failed { error, category } => {
                     out.push_str(&format!(
                         "## Task {}: {}\n\nFailed: {}\n\n",
                         t.id,
                         t.description,
-                        crate::provider_error::QUOTA_EXHAUSTED_MESSAGE
-                    ));
-                }
-                TaskState::Failed { error, .. } => {
-                    out.push_str(&format!(
-                        "## Task {}: {}\n\nFailed: {}\n\n",
-                        t.id, t.description, error
+                        failure_text(error, *category)
                     ));
                 }
                 TaskState::Pending | TaskState::Running | TaskState::AwaitingApproval { .. } => {
@@ -9866,6 +9859,25 @@ mod tests {
             matches!(unlocked.state, TaskState::Pending),
             "the unlocked task must not start: {:?}",
             unlocked.state
+        );
+    }
+
+    /// The execution summary goes into the coordinator's replan prompt, so a
+    /// quota failure reads as the plain message there.
+    #[tokio::test]
+    async fn the_execution_summary_hides_a_quota_failure_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, _store, _registry, _request_id) =
+            override_park_orchestrator(dir.path(), 4).await;
+        let mut plan = Plan::new("Investigate");
+        plan.add_task(failed_on_quota(0, "operations"));
+
+        let summary = orchestrator.build_execution_summary(&plan);
+
+        assert!(!summary.contains("req_011secret"), "{summary}");
+        assert!(
+            summary.contains(crate::provider_error::QUOTA_EXHAUSTED_MESSAGE),
+            "{summary}"
         );
     }
 

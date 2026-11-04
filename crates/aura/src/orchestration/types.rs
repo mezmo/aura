@@ -579,6 +579,17 @@ pub enum FailureCategory {
     AgentError,
 }
 
+/// A failed task's error as prompts and results show it. A quota failure's
+/// error is the provider's body and request id, which stay in the saved plan
+/// and logs, so it reads as the plain message.
+pub(crate) fn failure_text(error: &str, category: FailureCategory) -> &str {
+    if category == FailureCategory::ProviderQuotaExhausted {
+        crate::provider_error::QUOTA_EXHAUSTED_MESSAGE
+    } else {
+        error
+    }
+}
+
 /// One gated tool call parked for a human decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingCall {
@@ -1150,13 +1161,10 @@ impl IterationContext {
                     .as_deref()
                     .map(|w| format!(" (worker: {w})"))
                     .unwrap_or_default();
-                let error = if record.category == FailureCategory::ProviderQuotaExhausted {
-                    crate::provider_error::QUOTA_EXHAUSTED_MESSAGE
-                } else {
-                    record.error.as_str()
-                };
-                let (truncated_error, was_truncated) =
-                    crate::string_utils::safe_truncate(error, content_max_length);
+                let (truncated_error, was_truncated) = crate::string_utils::safe_truncate(
+                    failure_text(&record.error, record.category),
+                    content_max_length,
+                );
                 let suffix = if was_truncated { " [truncated]" } else { "" };
                 fh.push_str(&format!(
                     "\n- Iteration {}: \"{}\"{} — [{}] {}{}",
