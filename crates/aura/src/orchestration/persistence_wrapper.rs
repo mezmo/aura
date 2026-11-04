@@ -889,21 +889,7 @@ mod tests {
     /// drops the raw output `transform_output` cached for it.
     #[tokio::test]
     async fn test_raw_output_dropped_when_call_has_no_task_context() {
-        let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
-        let (in_flight, drain_notify) = {
-            let p = persistence.lock().await;
-            (p.in_flight_counter(), p.drain_notify())
-        };
-        let wrapper = PersistenceWrapper::new(PersistenceWrapperParams {
-            persistence,
-            in_flight,
-            drain_notify,
-            worker_name: None,
-            iteration: 1,
-            persistence_enabled: false,
-            size_threshold: 0,
-            duration_threshold_ms: 0,
-        });
+        let wrapper = test_wrapper(Arc::new(Mutex::new(ExecutionPersistence::disabled())));
 
         let ctx = ToolCallContext::new("tool");
         assert!(ctx.task_id.is_none() && ctx.attempt.is_none());
