@@ -757,6 +757,10 @@ fn timed_out_message(reason: &str, partial: &str) -> String {
     }
 }
 
+/// Why a parked worker's approvals are cancelled when its stream ended before
+/// the hook captured its conversation.
+const ORPHANED_PARK: &str = "stream ended before snapshot";
+
 const EMPTY_WORKER_RESULT: &str = "The worker produced no output and did not call submit_result.";
 
 /// The failure text for a worker that finished without calling `submit_result`.
@@ -1479,15 +1483,15 @@ impl Orchestrator {
             })
     }
 
-    /// Orphan cleanup for a parked worker whose stream ended before the hook
-    /// captured its conversation: every pending decision id is removed from
-    /// the store with an `approval_completed(cancelled)` event, so the human
-    /// is not left with a decidable approval nothing will consume.
+    /// Every pending decision id is removed from the store with an
+    /// `approval_completed(cancelled)` event, so the human is not left with a
+    /// decidable approval nothing will consume. `reason` says why, for the log.
     async fn cancel_parked_approvals(
         &self,
         task_id: usize,
         worker_name: Option<&str>,
         pending: &[PendingCall],
+        reason: &str,
     ) {
         let Some(hitl) = self.agent_build_context.hitl.clone() else {
             return;
@@ -1510,7 +1514,8 @@ impl Orchestrator {
                 decision_id = %call.decision_id,
                 tool = %call.tool_name,
                 task_id,
-                "orphaned park approval cancelled (stream ended before snapshot)",
+                reason,
+                "park approval cancelled",
             );
         }
     }
@@ -3802,9 +3807,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
         while !plan.is_finished() {
             // Collect ready tasks with their context and worker assignment
             // Tuple: (task_id, description, context, worker_name)
+            // A task on an account another task found exhausted would be
+            // refused the same way, so it stays pending.
+            let exhausted = self.exhausted_llms(plan);
             let ready_tasks: Vec<(usize, String, Option<String>, Option<String>)> = plan
                 .ready_tasks()
                 .iter()
+                .filter(|t| !self.runs_on_any(t.worker.as_deref(), &exhausted))
                 .map(|t| {
                     let context = self.build_task_context(plan, t.id);
                     (t.id, t.description.clone(), context, t.worker.clone())
@@ -3818,6 +3827,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     for line in park_verdict_lines(plan) {
                         tracing::warn!("{line}");
                     }
+                } else if !exhausted.is_empty() {
+                    tracing::warn!(
+                        "Provider quota exhausted — {} task(s) not started",
+                        plan.pending_count(),
+                    );
                 } else {
                     // No ready tasks but not finished - this shouldn't happen
                     // with valid plans
@@ -3913,6 +3927,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                     duration_ms,
                                     orchestrator_id: self.orchestrator_id.clone(),
                                     outcome: outcome_of(success, result_for_event),
+                                    quota_exhausted: false,
                                 },
                             )))))
                             .await;
@@ -3943,6 +3958,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                     duration_ms,
                                     orchestrator_id: self.orchestrator_id.clone(),
                                     outcome: outcome_of(false, final_result),
+                                    quota_exhausted: false,
                                 },
                             )))))
                             .await;
@@ -3995,6 +4011,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                     duration_ms,
                                     orchestrator_id: self.orchestrator_id.clone(),
                                     outcome: outcome_of(false, err_str.clone()),
+                                    quota_exhausted: category
+                                        == FailureCategory::ProviderQuotaExhausted,
                                 },
                             )))))
                             .await;
@@ -4011,17 +4029,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         );
                     }
                 }
-            }
-
-            // An exhausted quota refuses every later request, so no further
-            // wave starts. Tasks still pending stay pending, and
-            // `run_iteration` stops the run with the work completed so far.
-            if has_quota_exhausted_task(plan) {
-                tracing::warn!(
-                    "Provider quota exhausted — not starting the {} remaining task(s)",
-                    plan.pending_count(),
-                );
-                break;
             }
         }
 
@@ -4196,9 +4203,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             // Same effective-LLM resolution as `create_worker`; recorded here
             // (not there) so retries don't append duplicate attributes.
             let worker_cfg = worker_name.and_then(|name| self.config.workers.get(name));
-            let effective_llm = worker_cfg
-                .and_then(|w| w.llm.as_ref())
-                .unwrap_or(&self.agent_build_context.llm);
+            let effective_llm = self.effective_llm(*worker_name);
             let (provider, model) = effective_llm.model_info();
             crate::logging::set_llm_identifiers(&span, provider, model);
             if let Some(params) = crate::logging::llm_invocation_parameters(effective_llm) {
@@ -4355,8 +4360,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         // gated action never ran and cannot resume from a
                         // conversation nobody captured, so cancel the decisions
                         // and fail the task.
-                        self.cancel_parked_approvals(task_id, *worker_name, &pending)
-                            .await;
+                        self.cancel_parked_approvals(
+                            task_id,
+                            *worker_name,
+                            &pending,
+                            ORPHANED_PARK,
+                        )
+                        .await;
                         let underlying = match stream_result.as_ref() {
                             Err(e) => format!(" Underlying error: {e}"),
                             Ok(ForwardOutcome::TimedOut { reason, .. }) => {
@@ -4690,7 +4700,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 });
             }
             CellOutcome::Orphaned { pending } => {
-                self.cancel_parked_approvals(task_id, worker_name, &pending)
+                self.cancel_parked_approvals(task_id, worker_name, &pending, ORPHANED_PARK)
                     .await;
                 let underlying = match stream_result.as_ref() {
                     Err(e) => format!(" Underlying error: {e}"),
@@ -4875,13 +4885,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// a timeout (e.g. "request timed out after 30s") on the provider arm,
     /// since rig's "Invalid status code …" prefix proves provider origin. The
     /// generic "timed out" arm follows the provider arms as the fallback for
-    /// other timeout phrasings (e.g. reqwest "operation timed out").
+    /// other timeout phrasings (e.g. reqwest "operation timed out"). The
+    /// duplicate-loop arm precedes the quota arm because that error embeds the
+    /// worker's final text, which can quote a quota error from what it read.
     fn categorize_failure_error(error: &str) -> FailureCategory {
         let lower = error.to_lowercase();
         if lower.contains(STALL_MESSAGE) {
             // Inactivity stall carries its own sentinel so it cannot collide
             // with provider errors that merely mention a timeout.
             FailureCategory::AgentTimeout
+        } else if lower.contains("duplicate call loop") {
+            FailureCategory::LoopDetected
         } else if crate::provider_error::is_quota_exhausted(error) {
             // Before the rate-limit arm: OpenAI reports an exhausted quota as
             // a 429, which would otherwise read as a retryable overload.
@@ -4942,8 +4956,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             FailureCategory::AgentTimeout
         } else if lower.contains("maxdeptherror") || lower.contains("reached limit") {
             FailureCategory::DepthExhausted
-        } else if lower.contains("duplicate call loop") {
-            FailureCategory::LoopDetected
         } else if lower.contains("did not call submit_result") {
             FailureCategory::SoftFailure
         } else {
@@ -4967,23 +4979,67 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 FailureCategory::ProviderOverloaded
                     | FailureCategory::ProviderAuthError
                     | FailureCategory::ProviderNotFound
-                    | FailureCategory::ProviderQuotaExhausted
             )
         })
     }
 
-    /// How the run ends on `quota_failure`. With no completed task it is an
-    /// error carrying the provider's own text, so the caller can recognize the
-    /// quota and choose how much of it to show. Otherwise it is the completed
-    /// work as raw task results under the plain quota message.
-    fn quota_exhausted_stop(
-        plan: &Plan,
-        quota_failure: &FailedTaskRecord,
-    ) -> Result<String, String> {
-        if plan.completed_count() == 0 {
+    /// The LLM config `worker` runs on: its own, or `[agent.llm]`.
+    fn effective_llm(&self, worker: Option<&str>) -> &LlmConfig {
+        worker
+            .and_then(|name| self.config.workers.get(name))
+            .and_then(|w| w.llm.as_ref())
+            .unwrap_or(&self.agent_build_context.llm)
+    }
+
+    /// The LLM configs of the tasks that failed on an exhausted account.
+    fn exhausted_llms(&self, plan: &Plan) -> Vec<&LlmConfig> {
+        plan.tasks
+            .iter()
+            .filter(|t| t.is_quota_exhausted())
+            .map(|t| self.effective_llm(t.worker.as_deref()))
+            .collect()
+    }
+
+    /// Whether `worker` bills an account one of `llms` bills.
+    fn runs_on_any(&self, worker: Option<&str>, llms: &[&LlmConfig]) -> bool {
+        let llm = self.effective_llm(worker);
+        llms.iter().any(|exhausted| exhausted.same_account(llm))
+    }
+
+    /// The provider error of a task that failed on the coordinator's own
+    /// account, which refuses the coordinator too.
+    fn coordinator_quota_error<'a>(&self, plan: &'a Plan) -> Option<&'a str> {
+        let coordinator = [&self.agent_build_context.llm];
+        plan.tasks.iter().find_map(|t| match &t.state {
+            TaskState::Failed {
+                error,
+                category: FailureCategory::ProviderQuotaExhausted,
+            } if self.runs_on_any(t.worker.as_deref(), &coordinator) => Some(error.as_str()),
+            _ => None,
+        })
+    }
+
+    /// How the run ends on `quota_error`. With nothing to show it is an error
+    /// carrying the provider's own text, so the caller can recognize the quota
+    /// and choose how much of it to show. Otherwise it is the raw task results
+    /// under the plain quota message: completed tasks, and the output a soft
+    /// failure, timeout or duplicate-call loop kept.
+    fn quota_exhausted_stop(plan: &Plan, quota_error: &str) -> Result<String, String> {
+        let has_output = plan.tasks.iter().any(|t| {
+            matches!(
+                t.state,
+                TaskState::Complete { .. }
+                    | TaskState::Failed {
+                        category: FailureCategory::SoftFailure
+                            | FailureCategory::AgentTimeout
+                            | FailureCategory::LoopDetected,
+                        ..
+                    }
+            )
+        });
+        if !has_output {
             return Err(format!(
-                "Provider quota exhausted (not retryable via replan): {}",
-                quota_failure.error
+                "Provider quota exhausted (not retryable via replan): {quota_error}"
             ));
         }
         Ok(Self::build_raw_task_results(
@@ -5356,6 +5412,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 return Err(e);
             }
         };
+        let coordinator_quota_error = self.coordinator_quota_error(&plan).map(String::from);
+        self.cancel_exhausted_awaiting_tasks(&mut plan, coordinator_quota_error.is_some())
+            .await;
         let new_failure_start = failure_history.len();
         failure_history.extend(Self::collect_iteration_failures(&plan, iteration));
         let this_iteration_failures = &failure_history[new_failure_start..];
@@ -5384,23 +5443,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
 
         // ----------------------------------------------------------------
-        // QUOTA STOP: an exhausted provider quota ends the run here, before
-        // the park path and the post-execute coordinator call, completed
-        // tasks or not. Both would be refused the same way: a parked task
-        // resumes against the same account. Awaiting tasks have their
-        // approvals cancelled, so no decision is left for nothing to use.
+        // QUOTA STOP: a task refused on the coordinator's own account ends the
+        // run here, before the park path and the post-execute coordinator
+        // call, completed tasks or not. Both need that account: a parked run
+        // resumes through the coordinator. An exhausted worker account does
+        // not stop the run: the coordinator still has credit to replan the
+        // task onto another worker or summarize what finished.
         // ----------------------------------------------------------------
-        if let Some(quota_failure) = this_iteration_failures
-            .iter()
-            .find(|f| f.category == FailureCategory::ProviderQuotaExhausted)
-        {
-            self.cancel_awaiting_tasks(&mut plan).await;
+        if let Some(quota_error) = coordinator_quota_error {
             tracing::error!(
                 "Provider quota exhausted — skipping the post-execute coordinator call \
                  ({} task(s) completed)",
                 plan.completed_count(),
             );
-            let raw = match Self::quota_exhausted_stop(&plan, quota_failure) {
+            let raw = match Self::quota_exhausted_stop(&plan, &quota_error) {
                 Err(error) => {
                     self.write_run_manifest(&plan, iteration, None).await;
                     return Err(error.into());
@@ -6058,18 +6114,26 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
     }
 
-    /// Sweep the run's parked approvals by owner id, so no decidable
-    /// approval outlives a run that has no checkpoint.
-    /// Cancel every awaiting task's parked approvals and fail the task, for a
-    /// run that stops on an exhausted provider quota instead of parking.
-    async fn cancel_awaiting_tasks(&self, plan: &mut Plan) {
+    /// Cancel the parked approvals of each awaiting task and fail it when its
+    /// resume would be refused: its own account is exhausted, or
+    /// `coordinator_exhausted` says the run stops with no resume at all.
+    async fn cancel_exhausted_awaiting_tasks(&self, plan: &mut Plan, coordinator_exhausted: bool) {
+        let exhausted = self.exhausted_llms(plan);
         for task in &mut plan.tasks {
             let TaskState::AwaitingApproval { pending } = &task.state else {
                 continue;
             };
+            if !coordinator_exhausted && !self.runs_on_any(task.worker.as_deref(), &exhausted) {
+                continue;
+            }
             let pending = pending.clone();
-            self.cancel_parked_approvals(task.id, task.worker.as_deref(), &pending)
-                .await;
+            self.cancel_parked_approvals(
+                task.id,
+                task.worker.as_deref(),
+                &pending,
+                "provider quota exhausted",
+            )
+            .await;
             task.fail(
                 format!(
                     "{} pending approval(s) cancelled: {}",
@@ -6081,6 +6145,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
     }
 
+    /// Sweep the run's parked approvals by owner id, so no decidable
+    /// approval outlives a run that has no checkpoint.
     async fn cancel_run_parked_approvals(&self, run_id: &str) {
         let Some(hitl) = self.agent_build_context.hitl.clone() else {
             return;
@@ -6323,18 +6389,6 @@ fn truncate_query(query: &str, max_len: usize) -> String {
 // ============================================================================
 
 /// Whether any task carries non-empty parked calls.
-fn has_quota_exhausted_task(plan: &Plan) -> bool {
-    plan.tasks.iter().any(|t| {
-        matches!(
-            t.state,
-            TaskState::Failed {
-                category: FailureCategory::ProviderQuotaExhausted,
-                ..
-            }
-        )
-    })
-}
-
 fn has_awaiting_task(plan: &Plan) -> bool {
     plan.tasks
         .iter()
@@ -7861,6 +7915,25 @@ mod tests {
             FailureCategory::ProviderOverloaded,
             "a plain rate limit is still an overload"
         );
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                r#"Invalid status code 429 Too Many Requests with message: {"error":{"message":"You exceeded your current quota, please check your plan and billing details.","status":"RESOURCE_EXHAUSTED"}}"#
+            ),
+            FailureCategory::ProviderOverloaded,
+            "Gemini's per-minute limit clears by itself"
+        );
+    }
+
+    /// The duplicate-loop error embeds the worker's final text, which can
+    /// quote a quota error from what it was investigating.
+    #[test]
+    fn test_categorize_duplicate_loop_quoting_a_quota_error() {
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "Worker blocked by duplicate call loop.\nThe logs show insufficient_quota."
+            ),
+            FailureCategory::LoopDetected
+        );
     }
 
     /// A quota stop with nothing completed is an error the web server can
@@ -7875,15 +7948,15 @@ mod tests {
         failed.fail(quota.error.clone(), quota.category);
         plan.add_task(failed);
 
-        let err = Orchestrator::quota_exhausted_stop(&plan, &quota)
+        let err = Orchestrator::quota_exhausted_stop(&plan, &quota.error)
             .expect_err("nothing completed: the run ends in an error");
         assert!(crate::provider_error::is_quota_exhausted(&err), "{err}");
 
         let mut done = Task::new(1, "Search logs", "Query the log index");
         done.complete("Found two errors.".to_string());
         plan.add_task(done);
-        let raw =
-            Orchestrator::quota_exhausted_stop(&plan, &quota).expect("completed work is returned");
+        let raw = Orchestrator::quota_exhausted_stop(&plan, &quota.error)
+            .expect("completed work is returned");
         assert!(
             raw.starts_with(crate::provider_error::QUOTA_EXHAUSTED_MESSAGE),
             "{raw}"
@@ -7892,10 +7965,43 @@ mod tests {
         assert!(!raw.contains("credit balance is too low"), "{raw}");
     }
 
-    /// A quota failure counts as a provider error for the all-failed
-    /// short-circuit, beside the other provider categories.
+    /// With no completed task, the output a failed task kept still reaches the
+    /// user. A failure that kept none does not count.
     #[test]
-    fn test_should_short_circuit_quota_with_other_provider_errors() {
+    fn test_quota_exhausted_stop_keeps_output_from_failed_tasks() {
+        use super::super::types::Task;
+
+        for (category, output) in [
+            (FailureCategory::SoftFailure, "Partial answer."),
+            (FailureCategory::AgentTimeout, "Partial output."),
+            (FailureCategory::LoopDetected, "Findings before the loop."),
+        ] {
+            let mut plan = Plan::new("Investigate");
+            let mut kept = Task::new(0, "Search logs", "Query the log index");
+            kept.fail(output, category);
+            plan.add_task(kept);
+
+            let raw = Orchestrator::quota_exhausted_stop(&plan, "credit balance is too low")
+                .expect("kept output is returned");
+            assert!(
+                raw.starts_with(crate::provider_error::QUOTA_EXHAUSTED_MESSAGE),
+                "{raw}"
+            );
+            assert!(raw.contains(output), "{raw}");
+        }
+
+        let mut plan = Plan::new("Investigate");
+        let mut other = Task::new(0, "Search logs", "Query the log index");
+        other.fail("rate limit exceeded", FailureCategory::ProviderOverloaded);
+        plan.add_task(other);
+        assert!(Orchestrator::quota_exhausted_stop(&plan, "too low").is_err());
+    }
+
+    /// A quota failure that reaches the short-circuit is on a worker's own
+    /// account, so the coordinator can still replan it. The coordinator's own
+    /// account stops the run earlier.
+    #[test]
+    fn test_should_not_short_circuit_a_worker_quota_failure() {
         let failures = vec![
             make_failure("Your credit balance is too low to access the Anthropic API."),
             make_failure("rate limit exceeded (429)"),
@@ -7904,7 +8010,7 @@ mod tests {
             failures[0].category,
             FailureCategory::ProviderQuotaExhausted
         );
-        assert!(Orchestrator::should_short_circuit_provider_errors(
+        assert!(!Orchestrator::should_short_circuit_provider_errors(
             &failures, 0
         ));
     }
@@ -8859,7 +8965,7 @@ mod tests {
         // The orchestrator emits through the ambient run, as its own body does.
         crate::run_context::with_run(
             run,
-            orchestrator.cancel_parked_approvals(3, Some("operations"), &pending),
+            orchestrator.cancel_parked_approvals(3, Some("operations"), &pending, ORPHANED_PARK),
         )
         .await;
 
@@ -9741,7 +9847,11 @@ mod tests {
         assert!(!next_wave_built, "no worker is built after a quota failure");
         assert!(next_wave_model.requests().lock().unwrap().is_empty());
         assert_eq!(plan.completed_count(), 1, "{:?}", plan.tasks);
-        assert!(has_quota_exhausted_task(&plan), "{:?}", plan.tasks);
+        assert!(
+            plan.tasks.iter().any(Task::is_quota_exhausted),
+            "{:?}",
+            plan.tasks
+        );
         let unlocked = plan
             .tasks
             .iter()
@@ -9757,6 +9867,134 @@ mod tests {
             "the unlocked task must not start: {:?}",
             unlocked.state
         );
+    }
+
+    /// `worker` on an account of its own, beside the coordinator's.
+    fn add_own_account_worker(orchestrator: &mut Orchestrator, worker: &str) {
+        let mut config = orchestrator.config.workers["operations"].clone();
+        config.llm = Some(LlmConfig::OpenAI {
+            api_key: "another-account".to_string(),
+            model: "gpt-4o".to_string(),
+            base_url: None,
+            max_tokens: None,
+            context_window: None,
+            reasoning_effort: None,
+            temperature: None,
+            additional_params: None,
+        });
+        orchestrator
+            .config
+            .workers
+            .insert(worker.to_string(), config);
+    }
+
+    fn failed_on_quota(id: usize, worker: &str) -> Task {
+        let mut task = Task::new(id, "Check metrics", "r").with_worker(worker);
+        task.fail(QUOTA_ERROR, FailureCategory::ProviderQuotaExhausted);
+        task
+    }
+
+    /// An exhausted worker account holds back only the work on that account:
+    /// a task on another account still runs, and one on the same account
+    /// stays pending with its worker never built.
+    #[tokio::test]
+    async fn an_exhausted_worker_account_holds_back_only_its_own_tasks() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut orchestrator, _store, _registry, _request_id) =
+            override_park_orchestrator(dir.path(), 4).await;
+        add_own_account_worker(&mut orchestrator, "billing");
+
+        let (answers, _) = scripted_worker(submits("done"));
+        let (held_back, held_back_model) = scripted_worker(submits("too late"));
+        test_rig::install_worker_overrides(vec![answers, held_back]);
+
+        let mut plan = Plan::new("Investigate");
+        plan.add_task(failed_on_quota(0, "billing"));
+        plan.add_task(Task::new(1, "Search logs", "r").with_worker("operations"));
+        plan.add_task(Task::new(2, "Summarize spend", "r").with_worker("billing"));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(256);
+        orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+        let spare_override = test_rig::take_worker_override().is_some();
+        while test_rig::take_worker_override().is_some() {}
+
+        assert!(spare_override, "the held-back task builds no worker");
+        assert!(held_back_model.requests().lock().unwrap().is_empty());
+        assert!(
+            matches!(plan.tasks[1].state, TaskState::Complete { .. }),
+            "{:?}",
+            plan.tasks
+        );
+        assert!(
+            matches!(plan.tasks[2].state, TaskState::Pending),
+            "{:?}",
+            plan.tasks
+        );
+    }
+
+    /// The run stops only for a task on the coordinator's account, which a
+    /// worker with no `llm` of its own shares.
+    #[tokio::test]
+    async fn only_the_coordinators_account_stops_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut orchestrator, _store, _registry, _request_id) =
+            override_park_orchestrator(dir.path(), 4).await;
+        add_own_account_worker(&mut orchestrator, "billing");
+
+        let mut plan = Plan::new("Investigate");
+        plan.add_task(failed_on_quota(0, "billing"));
+        assert_eq!(orchestrator.coordinator_quota_error(&plan), None);
+
+        plan.add_task(failed_on_quota(1, "operations"));
+        assert_eq!(
+            orchestrator.coordinator_quota_error(&plan),
+            Some(QUOTA_ERROR)
+        );
+
+        let mut plan = Plan::new("Investigate");
+        let mut generic = Task::new(0, "Check metrics", "r");
+        generic.fail(QUOTA_ERROR, FailureCategory::ProviderQuotaExhausted);
+        plan.add_task(generic);
+        assert_eq!(
+            orchestrator.coordinator_quota_error(&plan),
+            Some(QUOTA_ERROR)
+        );
+    }
+
+    /// An exhausted worker account cancels only the approvals whose task would
+    /// resume on it. Others stay awaiting, for the run to park.
+    #[tokio::test]
+    async fn an_exhausted_worker_account_cancels_only_its_own_approvals() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut orchestrator, store, registry, request_id) =
+            override_park_orchestrator(dir.path(), 4).await;
+        add_own_account_worker(&mut orchestrator, "billing");
+        let (mut plan, _records, pending) =
+            awaiting_plan_with_parked_calls(&registry, &request_id).await;
+        plan.add_task(failed_on_quota(2, "billing"));
+        let (run, _events) =
+            crate::run_context::RunContext::channel(request_id.parse().expect("a run id"));
+
+        crate::run_context::with_run(
+            Arc::clone(&run),
+            orchestrator.cancel_exhausted_awaiting_tasks(&mut plan, false),
+        )
+        .await;
+        assert!(has_awaiting_task(&plan), "{:?}", plan.tasks);
+        for call in &pending {
+            assert!(store.get(&call.decision_id).await.unwrap().is_some());
+        }
+
+        plan.get_task_mut(1).unwrap().worker = Some("billing".to_string());
+        crate::run_context::with_run(
+            Arc::clone(&run),
+            orchestrator.cancel_exhausted_awaiting_tasks(&mut plan, false),
+        )
+        .await;
+        assert!(plan.tasks[1].is_quota_exhausted(), "{:?}", plan.tasks);
+        for call in &pending {
+            assert!(store.get(&call.decision_id).await.unwrap().is_none());
+        }
     }
 
     /// A quota failure beside a task awaiting approval stops the run instead
@@ -9817,6 +10055,15 @@ mod tests {
             "{raw}"
         );
         assert!(!raw.contains("req_011secret"), "{raw}");
+        let saved_plan = orchestrator
+            .persistence
+            .lock()
+            .await
+            .iteration_path()
+            .join("plan.json");
+        let saved_plan: Plan =
+            serde_json::from_str(&std::fs::read_to_string(saved_plan).unwrap()).unwrap();
+        assert!(!has_awaiting_task(&saved_plan), "{:?}", saved_plan.tasks);
         assert!(
             !dir.path()
                 .join("orphan-sess")

@@ -291,6 +291,71 @@ impl LlmConfig {
         }
     }
 
+    /// Whether `other` bills the same provider account: the same provider and
+    /// credentials, whatever the model.
+    pub fn same_account(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::OpenAI {
+                    api_key, base_url, ..
+                },
+                Self::OpenAI {
+                    api_key: other_key,
+                    base_url: other_url,
+                    ..
+                },
+            )
+            | (
+                Self::Anthropic {
+                    api_key, base_url, ..
+                },
+                Self::Anthropic {
+                    api_key: other_key,
+                    base_url: other_url,
+                    ..
+                },
+            )
+            | (
+                Self::Gemini {
+                    api_key, base_url, ..
+                },
+                Self::Gemini {
+                    api_key: other_key,
+                    base_url: other_url,
+                    ..
+                },
+            )
+            | (
+                Self::OpenRouter {
+                    api_key, base_url, ..
+                },
+                Self::OpenRouter {
+                    api_key: other_key,
+                    base_url: other_url,
+                    ..
+                },
+            ) => api_key == other_key && base_url == other_url,
+            (
+                Self::Bedrock {
+                    region, profile, ..
+                },
+                Self::Bedrock {
+                    region: other_region,
+                    profile: other_profile,
+                    ..
+                },
+            ) => region == other_region && profile == other_profile,
+            (
+                Self::Ollama { base_url, .. },
+                Self::Ollama {
+                    base_url: other_url,
+                    ..
+                },
+            ) => base_url == other_url,
+            _ => false,
+        }
+    }
+
     /// Get provider name and model identifier as a tuple.
     pub fn model_info(&self) -> (&str, &str) {
         match self {
@@ -1113,6 +1178,49 @@ impl Default for AgentSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn openai(api_key: &str, model: &str) -> LlmConfig {
+        LlmConfig::OpenAI {
+            api_key: api_key.to_string(),
+            model: model.to_string(),
+            base_url: None,
+            max_tokens: None,
+            context_window: None,
+            reasoning_effort: None,
+            temperature: None,
+            additional_params: None,
+        }
+    }
+
+    fn bedrock(region: &str, profile: Option<&str>) -> LlmConfig {
+        LlmConfig::Bedrock {
+            model: "anthropic.claude".to_string(),
+            region: region.to_string(),
+            profile: profile.map(String::from),
+            max_tokens: None,
+            context_window: None,
+            prompt_caching: false,
+            temperature: None,
+            additional_params: None,
+        }
+    }
+
+    #[test]
+    fn same_account_compares_provider_and_credentials_not_model() {
+        assert!(openai("key", "gpt-5").same_account(&openai("key", "gpt-4o")));
+        assert!(!openai("key", "gpt-5").same_account(&openai("other", "gpt-5")));
+
+        let mut proxied = openai("key", "gpt-5");
+        if let LlmConfig::OpenAI { base_url, .. } = &mut proxied {
+            *base_url = Some("https://proxy.example".to_string());
+        }
+        assert!(!openai("key", "gpt-5").same_account(&proxied));
+
+        assert!(bedrock("us-east-1", Some("a")).same_account(&bedrock("us-east-1", Some("a"))));
+        assert!(!bedrock("us-east-1", Some("a")).same_account(&bedrock("us-east-1", Some("b"))));
+        assert!(!bedrock("us-east-1", None).same_account(&bedrock("us-west-2", None)));
+        assert!(!openai("key", "gpt-5").same_account(&bedrock("us-east-1", None)));
+    }
 
     #[test]
     fn client_tool_filter_patterns_are_compiled_at_load() {

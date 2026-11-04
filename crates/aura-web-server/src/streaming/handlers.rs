@@ -1340,6 +1340,7 @@ fn handle_orchestrator_event(
             duration_ms,
             orchestrator_id,
             outcome,
+            quota_exhausted,
         } => {
             let (success, result): (bool, &str) = match outcome {
                 aura_events::agent::ToolOutcome::Success { result } => (true, result),
@@ -1355,7 +1356,7 @@ fn handle_orchestrator_event(
             // A quota failure carries the provider's raw body and request id,
             // which reach the client as they do on the stream-error path: only
             // with `debug_provider_errors`.
-            let result = if !success && aura::provider_error::is_quota_exhausted(result) {
+            let result = if *quota_exhausted {
                 std::borrow::Cow::Owned(build_quota_exhausted_message(
                     result,
                     config.debug_provider_errors,
@@ -1953,7 +1954,7 @@ mod tests {
         use aura_events::agent::{AgentEvent, AgentEventPayload, ToolOutcome};
 
         let ctx = test_turn_ctx();
-        let failed = |error: &str| {
+        let failed = |error: &str, quota_exhausted: bool| {
             AgentEvent::new(
                 aura_events::EmittingAgent::worker("log-analyst", None, "coordinator"),
                 AgentEventPayload::TaskCompleted {
@@ -1963,6 +1964,7 @@ mod tests {
                     outcome: ToolOutcome::Failure {
                         error: error.to_string(),
                     },
+                    quota_exhausted,
                 },
             )
         };
@@ -1975,7 +1977,7 @@ mod tests {
         let quota = r#"ProviderError: Invalid status code 400 Bad Request with message: {"error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."},"request_id":"req_011secret"}"#;
 
         let config = StreamConfig::new(true, false, ToolResultMode::None, 10_000);
-        let frame = render(&config, failed(quota));
+        let frame = render(&config, failed(quota, true));
         assert!(
             frame.contains(aura::provider_error::QUOTA_EXHAUSTED_MESSAGE),
             "{frame}"
@@ -1984,16 +1986,25 @@ mod tests {
 
         let debug = StreamConfig::new(true, false, ToolResultMode::None, 10_000)
             .with_debug_provider_errors(true);
-        let frame = render(&debug, failed(quota));
+        let frame = render(&debug, failed(quota, true));
         assert!(
             frame.contains(aura::provider_error::QUOTA_EXHAUSTED_MESSAGE),
             "{frame}"
         );
         assert!(frame.contains("req_011secret"), "{frame}");
 
-        let frame = render(&config, failed("tool read_file failed: not found"));
+        let frame = render(&config, failed("tool read_file failed: not found", false));
         assert!(
             frame.contains("tool read_file failed: not found"),
+            "{frame}"
+        );
+
+        // A worker's own text quoting a quota error is not a quota failure.
+        let quoted = "soft failure: the logs show insufficient_quota at 09:14";
+        let frame = render(&config, failed(quoted, false));
+        assert!(frame.contains(quoted), "{frame}");
+        assert!(
+            !frame.contains(aura::provider_error::QUOTA_EXHAUSTED_MESSAGE),
             "{frame}"
         );
     }
@@ -2570,6 +2581,36 @@ mod tests {
         );
         assert!(msg.contains('…'), "expected ellipsis marker: {msg}");
         assert!(msg.contains("test-model"), "model missing: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_collect_stream_quota_error_uses_the_quota_message() {
+        let config = StreamConfig::new(false, false, ToolResultMode::None, 0);
+        let ctx = TurnContext::new(
+            "test-id".to_string(),
+            "test-model".to_string(),
+            0,
+            None,
+            "test-session",
+        );
+
+        let items: Vec<Result<StreamItem, StreamError>> = vec![Err(
+            r#"Invalid status code 400 Bad Request with message: {"error":{"message":"Your credit balance is too low to access the Anthropic API."},"request_id":"req_011secret"}"#
+                .into(),
+        )];
+        let stream = futures_util::stream::iter(items);
+
+        let (outcome, termination) = collect_stream_to_completion(&config, &ctx, stream).await;
+
+        assert_eq!(
+            outcome.content,
+            aura::provider_error::QUOTA_EXHAUSTED_MESSAGE
+        );
+        assert!(
+            matches!(&termination, StreamTermination::StreamError(_)),
+            "Expected StreamError termination, got: {:?}",
+            termination
+        );
     }
 
     #[tokio::test]
