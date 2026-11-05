@@ -2159,12 +2159,7 @@ pub async fn build_streaming_agent_with_tools(
             );
         }
         let attached = if build_context.agent.enable_client_tools {
-            client_tools.map(|tools| {
-                tools
-                    .into_iter()
-                    .filter(|t| build_context.client_tool_matches_filter(&t.name))
-                    .collect::<Vec<_>>()
-            })
+            client_tools.map(|tools| build_context.filter_client_tools(tools))
         } else {
             None
         };
