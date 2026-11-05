@@ -1,7 +1,7 @@
 {
   "uid": "aura-overview",
   "title": "AURA overview",
-  "description": "Runs, LLM calls and tokens, scratchpad, MCP tools, orchestration and HITL for aura webserver, from its /metrics endpoint (OpenTelemetry GenAI and MCP semantic conventions).",
+  "description": "Runs, LLM calls and tokens, scratchpad, MCP tools, orchestration and HITL for aura webserver, from its /metrics endpoint (OpenTelemetry GenAI and MCP semantic conventions). Counters credit their first sample, so a fresh process shows its first run, interception and tool call; needs Grafana 10.3+ for $__rate_interval_ms.",
   "tags": [
     "aura",
     "genai"
@@ -193,7 +193,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__range]))",
+          "expr": "sum((increase(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__range]) + (min_over_time(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__range]) unless max_over_time(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[5m] offset $__range)) or increase(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__range])))",
           "legendFormat": "runs",
           "refId": "A",
           "range": false,
@@ -251,7 +251,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\",error_type!=\"\"}[$__range])) / sum(increase(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__range]))",
+          "expr": "sum((increase(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\",error_type!=\"\"}[$__range]) + (min_over_time(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\",error_type!=\"\"}[$__range]) unless max_over_time(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\",error_type!=\"\"}[5m] offset $__range)) or increase(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\",error_type!=\"\"}[$__range]))) / sum((increase(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__range]) + (min_over_time(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__range]) unless max_over_time(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[5m] offset $__range)) or increase(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__range])))",
           "legendFormat": "errors",
           "refId": "A",
           "range": false,
@@ -318,7 +318,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(gen_ai_invoke_agent_inference_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range])) / sum(increase(gen_ai_invoke_agent_inference_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]))",
+          "expr": "sum((increase(gen_ai_invoke_agent_inference_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) + (min_over_time(gen_ai_invoke_agent_inference_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) unless max_over_time(gen_ai_invoke_agent_inference_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__range)) or increase(gen_ai_invoke_agent_inference_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]))) / sum((increase(gen_ai_invoke_agent_inference_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) + (min_over_time(gen_ai_invoke_agent_inference_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) unless max_over_time(gen_ai_invoke_agent_inference_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__range)) or increase(gen_ai_invoke_agent_inference_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range])))",
           "legendFormat": "calls",
           "refId": "A",
           "range": false,
@@ -376,7 +376,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(gen_ai_invoke_agent_tool_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range])) / sum(increase(gen_ai_invoke_agent_tool_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]))",
+          "expr": "sum((increase(gen_ai_invoke_agent_tool_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) + (min_over_time(gen_ai_invoke_agent_tool_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) unless max_over_time(gen_ai_invoke_agent_tool_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__range)) or increase(gen_ai_invoke_agent_tool_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]))) / sum((increase(gen_ai_invoke_agent_tool_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) + (min_over_time(gen_ai_invoke_agent_tool_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) unless max_over_time(gen_ai_invoke_agent_tool_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__range)) or increase(gen_ai_invoke_agent_tool_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range])))",
           "legendFormat": "calls",
           "refId": "A",
           "range": false,
@@ -434,7 +434,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(gen_ai_invoke_agent_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__range])))",
+          "expr": "histogram_quantile(0.95, sum by (le) ((rate(gen_ai_invoke_agent_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__range]) + (min_over_time(gen_ai_invoke_agent_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__range]) / ($__range_ms / 1000) unless max_over_time(gen_ai_invoke_agent_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[5m] offset $__range)) or rate(gen_ai_invoke_agent_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__range]))))",
           "legendFormat": "p95",
           "refId": "A",
           "range": false,
@@ -493,7 +493,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (gen_ai_agent_name, aura_ingress, aura_mode) (rate(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__rate_interval]))",
+          "expr": "sum by (gen_ai_agent_name, aura_ingress, aura_mode) ((rate(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__rate_interval]) + (min_over_time(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[5m] offset $__rate_interval)) or rate(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__rate_interval])))",
           "legendFormat": "{{gen_ai_agent_name}} {{aura_ingress}} {{aura_mode}}",
           "refId": "A",
           "range": true,
@@ -545,7 +545,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "label_replace(sum by (error_type) (rate(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__rate_interval])), \"error_type\", \"ok\", \"error_type\", \"^$\")",
+          "expr": "label_replace(sum by (error_type) ((rate(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__rate_interval]) + (min_over_time(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[5m] offset $__rate_interval)) or rate(gen_ai_invoke_agent_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__rate_interval]))), \"error_type\", \"ok\", \"error_type\", \"^$\")",
           "legendFormat": "{{error_type}}",
           "refId": "A",
           "range": true,
@@ -601,7 +601,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (gen_ai_agent_name) (rate(gen_ai_invoke_agent_inference_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])) / sum by (gen_ai_agent_name) (rate(gen_ai_invoke_agent_inference_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))",
+          "expr": "sum by (gen_ai_agent_name) ((rate(gen_ai_invoke_agent_inference_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_invoke_agent_inference_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_invoke_agent_inference_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_invoke_agent_inference_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))) / sum by (gen_ai_agent_name) ((rate(gen_ai_invoke_agent_inference_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_invoke_agent_inference_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_invoke_agent_inference_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_invoke_agent_inference_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
           "legendFormat": "{{gen_ai_agent_name}} llm",
           "refId": "A",
           "range": true,
@@ -612,7 +612,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (gen_ai_agent_name) (rate(gen_ai_invoke_agent_tool_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])) / sum by (gen_ai_agent_name) (rate(gen_ai_invoke_agent_tool_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))",
+          "expr": "sum by (gen_ai_agent_name) ((rate(gen_ai_invoke_agent_tool_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_invoke_agent_tool_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_invoke_agent_tool_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_invoke_agent_tool_calls_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))) / sum by (gen_ai_agent_name) ((rate(gen_ai_invoke_agent_tool_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_invoke_agent_tool_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_invoke_agent_tool_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_invoke_agent_tool_calls_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
           "legendFormat": "{{gen_ai_agent_name}} tools",
           "refId": "B",
           "range": true,
@@ -663,7 +663,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (http_route, http_request_method, http_response_status_code) (rate(http_server_request_duration_seconds_count{instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum by (http_route, http_request_method, http_response_status_code) ((rate(http_server_request_duration_seconds_count{instance=~\"$instance\"}[$__rate_interval]) + (min_over_time(http_server_request_duration_seconds_count{instance=~\"$instance\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(http_server_request_duration_seconds_count{instance=~\"$instance\"}[5m] offset $__rate_interval)) or rate(http_server_request_duration_seconds_count{instance=~\"$instance\"}[$__rate_interval])))",
           "legendFormat": "{{http_request_method}} {{http_route}} {{http_response_status_code}}",
           "refId": "A",
           "range": true,
@@ -715,7 +715,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum by (le, gen_ai_agent_name) (rate(gen_ai_invoke_agent_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le, gen_ai_agent_name) ((rate(gen_ai_invoke_agent_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__rate_interval]) + (min_over_time(gen_ai_invoke_agent_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_invoke_agent_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[5m] offset $__rate_interval)) or rate(gen_ai_invoke_agent_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__rate_interval]))))",
           "legendFormat": "{{gen_ai_agent_name}}",
           "refId": "A",
           "range": true,
@@ -767,7 +767,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum by (le, http_route) (rate(http_server_request_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le, http_route) ((rate(http_server_request_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]) + (min_over_time(http_server_request_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(http_server_request_duration_seconds_bucket{instance=~\"$instance\"}[5m] offset $__rate_interval)) or rate(http_server_request_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))))",
           "legendFormat": "{{http_route}}",
           "refId": "A",
           "range": true,
@@ -819,7 +819,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_agent_name) (rate(gen_ai_invoke_agent_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_agent_name) ((rate(gen_ai_invoke_agent_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__rate_interval]) + (min_over_time(gen_ai_invoke_agent_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_invoke_agent_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[5m] offset $__rate_interval)) or rate(gen_ai_invoke_agent_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",aura_role=\"main\"}[$__rate_interval]))))",
           "legendFormat": "{{gen_ai_agent_name}}",
           "refId": "A",
           "range": true,
@@ -870,7 +870,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, http_route) (rate(http_server_request_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, http_route) ((rate(http_server_request_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]) + (min_over_time(http_server_request_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(http_server_request_duration_seconds_bucket{instance=~\"$instance\"}[5m] offset $__rate_interval)) or rate(http_server_request_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))))",
           "legendFormat": "{{http_route}}",
           "refId": "A",
           "range": true,
@@ -934,7 +934,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]))",
+          "expr": "sum((increase(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) + (min_over_time(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) unless max_over_time(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__range)) or increase(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range])))",
           "legendFormat": "input",
           "refId": "A",
           "range": false,
@@ -993,7 +993,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(gen_ai_client_inference_usage_output_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]))",
+          "expr": "sum((increase(gen_ai_client_inference_usage_output_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) + (min_over_time(gen_ai_client_inference_usage_output_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) unless max_over_time(gen_ai_client_inference_usage_output_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__range)) or increase(gen_ai_client_inference_usage_output_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range])))",
           "legendFormat": "output",
           "refId": "A",
           "range": false,
@@ -1051,7 +1051,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]))",
+          "expr": "sum((increase(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) + (min_over_time(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) unless max_over_time(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__range)) or increase(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range])))",
           "legendFormat": "cache read",
           "refId": "A",
           "range": false,
@@ -1110,7 +1110,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(gen_ai_client_inference_usage_cache_write_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]))",
+          "expr": "sum((increase(gen_ai_client_inference_usage_cache_write_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) + (min_over_time(gen_ai_client_inference_usage_cache_write_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) unless max_over_time(gen_ai_client_inference_usage_cache_write_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__range)) or increase(gen_ai_client_inference_usage_cache_write_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range])))",
           "legendFormat": "cache write",
           "refId": "A",
           "range": false,
@@ -1169,7 +1169,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range])) / sum(increase(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]))",
+          "expr": "sum((increase(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) + (min_over_time(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) unless max_over_time(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__range)) or increase(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]))) / sum((increase(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) + (min_over_time(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) unless max_over_time(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__range)) or increase(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range])))",
           "legendFormat": "cache hit ratio",
           "refId": "A",
           "range": false,
@@ -1228,7 +1228,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]))",
+          "expr": "sum((increase(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) + (min_over_time(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) unless max_over_time(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__range)) or increase(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range])))",
           "legendFormat": "calls",
           "refId": "A",
           "range": false,
@@ -1286,7 +1286,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[$__range])) / sum(increase(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]))",
+          "expr": "sum((increase(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[$__range]) + (min_over_time(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[$__range]) unless max_over_time(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[5m] offset $__range)) or increase(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[$__range]))) / sum((increase(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) + (min_over_time(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range]) unless max_over_time(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__range)) or increase(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__range])))",
           "legendFormat": "errors",
           "refId": "A",
           "range": false,
@@ -1352,7 +1352,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (gen_ai_agent_name, gen_ai_provider_name, gen_ai_request_model) (rate(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))",
+          "expr": "sum by (gen_ai_agent_name, gen_ai_provider_name, gen_ai_request_model) ((rate(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
           "legendFormat": "{{gen_ai_agent_name}} {{gen_ai_provider_name}}/{{gen_ai_request_model}}",
           "refId": "A",
           "range": true,
@@ -1404,7 +1404,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (gen_ai_agent_name, error_type) (rate(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[$__rate_interval]))",
+          "expr": "sum by (gen_ai_agent_name, error_type) ((rate(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[$__rate_interval]) + (min_over_time(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[5m] offset $__rate_interval)) or rate(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[$__rate_interval])))",
           "legendFormat": "{{gen_ai_agent_name}} {{error_type}}",
           "refId": "A",
           "range": true,
@@ -1456,7 +1456,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (gen_ai_agent_name) (rate(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))",
+          "expr": "sum by (gen_ai_agent_name) ((rate(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
           "legendFormat": "{{gen_ai_agent_name}} input",
           "refId": "A",
           "range": true,
@@ -1467,7 +1467,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (gen_ai_agent_name) (rate(gen_ai_client_inference_usage_output_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))",
+          "expr": "sum by (gen_ai_agent_name) ((rate(gen_ai_client_inference_usage_output_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_client_inference_usage_output_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_client_inference_usage_output_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_client_inference_usage_output_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
           "legendFormat": "{{gen_ai_agent_name}} output",
           "refId": "B",
           "range": true,
@@ -1478,7 +1478,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (gen_ai_agent_name) (rate(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))",
+          "expr": "sum by (gen_ai_agent_name) ((rate(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
           "legendFormat": "{{gen_ai_agent_name}} cache read",
           "refId": "C",
           "range": true,
@@ -1530,7 +1530,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (gen_ai_agent_name, gen_ai_provider_name, gen_ai_request_model) (rate(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])) / sum by (gen_ai_agent_name, gen_ai_provider_name, gen_ai_request_model) (rate(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))",
+          "expr": "sum by (gen_ai_agent_name, gen_ai_provider_name, gen_ai_request_model) ((rate(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))) / sum by (gen_ai_agent_name, gen_ai_provider_name, gen_ai_request_model) ((rate(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
           "legendFormat": "{{gen_ai_agent_name}} {{gen_ai_provider_name}}/{{gen_ai_request_model}}",
           "refId": "A",
           "range": true,
@@ -1584,7 +1584,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum by (le, gen_ai_provider_name, gen_ai_request_model) (rate(gen_ai_client_inference_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le, gen_ai_provider_name, gen_ai_request_model) ((rate(gen_ai_client_inference_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_client_inference_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_client_inference_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_client_inference_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))))",
           "legendFormat": "{{gen_ai_provider_name}}/{{gen_ai_request_model}}",
           "refId": "A",
           "range": true,
@@ -1636,7 +1636,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum by (le, gen_ai_agent_name) (rate(gen_ai_client_inference_operation_input_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le, gen_ai_agent_name) ((rate(gen_ai_client_inference_operation_input_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_client_inference_operation_input_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_client_inference_operation_input_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_client_inference_operation_input_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))))",
           "legendFormat": "{{gen_ai_agent_name}}",
           "refId": "A",
           "range": true,
@@ -1688,7 +1688,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum by (le, gen_ai_agent_name) (rate(gen_ai_client_inference_operation_output_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le, gen_ai_agent_name) ((rate(gen_ai_client_inference_operation_output_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_client_inference_operation_output_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_client_inference_operation_output_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_client_inference_operation_output_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))))",
           "legendFormat": "{{gen_ai_agent_name}}",
           "refId": "A",
           "range": true,
@@ -1739,7 +1739,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_provider_name, gen_ai_request_model) (rate(gen_ai_client_inference_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_provider_name, gen_ai_request_model) ((rate(gen_ai_client_inference_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_client_inference_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_client_inference_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_client_inference_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))))",
           "legendFormat": "{{gen_ai_provider_name}}/{{gen_ai_request_model}}",
           "refId": "A",
           "range": true,
@@ -1790,7 +1790,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_agent_name) (rate(gen_ai_client_inference_operation_input_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_agent_name) ((rate(gen_ai_client_inference_operation_input_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_client_inference_operation_input_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_client_inference_operation_input_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_client_inference_operation_input_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))))",
           "legendFormat": "{{gen_ai_agent_name}}",
           "refId": "A",
           "range": true,
@@ -1841,7 +1841,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_agent_name) (rate(gen_ai_client_inference_operation_output_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_agent_name) ((rate(gen_ai_client_inference_operation_output_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_client_inference_operation_output_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_client_inference_operation_output_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_client_inference_operation_output_tokens_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))))",
           "legendFormat": "{{gen_ai_agent_name}}",
           "refId": "A",
           "range": true,
@@ -1905,7 +1905,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range]))",
+          "expr": "sum((increase(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range]) + (min_over_time(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range]) unless max_over_time(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[5m] offset $__range)) or increase(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range])))",
           "legendFormat": "intercepted",
           "refId": "A",
           "range": false,
@@ -1964,7 +1964,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[$__range]))",
+          "expr": "sum((increase(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[$__range]) + (min_over_time(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[$__range]) unless max_over_time(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[5m] offset $__range)) or increase(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[$__range])))",
           "legendFormat": "extracted",
           "refId": "A",
           "range": false,
@@ -2023,7 +2023,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range])) - sum(increase(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[$__range]))",
+          "expr": "sum((increase(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range]) + (min_over_time(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range]) unless max_over_time(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[5m] offset $__range)) or increase(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range]))) - sum((increase(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[$__range]) + (min_over_time(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[$__range]) unless max_over_time(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[5m] offset $__range)) or increase(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[$__range])))",
           "legendFormat": "saved",
           "refId": "A",
           "range": false,
@@ -2082,7 +2082,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "(sum(increase(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range])) - sum(increase(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[$__range]))) / sum(increase(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range]))",
+          "expr": "(sum((increase(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range]) + (min_over_time(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range]) unless max_over_time(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[5m] offset $__range)) or increase(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range]))) - sum((increase(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[$__range]) + (min_over_time(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[$__range]) unless max_over_time(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[5m] offset $__range)) or increase(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[$__range])))) / sum((increase(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range]) + (min_over_time(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range]) unless max_over_time(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[5m] offset $__range)) or increase(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range])))",
           "legendFormat": "saved",
           "refId": "A",
           "range": false,
@@ -2149,7 +2149,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(aura_scratchpad_intercepted_tokens_count{instance=~\"$instance\"}[$__range]))",
+          "expr": "sum((increase(aura_scratchpad_intercepted_tokens_count{instance=~\"$instance\"}[$__range]) + (min_over_time(aura_scratchpad_intercepted_tokens_count{instance=~\"$instance\"}[$__range]) unless max_over_time(aura_scratchpad_intercepted_tokens_count{instance=~\"$instance\"}[5m] offset $__range)) or increase(aura_scratchpad_intercepted_tokens_count{instance=~\"$instance\"}[$__range])))",
           "legendFormat": "outputs",
           "refId": "A",
           "range": false,
@@ -2207,7 +2207,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(aura_scratchpad_extracted_tokens_count{instance=~\"$instance\"}[$__range]))",
+          "expr": "sum((increase(aura_scratchpad_extracted_tokens_count{instance=~\"$instance\"}[$__range]) + (min_over_time(aura_scratchpad_extracted_tokens_count{instance=~\"$instance\"}[$__range]) unless max_over_time(aura_scratchpad_extracted_tokens_count{instance=~\"$instance\"}[5m] offset $__range)) or increase(aura_scratchpad_extracted_tokens_count{instance=~\"$instance\"}[$__range])))",
           "legendFormat": "reads",
           "refId": "A",
           "range": false,
@@ -2265,7 +2265,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (gen_ai_tool_name) (rate(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum by (gen_ai_tool_name) ((rate(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__rate_interval]) + (min_over_time(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[5m] offset $__rate_interval)) or rate(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__rate_interval])))",
           "legendFormat": "{{gen_ai_tool_name}}",
           "refId": "A",
           "range": true,
@@ -2321,7 +2321,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (gen_ai_tool_name) (rate(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum by (gen_ai_tool_name) ((rate(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[$__rate_interval]) + (min_over_time(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[5m] offset $__rate_interval)) or rate(aura_scratchpad_extracted_tokens_sum{instance=~\"$instance\"}[$__rate_interval])))",
           "legendFormat": "{{gen_ai_tool_name}}",
           "refId": "A",
           "range": true,
@@ -2377,7 +2377,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (gen_ai_tool_name) (increase(aura_scratchpad_intercepted_tokens_count{instance=~\"$instance\"}[$__range]))",
+          "expr": "sum by (gen_ai_tool_name) ((increase(aura_scratchpad_intercepted_tokens_count{instance=~\"$instance\"}[$__range]) + (min_over_time(aura_scratchpad_intercepted_tokens_count{instance=~\"$instance\"}[$__range]) unless max_over_time(aura_scratchpad_intercepted_tokens_count{instance=~\"$instance\"}[5m] offset $__range)) or increase(aura_scratchpad_intercepted_tokens_count{instance=~\"$instance\"}[$__range])))",
           "legendFormat": "",
           "refId": "A",
           "range": false,
@@ -2389,7 +2389,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (gen_ai_tool_name) (increase(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range]))",
+          "expr": "sum by (gen_ai_tool_name) ((increase(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range]) + (min_over_time(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range]) unless max_over_time(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[5m] offset $__range)) or increase(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range])))",
           "legendFormat": "",
           "refId": "B",
           "range": false,
@@ -2401,7 +2401,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (gen_ai_tool_name) (increase(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range])) / sum by (gen_ai_tool_name) (increase(aura_scratchpad_intercepted_tokens_count{instance=~\"$instance\"}[$__range]))",
+          "expr": "sum by (gen_ai_tool_name) ((increase(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range]) + (min_over_time(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range]) unless max_over_time(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[5m] offset $__range)) or increase(aura_scratchpad_intercepted_tokens_sum{instance=~\"$instance\"}[$__range]))) / sum by (gen_ai_tool_name) ((increase(aura_scratchpad_intercepted_tokens_count{instance=~\"$instance\"}[$__range]) + (min_over_time(aura_scratchpad_intercepted_tokens_count{instance=~\"$instance\"}[$__range]) unless max_over_time(aura_scratchpad_intercepted_tokens_count{instance=~\"$instance\"}[5m] offset $__range)) or increase(aura_scratchpad_intercepted_tokens_count{instance=~\"$instance\"}[$__range])))",
           "legendFormat": "",
           "refId": "C",
           "range": false,
@@ -2455,6 +2455,10 @@
               {
                 "id": "decimals",
                 "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 90
               }
             ]
           },
@@ -2471,6 +2475,10 @@
               {
                 "id": "decimals",
                 "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 90
               }
             ]
           },
@@ -2487,6 +2495,10 @@
               {
                 "id": "decimals",
                 "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 130
               }
             ]
           }
@@ -2532,7 +2544,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum by (le, gen_ai_tool_name) (rate(aura_scratchpad_intercepted_tokens_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le, gen_ai_tool_name) ((rate(aura_scratchpad_intercepted_tokens_bucket{instance=~\"$instance\"}[$__rate_interval]) + (min_over_time(aura_scratchpad_intercepted_tokens_bucket{instance=~\"$instance\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(aura_scratchpad_intercepted_tokens_bucket{instance=~\"$instance\"}[5m] offset $__rate_interval)) or rate(aura_scratchpad_intercepted_tokens_bucket{instance=~\"$instance\"}[$__rate_interval]))))",
           "legendFormat": "{{gen_ai_tool_name}}",
           "refId": "A",
           "range": true,
@@ -2584,7 +2596,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum by (le, gen_ai_tool_name) (rate(aura_scratchpad_extracted_tokens_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le, gen_ai_tool_name) ((rate(aura_scratchpad_extracted_tokens_bucket{instance=~\"$instance\"}[$__rate_interval]) + (min_over_time(aura_scratchpad_extracted_tokens_bucket{instance=~\"$instance\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(aura_scratchpad_extracted_tokens_bucket{instance=~\"$instance\"}[5m] offset $__rate_interval)) or rate(aura_scratchpad_extracted_tokens_bucket{instance=~\"$instance\"}[$__rate_interval]))))",
           "legendFormat": "{{gen_ai_tool_name}}",
           "refId": "A",
           "range": true,
@@ -2636,7 +2648,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_tool_name) (rate(aura_scratchpad_intercepted_tokens_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_tool_name) ((rate(aura_scratchpad_intercepted_tokens_bucket{instance=~\"$instance\"}[$__rate_interval]) + (min_over_time(aura_scratchpad_intercepted_tokens_bucket{instance=~\"$instance\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(aura_scratchpad_intercepted_tokens_bucket{instance=~\"$instance\"}[5m] offset $__rate_interval)) or rate(aura_scratchpad_intercepted_tokens_bucket{instance=~\"$instance\"}[$__rate_interval]))))",
           "legendFormat": "{{gen_ai_tool_name}}",
           "refId": "A",
           "range": true,
@@ -2687,7 +2699,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_tool_name) (rate(aura_scratchpad_extracted_tokens_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_tool_name) ((rate(aura_scratchpad_extracted_tokens_bucket{instance=~\"$instance\"}[$__rate_interval]) + (min_over_time(aura_scratchpad_extracted_tokens_bucket{instance=~\"$instance\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(aura_scratchpad_extracted_tokens_bucket{instance=~\"$instance\"}[5m] offset $__rate_interval)) or rate(aura_scratchpad_extracted_tokens_bucket{instance=~\"$instance\"}[$__rate_interval]))))",
           "legendFormat": "{{gen_ai_tool_name}}",
           "refId": "A",
           "range": true,
@@ -2985,7 +2997,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (aura_mcp_server, gen_ai_tool_name) (rate(mcp_client_operation_duration_seconds_count{instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum by (aura_mcp_server, gen_ai_tool_name) ((rate(mcp_client_operation_duration_seconds_count{instance=~\"$instance\"}[$__rate_interval]) + (min_over_time(mcp_client_operation_duration_seconds_count{instance=~\"$instance\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(mcp_client_operation_duration_seconds_count{instance=~\"$instance\"}[5m] offset $__rate_interval)) or rate(mcp_client_operation_duration_seconds_count{instance=~\"$instance\"}[$__rate_interval])))",
           "legendFormat": "{{aura_mcp_server}}/{{gen_ai_tool_name}}",
           "refId": "A",
           "range": true,
@@ -3037,7 +3049,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (aura_mcp_server, gen_ai_tool_name, error_type) (rate(mcp_client_operation_duration_seconds_count{instance=~\"$instance\",error_type!=\"\"}[$__rate_interval]))",
+          "expr": "sum by (aura_mcp_server, gen_ai_tool_name, error_type) ((rate(mcp_client_operation_duration_seconds_count{instance=~\"$instance\",error_type!=\"\"}[$__rate_interval]) + (min_over_time(mcp_client_operation_duration_seconds_count{instance=~\"$instance\",error_type!=\"\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(mcp_client_operation_duration_seconds_count{instance=~\"$instance\",error_type!=\"\"}[5m] offset $__rate_interval)) or rate(mcp_client_operation_duration_seconds_count{instance=~\"$instance\",error_type!=\"\"}[$__rate_interval])))",
           "legendFormat": "{{aura_mcp_server}}/{{gen_ai_tool_name}} {{error_type}}",
           "refId": "A",
           "range": true,
@@ -3089,7 +3101,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (gen_ai_tool_name) (rate(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum by (gen_ai_tool_name) ((rate(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\"}[$__rate_interval]) + (min_over_time(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\"}[5m] offset $__rate_interval)) or rate(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\"}[$__rate_interval])))",
           "legendFormat": "{{gen_ai_tool_name}}",
           "refId": "A",
           "range": true,
@@ -3141,7 +3153,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (gen_ai_tool_name, error_type) (rate(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",error_type!=\"\"}[$__rate_interval]))",
+          "expr": "sum by (gen_ai_tool_name, error_type) ((rate(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",error_type!=\"\"}[$__rate_interval]) + (min_over_time(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",error_type!=\"\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",error_type!=\"\"}[5m] offset $__rate_interval)) or rate(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",error_type!=\"\"}[$__rate_interval])))",
           "legendFormat": "{{gen_ai_tool_name}} {{error_type}}",
           "refId": "A",
           "range": true,
@@ -3193,7 +3205,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum by (le, aura_mcp_server, gen_ai_tool_name) (rate(mcp_client_operation_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le, aura_mcp_server, gen_ai_tool_name) ((rate(mcp_client_operation_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]) + (min_over_time(mcp_client_operation_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(mcp_client_operation_duration_seconds_bucket{instance=~\"$instance\"}[5m] offset $__rate_interval)) or rate(mcp_client_operation_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))))",
           "legendFormat": "{{aura_mcp_server}}/{{gen_ai_tool_name}}",
           "refId": "A",
           "range": true,
@@ -3245,7 +3257,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum by (le, gen_ai_tool_name) (rate(gen_ai_execute_tool_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le, gen_ai_tool_name) ((rate(gen_ai_execute_tool_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]) + (min_over_time(gen_ai_execute_tool_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_execute_tool_duration_seconds_bucket{instance=~\"$instance\"}[5m] offset $__rate_interval)) or rate(gen_ai_execute_tool_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))))",
           "legendFormat": "{{gen_ai_tool_name}}",
           "refId": "A",
           "range": true,
@@ -3296,7 +3308,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, aura_mcp_server, gen_ai_tool_name) (rate(mcp_client_operation_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, aura_mcp_server, gen_ai_tool_name) ((rate(mcp_client_operation_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]) + (min_over_time(mcp_client_operation_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(mcp_client_operation_duration_seconds_bucket{instance=~\"$instance\"}[5m] offset $__rate_interval)) or rate(mcp_client_operation_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))))",
           "legendFormat": "{{aura_mcp_server}}/{{gen_ai_tool_name}}",
           "refId": "A",
           "range": true,
@@ -3347,7 +3359,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_tool_name) (rate(gen_ai_execute_tool_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_tool_name) ((rate(gen_ai_execute_tool_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]) + (min_over_time(gen_ai_execute_tool_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_execute_tool_duration_seconds_bucket{instance=~\"$instance\"}[5m] offset $__rate_interval)) or rate(gen_ai_execute_tool_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))))",
           "legendFormat": "{{gen_ai_tool_name}}",
           "refId": "A",
           "range": true,
@@ -3411,7 +3423,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (gen_ai_agent_name, aura_decision) (rate(aura_orchestration_routing_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))",
+          "expr": "sum by (gen_ai_agent_name, aura_decision) ((rate(aura_orchestration_routing_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(aura_orchestration_routing_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(aura_orchestration_routing_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(aura_orchestration_routing_total{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
           "legendFormat": "{{gen_ai_agent_name}} {{aura_decision}}",
           "refId": "A",
           "range": true,
@@ -3467,7 +3479,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (gen_ai_agent_name) (rate(aura_orchestration_planning_cycles_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])) / sum by (gen_ai_agent_name) (rate(aura_orchestration_planning_cycles_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))",
+          "expr": "sum by (gen_ai_agent_name) ((rate(aura_orchestration_planning_cycles_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(aura_orchestration_planning_cycles_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(aura_orchestration_planning_cycles_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(aura_orchestration_planning_cycles_sum{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))) / sum by (gen_ai_agent_name) ((rate(aura_orchestration_planning_cycles_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(aura_orchestration_planning_cycles_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(aura_orchestration_planning_cycles_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(aura_orchestration_planning_cycles_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
           "legendFormat": "{{gen_ai_agent_name}}",
           "refId": "A",
           "range": true,
@@ -3518,7 +3530,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (aura_worker, aura_outcome) (rate(aura_orchestration_task_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))",
+          "expr": "sum by (aura_worker, aura_outcome) ((rate(aura_orchestration_task_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(aura_orchestration_task_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(aura_orchestration_task_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(aura_orchestration_task_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
           "legendFormat": "{{aura_worker}} {{aura_outcome}}",
           "refId": "A",
           "range": true,
@@ -3635,7 +3647,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (gen_ai_agent_name, aura_decision) (rate(aura_hitl_decision_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))",
+          "expr": "sum by (gen_ai_agent_name, aura_decision) ((rate(aura_hitl_decision_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(aura_hitl_decision_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(aura_hitl_decision_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(aura_hitl_decision_duration_seconds_count{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
           "legendFormat": "{{gen_ai_agent_name}} {{aura_decision}}",
           "refId": "A",
           "range": true,
@@ -3691,7 +3703,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum by (le, aura_worker) (rate(aura_orchestration_task_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le, aura_worker) ((rate(aura_orchestration_task_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(aura_orchestration_task_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(aura_orchestration_task_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(aura_orchestration_task_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))))",
           "legendFormat": "{{aura_worker}}",
           "refId": "A",
           "range": true,
@@ -3742,7 +3754,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum by (le, gen_ai_agent_name) (rate(aura_hitl_decision_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le, gen_ai_agent_name) ((rate(aura_hitl_decision_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(aura_hitl_decision_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(aura_hitl_decision_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(aura_hitl_decision_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))))",
           "legendFormat": "{{gen_ai_agent_name}}",
           "refId": "A",
           "range": true,
@@ -3794,7 +3806,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, aura_worker) (rate(aura_orchestration_task_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, aura_worker) ((rate(aura_orchestration_task_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(aura_orchestration_task_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(aura_orchestration_task_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(aura_orchestration_task_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))))",
           "legendFormat": "{{aura_worker}}",
           "refId": "A",
           "range": true,
@@ -3845,7 +3857,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_agent_name) (rate(aura_hitl_decision_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_agent_name) ((rate(aura_hitl_decision_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(aura_hitl_decision_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(aura_hitl_decision_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(aura_hitl_decision_duration_seconds_bucket{instance=~\"$instance\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))))",
           "legendFormat": "{{gen_ai_agent_name}}",
           "refId": "A",
           "range": true,
