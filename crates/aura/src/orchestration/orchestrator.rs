@@ -73,7 +73,7 @@ use super::park::{
 use super::persistence::ExecutionPersistence;
 use super::types::{
     BlockedCell, CellOutcome, FailedTaskRecord, FailureCategory, FailureSummary, IterationContext,
-    IterationOutcome, IterationTimings, ParkSnapshot, PendingCall, Plan, PlanningResponse,
+    IterationOutcome, IterationTimings, ParkSnapshot, PendingCall, Plan, PlanningResponse, Task,
     TaskState, TaskStatus,
 };
 
@@ -764,11 +764,22 @@ fn timed_out_message(reason: &str, partial: &str) -> String {
     }
 }
 
-/// The failure text for a task whose retry failed after an earlier attempt
-/// produced output.
-fn failed_with_output_message(error: &str, output: &str) -> String {
-    format!("{error}\nOutput from an earlier attempt, which did not call submit_result:\n{output}")
+/// A task's preview in the run manifest: its summary, or the start of its
+/// result or kept output.
+fn result_preview(task: &Task) -> Option<String> {
+    let text = match &task.state {
+        TaskState::Complete { result } => Some(result),
+        _ => task.kept_output.as_ref(),
+    };
+    task.structured_output
+        .as_ref()
+        .map(|s| s.summary.clone())
+        .or_else(|| text.map(|t| safe_truncate(t, 200).0.to_string()))
 }
+
+/// The heading kept output appears under, wherever it is shown.
+const KEPT_OUTPUT_HEADING: &str =
+    "Output from an earlier attempt, which did not call submit_result:";
 
 const EMPTY_WORKER_RESULT: &str = "The worker produced no output and did not call submit_result.";
 
@@ -3961,16 +3972,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             .await;
                         tracing::warn!("Task {} timed out after {}ms", task_id, duration_ms);
                     }
-                    // The category comes from the error alone: the output is
-                    // worker text, which can quote a provider error.
+                    // The error and the output stay separate: the output is
+                    // worker text, which can quote a provider error, and
+                    // whatever replaces an error must not take it along.
                     Ok(TaskOutcome::FailedWithOutput { error, output }) => {
                         let category = Self::categorize_failure_error(&error);
                         let output = self
                             .maybe_create_artifact(task_id, worker_name.as_deref(), output)
                             .await;
-                        let message = failed_with_output_message(&error, &output);
+                        let message = format!("{error}\n{KEPT_OUTPUT_HEADING}\n{output}");
                         if let Some(t) = plan.get_task_mut(task_id) {
-                            t.fail(message.clone(), category);
+                            t.fail(error.clone(), category);
+                            t.kept_output = Some(output);
                         }
                         let _ = event_tx
                             .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
@@ -4910,7 +4923,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         let (truncated, was_truncated) =
                             safe_truncate(error, self.config.result_summary_length());
                         let suffix = if was_truncated { " [truncated]" } else { "" };
-                        format!("✗ failed: {}{}", truncated, suffix)
+                        let kept = t.kept_output.as_deref().map_or(String::new(), |output| {
+                            let (output, was_truncated) =
+                                safe_truncate(output, self.config.result_summary_length());
+                            let suffix = if was_truncated { " [truncated]" } else { "" };
+                            format!("\n  {KEPT_OUTPUT_HEADING} {output}{suffix}")
+                        });
+                        format!("✗ failed: {}{}{}", truncated, suffix, kept)
                     }
                     TaskState::Pending => {
                         let blocked_by = t.dependencies.iter().any(|dep_id| {
@@ -5526,6 +5545,30 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     this_iteration_failures.len(),
                     summary
                 );
+                if let Some(kept) = Self::build_kept_output_results(&plan) {
+                    let note = kept.lines().next().unwrap_or_default().to_string();
+                    let tool_traces = self.load_tool_traces_for_plan(&plan).await;
+                    let timings = Self::iteration_timings(
+                        &tool_traces,
+                        planning_ms,
+                        execution_start,
+                        task_compute_ms,
+                    );
+                    Self::emit_event(
+                        event_tx,
+                        AgentEventPayload::IterationComplete {
+                            iteration,
+                            will_replan: false,
+                            reasoning: note,
+                            gaps: vec![],
+                            timings,
+                        },
+                    )
+                    .await;
+                    self.write_run_manifest(&plan, iteration, Some(timings))
+                        .await;
+                    return Ok(IterationOutcome::FinalResult(kept));
+                }
                 self.write_run_manifest(&plan, iteration, None).await;
                 return Err(format!(
                     "Provider error: all tasks failed due to provider issues (not retryable via replan):\n{}",
@@ -5846,6 +5889,28 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
     }
 
+    /// The kept output of a run that failed on provider errors, or None if
+    /// no task kept any. Only the output is shown: the errors hold the
+    /// provider's raw response, which clients don't see on this path.
+    fn build_kept_output_results(plan: &Plan) -> Option<String> {
+        let kept: Vec<String> = plan
+            .tasks
+            .iter()
+            .filter_map(|t| {
+                t.kept_output
+                    .as_ref()
+                    .map(|output| format!("## Task {}: {}\n\n{}\n\n", t.id, t.description, output))
+            })
+            .collect();
+        if kept.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "Provider error: the run stopped (not retryable via replan). {KEPT_OUTPUT_HEADING}\n\n{}",
+            kept.concat()
+        ))
+    }
+
     /// Format the plan's per-task results as a Markdown string prefixed with
     /// a short context note. Used when the post-execute coordinator call
     /// errors before it can route, so the user still sees what the workers
@@ -5876,6 +5941,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         "## Task {}: {}\n\nFailed: {}\n\n",
                         t.id, t.description, error
                     ));
+                    if let Some(output) = &t.kept_output {
+                        out.push_str(&format!("{KEPT_OUTPUT_HEADING}\n\n{output}\n\n"));
+                    }
                 }
                 TaskState::Pending | TaskState::Running | TaskState::AwaitingApproval { .. } => {
                     out.push_str(&format!(
@@ -6084,7 +6152,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
         use super::persistence::{
             ArtifactEntry, ErrorContext, RunManifest, RunStatus, TaskSummary,
         };
-        use crate::string_utils::safe_truncate;
 
         let persistence = self.persistence.lock().await;
 
@@ -6144,16 +6211,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 description: t.description.clone(),
                 status: TaskStatus::from(&t.state),
                 worker: t.worker.clone(),
-                result_preview: t
-                    .structured_output
-                    .as_ref()
-                    .map(|s| s.summary.clone())
-                    .or_else(|| match &t.state {
-                        TaskState::Complete { result } => {
-                            Some(safe_truncate(result, 200).0.to_string())
-                        }
-                        _ => None,
-                    }),
+                result_preview: result_preview(t),
                 confidence: t
                     .structured_output
                     .as_ref()
@@ -9902,7 +9960,11 @@ mod tests {
         let (error, category) = failed(&run.plan);
         assert_eq!(category, FailureCategory::AgentError, "{error}");
         assert!(error.contains("after 2 attempts"), "{error}");
-        assert!(error.contains("found two idle nodes"), "{error}");
+        assert!(!error.contains("found two idle nodes"), "{error}");
+        assert_eq!(
+            run.plan.tasks[0].kept_output.as_deref(),
+            Some("found two idle nodes")
+        );
         assert_eq!(
             run.responses.len(),
             1,
@@ -9930,7 +9992,10 @@ mod tests {
 
         let (error, category) = failed(&run.plan);
         assert_eq!(category, FailureCategory::ProviderAuthError, "{error}");
-        assert!(error.contains("found two idle nodes"), "{error}");
+        assert_eq!(
+            run.plan.tasks[0].kept_output.as_deref(),
+            Some("found two idle nodes")
+        );
         assert!(Orchestrator::should_short_circuit_provider_errors(
             &Orchestrator::collect_iteration_failures(&run.plan, 1),
             run.plan.completed_count(),
@@ -9950,7 +10015,127 @@ mod tests {
 
         let (error, category) = failed(&run.plan);
         assert_eq!(category, FailureCategory::AgentError, "{error}");
-        assert!(error.contains("401 Unauthorized"), "{error}");
+        assert_eq!(
+            run.plan.tasks[0].kept_output.as_deref(),
+            Some("the logs show 401 Unauthorized")
+        );
+    }
+
+    /// #594's own failure: one task, and a retry the provider refuses. The
+    /// provider short-circuit fires, and the first attempt's output still
+    /// reaches the client, without the provider's response body.
+    #[tokio::test]
+    async fn the_provider_short_circuit_returns_kept_output() {
+        const PROVIDER_ERROR: &str =
+            r#"Invalid status code 401 Unauthorized with message: {"request_id":"req_011secret"}"#;
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, _store, _registry, request_id) =
+            override_park_orchestrator(dir.path(), 4).await;
+        test_rig::install_worker_overrides(vec![
+            WorkerOverride {
+                model: test_rig::ScriptedCompletionModel::new(vec![ScriptedTurn::text(
+                    "found two idle nodes",
+                )]),
+                extra_tools: vec![],
+            },
+            WorkerOverride {
+                model: test_rig::ScriptedCompletionModel::new(vec![ScriptedTurn::provider_error(
+                    PROVIDER_ERROR,
+                )]),
+                extra_tools: vec![],
+            },
+        ]);
+
+        let mut plan = Plan::new("Inspect");
+        plan.add_task(Task::new(0, "Inspect the pool", "r").with_worker("operations"));
+        let (run, _events) =
+            crate::run_context::RunContext::channel(request_id.parse().expect("a run id"));
+        let routing_toolset = RoutingToolSet::new();
+        let routing_decision = routing_toolset.decision.clone();
+        let coordinator = orchestrator
+            .create_coordinator(routing_toolset, true)
+            .await
+            .expect("the coordinator builds without a provider call");
+        let mut coordinator_state = CoordinatorState {
+            agent: coordinator.agent,
+            preamble: coordinator.preamble,
+            conversation: Vec::new(),
+            routing_decision,
+            chat_history_tokens: None,
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(256);
+        let mut failure_history = Vec::new();
+        let outcome = crate::run_context::with_run(
+            Arc::clone(&run),
+            orchestrator.run_iteration(
+                1,
+                "inspect the pool",
+                plan,
+                &[],
+                &mut coordinator_state,
+                None,
+                &event_tx,
+                Instant::now(),
+                0,
+                &mut failure_history,
+            ),
+        )
+        .await;
+
+        let Ok(IterationOutcome::FinalResult(raw)) = outcome else {
+            panic!("kept output must end the run as a result, not an error");
+        };
+        assert!(raw.starts_with("Provider error:"), "{raw}");
+        assert!(raw.contains("found two idle nodes"), "{raw}");
+        assert!(!raw.contains("req_011secret"), "{raw}");
+    }
+
+    /// The run manifest previews kept output, which the session context shows
+    /// on later turns.
+    #[test]
+    fn a_failed_tasks_preview_is_its_kept_output() {
+        let mut task = Task::new(0, "Inspect the pool", "r");
+        task.fail("401", FailureCategory::ProviderAuthError);
+        assert_eq!(result_preview(&task), None);
+
+        task.kept_output = Some("found two idle nodes".to_string());
+        assert_eq!(
+            result_preview(&task).as_deref(),
+            Some("found two idle nodes")
+        );
+    }
+
+    /// With no output kept, the provider short-circuit stays an error.
+    #[test]
+    fn no_kept_output_builds_no_results() {
+        let mut plan = Plan::new("Inspect");
+        let mut task = Task::new(0, "Inspect the pool", "r");
+        task.fail("401", FailureCategory::ProviderAuthError);
+        plan.add_task(task);
+
+        assert_eq!(Orchestrator::build_kept_output_results(&plan), None);
+    }
+
+    /// Every path that summarizes a failed task carries its kept output, even
+    /// when the error alone fills the summary length.
+    #[tokio::test]
+    async fn summaries_show_kept_output_beside_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let orchestrator = retry_orchestrator(dir.path(), OrchestrationConfig::default()).await;
+        let mut task = Task::new(0, "Inspect the pool", "r");
+        task.fail(
+            "provider refused the call. ".repeat(40),
+            FailureCategory::AgentError,
+        );
+        task.kept_output = Some("found two idle nodes".to_string());
+        let mut plan = Plan::new("Inspect");
+        plan.add_task(task);
+
+        let summary = orchestrator.build_execution_summary(&plan);
+        assert!(summary.contains("found two idle nodes"), "{summary}");
+        let raw = Orchestrator::build_raw_task_results(&plan, "note");
+        assert!(raw.contains("found two idle nodes"), "{raw}");
     }
 
     /// With nothing from the first attempt to keep, the retry's hard error
@@ -9962,7 +10147,7 @@ mod tests {
         let (error, category) = failed(&run.plan);
         assert_ne!(category, FailureCategory::SoftFailure, "{error}");
         assert!(error.contains("after 2 attempts"), "{error}");
-        assert!(!error.contains("earlier attempt"), "{error}");
+        assert_eq!(run.plan.tasks[0].kept_output, None);
     }
 
     /// A duplicate-call loop on the retry fails on the retry's own text, which
@@ -10007,7 +10192,8 @@ mod tests {
 
         let (error, category) = failed(&run.plan);
         assert_eq!(category, FailureCategory::AgentError, "{error}");
-        assert!(error.contains("saved to artifact"), "{error}");
+        let kept = run.plan.tasks[0].kept_output.as_deref().unwrap_or_default();
+        assert!(kept.contains("saved to artifact"), "{kept}");
         assert_eq!(run.artifacts, vec![first]);
     }
 
