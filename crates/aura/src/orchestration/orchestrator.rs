@@ -120,6 +120,13 @@ enum TaskOutcome {
         attempt: usize,
         snapshot: ParkSnapshot,
     },
+    /// A hard error ended a retry after an earlier attempt produced output.
+    FailedWithOutput {
+        /// The failure the retry ended on.
+        error: String,
+        /// The earlier attempt's output.
+        output: String,
+    },
 }
 
 /// Park-mode state for one worker stream: its blocked cell and the stream key
@@ -755,6 +762,12 @@ fn timed_out_message(reason: &str, partial: &str) -> String {
     } else {
         format!("{reason} before calling submit_result. Partial output so far:\n{partial}")
     }
+}
+
+/// The failure text for a task whose retry failed after an earlier attempt
+/// produced output.
+fn failed_with_output_message(error: &str, output: &str) -> String {
+    format!("{error}\nOutput from an earlier attempt, which did not call submit_result:\n{output}")
 }
 
 const EMPTY_WORKER_RESULT: &str = "The worker produced no output and did not call submit_result.";
@@ -3948,6 +3961,36 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             .await;
                         tracing::warn!("Task {} timed out after {}ms", task_id, duration_ms);
                     }
+                    // The category comes from the error alone: the output is
+                    // worker text, which can quote a provider error.
+                    Ok(TaskOutcome::FailedWithOutput { error, output }) => {
+                        let category = Self::categorize_failure_error(&error);
+                        let output = self
+                            .maybe_create_artifact(task_id, worker_name.as_deref(), output)
+                            .await;
+                        let message = failed_with_output_message(&error, &output);
+                        if let Some(t) = plan.get_task_mut(task_id) {
+                            t.fail(message.clone(), category);
+                        }
+                        let _ = event_tx
+                            .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                                &worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
+                                AgentEventPayload::TaskCompleted {
+                                    task_id,
+                                    duration_ms,
+                                    orchestrator_id: self.orchestrator_id.clone(),
+                                    outcome: outcome_of(false, message),
+                                },
+                            )))))
+                            .await;
+                        tracing::warn!(
+                            "Task {} failed after {}ms ({}), keeping an earlier attempt's output: {}",
+                            task_id,
+                            duration_ms,
+                            category,
+                            error
+                        );
+                    }
                     Ok(TaskOutcome::Blocked {
                         pending,
                         attempt,
@@ -4343,7 +4386,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         // The stream ended before the hook could snapshot: the
                         // gated action never ran and cannot resume from a
                         // conversation nobody captured, so cancel the decisions
-                        // and fail the task.
+                        // and fail the task. An earlier attempt's output would
+                        // hide the cancelled action from the coordinator.
+                        last_raw_response.clear();
                         self.cancel_parked_approvals(task_id, *worker_name, &pending)
                             .await;
                         let underlying = match stream_result.as_ref() {
@@ -4437,6 +4482,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
             // Check escalation flag (duplicate call loop)
             let result: Result<String, StreamError> = match result {
                 Ok(worker_output) if escalation_flag.load(std::sync::atomic::Ordering::SeqCst) => {
+                    // The artifact below is named per task, so writing an
+                    // earlier attempt's output would replace this attempt's.
+                    last_raw_response.clear();
                     let processed = self
                         .maybe_create_artifact(task_id, *worker_name, worker_output)
                         .await;
@@ -4502,10 +4550,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 task_id
                             );
                             // Record this attempt's output now: if the retry
-                            // dies on a hard error, it is what the task falls
-                            // back to, and the run directory should hold it.
+                            // dies on a hard error, it is what the task keeps,
+                            // and the run directory should hold it.
                             let duration_ms = start_time.elapsed().as_millis() as u64;
-                            self.persist_worker_execution(
+                            self.record_worker_execution(
                                 task_id,
                                 task_description,
                                 attempt,
@@ -4540,30 +4588,21 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 &base_worker_prompt,
             )
             .await;
-            // An earlier attempt finished with output but no submit_result,
-            // and its retry died on a hard error. That output is what the
-            // final attempt would have kept without submit_result, so keep it
-            // the same way rather than failing the task (mezmo/aura#594).
-            if !last_raw_response.trim().is_empty() {
-                tracing::warn!(
-                    "Worker attempt {} for task {} failed ({}). Keeping attempt {}'s output, \
-                     which did not call submit_result.",
-                    actual_attempts,
-                    task_id,
-                    e,
-                    actual_attempts - 1
-                );
-                crate::logging::set_span_ok(&tracing::Span::current());
-                return Ok(TaskOutcome::Completed(TaskExecutionResult {
-                    result: last_raw_response,
-                    structured_output: None,
-                }));
-            }
-            Err(format!(
+            let error = format!(
                 "Worker failed task {} after {} attempts: {}",
                 task_id, actual_attempts, e
-            )
-            .into())
+            );
+            // An earlier attempt finished with output but no submit_result,
+            // and its retry died on a hard error. The failure stays the
+            // retry's, so a provider error still reads as one, and the output
+            // goes with it (mezmo/aura#594).
+            if !last_raw_response.trim().is_empty() {
+                return Ok(TaskOutcome::FailedWithOutput {
+                    error,
+                    output: last_raw_response,
+                });
+            }
+            Err(error.into())
         } else {
             // Should not reach here — final attempt should have returned above
             self.persist_worker_execution(
@@ -4776,9 +4815,40 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }))
     }
 
-    /// Persist a single worker execution attempt to the persistence store.
+    /// Persist a task's final worker execution attempt and set the worker
+    /// span's status from its result.
     #[allow(clippy::too_many_arguments)]
     async fn persist_worker_execution(
+        &self,
+        task_id: usize,
+        task_description: &str,
+        attempt: usize,
+        duration_ms: u64,
+        result: Result<&str, &(dyn std::error::Error + Send + Sync)>,
+        structured_output: Option<&super::types::StructuredTaskOutput>,
+        worker_prompt: &str,
+    ) {
+        self.record_worker_execution(
+            task_id,
+            task_description,
+            attempt,
+            duration_ms,
+            result,
+            structured_output,
+            worker_prompt,
+        )
+        .await;
+
+        let span = tracing::Span::current();
+        match result {
+            Ok(_) => crate::logging::set_span_ok(&span),
+            Err(e) => crate::logging::set_span_error(&span, e.to_string()),
+        }
+    }
+
+    /// Write one worker execution attempt to the persistence store.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_worker_execution(
         &self,
         task_id: usize,
         task_description: &str,
@@ -4819,14 +4889,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .await
             {
                 tracing::warn!("Failed to persist task execution: {}", e);
-            }
-        }
-
-        {
-            let span = tracing::Span::current();
-            match result {
-                Ok(_) => crate::logging::set_span_ok(&span),
-                Err(e) => crate::logging::set_span_error(&span, e.to_string()),
             }
         }
     }
@@ -6399,6 +6461,7 @@ mod tests {
     /// for.
     #[tokio::test]
     async fn a_plain_worker_budget_starts_from_the_fixed_overhead() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
         let temp = tempfile::TempDir::new().unwrap();
         let mut build_context = crate::config::AgentBuildContext {
             memory_dir: Some(temp.path().join("memory").to_string_lossy().into_owned()),
@@ -9713,13 +9776,10 @@ mod tests {
     // (mezmo/aura#594).
     // ====================================================================
 
-    /// Runs one task whose first attempt answers `first` without calling
-    /// submit_result, and whose retry hits a hard error: its scripted model
-    /// has no turns, so the provider call fails. Returns the task's state and
-    /// every `task-0.attempt-1.response.txt` written under the memory dir.
-    async fn run_retry_with_hard_error(first: &str) -> (TaskState, Vec<String>) {
-        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
-        let dir = tempfile::tempdir().unwrap();
+    async fn retry_orchestrator(
+        memory_dir: &std::path::Path,
+        config: OrchestrationConfig,
+    ) -> Orchestrator {
         let workers = std::collections::HashMap::from([(
             "operations".to_string(),
             crate::orchestration::WorkerConfig {
@@ -9734,24 +9794,47 @@ mod tests {
             },
         )]);
         let build_context = AgentBuildContext {
-            memory_dir: Some(dir.path().to_string_lossy().into_owned()),
+            memory_dir: Some(memory_dir.to_string_lossy().into_owned()),
             orchestration: Some(OrchestrationConfig {
                 enabled: true,
                 workers,
-                ..Default::default()
+                ..config
             }),
             ..AgentBuildContext::default()
         };
-        let orchestrator = Orchestrator::new(build_context).await.unwrap();
+        Orchestrator::new(build_context).await.unwrap()
+    }
 
+    struct RetryRun {
+        plan: Plan,
+        /// Every `task-0.attempt-1.response.txt` under the memory dir.
+        responses: Vec<String>,
+        /// Every `task-0-*-result.txt` artifact under the memory dir.
+        artifacts: Vec<String>,
+    }
+
+    /// Runs one task through its first attempt, which answers `first` without
+    /// calling submit_result, and a retry scripted by `retry`.
+    async fn run_retry(
+        first: &str,
+        retry: Vec<ScriptedTurn>,
+        config: OrchestrationConfig,
+    ) -> RetryRun {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let orchestrator = retry_orchestrator(dir.path(), config).await;
+
+        let retry_tool = Box::new(test_rig::RecordingTool::new(Arc::new(
+            std::sync::Mutex::new(Vec::new()),
+        ))) as Box<dyn rig::tool::ToolDyn>;
         test_rig::install_worker_overrides(vec![
             WorkerOverride {
                 model: test_rig::ScriptedCompletionModel::new(vec![ScriptedTurn::text(first)]),
                 extra_tools: vec![],
             },
             WorkerOverride {
-                model: test_rig::ScriptedCompletionModel::new(vec![]),
-                extra_tools: vec![],
+                model: test_rig::ScriptedCompletionModel::new(retry),
+                extra_tools: vec![retry_tool],
             },
         ]);
 
@@ -9761,63 +9844,329 @@ mod tests {
         orchestrator.execute(&mut plan, &event_tx).await.unwrap();
 
         // Skips symlinks: the run directory is also reachable as `latest`.
-        fn find(dir: &std::path::Path, out: &mut Vec<String>) {
+        fn find(dir: &std::path::Path, run: &mut RetryRun) {
             for entry in std::fs::read_dir(dir).unwrap().flatten() {
                 let path = entry.path();
                 if path.is_symlink() {
                     continue;
                 }
                 if path.is_dir() {
-                    find(&path, out);
-                } else if path.file_name().and_then(|n| n.to_str())
-                    == Some("task-0.attempt-1.response.txt")
-                {
-                    out.push(std::fs::read_to_string(&path).unwrap());
+                    find(&path, run);
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name == "task-0.attempt-1.response.txt" {
+                    run.responses.push(std::fs::read_to_string(&path).unwrap());
+                } else if name.starts_with("task-0-") && name.ends_with("-result.txt") {
+                    run.artifacts.push(std::fs::read_to_string(&path).unwrap());
                 }
             }
         }
-        let mut responses = Vec::new();
-        find(dir.path(), &mut responses);
-        (plan.tasks[0].state.clone(), responses)
+        let mut run = RetryRun {
+            plan,
+            responses: Vec::new(),
+            artifacts: Vec::new(),
+        };
+        find(dir.path(), &mut run);
+        run
     }
 
-    /// The first attempt's answer survives its retry failing. The task ends
-    /// as it would had the last attempt returned that output without
-    /// submit_result: a soft failure carrying the output for the coordinator,
-    /// not a hard failure with only the provider's error. The run directory
-    /// holds the output as attempt 1.
+    fn artifact_threshold(result_artifact_threshold: usize) -> OrchestrationConfig {
+        OrchestrationConfig {
+            artifacts: aura_config::ArtifactsConfig {
+                result_artifact_threshold,
+                ..Default::default()
+            },
+            ..OrchestrationConfig::default()
+        }
+    }
+
+    fn failed(plan: &Plan) -> (&str, FailureCategory) {
+        match &plan.tasks[0].state {
+            TaskState::Failed { error, category } => (error, *category),
+            other => panic!("the task must fail, got {other:?}"),
+        }
+    }
+
+    /// The first attempt's answer survives its retry failing, beside the
+    /// retry's own error. The run directory holds it as attempt 1.
     #[tokio::test]
     async fn a_hard_error_on_the_retry_keeps_the_first_attempts_output() {
-        let (state, responses) = run_retry_with_hard_error("found two idle nodes").await;
+        let run = run_retry(
+            "found two idle nodes",
+            vec![],
+            OrchestrationConfig::default(),
+        )
+        .await;
 
-        match &state {
-            TaskState::Failed { error, category } => {
-                assert_eq!(*category, FailureCategory::SoftFailure, "{error}");
-                assert!(error.contains("found two idle nodes"), "{error}");
-            }
-            other => panic!("the task must keep attempt 1's output, got {other:?}"),
-        }
-        assert_eq!(responses.len(), 1, "attempt 1's response is persisted once");
+        let (error, category) = failed(&run.plan);
+        assert_eq!(category, FailureCategory::AgentError, "{error}");
+        assert!(error.contains("after 2 attempts"), "{error}");
+        assert!(error.contains("found two idle nodes"), "{error}");
+        assert_eq!(
+            run.responses.len(),
+            1,
+            "attempt 1's response is persisted once"
+        );
         assert!(
-            responses[0].contains("found two idle nodes"),
+            run.responses[0].contains("found two idle nodes"),
             "{}",
-            responses[0]
+            run.responses[0]
         );
     }
 
+    /// A provider failure on the retry stays one, so the wave still takes the
+    /// provider short-circuit, and the first attempt's answer goes with it.
+    #[tokio::test]
+    async fn a_provider_error_on_the_retry_keeps_its_category_and_the_output() {
+        let run = run_retry(
+            "found two idle nodes",
+            vec![ScriptedTurn::provider_error(
+                "Invalid status code 401 Unauthorized",
+            )],
+            OrchestrationConfig::default(),
+        )
+        .await;
+
+        let (error, category) = failed(&run.plan);
+        assert_eq!(category, FailureCategory::ProviderAuthError, "{error}");
+        assert!(error.contains("found two idle nodes"), "{error}");
+        assert!(Orchestrator::should_short_circuit_provider_errors(
+            &Orchestrator::collect_iteration_failures(&run.plan, 1),
+            run.plan.completed_count(),
+        ));
+    }
+
+    /// The first attempt's text can quote a provider error without changing
+    /// what the task failed on.
+    #[tokio::test]
+    async fn quoted_provider_text_in_the_output_does_not_set_the_category() {
+        let run = run_retry(
+            "the logs show 401 Unauthorized",
+            vec![],
+            OrchestrationConfig::default(),
+        )
+        .await;
+
+        let (error, category) = failed(&run.plan);
+        assert_eq!(category, FailureCategory::AgentError, "{error}");
+        assert!(error.contains("401 Unauthorized"), "{error}");
+    }
+
     /// With nothing from the first attempt to keep, the retry's hard error
-    /// still fails the task.
+    /// fails the task alone.
     #[tokio::test]
     async fn a_hard_error_on_the_retry_fails_when_the_first_attempt_was_empty() {
-        let (state, _responses) = run_retry_with_hard_error("").await;
+        let run = run_retry("", vec![], OrchestrationConfig::default()).await;
 
-        match &state {
-            TaskState::Failed { error, category } => {
-                assert_ne!(*category, FailureCategory::SoftFailure, "{error}");
-                assert!(error.contains("after 2 attempts"), "{error}");
+        let (error, category) = failed(&run.plan);
+        assert_ne!(category, FailureCategory::SoftFailure, "{error}");
+        assert!(error.contains("after 2 attempts"), "{error}");
+        assert!(!error.contains("earlier attempt"), "{error}");
+    }
+
+    /// A duplicate-call loop on the retry fails on the retry's own text, which
+    /// the first attempt's output must not replace.
+    #[tokio::test]
+    async fn a_duplicate_call_loop_on_the_retry_keeps_the_retrys_text() {
+        let call = || {
+            ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                "call_0",
+                test_rig::ECHO_TOOL_NAME,
+                serde_json::json!({"namespace": "prod"}),
+            )])
+        };
+        let run = run_retry(
+            "found two idle nodes",
+            vec![
+                call(),
+                call(),
+                call(),
+                ScriptedTurn::text("the retry's findings"),
+            ],
+            OrchestrationConfig {
+                duplicate_call_nudge_threshold: 1,
+                duplicate_call_block_threshold: 2,
+                ..OrchestrationConfig::default()
+            },
+        )
+        .await;
+
+        let (error, category) = failed(&run.plan);
+        assert_eq!(category, FailureCategory::LoopDetected, "{error}");
+        assert!(error.contains("the retry's findings"), "{error}");
+        assert!(!error.contains("found two idle nodes"), "{error}");
+    }
+
+    /// A first attempt too long to inline goes through the artifact flow, and
+    /// the failure points at it.
+    #[tokio::test]
+    async fn a_long_first_attempt_is_kept_as_an_artifact() {
+        let first = "found two idle nodes. ".repeat(20);
+        let run = run_retry(&first, vec![], artifact_threshold(40)).await;
+
+        let (error, category) = failed(&run.plan);
+        assert_eq!(category, FailureCategory::AgentError, "{error}");
+        assert!(error.contains("saved to artifact"), "{error}");
+        assert_eq!(run.artifacts, vec![first]);
+    }
+
+    /// Over the artifact threshold both attempts would write the same file, so
+    /// the retry's output must be the one that stays there.
+    #[tokio::test]
+    async fn a_duplicate_call_loop_on_the_retry_keeps_the_retrys_artifact() {
+        let call = || {
+            ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                "call_0",
+                test_rig::ECHO_TOOL_NAME,
+                serde_json::json!({"namespace": "prod"}),
+            )])
+        };
+        let retry_text = "the retry's findings. ".repeat(20);
+        let run = run_retry(
+            &"found two idle nodes. ".repeat(20),
+            vec![call(), call(), call(), ScriptedTurn::text(&retry_text)],
+            OrchestrationConfig {
+                duplicate_call_nudge_threshold: 1,
+                duplicate_call_block_threshold: 2,
+                ..artifact_threshold(40)
+            },
+        )
+        .await;
+
+        let (error, category) = failed(&run.plan);
+        assert_eq!(category, FailureCategory::LoopDetected, "{error}");
+        assert_eq!(run.artifacts, vec![retry_text]);
+    }
+
+    /// A retry that parks a gated call and loses its stream before the
+    /// snapshot fails on the cancelled approval, so the coordinator learns a
+    /// gated action was requested. The first attempt's text does not replace
+    /// that.
+    #[tokio::test]
+    async fn an_orphaned_approval_on_the_retry_fails_the_task() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (orchestrator, _store, _registry, request_id) =
+            override_park_orchestrator(dir.path(), 4).await;
+        let (run, _events) =
+            crate::run_context::RunContext::channel(request_id.parse().expect("a run id"));
+
+        let gated_tool = Box::new(test_rig::RecordingTool::new(Arc::new(
+            std::sync::Mutex::new(Vec::new()),
+        ))) as Box<dyn rig::tool::ToolDyn>;
+        test_rig::install_worker_overrides(vec![
+            WorkerOverride {
+                model: test_rig::ScriptedCompletionModel::new(vec![ScriptedTurn::text(
+                    "found two idle nodes",
+                )]),
+                extra_tools: vec![],
+            },
+            WorkerOverride {
+                model: test_rig::ScriptedCompletionModel::new(vec![
+                    ScriptedTurn::tool_calls_then_stream_failure(vec![
+                        ScriptedToolCall::new(
+                            "call_0",
+                            test_rig::ECHO_TOOL_NAME,
+                            serde_json::json!({"namespace": "prod"}),
+                        )
+                        .with_call_id("call_id_0"),
+                    ]),
+                ]),
+                extra_tools: vec![gated_tool],
+            },
+        ]);
+
+        let params = TaskExecutionParams {
+            task_description: "apply the manifest",
+            task_context: &None,
+            worker_name: Some("operations"),
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let result = crate::run_context::with_run(
+            Arc::clone(&run),
+            orchestrator.execute_task(0, &params, Some(&event_tx), None, None),
+        )
+        .await;
+
+        let message = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("the task must fail on the cancelled approval"),
+        };
+        assert!(
+            message.contains("pending approval(s) cancelled"),
+            "{message}"
+        );
+        assert!(!message.contains("found two idle nodes"), "{message}");
+    }
+
+    /// Recording a retried attempt leaves the worker span's status alone: a
+    /// worker cancelled during its retry does not export as finished.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn a_worker_cancelled_during_its_retry_does_not_export_as_ok() {
+        use opentelemetry::trace::{Status, TracerProvider as _};
+        use opentelemetry_sdk::trace::TracerProvider;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let captured = crate::test_span_capture::CapturedSpans::default();
+        let provider = TracerProvider::builder()
+            .with_simple_exporter(captured.clone())
+            .build();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test"))),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let orchestrator = retry_orchestrator(dir.path(), OrchestrationConfig::default()).await;
+        let second = test_rig::ScriptedCompletionModel::new(vec![ScriptedTurn::text_then_stall(
+            "still working",
+        )]);
+        let requests = second.requests();
+        test_rig::install_worker_overrides(vec![
+            WorkerOverride {
+                model: test_rig::ScriptedCompletionModel::new(vec![ScriptedTurn::text(
+                    "found two idle nodes",
+                )]),
+                extra_tools: vec![],
+            },
+            WorkerOverride {
+                model: second,
+                extra_tools: vec![],
+            },
+        ]);
+
+        let params = TaskExecutionParams {
+            task_description: "Inspect the pool",
+            task_context: &None,
+            worker_name: Some("operations"),
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(256);
+        let cancelled = tokio::time::timeout(Duration::from_secs(5), async {
+            let task = orchestrator.execute_task(0, &params, Some(&event_tx), None, None);
+            tokio::pin!(task);
+            loop {
+                tokio::select! {
+                    _ = &mut task => panic!("the retry must stall until it is cancelled"),
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {
+                        if !requests.lock().unwrap().is_empty() {
+                            break;
+                        }
+                    }
+                }
             }
-            other => panic!("the task must fail, got {other:?}"),
-        }
+        })
+        .await;
+        assert!(cancelled.is_ok(), "the retry never started");
+
+        let spans = captured.spans();
+        let worker = spans
+            .iter()
+            .find(|span| span.name == "orchestration.worker")
+            .expect("the worker span was never exported");
+        assert_eq!(worker.status, Status::Unset);
     }
 
     /// Each kept tool result is capped at `result_summary_length`.
