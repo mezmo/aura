@@ -518,4 +518,30 @@ mod tests {
         assert!(matches!(outcome, ToolOutcome::Unknown));
         assert!(serde_json::to_value(&event).is_err());
     }
+
+    /// An approval outcome added by a newer producer keeps the event around
+    /// it, so an older reader does not lose it or the envelope's `seq`.
+    #[test]
+    fn an_unknown_approval_outcome_keeps_the_event() {
+        let event: AgentEvent = serde_json::from_value(json!({
+            "agent": serde_json::to_value(EmittingAgent::single_agent()).unwrap(),
+            "payload": {
+                "type": "approval_completed",
+                "decision_id": "d-1",
+                "outcome": {"kind": "deferred"},
+                "duration_ms": 7,
+                "scope": {"kind": "subagent"}
+            }
+        }))
+        .expect("an unknown outcome should not fail the event");
+
+        let AgentEventPayload::ApprovalCompleted(completed) = &event.payload else {
+            panic!("expected ApprovalCompleted, got {:?}", event.payload);
+        };
+        assert_eq!(completed.decision_id, "d-1");
+        assert!(matches!(
+            completed.outcome,
+            crate::ApprovalOutcomeWire::Unknown
+        ));
+    }
 }

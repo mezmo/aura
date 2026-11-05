@@ -499,6 +499,7 @@ mod tests {
     #[derive(Default)]
     struct Captures {
         tokens: Vec<String>,
+        approvals_pending: Vec<String>,
         tools_requested: Vec<(String, String, BTreeMap<String, serde_json::Value>)>,
         tools_started: Vec<(String, String)>,
         tools_completed: Vec<(String, String, Option<String>)>,
@@ -562,6 +563,9 @@ mod tests {
             self.reasoning
                 .push((content.to_string(), agent_id.to_string()));
         }
+        fn on_approval_pending(&mut self, pending: &ApprovalPending) {
+            self.approvals_pending.push(pending.decision_id.clone());
+        }
         fn on_raw_event(&mut self, event_name: &str, data: &str) {
             self.raw_events
                 .push((event_name.to_string(), data.to_string()));
@@ -590,6 +594,26 @@ mod tests {
     // -----------------------------------------------------------------------
     // Text response tests
     // -----------------------------------------------------------------------
+
+    /// An `approval_pending` from a newer server must still reach the handler:
+    /// dropping it leaves the user unasked until the approval times out.
+    #[tokio::test]
+    async fn approval_pending_with_an_unknown_origin_and_scope_reaches_the_handler() {
+        let pending = serde_json::json!({
+            "decision_id": "d-1",
+            "tool_name": "deploy",
+            "arguments": {},
+            "origin": {"kind": "policy_engine"},
+            "scope": {"kind": "subagent"},
+            "expires_at": "2026-11-04T00:00:00Z",
+        })
+        .to_string();
+
+        let (result, caps) = run_stream(vec![sse(event_names::APPROVAL_PENDING, &pending)]).await;
+
+        result.unwrap();
+        assert_eq!(caps.approvals_pending, vec!["d-1"]);
+    }
 
     #[tokio::test]
     async fn text_only_response() {
