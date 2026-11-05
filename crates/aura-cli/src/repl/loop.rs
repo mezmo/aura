@@ -510,8 +510,40 @@ fn approval_requested_line(requested: &aura_events::ApprovalRequested) -> String
             format!("config gate · {matched_pattern}")
         }
         ApprovalOriginWire::AgentRequested { .. } => "agent requested".to_string(),
+        ApprovalOriginWire::Unknown => "unknown origin".to_string(),
     };
     format!("⏸ Approval requested — {} ({origin})", requested.tool_name)
+}
+
+/// Style and scrollback line for an `approval_completed` outcome.
+fn approval_outcome_line(outcome: &aura_events::ApprovalOutcomeWire) -> (AuraStyle, String) {
+    use aura_events::ApprovalOutcomeWire;
+    let (style, label, detail) = match outcome {
+        ApprovalOutcomeWire::Approved => (AuraStyle::Success, "✓ Approved", String::new()),
+        ApprovalOutcomeWire::Denied { reason } => (
+            AuraStyle::Warning,
+            "✗ Denied",
+            reason
+                .as_ref()
+                .map(|r| format!(" — {r}"))
+                .unwrap_or_default(),
+        ),
+        ApprovalOutcomeWire::TimedOut { waited_ms } => {
+            (AuraStyle::Muted, "⏱ Timed out", format!(" ({waited_ms}ms)"))
+        }
+        ApprovalOutcomeWire::Cancelled { reason } => {
+            (AuraStyle::Error, "✗ Cancelled", format!(" — {reason:?}"))
+        }
+        ApprovalOutcomeWire::Errored { message } => {
+            (AuraStyle::Error, "✗ Error", format!(" — {message}"))
+        }
+        ApprovalOutcomeWire::Unknown => (
+            AuraStyle::Muted,
+            "? Ended",
+            " (unknown outcome)".to_string(),
+        ),
+    };
+    (style, format!("⏺ Approval {label}{detail}"))
 }
 
 /// Live worker reasoning blocks, one per concurrently-executing task.
@@ -3691,30 +3723,7 @@ impl StreamHandler for ReplStreamHandler {
             let _term = lock_term();
             erase_input_frame();
 
-            use aura_events::ApprovalOutcomeWire;
-
-            let (style, label, detail) = match &completed.outcome {
-                ApprovalOutcomeWire::Approved => (AuraStyle::Success, "✓ Approved", String::new()),
-                ApprovalOutcomeWire::Denied { reason } => (
-                    AuraStyle::Warning,
-                    "✗ Denied",
-                    reason
-                        .as_ref()
-                        .map(|r| format!(" — {r}"))
-                        .unwrap_or_default(),
-                ),
-                ApprovalOutcomeWire::TimedOut { waited_ms } => {
-                    (AuraStyle::Muted, "⏱ Timed out", format!(" ({waited_ms}ms)"))
-                }
-                ApprovalOutcomeWire::Cancelled { reason } => {
-                    (AuraStyle::Error, "✗ Cancelled", format!(" — {reason:?}"))
-                }
-                ApprovalOutcomeWire::Errored { message } => {
-                    (AuraStyle::Error, "✗ Error", format!(" — {message}"))
-                }
-            };
-
-            let line = format!("⏺ Approval {label}{detail}");
+            let (style, line) = approval_outcome_line(&completed.outcome);
             println!("{}", line.themed(style));
             crate::ui::prompt::increment_orch_scrollback();
             println!();
@@ -3741,8 +3750,8 @@ impl StreamHandler for ReplStreamHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMAND_ALIASES, COMPACT_NUDGE_FILL, ReplTelemetryLifecycle, approval_requested_line,
-        command_hint, compaction_note, should_nudge_at_fill,
+        COMMAND_ALIASES, COMPACT_NUDGE_FILL, ReplTelemetryLifecycle, approval_outcome_line,
+        approval_requested_line, command_hint, compaction_note, should_nudge_at_fill,
     };
     use crate::repl::registry;
     use crate::ui::prompt::ContextWindowUsage;
@@ -3982,6 +3991,29 @@ mod tests {
             approval_requested_line(&requested),
             "⏸ Approval requested — mock_tool (config gate · mock_*)",
         );
+    }
+
+    #[test]
+    fn approval_requested_line_handles_an_unknown_origin() {
+        let requested = approval_requested(aura_events::ApprovalOriginWire::Unknown);
+        assert_eq!(
+            approval_requested_line(&requested),
+            "⏸ Approval requested — mock_tool (unknown origin)",
+        );
+    }
+
+    #[test]
+    fn approval_outcome_line_handles_an_unknown_outcome() {
+        let (_, line) = approval_outcome_line(&aura_events::ApprovalOutcomeWire::Unknown);
+        assert_eq!(line, "⏺ Approval ? Ended (unknown outcome)");
+    }
+
+    #[test]
+    fn approval_outcome_line_shows_a_cancellation_with_an_unknown_reason() {
+        let (_, line) = approval_outcome_line(&aura_events::ApprovalOutcomeWire::Cancelled {
+            reason: aura_events::CancelReasonWire::Unknown,
+        });
+        assert_eq!(line, "⏺ Approval ✗ Cancelled — Unknown");
     }
 
     #[test]
