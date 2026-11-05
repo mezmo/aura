@@ -120,9 +120,9 @@ enum TaskOutcome {
         attempt: usize,
         snapshot: ParkSnapshot,
     },
-    /// A hard error ended a retry after an earlier attempt produced output.
+    /// A task failure with output from an earlier attempt.
     FailedWithOutput {
-        /// The failure the retry ended on.
+        /// The failure.
         error: String,
         /// The earlier attempt's output.
         output: String,
