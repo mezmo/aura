@@ -751,10 +751,29 @@ impl PartialOutput {
 /// The failure text of a timed-out worker: the reason, then any partial output.
 fn timed_out_message(reason: &str, partial: &str) -> String {
     if partial.is_empty() {
-        format!("{reason} before any output")
+        format!("{reason}{NO_OUTPUT_SUFFIX}")
     } else {
-        format!("{reason} before calling submit_result. Partial output so far:\n{partial}")
+        format!("{reason}{PARTIAL_OUTPUT_MARKER}{partial}")
     }
+}
+
+/// The end of a timeout message with no partial output.
+const NO_OUTPUT_SUFFIX: &str = " before any output";
+
+/// What separates a timeout's reason from its partial output.
+const PARTIAL_OUTPUT_MARKER: &str = " before calling submit_result. Partial output so far:\n";
+
+/// The start of a duplicate-call loop's failure, ahead of the worker's text.
+const DUPLICATE_LOOP_FAILURE: &str = "Worker blocked by duplicate call loop.";
+
+/// Whether a failure's text holds any of the worker's output, rather than only
+/// naming the failure.
+fn failure_kept_output(error: &str) -> bool {
+    let error = error.trim_end();
+    !(error.is_empty()
+        || error == EMPTY_WORKER_RESULT
+        || error.ends_with(DUPLICATE_LOOP_FAILURE)
+        || (error.ends_with(NO_OUTPUT_SUFFIX) && !error.contains(PARTIAL_OUTPUT_MARKER)))
 }
 
 /// Why a parked worker's approvals are cancelled when its stream ended before
@@ -3797,6 +3816,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     async fn execute(
         &self,
         plan: &mut Plan,
+        failure_history: &[FailedTaskRecord],
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
     ) -> Result<(u64, ParkedTaskRecords), StreamError> {
         use futures::StreamExt;
@@ -3807,18 +3827,27 @@ Assign tasks to the worker whose tools best match the required operations."#,
         while !plan.is_finished() {
             // Collect ready tasks with their context and worker assignment
             // Tuple: (task_id, description, context, worker_name)
-            // A task on an account another task found exhausted would be
-            // refused the same way, so it stays pending.
-            let exhausted = self.exhausted_llms(plan);
-            let ready_tasks: Vec<(usize, String, Option<String>, Option<String>)> = plan
-                .ready_tasks()
-                .iter()
-                .filter(|t| !self.runs_on_any(t.worker.as_deref(), &exhausted))
-                .map(|t| {
-                    let context = self.build_task_context(plan, t.id);
-                    (t.id, t.description.clone(), context, t.worker.clone())
-                })
-                .collect();
+            // The run stops on an exhausted coordinator account, so nothing
+            // new starts. On a worker's account only, a task there would be
+            // refused the same way, so it fails without a call.
+            let exhausted = self.exhausted_llms(plan, failure_history);
+            let run_is_stopping = self.runs_on_any(None, &exhausted);
+            if !run_is_stopping {
+                self.fail_tasks_on_exhausted_accounts(plan, &exhausted, event_tx)
+                    .await;
+            }
+            let ready_tasks: Vec<(usize, String, Option<String>, Option<String>)> =
+                if run_is_stopping {
+                    Vec::new()
+                } else {
+                    plan.ready_tasks()
+                        .iter()
+                        .map(|t| {
+                            let context = self.build_task_context(plan, t.id);
+                            (t.id, t.description.clone(), context, t.worker.clone())
+                        })
+                        .collect()
+                };
 
             if ready_tasks.is_empty() {
                 // Quiescence: park outranks the replan path while a decision
@@ -4461,7 +4490,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     let processed = self
                         .maybe_create_artifact(task_id, *worker_name, worker_output)
                         .await;
-                    Err(format!("Worker blocked by duplicate call loop.\n{processed}").into())
+                    Err(format!("{DUPLICATE_LOOP_FAILURE}\n{processed}").into())
                 }
                 other => other,
             };
@@ -4993,13 +5022,71 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .unwrap_or(&self.agent_build_context.llm)
     }
 
-    /// The LLM configs of the tasks that failed on an exhausted account.
-    fn exhausted_llms(&self, plan: &Plan) -> Vec<&LlmConfig> {
-        plan.tasks
+    /// The LLM configs of every task this run has seen fail on an exhausted
+    /// account: in earlier plans and in `plan`.
+    fn exhausted_llms(&self, plan: &Plan, failure_history: &[FailedTaskRecord]) -> Vec<&LlmConfig> {
+        let earlier = failure_history
+            .iter()
+            .filter(|f| f.category == FailureCategory::ProviderQuotaExhausted)
+            .map(|f| f.worker.as_deref());
+        let current = plan
+            .tasks
             .iter()
             .filter(|t| t.is_quota_exhausted())
-            .map(|t| self.effective_llm(t.worker.as_deref()))
+            .map(|t| t.worker.as_deref());
+        earlier
+            .chain(current)
+            .map(|worker| self.effective_llm(worker))
             .collect()
+    }
+
+    /// Fail each ready task on one of the `exhausted` accounts.
+    async fn fail_tasks_on_exhausted_accounts(
+        &self,
+        plan: &mut Plan,
+        exhausted: &[&LlmConfig],
+        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+    ) {
+        let refused: Vec<(usize, Option<String>)> = plan
+            .ready_tasks()
+            .iter()
+            .filter(|t| self.runs_on_any(t.worker.as_deref(), exhausted))
+            .map(|t| (t.id, t.worker.clone()))
+            .collect();
+        for (task_id, worker) in refused {
+            let message = format!(
+                "Not started: {}",
+                crate::provider_error::QUOTA_EXHAUSTED_MESSAGE
+            );
+            if let Some(task) = plan.get_task_mut(task_id) {
+                task.fail(message.clone(), FailureCategory::ProviderQuotaExhausted);
+            }
+            self.emit_quota_task_completed(task_id, worker.as_deref(), message, event_tx)
+                .await;
+        }
+    }
+
+    /// Close out a task that failed on an exhausted account without a worker
+    /// run to report it.
+    async fn emit_quota_task_completed(
+        &self,
+        task_id: usize,
+        worker: Option<&str>,
+        message: String,
+        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+    ) {
+        let _ = event_tx
+            .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                worker.unwrap_or(&self.orchestrator_id),
+                AgentEventPayload::TaskCompleted {
+                    task_id,
+                    duration_ms: 0,
+                    orchestrator_id: self.orchestrator_id.clone(),
+                    outcome: outcome_of(false, message),
+                    quota_exhausted: true,
+                },
+            )))))
+            .await;
     }
 
     /// Whether `worker` bills an account one of `llms` bills.
@@ -5027,17 +5114,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// under the plain quota message: completed tasks, and the output a soft
     /// failure, timeout or duplicate-call loop kept.
     fn quota_exhausted_stop(plan: &Plan, quota_error: &str) -> Result<String, String> {
-        let has_output = plan.tasks.iter().any(|t| {
-            matches!(
-                t.state,
-                TaskState::Complete { .. }
-                    | TaskState::Failed {
-                        category: FailureCategory::SoftFailure
-                            | FailureCategory::AgentTimeout
-                            | FailureCategory::LoopDetected,
-                        ..
-                    }
-            )
+        let has_output = plan.tasks.iter().any(|t| match &t.state {
+            TaskState::Complete { .. } => true,
+            TaskState::Failed {
+                error,
+                category:
+                    FailureCategory::SoftFailure
+                    | FailureCategory::AgentTimeout
+                    | FailureCategory::LoopDetected,
+            } => failure_kept_output(error),
+            _ => false,
         });
         if !has_output {
             return Err(format!(
@@ -5407,16 +5493,22 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // ----------------------------------------------------------------
         // EXECUTE: Run workers on tasks (parallel when possible)
         // ----------------------------------------------------------------
-        let (task_compute_ms, park_records) = match self.execute(&mut plan, event_tx).await {
-            Ok(result) => result,
-            Err(e) => {
-                self.write_run_manifest(&plan, iteration, None).await;
-                return Err(e);
-            }
-        };
+        let (task_compute_ms, park_records) =
+            match self.execute(&mut plan, failure_history, event_tx).await {
+                Ok(result) => result,
+                Err(e) => {
+                    self.write_run_manifest(&plan, iteration, None).await;
+                    return Err(e);
+                }
+            };
         let coordinator_quota_error = self.coordinator_quota_error(&plan).map(String::from);
-        self.cancel_exhausted_awaiting_tasks(&mut plan, coordinator_quota_error.is_some())
-            .await;
+        self.cancel_exhausted_awaiting_tasks(
+            &mut plan,
+            coordinator_quota_error.is_some(),
+            failure_history,
+            event_tx,
+        )
+        .await;
         let new_failure_start = failure_history.len();
         failure_history.extend(Self::collect_iteration_failures(&plan, iteration));
         let this_iteration_failures = &failure_history[new_failure_start..];
@@ -6110,8 +6202,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Cancel the parked approvals of each awaiting task and fail it when its
     /// resume would be refused: its own account is exhausted, or
     /// `coordinator_exhausted` says the run stops with no resume at all.
-    async fn cancel_exhausted_awaiting_tasks(&self, plan: &mut Plan, coordinator_exhausted: bool) {
-        let exhausted = self.exhausted_llms(plan);
+    async fn cancel_exhausted_awaiting_tasks(
+        &self,
+        plan: &mut Plan,
+        coordinator_exhausted: bool,
+        failure_history: &[FailedTaskRecord],
+        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+    ) {
+        let exhausted = self.exhausted_llms(plan, failure_history);
         for task in &mut plan.tasks {
             let TaskState::AwaitingApproval { pending } = &task.state else {
                 continue;
@@ -6127,14 +6225,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 "provider quota exhausted",
             )
             .await;
-            task.fail(
-                format!(
-                    "{} pending approval(s) cancelled: {}",
-                    pending.len(),
-                    crate::provider_error::QUOTA_EXHAUSTED_MESSAGE
-                ),
-                FailureCategory::ProviderQuotaExhausted,
+            let message = format!(
+                "{} pending approval(s) cancelled: {}",
+                pending.len(),
+                crate::provider_error::QUOTA_EXHAUSTED_MESSAGE
             );
+            task.fail(message.clone(), FailureCategory::ProviderQuotaExhausted);
+            self.emit_quota_task_completed(task.id, task.worker.as_deref(), message, event_tx)
+                .await;
         }
     }
 
@@ -7991,6 +8089,42 @@ mod tests {
         assert!(Orchestrator::quota_exhausted_stop(&plan, "too low").is_err());
     }
 
+    /// A failure that kept nothing is not output, so the stop stays an error
+    /// rather than a success made of "Failed:" lines.
+    #[test]
+    fn test_quota_exhausted_stop_ignores_a_failure_that_kept_nothing() {
+        use super::super::types::Task;
+
+        for (category, error) in [
+            (
+                FailureCategory::SoftFailure,
+                EMPTY_WORKER_RESULT.to_string(),
+            ),
+            (FailureCategory::SoftFailure, "  ".to_string()),
+            (
+                FailureCategory::AgentTimeout,
+                timed_out_message("Worker task timed out after 7s", ""),
+            ),
+            (
+                FailureCategory::LoopDetected,
+                format!("Worker failed task 0 after 1 attempts: {DUPLICATE_LOOP_FAILURE}\n"),
+            ),
+        ] {
+            let mut plan = Plan::new("Investigate");
+            let mut empty = Task::new(0, "Search logs", "Query the log index");
+            empty.fail(error.clone(), category);
+            plan.add_task(empty);
+
+            assert!(
+                Orchestrator::quota_exhausted_stop(&plan, "too low").is_err(),
+                "{error}"
+            );
+        }
+
+        let quoted = timed_out_message("timed out", "stopped before any output");
+        assert!(failure_kept_output(&quoted), "{quoted}");
+    }
+
     /// A quota failure that reaches the short-circuit is on a worker's own
     /// account, so the coordinator can still replan it. The coordinator's own
     /// account stops the run earlier.
@@ -8746,7 +8880,10 @@ mod tests {
         mark_awaiting(&mut plan, 1, vec![parked_call("kubectl_apply")]);
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
-        let (compute_ms, park_records) = orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+        let (compute_ms, park_records) = orchestrator
+            .execute(&mut plan, &[], &event_tx)
+            .await
+            .unwrap();
 
         assert_eq!(compute_ms, 0, "no worker ran");
         assert!(
@@ -9834,7 +9971,10 @@ mod tests {
                 .with_dependency(1),
         );
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(256);
-        orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+        orchestrator
+            .execute(&mut plan, &[], &event_tx)
+            .await
+            .unwrap();
         let next_wave_built = test_rig::take_worker_override().is_none();
         while test_rig::take_worker_override().is_some() {}
 
@@ -9907,9 +10047,28 @@ mod tests {
         task
     }
 
-    /// An exhausted worker account holds back only the work on that account:
-    /// a task on another account still runs, and one on the same account
-    /// stays pending with its worker never built.
+    /// The tasks a quota failure closed out with `quota_exhausted` set.
+    fn quota_completed_tasks(
+        events: &mut tokio::sync::mpsc::Receiver<Result<StreamItem, StreamError>>,
+    ) -> Vec<usize> {
+        let mut tasks = Vec::new();
+        while let Ok(item) = events.try_recv() {
+            if let Ok(StreamItem::AgentEvent(event)) = item
+                && let AgentEventPayload::TaskCompleted {
+                    task_id,
+                    quota_exhausted: true,
+                    ..
+                } = event.payload
+            {
+                tasks.push(task_id);
+            }
+        }
+        tasks
+    }
+
+    /// An exhausted worker account stops only the work on that account: a task
+    /// on another account still runs, and one on the same account fails with
+    /// the quota reason, its worker never built.
     #[tokio::test]
     async fn an_exhausted_worker_account_holds_back_only_its_own_tasks() {
         let _serial = WORKER_OVERRIDE_LOCK.lock().await;
@@ -9926,8 +10085,11 @@ mod tests {
         plan.add_task(failed_on_quota(0, "billing"));
         plan.add_task(Task::new(1, "Search logs", "r").with_worker("operations"));
         plan.add_task(Task::new(2, "Summarize spend", "r").with_worker("billing"));
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(256);
-        orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
+        orchestrator
+            .execute(&mut plan, &[], &event_tx)
+            .await
+            .unwrap();
         let spare_override = test_rig::take_worker_override().is_some();
         while test_rig::take_worker_override().is_some() {}
 
@@ -9938,8 +10100,76 @@ mod tests {
             "{:?}",
             plan.tasks
         );
+        assert!(plan.tasks[2].is_quota_exhausted(), "{:?}", plan.tasks);
+        assert_eq!(quota_completed_tasks(&mut event_rx), vec![2]);
+    }
+
+    /// A replanned iteration starts from a fresh plan, and an account an
+    /// earlier plan found exhausted is not called again.
+    #[tokio::test]
+    async fn a_replan_does_not_call_an_account_an_earlier_plan_found_exhausted() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut orchestrator, _store, _registry, _request_id) =
+            override_park_orchestrator(dir.path(), 4).await;
+        add_own_account_worker(&mut orchestrator, "billing");
+
+        let (answers, _) = scripted_worker(submits("done"));
+        let (held_back, held_back_model) = scripted_worker(submits("too late"));
+        test_rig::install_worker_overrides(vec![answers, held_back]);
+
+        let history = vec![FailedTaskRecord {
+            description: "Check spend".to_string(),
+            error: QUOTA_ERROR.to_string(),
+            iteration: 1,
+            worker: Some("billing".to_string()),
+            category: FailureCategory::ProviderQuotaExhausted,
+        }];
+        let mut plan = Plan::new("Investigate");
+        plan.add_task(Task::new(0, "Search logs", "r").with_worker("operations"));
+        plan.add_task(Task::new(1, "Summarize spend", "r").with_worker("billing"));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(256);
+        orchestrator
+            .execute(&mut plan, &history, &event_tx)
+            .await
+            .unwrap();
+        while test_rig::take_worker_override().is_some() {}
+
+        assert!(held_back_model.requests().lock().unwrap().is_empty());
         assert!(
-            matches!(plan.tasks[2].state, TaskState::Pending),
+            matches!(plan.tasks[0].state, TaskState::Complete { .. }),
+            "{:?}",
+            plan.tasks
+        );
+        assert!(plan.tasks[1].is_quota_exhausted(), "{:?}", plan.tasks);
+    }
+
+    /// With the coordinator's account exhausted the run is certain to stop, so
+    /// no wave starts, even on an account with credit.
+    #[tokio::test]
+    async fn an_exhausted_coordinator_account_starts_no_wave_on_any_account() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut orchestrator, _store, _registry, _request_id) =
+            override_park_orchestrator(dir.path(), 4).await;
+        add_own_account_worker(&mut orchestrator, "billing");
+
+        let (unused, unused_model) = scripted_worker(submits("too late"));
+        test_rig::install_worker_overrides(vec![unused]);
+
+        let mut plan = Plan::new("Investigate");
+        plan.add_task(failed_on_quota(0, "operations"));
+        plan.add_task(Task::new(1, "Summarize spend", "r").with_worker("billing"));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(256);
+        orchestrator
+            .execute(&mut plan, &[], &event_tx)
+            .await
+            .unwrap();
+        while test_rig::take_worker_override().is_some() {}
+
+        assert!(unused_model.requests().lock().unwrap().is_empty());
+        assert!(
+            matches!(plan.tasks[1].state, TaskState::Pending),
             "{:?}",
             plan.tasks
         );
@@ -9988,12 +10218,14 @@ mod tests {
         let (run, _events) =
             crate::run_context::RunContext::channel(request_id.parse().expect("a run id"));
 
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
         crate::run_context::with_run(
             Arc::clone(&run),
-            orchestrator.cancel_exhausted_awaiting_tasks(&mut plan, false),
+            orchestrator.cancel_exhausted_awaiting_tasks(&mut plan, false, &[], &event_tx),
         )
         .await;
         assert!(has_awaiting_task(&plan), "{:?}", plan.tasks);
+        assert!(quota_completed_tasks(&mut event_rx).is_empty());
         for call in &pending {
             assert!(store.get(&call.decision_id).await.unwrap().is_some());
         }
@@ -10001,10 +10233,15 @@ mod tests {
         plan.get_task_mut(1).unwrap().worker = Some("billing".to_string());
         crate::run_context::with_run(
             Arc::clone(&run),
-            orchestrator.cancel_exhausted_awaiting_tasks(&mut plan, false),
+            orchestrator.cancel_exhausted_awaiting_tasks(&mut plan, false, &[], &event_tx),
         )
         .await;
         assert!(plan.tasks[1].is_quota_exhausted(), "{:?}", plan.tasks);
+        assert_eq!(
+            quota_completed_tasks(&mut event_rx),
+            vec![1],
+            "a client that saw task_blocked is told the task ended"
+        );
         for call in &pending {
             assert!(store.get(&call.decision_id).await.unwrap().is_none());
         }
@@ -10296,7 +10533,10 @@ mod tests {
         let mut plan = Plan::new("Inspect");
         plan.add_task(Task::new(0, "Inspect the pool", "r").with_worker("operations"));
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
-        orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+        orchestrator
+            .execute(&mut plan, &[], &event_tx)
+            .await
+            .unwrap();
         let requests = model.requests().lock().unwrap().len();
         (plan.tasks[0].state.clone(), requests, event_rx)
     }
@@ -10550,7 +10790,10 @@ mod tests {
 
         let mut plan = Plan::new("Deploy");
         plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
-        orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+        orchestrator
+            .execute(&mut plan, &[], &event_tx)
+            .await
+            .unwrap();
 
         assert!(matches!(
             plan.tasks[0].state,
@@ -10596,7 +10839,10 @@ mod tests {
 
         let mut plan = Plan::new("Deploy");
         plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
-        let (_compute_ms, park_records) = orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+        let (_compute_ms, park_records) = orchestrator
+            .execute(&mut plan, &[], &event_tx)
+            .await
+            .unwrap();
         let TaskState::AwaitingApproval { pending } = &plan.tasks[0].state else {
             unreachable!("the fixture task is awaiting")
         };
