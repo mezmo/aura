@@ -151,7 +151,7 @@ impl ReadArtifactTool {
             }
         };
 
-        let tokens = match check_and_record_budget(&budget, &content) {
+        let tokens = match check_and_record_budget(&budget, Self::NAME, &content) {
             Ok(()) => return content,
             Err(check) => check.tokens(),
         };

@@ -186,6 +186,7 @@ impl ScratchpadMiddleware {
                 }
 
                 budget.record_intercepted(token_count);
+                crate::metrics::record_scratchpad_intercept(&ctx.tool_name, token_count as u64);
 
                 tracing::debug!(
                     "Scratchpad: intercepted {} output (~{} tokens) → {} ({} companions)",

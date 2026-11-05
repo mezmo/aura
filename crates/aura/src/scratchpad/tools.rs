@@ -173,15 +173,17 @@ impl BudgetCheckError {
     }
 }
 
-/// Check budget and record usage as an extraction from the scratchpad.
-/// Returns `Ok(())` if within budget, or `Err` with details for the caller
-/// to format.
+/// Check budget and record usage as an extraction from the scratchpad by
+/// the read tool `tool`. Returns `Ok(())` if within budget, or `Err` with
+/// details for the caller to format.
 pub(crate) fn check_and_record_budget(
     budget: &ContextBudget,
+    tool: &str,
     content: &str,
 ) -> Result<(), BudgetCheckError> {
     let tokens = check_budget(budget, content)?;
     budget.record_extracted(tokens);
+    crate::metrics::record_scratchpad_extract(tool, tokens as u64);
     Ok(())
 }
 
@@ -306,7 +308,7 @@ impl Tool for HeadTool {
             meta
         );
 
-        if let Err(e) = check_and_record_budget(&budget, &final_output) {
+        if let Err(e) = check_and_record_budget(&budget, Self::NAME, &final_output) {
             return Ok(format_budget_error(
                 e,
                 "head_too_large",
@@ -428,7 +430,7 @@ impl Tool for SliceTool {
             numbered, args.start, args.end, total_lines, meta
         );
 
-        if let Err(e) = check_and_record_budget(&budget, &final_output) {
+        if let Err(e) = check_and_record_budget(&budget, Self::NAME, &final_output) {
             let suggested_end = args.start + (args.end - args.start) / 2;
             return Ok(format_budget_error(
                 e,
@@ -613,7 +615,7 @@ impl Tool for GrepTool {
             meta
         );
 
-        if let Err(e) = check_and_record_budget(&budget, &final_output) {
+        if let Err(e) = check_and_record_budget(&budget, Self::NAME, &final_output) {
             return Ok(format_budget_error(
                 e,
                 "grep_too_large",
@@ -745,7 +747,7 @@ impl Tool for SchemaTool {
             schema, args.file, meta
         );
 
-        if let Err(e) = check_and_record_budget(&budget, &final_output) {
+        if let Err(e) = check_and_record_budget(&budget, Self::NAME, &final_output) {
             let suggestions = if is_markdown {
                 json!([
                     format!(
@@ -877,7 +879,7 @@ impl GetInTool {
             meta
         );
 
-        if let Err(e) = check_and_record_budget(budget, &final_output) {
+        if let Err(e) = check_and_record_budget(budget, Self::NAME, &final_output) {
             return Ok(format_budget_error(
                 e,
                 "get_in_too_large",
@@ -957,7 +959,7 @@ impl Tool for GetInTool {
                 numbered, args.path, meta
             );
 
-            if let Err(e) = check_and_record_budget(&budget, &final_output) {
+            if let Err(e) = check_and_record_budget(&budget, Self::NAME, &final_output) {
                 return Ok(format_budget_error(
                     e,
                     "get_in_too_large",
@@ -998,7 +1000,7 @@ impl Tool for GetInTool {
             numbered, args.path, meta
         );
 
-        if let Err(e) = check_and_record_budget(&budget, &final_output) {
+        if let Err(e) = check_and_record_budget(&budget, Self::NAME, &final_output) {
             return Ok(format_budget_error(
                 e,
                 "get_in_too_large",
@@ -1186,7 +1188,7 @@ impl Tool for IterateOverTool {
             result, args.path, window_desc, args.fields, meta
         );
 
-        if let Err(e) = check_and_record_budget(&budget, &final_output) {
+        if let Err(e) = check_and_record_budget(&budget, Self::NAME, &final_output) {
             let mut suggestions = Vec::new();
             // A retry is only proposed when it strictly narrows the window;
             // a single over-budget item needs fewer fields, not fewer items.
@@ -1380,7 +1382,7 @@ impl Tool for ItemSchemaTool {
             result, args.path, meta
         );
 
-        if let Err(e) = check_and_record_budget(&budget, &final_output) {
+        if let Err(e) = check_and_record_budget(&budget, Self::NAME, &final_output) {
             // Suggest halving the current window (min 10) as a starting point.
             let suggested_limit = (window_size / 2).max(10);
             return Ok(format_budget_error(
@@ -1749,7 +1751,7 @@ impl Tool for ReadTool {
             meta
         );
 
-        if let Err(e) = check_and_record_budget(&budget, &final_output) {
+        if let Err(e) = check_and_record_budget(&budget, Self::NAME, &final_output) {
             return Ok(format_budget_error(
                 e,
                 "read_too_large",

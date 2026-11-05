@@ -212,6 +212,8 @@ mod imp {
         operation_output_tokens: Histogram<u64>,
         mcp_operation_duration: Histogram<f64>,
         execute_tool_duration: Histogram<f64>,
+        scratchpad_intercepted_tokens: Histogram<u64>,
+        scratchpad_extracted_tokens: Histogram<u64>,
         mcp_server_connected: Gauge<u64>,
         mcp_server_tools: Gauge<u64>,
         routing: Counter<u64>,
@@ -304,6 +306,20 @@ mod imp {
                         "Duration of one tool execution as the agent sees it, middleware included",
                     )
                     .with_boundaries(MCP_SECONDS.to_vec())
+                    .build(),
+                scratchpad_intercepted_tokens: meter
+                    .u64_histogram("aura.scratchpad.intercepted_tokens")
+                    .with_unit("{token}")
+                    .with_description(
+                        "Tokens of one tool output the scratchpad kept out of the context window",
+                    )
+                    .with_boundaries(TOKENS.to_vec())
+                    .build(),
+                scratchpad_extracted_tokens: meter
+                    .u64_histogram("aura.scratchpad.extracted_tokens")
+                    .with_unit("{token}")
+                    .with_description("Tokens one scratchpad read returned to the context window")
+                    .with_boundaries(TOKENS.to_vec())
                     .build(),
                 mcp_server_connected: meter
                     .u64_gauge("aura.mcp.server.connected")
@@ -603,6 +619,18 @@ mod imp {
             .record(duration.as_secs_f64(), &attrs);
     }
 
+    pub fn record_scratchpad_intercept(tool: &str, tokens: u64) {
+        let Some(i) = instruments() else { return };
+        i.scratchpad_intercepted_tokens
+            .record(tokens, &[kv(GEN_AI_TOOL_NAME, tool)]);
+    }
+
+    pub fn record_scratchpad_extract(tool: &str, tokens: u64) {
+        let Some(i) = instruments() else { return };
+        i.scratchpad_extracted_tokens
+            .record(tokens, &[kv(GEN_AI_TOOL_NAME, tool)]);
+    }
+
     pub fn set_mcp_server_status(agent: &str, server: &str, connected: bool, tool_count: u64) {
         let Some(i) = instruments() else { return };
         let attrs = [kv(GEN_AI_AGENT_NAME, agent), kv(AURA_MCP_SERVER, server)];
@@ -674,6 +702,8 @@ mod stub {
     pub fn record_token_usage(_: &InferenceLabels, _: TokenMeasure) {}
     pub fn record_mcp_operation(_: &str, _: &str, _: Option<&str>, _: Duration) {}
     pub fn record_tool_execution(_: &str, _: Option<&str>, _: Duration) {}
+    pub fn record_scratchpad_intercept(_: &str, _: u64) {}
+    pub fn record_scratchpad_extract(_: &str, _: u64) {}
     pub fn set_mcp_server_status(_: &str, _: &str, _: bool, _: u64) {}
     pub fn record_routing_decision(_: &str, _: &str) {}
     pub fn record_planning_cycles(_: &str, _: u64) {}
@@ -736,6 +766,8 @@ mod tests {
             Duration::from_secs(1),
         );
         record_tool_execution("search_logs", None, Duration::from_secs(1));
+        record_scratchpad_intercept("search_logs", 9000);
+        record_scratchpad_extract("head", 300);
         set_mcp_server_status("demo", "mezmo", true, 17);
         record_routing_decision("demo", "orchestrated");
         record_planning_cycles("demo", 2);
@@ -756,6 +788,8 @@ mod tests {
             r#"gen_ai_client_inference_operation_input_tokens_sum{gen_ai_agent_name="demo",gen_ai_operation_name="chat",gen_ai_provider_name="aws.bedrock",gen_ai_request_model="claude"} 100"#,
             r#"mcp_client_operation_duration_seconds_count{aura_mcp_server="mezmo",error_type="tool_error",gen_ai_tool_name="search_logs",mcp_method_name="tools/call"} 1"#,
             r#"gen_ai_execute_tool_duration_seconds_count{gen_ai_tool_name="search_logs"} 1"#,
+            r#"aura_scratchpad_intercepted_tokens_sum{gen_ai_tool_name="search_logs"} 9000"#,
+            r#"aura_scratchpad_extracted_tokens_count{gen_ai_tool_name="head"} 1"#,
             r#"aura_mcp_server_connected{aura_mcp_server="mezmo",gen_ai_agent_name="demo"} 1"#,
             r#"aura_mcp_server_tools{aura_mcp_server="mezmo",gen_ai_agent_name="demo"} 17"#,
             r#"aura_orchestration_routing_total{aura_decision="orchestrated",gen_ai_agent_name="demo"} 1"#,
