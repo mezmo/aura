@@ -74,7 +74,7 @@ use super::persistence::ExecutionPersistence;
 use super::types::{
     BlockedCell, CellOutcome, FailedTaskRecord, FailureCategory, FailureSummary, IterationContext,
     IterationOutcome, IterationTimings, ParkSnapshot, PendingCall, Plan, PlanningResponse, Task,
-    TaskState, TaskStatus,
+    TaskState, TaskStatus, truncate_kept_output,
 };
 
 // ============================================================================
@@ -4924,10 +4924,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             safe_truncate(error, self.config.result_summary_length());
                         let suffix = if was_truncated { " [truncated]" } else { "" };
                         let kept = t.kept_output.as_deref().map_or(String::new(), |output| {
-                            let (output, was_truncated) =
-                                safe_truncate(output, self.config.result_summary_length());
-                            let suffix = if was_truncated { " [truncated]" } else { "" };
-                            format!("\n  {KEPT_OUTPUT_HEADING} {output}{suffix}")
+                            let output =
+                                truncate_kept_output(output, self.config.result_summary_length());
+                            format!("\n  {KEPT_OUTPUT_HEADING} {output}")
                         });
                         format!("✗ failed: {}{}{}", truncated, suffix, kept)
                     }
@@ -10136,6 +10135,25 @@ mod tests {
         assert!(summary.contains("found two idle nodes"), "{summary}");
         let raw = Orchestrator::build_raw_task_results(&plan, "note");
         assert!(raw.contains("found two idle nodes"), "{raw}");
+    }
+
+    /// The execution summary keeps the filename of kept output saved as an
+    /// artifact, which the same cut would otherwise remove.
+    #[tokio::test]
+    async fn the_execution_summary_keeps_a_kept_outputs_artifact_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let orchestrator = retry_orchestrator(dir.path(), artifact_threshold(40)).await;
+        let length = orchestrator.config.result_summary_length();
+        let footer = "[Full result (5000 chars) saved to artifact: task-0-sre-iter-1-result.txt]";
+        let mut task = Task::new(0, "Inspect the pool", "r");
+        task.fail("context overflow", FailureCategory::ContextOverflow);
+        task.kept_output = Some(format!("{}\n\n{footer}", "f".repeat(length)));
+        let mut plan = Plan::new("Inspect");
+        plan.add_task(task);
+
+        let summary = orchestrator.build_execution_summary(&plan);
+
+        assert!(summary.contains(footer), "{summary}");
     }
 
     /// With nothing from the first attempt to keep, the retry's hard error

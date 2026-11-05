@@ -1057,13 +1057,9 @@ impl IterationContext {
                     };
                     redesign_lines.push(line);
                     if let Some(output) = &t.kept_output {
-                        let (truncated, was_truncated) =
-                            crate::string_utils::safe_truncate(output, content_max_length);
-                        let suffix = if was_truncated { " [truncated]" } else { "" };
                         redesign_lines.push(format!(
-                            "    Output from an earlier attempt:\n{}{}",
-                            indent_lines(truncated),
-                            suffix
+                            "    Output from an earlier attempt:\n{}",
+                            indent_lines(&truncate_kept_output(output, content_max_length))
                         ));
                     }
                     // A task can fail after its tools succeeded — a timeout or
@@ -1229,6 +1225,19 @@ impl IterationContext {
 fn extract_artifact_footer(result: &str) -> Option<&str> {
     const FOOTER_PREFIX: &str = "[Full result (";
     result.rfind(FOOTER_PREFIX).map(|idx| &result[idx..])
+}
+
+/// `output` cut to `max_length`, with its artifact footer kept so the filename
+/// survives the cut.
+pub(super) fn truncate_kept_output(output: &str, max_length: usize) -> String {
+    let (truncated, was_truncated) = crate::string_utils::safe_truncate(output, max_length);
+    if !was_truncated {
+        return output.to_string();
+    }
+    match extract_artifact_footer(output) {
+        Some(footer) => format!("{truncated} [truncated]\n{footer}"),
+        None => format!("{truncated} [truncated]"),
+    }
 }
 
 /// Indent each line of `text` by 4 spaces for nesting under a task header.
@@ -2956,6 +2965,24 @@ mod tests {
         assert!(plain.get("kept_output").is_none());
         let legacy: Task = serde_json::from_value(plain).unwrap();
         assert_eq!(legacy.kept_output, None);
+    }
+
+    /// Kept output long enough to be saved as an artifact keeps the filename
+    /// through the same cut that made its preview.
+    #[test]
+    fn test_continuation_prompt_keeps_a_kept_outputs_artifact_filename() {
+        let footer = "[Full result (5000 chars) saved to artifact: task-0-sre-iter-1-result.txt]";
+        let mut task = Task::new(0, "Inspect", "r");
+        task.fail("context overflow", FailureCategory::ContextOverflow);
+        task.kept_output = Some(format!("{}\n\n{footer}", "finding ".repeat(50)));
+        let mut plan = Plan::new("Inspect");
+        plan.add_task(task);
+
+        let prompt = IterationContext::new(1, plan, None, vec![], HashMap::new())
+            .build_continuation_prompt(3, false, 100);
+
+        assert!(prompt.contains("[truncated]"), "{prompt}");
+        assert!(prompt.contains(footer), "{prompt}");
     }
 
     /// The continuation prompt shows kept output on its own line, however long
