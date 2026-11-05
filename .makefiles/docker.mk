@@ -32,6 +32,8 @@ lint-docker: | $(REPORT_DIR)
 	sed ${SED_INPLACE} 's/"file":"-"/"file":"Dockerfile"/g' report/ci/hadolint.json ; \
 	exit $$ret
 
+# The server image is server-ci (see Dockerfile), the runtime alone, so its
+# small layers are all its cache needs (mode=min).
 .PHONY: build-images
 build-images: | $(REPORT_DIR) ## Build server+test images via buildx with an S3 layer cache
 	@set -euo pipefail; \
@@ -74,10 +76,17 @@ build-images: | $(REPORT_DIR) ## Build server+test images via buildx with an S3 
 			- 2>&1 \
 		| tee $(REPORT_DIR)/buildx-cached-build-probe.log; \
 	manifest_hash=$$(cat Cargo.toml Cargo.lock crates/*/Cargo.toml | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d' ' -f1); \
+	cache_spec() { \
+		printf 'type=s3,region=%s,bucket=%s,prefix=%s,name=%s' \
+			"$${BUILD_CACHE_REGION}" "$${BUILD_CACHE_BUCKET}" "$${BUILD_CACHE_PREFIX}" "$$1"; \
+	}; \
 	build_target() { \
-		local target=$$1 cache_name=$$2 tag=$$3 extra_args=$${4:-}; \
+		local target=$$1 cache_name=$$2 tag=$$3 extra_args=$${4:-} cache_mode=$${5:-max} extra_cache_from=$${6:-}; \
 		local log="$(REPORT_DIR)/buildx-cached-build-$${target}.log"; \
-		local cache_spec="type=s3,region=$${BUILD_CACHE_REGION},bucket=$${BUILD_CACHE_BUCKET},prefix=$${BUILD_CACHE_PREFIX},name=$${cache_name}"; \
+		local cache_from="--cache-from $$(cache_spec "$${cache_name}")" from_name; \
+		for from_name in $$extra_cache_from; do \
+			cache_from="$$cache_from --cache-from $$(cache_spec "$$from_name")"; \
+		done; \
 		local started finished; \
 		started=$$(date +%s); \
 		docker buildx build \
@@ -87,8 +96,8 @@ build-images: | $(REPORT_DIR) ## Build server+test images via buildx with an S3 
 			--pull \
 			$$extra_args \
 			--target "$${target}" \
-			--cache-from "$${cache_spec}" \
-			--cache-to "$${cache_spec},mode=max" \
+			$$cache_from \
+			--cache-to "$$(cache_spec "$${cache_name}"),mode=$${cache_mode}" \
 			--load \
 			-t "$${tag}" \
 			-f Dockerfile . 2>&1 \
@@ -110,7 +119,7 @@ build-images: | $(REPORT_DIR) ## Build server+test images via buildx with an S3 
 	}; \
 	build_target test test-amd64 "$${AURA_TEST_IMAGE}" \
 		"--build-arg NEXTEST_VERSION=$(NEXTEST_VERSION) --build-arg GRCOV_VERSION=$(GRCOV_VERSION)"; \
-	build_target server server-amd64 "$${AURA_SERVER_IMAGE}"; \
+	build_target server-ci server-amd64 "$${AURA_SERVER_IMAGE}" "" min; \
 	docker image ls --format '{{.Repository}}:{{.Tag}} {{.Size}}' \
 		| grep -F -e "$${AURA_SERVER_IMAGE}" -e "$${AURA_TEST_IMAGE}" || true
 

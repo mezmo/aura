@@ -258,6 +258,11 @@ impl ToolWrapper for PersistenceWrapper {
             notify: self.drain_notify.clone(),
         };
 
+        // Take the call's entry before any early return, so every call that
+        // `transform_output` cached is removed exactly once.
+        let raw_output = find_field(extracted, CALL_ID_FIELD)
+            .and_then(|id| self.raw_outputs.lock().unwrap().remove(id));
+
         let task_id = match (ctx.task_id, ctx.attempt) {
             (Some(tid), Some(_)) => tid,
             _ => {
@@ -270,8 +275,6 @@ impl ToolWrapper for PersistenceWrapper {
         };
 
         let reasoning = find_field(extracted, "reasoning").unwrap_or("").to_string();
-        let raw_output = find_field(extracted, CALL_ID_FIELD)
-            .and_then(|id| self.raw_outputs.lock().unwrap().remove(id));
 
         // Prefer the raw output captured in `transform_output` over the
         // `result` later wrappers may have added to. An `Err` takes the raw
@@ -879,6 +882,32 @@ mod tests {
         assert!(
             wrapper.raw_outputs.lock().unwrap().is_empty(),
             "on_complete should drain the per-call cache entry"
+        );
+    }
+
+    /// A call with no task context skips persistence, but `on_complete` still
+    /// drops the raw output `transform_output` cached for it.
+    #[tokio::test]
+    async fn test_raw_output_dropped_when_call_has_no_task_context() {
+        let wrapper = test_wrapper(Arc::new(Mutex::new(ExecutionPersistence::disabled())));
+
+        let ctx = ToolCallContext::new("tool");
+        assert!(ctx.task_id.is_none() && ctx.attempt.is_none());
+        let TransformArgsResult { extracted, .. } =
+            wrapper.transform_args(serde_json::json!({}), &ctx);
+        let extracted = extracted.expect("transform_args always produces extracted");
+
+        let _ = wrapper
+            .transform_output("raw output".to_string(), false, &ctx, Some(&extracted))
+            .await;
+        assert_eq!(wrapper.raw_outputs.lock().unwrap().len(), 1);
+
+        wrapper
+            .on_complete(&ctx, Some(&extracted), Ok("raw output"), 7)
+            .await;
+        assert!(
+            wrapper.raw_outputs.lock().unwrap().is_empty(),
+            "on_complete should drop the cached output even without a task context"
         );
     }
 

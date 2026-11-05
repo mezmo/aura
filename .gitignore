@@ -8,6 +8,9 @@
 # Release binaries
 /dist/
 
+# CI web-server binary, copied out of the test container
+/.ci-bin/
+
 # Written by the release config's verifyReleaseCmd
 /.next-release-version
 

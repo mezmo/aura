@@ -171,6 +171,7 @@ impl RigBuilder {
         let mut build_context = self.discovered_build_context(req_headers)?;
         resolve_mcp_headers(&mut build_context, req_headers);
         build_context.session_id = session_id;
+        let client_tools = client_tools.map(|tools| build_context.filter_client_tools(tools));
         PreparedAgent::prepare(&build_context, additional_tools, client_tools)
             .await
             .map(Arc::new)
@@ -847,5 +848,38 @@ source = '/nonexistent/path/to/worker/skills'
             .discovered_build_context(None)
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    /// The chat-completions handler and the CLI prepare a single agent through
+    /// `prepare_agent`, so `client_tool_filter` has to apply there (#827).
+    #[tokio::test]
+    async fn prepare_agent_applies_client_tool_filter() {
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+enable_client_tools = true
+client_tool_filter = ["Read"]
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+"#;
+        let loaded = load_config_from_str(config).expect("should parse");
+        let tool = |name: &str| ClientTool {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        };
+
+        let prepared = RigBuilder::new(loaded, PendingApprovals::new())
+            .prepare_agent(None, vec![], Some(vec![tool("Read"), tool("Shell")]), None)
+            .await
+            .expect("agent should prepare");
+
+        let mut names: Vec<_> = prepared.client_tool_names.iter().cloned().collect();
+        names.sort();
+        assert_eq!(names, ["Read"]);
     }
 }

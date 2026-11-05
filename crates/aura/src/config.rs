@@ -107,6 +107,9 @@ pub struct AgentBuildContext {
     /// The resolved `[hitl]` approval policy.
     pub hitl: Option<HitlPolicy>,
 
+    /// The `[hitl]` config gate as a tool middleware layer.
+    pub hitl_gate_layer: Option<Arc<dyn ToolMiddleware>>,
+
     /// The run this build serves.
     pub run_id: Option<RunId>,
 
@@ -150,6 +153,7 @@ impl Clone for AgentBuildContext {
             scratchpad_tools_config: self.scratchpad_tools_config.clone(),
             orchestration_submit_result: self.orchestration_submit_result.clone(),
             hitl: self.hitl.clone(),
+            hitl_gate_layer: self.hitl_gate_layer.clone(),
             run_id: self.run_id,
             forwarded_headers: self.forwarded_headers.clone(),
             instance_id: self.instance_id.clone(),
@@ -199,6 +203,10 @@ impl std::fmt::Debug for AgentBuildContext {
                     .map(|_| "<submit_result>"),
             )
             .field("hitl", &self.hitl.as_ref().map(|_| "<hitl>"))
+            .field(
+                "hitl_gate_layer",
+                &self.hitl_gate_layer.as_ref().map(|_| "<gate>"),
+            )
             .field("run_id", &self.run_id)
             .field("forwarded_headers", &self.forwarded_headers)
             .field("instance_id", &self.instance_id)
@@ -295,6 +303,17 @@ impl AgentBuildContext {
             Some(patterns) if patterns.is_empty() => true,
             Some(patterns) => patterns.iter().any(|p| p.matches(None, tool_name)),
         }
+    }
+
+    /// Keeps the client tools that pass `[agent].client_tool_filter`.
+    pub fn filter_client_tools(
+        &self,
+        tools: Vec<crate::builder::ClientTool>,
+    ) -> Vec<crate::builder::ClientTool> {
+        tools
+            .into_iter()
+            .filter(|t| self.client_tool_matches_filter(&t.name))
+            .collect()
     }
 
     /// Get the effective system prompt for agent building.
@@ -506,5 +525,26 @@ mod tests {
         assert!(build_context.client_tool_matches_filter("Read"));
         assert!(build_context.client_tool_matches_filter("FindFiles"));
         assert!(!build_context.client_tool_matches_filter("Shell"));
+    }
+
+    #[test]
+    fn filter_client_tools_keeps_only_matching_tools() {
+        let build_context = AgentBuildContext {
+            agent: AgentSettings {
+                client_tool_filter: Some(vec!["Read".into()]),
+                ..AgentSettings::default()
+            },
+            ..Default::default()
+        };
+        let tool = |name: &str| crate::builder::ClientTool {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+        };
+
+        let kept = build_context.filter_client_tools(vec![tool("Read"), tool("Shell")]);
+
+        let names: Vec<_> = kept.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["Read"]);
     }
 }
