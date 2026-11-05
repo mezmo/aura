@@ -79,6 +79,18 @@ pub struct ParkedApproval {
     pub request: ApprovalRequest,
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
+    /// The polling approval's target binding.
+    pub polling_target: Option<PollingTarget>,
+}
+
+/// The resolved target and original invocation covered by a polling approval.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PollingTarget {
+    pub server_id: String,
+    pub namespace: String,
+    pub tool_name: String,
+    /// The original, unnormalized `wait_for` arguments.
+    pub invocation_arguments: serde_json::Value,
 }
 
 /// Why a [`PendingApprovals::resolve`] could not complete.
@@ -125,6 +137,7 @@ impl PendingApprovals {
         let now = chrono::Utc::now();
         let (tx, rx) = oneshot::channel();
         let parked = ParkedApproval {
+            polling_target: None,
             request,
             registered_at: now,
             expires_at: now

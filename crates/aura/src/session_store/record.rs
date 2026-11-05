@@ -35,6 +35,8 @@ pub struct ParkedApprovalRecord {
     pub items: Vec<ApprovalItem>,
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polling_target: Option<crate::hitl::PollingTarget>,
 }
 
 /// Storage form of [`AgentScope`].
@@ -126,6 +128,7 @@ impl From<&ParkedApproval> for ParkedApprovalRecord {
             items: request.items.clone(),
             registered_at: parked.registered_at,
             expires_at: parked.expires_at,
+            polling_target: parked.polling_target.clone(),
         }
     }
 }
@@ -146,6 +149,7 @@ impl TryFrom<ParkedApprovalRecord> for ParkedApproval {
             },
             registered_at: record.registered_at,
             expires_at: record.expires_at,
+            polling_target: record.polling_target,
         })
     }
 }
@@ -247,6 +251,7 @@ mod tests {
     fn parked(scope: AgentScope, origin: ApprovalOrigin) -> ParkedApproval {
         let now = chrono::Utc::now();
         ParkedApproval {
+            polling_target: None,
             request: ApprovalRequest {
                 version: PROTOCOL_VERSION,
                 instance_id: "test-instance".to_string(),
@@ -288,6 +293,24 @@ mod tests {
                 agent_name: "test-agent".to_string(),
             },
         ));
+    }
+
+    #[test]
+    fn polling_target_and_raw_invocation_survive_storage() {
+        let mut approval = parked(
+            AgentScope::Single { session_id: None },
+            ApprovalOrigin::ConfigGate {
+                matched_pattern: "*".to_owned(),
+                agent_name: "worker".to_owned(),
+            },
+        );
+        approval.polling_target = Some(crate::hitl::PollingTarget {
+            server_id: "server-id".to_owned(),
+            namespace: "test".to_owned(),
+            tool_name: "query".to_owned(),
+            invocation_arguments: serde_json::json!({"probe": {"tool": "query", "args": {}}}),
+        });
+        assert_round_trip(approval);
     }
 
     #[test]

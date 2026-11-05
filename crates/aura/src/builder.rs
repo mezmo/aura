@@ -1351,6 +1351,14 @@ impl PreparedAgent {
         if let Some(ref decision) = build_context.orchestration_submit_result {
             let submit_tool = crate::orchestration::SubmitResultTool::new(decision.clone());
             builder_state = builder_state.add_tool(submit_tool);
+            if let Some(mcp) = mcp_manager {
+                builder_state = builder_state.add_tools_dyn(vec![Box::new(
+                    crate::orchestration::tools::WaitForTool::scoped(
+                        Arc::clone(mcp),
+                        build_context,
+                    ),
+                )]);
+            }
         }
 
         // Native run tools (the Slack tools) run through the HITL gate layer
@@ -3111,6 +3119,66 @@ timeout_secs = 60
         use super::*;
         use crate::mcp::client::tests::RecordingMcpServer;
         use crate::mcp::{McpClient, McpManager};
+
+        #[tokio::test]
+        async fn an_external_native_tool_named_wait_for_keeps_its_gate() {
+            struct ExternalWaitFor(Arc<std::sync::atomic::AtomicUsize>);
+            impl rig::tool::Tool for ExternalWaitFor {
+                const NAME: &'static str = "wait_for";
+                type Args = serde_json::Value;
+                type Output = String;
+                type Error = std::convert::Infallible;
+                async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+                    rig::completion::ToolDefinition {
+                        name: Self::NAME.to_owned(),
+                        description: String::new(),
+                        parameters: json!({"type": "object"}),
+                    }
+                }
+                async fn call(&self, _args: Self::Args) -> Result<String, Self::Error> {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok("executed".to_owned())
+                }
+            }
+            let invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let native = ExternalWaitFor(Arc::clone(&invocations));
+            let gate = Arc::new(crate::hitl::HitlApprovalWrapper::new(
+                Arc::from(["*".into()]),
+                Arc::new(crate::hitl::DecisionRoute::Webhook {
+                    client: crate::hitl::WebhookClient::new(
+                        reqwest::Client::new(),
+                        aura_config::WebhookUrl::new("http://127.0.0.1:9").unwrap(),
+                    ),
+                    timeout: std::time::Duration::from_secs(1),
+                }),
+                crate::hitl::AgentScope::Single { session_id: None },
+                "agent".to_owned(),
+                "instance".to_owned(),
+            ));
+            let context = AgentBuildContext {
+                hitl_gate_layer: Some(Arc::new(crate::tool_middleware::WrapperLayer(gate))),
+                ..Default::default()
+            };
+            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
+            let agent = PreparedAgent::add_all_tools(
+                state,
+                &context,
+                &None,
+                &Arc::default(),
+                vec![Box::new(native)],
+            )
+            .await
+            .unwrap()
+            .build();
+            assert!(
+                agent
+                    .tool_server_handle
+                    .call_tool("wait_for", "{}")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(invocations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
 
         async fn client_for(namespace: &str, server: &RecordingMcpServer) -> McpClient {
             McpClient::new(

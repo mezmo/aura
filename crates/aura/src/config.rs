@@ -109,6 +109,8 @@ pub struct AgentBuildContext {
 
     /// The `[hitl]` config gate as a tool middleware layer.
     pub hitl_gate_layer: Option<Arc<dyn ToolMiddleware>>,
+    /// The same gate, retained for delegated polling authorization.
+    pub hitl_gate: Option<Arc<crate::hitl::HitlApprovalWrapper>>,
 
     /// The run this build serves.
     pub run_id: Option<RunId>,
@@ -154,6 +156,7 @@ impl Clone for AgentBuildContext {
             orchestration_submit_result: self.orchestration_submit_result.clone(),
             hitl: self.hitl.clone(),
             hitl_gate_layer: self.hitl_gate_layer.clone(),
+            hitl_gate: self.hitl_gate.clone(),
             run_id: self.run_id,
             forwarded_headers: self.forwarded_headers.clone(),
             instance_id: self.instance_id.clone(),

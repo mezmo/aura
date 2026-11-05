@@ -615,6 +615,7 @@ mod tests {
     fn parked(request_id: &str) -> ParkedApproval {
         let now = chrono::Utc::now();
         ParkedApproval {
+            polling_target: None,
             request: ApprovalRequest {
                 version: PROTOCOL_VERSION,
                 instance_id: "test-instance".to_string(),

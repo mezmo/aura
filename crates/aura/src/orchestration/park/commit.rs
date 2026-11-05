@@ -319,6 +319,7 @@ mod tests {
         expires_at: chrono::DateTime<chrono::Utc>,
     ) -> ParkedApproval {
         ParkedApproval {
+            polling_target: None,
             request: ApprovalRequest {
                 version: PROTOCOL_VERSION,
                 instance_id: "test-instance".to_string(),

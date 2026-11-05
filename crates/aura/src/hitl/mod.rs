@@ -48,7 +48,7 @@ pub(crate) use events::completed_cancelled_event;
 pub(crate) use gate::DENIAL_PREFIX;
 pub use gate::HitlApprovalWrapper;
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
-pub use registry::{ParkedApproval, PendingApprovals, ResolveError};
+pub use registry::{ParkedApproval, PendingApprovals, PollingTarget, ResolveError};
 pub use route::{
     ApprovalError, DecisionRoute, HitlPolicy, PlaintextWebhookUrlError, WebhookClient,
     cleartext_capture_warning, validate_webhook_signing_config, warn_on_cleartext_capture,

@@ -11,7 +11,13 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::hitl::ApprovalDecision;
+use crate::hitl::{ApprovalDecision, PollingTarget};
+
+#[derive(Debug)]
+struct RecordedDecision {
+    decision: ApprovalDecision,
+    polling_target: Option<PollingTarget>,
+}
 
 /// Decisions already recorded for this run's parked calls, consumed at most
 /// once each. `strict_tasks` holds the task ids whose continuation is
@@ -24,7 +30,7 @@ use crate::hitl::ApprovalDecision;
 /// mismatch) clears the task's entry.
 #[derive(Debug, Default)]
 pub(crate) struct RecordedDecisions {
-    entries: Mutex<HashMap<CallKey, VecDeque<ApprovalDecision>>>,
+    entries: Mutex<HashMap<CallKey, VecDeque<RecordedDecision>>>,
     strict_tasks: Mutex<HashSet<usize>>,
 }
 
@@ -34,12 +40,24 @@ impl RecordedDecisions {
     /// decisions. Wired by the orchestrator continuation (P44 commit 3).
     #[allow(dead_code)]
     pub(crate) fn push(&self, key: CallKey, decision: ApprovalDecision) {
+        self.push_bound(key, decision, None);
+    }
+
+    pub(crate) fn push_bound(
+        &self,
+        key: CallKey,
+        decision: ApprovalDecision,
+        polling_target: Option<PollingTarget>,
+    ) {
         self.entries
             .lock()
             .expect("recorded-decisions lock")
             .entry(key)
             .or_default()
-            .push_back(decision);
+            .push_back(RecordedDecision {
+                decision,
+                polling_target,
+            });
     }
 
     /// Mark a task's continuation as in-flight (`on = true`) or clear it. A
@@ -65,12 +83,30 @@ impl RecordedDecisions {
 
     /// Consume one decision for a key in recorded order; the next call returns
     /// the following decision, and an empty queue returns `None`.
+    #[cfg(test)]
     pub(crate) fn take(&self, key: &CallKey) -> Option<ApprovalDecision> {
-        self.entries
+        self.take_bound(key, None).ok().flatten()
+    }
+
+    pub(crate) fn take_bound(
+        &self,
+        key: &CallKey,
+        target: Option<&PollingTarget>,
+    ) -> Result<Option<ApprovalDecision>, &'static str> {
+        let entry = self
+            .entries
             .lock()
             .expect("recorded-decisions lock")
             .get_mut(key)
-            .and_then(VecDeque::pop_front)
+            .and_then(VecDeque::pop_front);
+        entry
+            .map(|entry| {
+                if entry.polling_target.as_ref() != target {
+                    return Err("resume mismatch: polling target changed");
+                }
+                Ok(entry.decision)
+            })
+            .transpose()
     }
 
     /// Arm a drop guard that holds `task_id` strict until the guard is
@@ -142,6 +178,82 @@ mod tests {
 
     fn key(task_id: usize, tool_name: &str, args: &Value) -> CallKey {
         CallKey::new(task_id, tool_name, args)
+    }
+
+    #[test]
+    fn polling_consent_is_consumed_once_and_requires_the_exact_target() {
+        let args = serde_json::json!({"probe": {"tool": "query", "args": {"q": 1}}});
+        let target = PollingTarget {
+            server_id: "server-a".to_owned(),
+            namespace: "ns".to_owned(),
+            tool_name: "query".to_owned(),
+            invocation_arguments: args.clone(),
+        };
+        let recorded = RecordedDecisions::default();
+        recorded.push_bound(
+            key(1, "wait_for", &args),
+            ApprovalDecision::Approved,
+            Some(target.clone()),
+        );
+        assert_eq!(
+            recorded
+                .take_bound(&key(1, "wait_for", &args), Some(&target))
+                .unwrap(),
+            Some(ApprovalDecision::Approved)
+        );
+        assert_eq!(
+            recorded
+                .take_bound(&key(1, "wait_for", &args), Some(&target))
+                .unwrap(),
+            None
+        );
+        for changed in [
+            PollingTarget {
+                server_id: "server-b".to_owned(),
+                ..target.clone()
+            },
+            PollingTarget {
+                namespace: "other".to_owned(),
+                ..target.clone()
+            },
+            PollingTarget {
+                tool_name: "other".to_owned(),
+                ..target.clone()
+            },
+            PollingTarget {
+                invocation_arguments: serde_json::json!({}),
+                ..target.clone()
+            },
+        ] {
+            recorded.push_bound(
+                key(1, "wait_for", &args),
+                ApprovalDecision::Approved,
+                Some(target.clone()),
+            );
+            assert!(
+                recorded
+                    .take_bound(&key(1, "wait_for", &args), Some(&changed))
+                    .is_err()
+            );
+        }
+        recorded.push_bound(
+            key(1, "wait_for", &args),
+            ApprovalDecision::Approved,
+            Some(target.clone()),
+        );
+        assert!(
+            recorded
+                .take_bound(&key(1, "wait_for", &args), None)
+                .is_err(),
+            "ordinary calls cannot consume polling consent"
+        );
+        recorded.push(key(1, "wait_for", &args), ApprovalDecision::Approved);
+        assert!(
+            recorded
+                .take_bound(&key(1, "wait_for", &args), Some(&target))
+                .is_err(),
+            "ordinary consent cannot authorize polling"
+        );
     }
 
     /// Two same-key decisions consume in recorded order; a third take is

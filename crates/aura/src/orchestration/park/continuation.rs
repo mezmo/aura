@@ -267,7 +267,11 @@ pub(crate) async fn load_recorded_decisions(
                     call.decision_id
                 )));
             };
-            if item.tool_name != call.tool_name || item.arguments != call.arguments {
+            let invocation_arguments = parked
+                .polling_target
+                .as_ref()
+                .map_or(&item.arguments, |target| &target.invocation_arguments);
+            if item.tool_name != call.tool_name || *invocation_arguments != call.arguments {
                 return Err(RehydrateError::Mismatch(format!(
                     "documented call {}({}) does not match the stored approval",
                     call.tool_name, call.decision_id
@@ -285,9 +289,10 @@ pub(crate) async fn load_recorded_decisions(
             };
             // The key's task id comes from the awaiting node, the tool name
             // and arguments from the store's approval record.
-            recorded.push(
-                CallKey::new(node.task_id, &item.tool_name, &item.arguments),
+            recorded.push_bound(
+                CallKey::new(node.task_id, &item.tool_name, invocation_arguments),
                 decision,
+                parked.polling_target.clone(),
             );
             decision_ids.push(call.decision_id);
         }
@@ -384,6 +389,7 @@ mod tests {
 
     fn approval(decision_id: DecisionId, args: serde_json::Value) -> ParkedApproval {
         ParkedApproval {
+            polling_target: None,
             request: ApprovalRequest {
                 version: PROTOCOL_VERSION,
                 instance_id: "test-instance".to_string(),
