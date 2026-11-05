@@ -366,6 +366,8 @@ pub struct Task {
     pub structured_output: Option<StructuredTaskOutput>,
     /// Run artifact filenames attached to this task.
     pub artifacts: Vec<String>,
+    /// Output of an earlier attempt of this failed task.
+    pub kept_output: Option<String>,
 }
 
 impl Serialize for Task {
@@ -399,6 +401,9 @@ impl Serialize for Task {
         if !self.artifacts.is_empty() {
             map.serialize_entry("artifacts", &self.artifacts)?;
         }
+        if let Some(ref output) = self.kept_output {
+            map.serialize_entry("kept_output", output)?;
+        }
         map.end()
     }
 }
@@ -426,6 +431,8 @@ impl<'de> Deserialize<'de> for Task {
             structured_output: Option<StructuredTaskOutput>,
             #[serde(default)]
             artifacts: Vec<String>,
+            #[serde(default)]
+            kept_output: Option<String>,
         }
         let h = TaskHelper::deserialize(deserializer)?;
         let state = match h.status {
@@ -451,6 +458,7 @@ impl<'de> Deserialize<'de> for Task {
             rationale: h.rationale,
             structured_output: h.structured_output,
             artifacts: h.artifacts,
+            kept_output: h.kept_output,
         })
     }
 }
@@ -475,6 +483,7 @@ impl Task {
             rationale: rationale.into(),
             structured_output: None,
             artifacts: Vec::new(),
+            kept_output: None,
         }
     }
 
@@ -1047,6 +1056,16 @@ impl IterationContext {
                         }
                     };
                     redesign_lines.push(line);
+                    if let Some(output) = &t.kept_output {
+                        let (truncated, was_truncated) =
+                            crate::string_utils::safe_truncate(output, content_max_length);
+                        let suffix = if was_truncated { " [truncated]" } else { "" };
+                        redesign_lines.push(format!(
+                            "    Output from an earlier attempt:\n{}{}",
+                            indent_lines(truncated),
+                            suffix
+                        ));
+                    }
                     // A task can fail after its tools succeeded — a timeout or
                     // depth limit reached before submit_result. Those artifacts
                     // are on disk and readable, so list them as for completed
@@ -2917,6 +2936,45 @@ mod tests {
             let deserialized: FailureCategory = serde_json::from_str(&json).unwrap();
             assert_eq!(&deserialized, variant);
         }
+    }
+
+    /// Kept output survives a saved plan, and a plan saved before it existed
+    /// still loads.
+    #[test]
+    fn test_kept_output_serde_roundtrip() {
+        let mut task = Task::new(0, "Inspect", "r");
+        task.fail("401", FailureCategory::ProviderAuthError);
+        task.kept_output = Some("found two idle nodes".to_string());
+
+        let json = serde_json::to_value(&task).unwrap();
+        assert_eq!(json["error"], "401");
+        assert_eq!(json["kept_output"], "found two idle nodes");
+        let back: Task = serde_json::from_value(json).unwrap();
+        assert_eq!(back.kept_output.as_deref(), Some("found two idle nodes"));
+
+        let plain = serde_json::to_value(Task::new(1, "Plain", "r")).unwrap();
+        assert!(plain.get("kept_output").is_none());
+        let legacy: Task = serde_json::from_value(plain).unwrap();
+        assert_eq!(legacy.kept_output, None);
+    }
+
+    /// The continuation prompt shows kept output on its own line, however long
+    /// the error is.
+    #[test]
+    fn test_continuation_prompt_shows_kept_output() {
+        let mut task = Task::new(0, "Inspect", "r");
+        task.fail(
+            "provider refused. ".repeat(100),
+            FailureCategory::AgentError,
+        );
+        task.kept_output = Some("found two idle nodes".to_string());
+        let mut plan = Plan::new("Inspect");
+        plan.add_task(task);
+
+        let prompt = IterationContext::new(1, plan, None, vec![], HashMap::new())
+            .build_continuation_prompt(3, false, 200);
+
+        assert!(prompt.contains("found two idle nodes"), "{prompt}");
     }
 
     #[test]
