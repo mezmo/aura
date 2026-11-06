@@ -2371,8 +2371,7 @@ api_key = "test"
 model = "gpt-4"
 "#;
 
-    /// Header names are lowercased before use, so two names equal ignoring
-    /// case would collapse into one entry with an arbitrary value.
+    /// See `validate_header_names_unique`.
     #[test]
     fn header_names_differing_only_by_case_are_rejected() {
         for (table, location) in [
@@ -2418,5 +2417,24 @@ model = "gpt-4"
             "{HEADER_CASE_BASE}\n[mcp.servers.example]\ntransport = \"http_streamable\"\nurl = \"http://localhost:9999/mcp\"\nheaders = {{ Authorization = \"Bearer A\", X-Tenant = \"t\" }}\nheaders_from_request = {{ authorization = \"authorization\" }}\n"
         );
         load_config_from_str(&toml).expect("distinct header names should load");
+    }
+
+    #[test]
+    fn invalid_header_names_are_rejected() {
+        for headers in [
+            "headers = { \"Authorization:\" = \"Bearer x\" }",
+            "headers = { \"X Tenant\" = \"t\" }",
+            "headers = { \"X\u{2013}Tenant\" = \"t\" }",
+            "headers = { \"\u{212A}-Tenant\" = \"a\", \"k-tenant\" = \"b\" }",
+        ] {
+            let toml = format!(
+                "{HEADER_CASE_BASE}\n[mcp.servers.example]\ntransport = \"http_streamable\"\nurl = \"http://localhost:9999/mcp\"\n{headers}\n"
+            );
+            let err = load_config_from_str(&toml).expect_err(headers).to_string();
+            assert!(
+                err.contains("is not a valid header name"),
+                "unexpected error for {headers}: {err}"
+            );
+        }
     }
 }
