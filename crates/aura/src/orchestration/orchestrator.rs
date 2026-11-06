@@ -3446,7 +3446,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let shared_mcp: Option<Arc<McpManager>> = self.mcp_manager.clone();
 
         // Box<dyn ToolDyn> is not Clone, so each provider arm constructs its own instance.
-        let wait_for_tools = || self.worker_own_tools();
+        let run_tools = || self.worker_own_tools();
 
         // Test-only model injection (park/reify rig): a queued override builds
         // this worker from a scripted model. The override's extra tools go
@@ -3492,7 +3492,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 worker_build_context,
                 &shared_mcp,
                 run,
-                wait_for_tools(),
+                run_tools(),
             )
             .await?;
             return Ok((
@@ -3551,7 +3551,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     worker_build_context,
                     &shared_mcp,
                     run,
-                    wait_for_tools(),
+                    run_tools(),
                 )
                 .await?;
                 Ok((ProviderAgent::OpenAI(state.build()), model.clone()))
@@ -3595,7 +3595,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     worker_build_context,
                     &shared_mcp,
                     run,
-                    wait_for_tools(),
+                    run_tools(),
                 )
                 .await?;
                 Ok((ProviderAgent::Anthropic(state.build()), model.clone()))
@@ -3647,7 +3647,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     worker_build_context,
                     &shared_mcp,
                     run,
-                    wait_for_tools(),
+                    run_tools(),
                 )
                 .await?;
                 Ok((ProviderAgent::Bedrock(state.build()), model.clone()))
@@ -3684,7 +3684,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     worker_build_context,
                     &shared_mcp,
                     run,
-                    wait_for_tools(),
+                    run_tools(),
                 )
                 .await?;
                 Ok((ProviderAgent::Gemini(state.build()), model.clone()))
@@ -3720,7 +3720,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     worker_build_context,
                     &shared_mcp,
                     run,
-                    wait_for_tools(),
+                    run_tools(),
                 )
                 .await?;
                 Ok((ProviderAgent::Ollama(state.build()), model.clone()))
@@ -3760,7 +3760,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     worker_build_context,
                     &shared_mcp,
                     run,
-                    wait_for_tools(),
+                    run_tools(),
                 )
                 .await?;
                 Ok((ProviderAgent::OpenRouter(state.build()), model.clone()))
@@ -8694,6 +8694,7 @@ mod tests {
                             tool_namespace: None,
                             arguments: serde_json::json!({ "namespace": "prod" }),
                             tool_call_intent: None,
+                            polling: None,
                         }],
                     },
                     registered_at: now,
@@ -9320,7 +9321,7 @@ mod tests {
             .unwrap()
             .patterns = Arc::from(["*".into()]);
         orchestrator.mcp_manager = Some(manager_for("server-a"));
-        // Approval intent includes effective defaults; replay keeps the original arguments.
+        // Approval scope includes effective defaults; replay keeps the original arguments.
         let args = serde_json::json!({"probe": {"tool": "probe_tool", "args": {"query": "fixed"}}, "until": {"matches": "ok"}});
         let reasoning = "Wait for the rollout to recover before continuing.";
         let mut model_args = args.clone();
@@ -9362,11 +9363,14 @@ mod tests {
         let item = &stored.request.items[0];
         assert_eq!(item.tool_name, "probe_tool");
         assert_eq!(item.arguments, args["probe"]["args"]);
-        let intent = item.tool_call_intent.as_deref().unwrap();
-        assert!(intent.contains("wait_for"));
-        assert!(intent.contains("2s"));
-        assert!(intent.contains("120s"));
-        assert!(intent.ends_with(reasoning));
+        assert_eq!(item.tool_call_intent.as_deref(), Some(reasoning));
+        assert_eq!(
+            item.polling,
+            Some(crate::hitl::PollingScope {
+                every_secs: 2,
+                for_up_to_secs: 120,
+            })
+        );
         assert_eq!(
             stored.polling_target.as_ref().unwrap().invocation_arguments,
             args

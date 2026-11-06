@@ -47,6 +47,15 @@ pub struct ApprovalItem {
     /// Agent's stated rationale for the tool call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_intent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polling: Option<PollingScope>,
+}
+
+/// The cadence and effective duration of one polling invocation, in seconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollingScope {
+    pub every_secs: u64,
+    pub for_up_to_secs: u64,
 }
 
 /// Wire form of a single decision: the `{ "approved": bool, "reason": ... }`

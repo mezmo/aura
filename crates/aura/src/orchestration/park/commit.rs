@@ -335,6 +335,7 @@ mod tests {
                     tool_namespace: None,
                     arguments: serde_json::json!({ "namespace": "prod" }),
                     tool_call_intent: None,
+                    polling: None,
                 }],
             },
             registered_at: chrono::Utc::now(),

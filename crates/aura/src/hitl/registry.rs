@@ -84,7 +84,7 @@ pub struct ParkedApproval {
 }
 
 /// The resolved target and original invocation covered by a polling approval.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PollingTarget {
     pub server_id: String,
     pub namespace: String,
@@ -400,6 +400,7 @@ mod tests {
                 tool_namespace: None,
                 arguments: json!({}),
                 tool_call_intent: None,
+                polling: None,
             }],
         }
     }

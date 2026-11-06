@@ -28,28 +28,33 @@ of `POST /v1/approvals/{id}`.
 
 ## Polling probes
 
-This section records the polling contract as of 2026-11-05.
+This section records the polling contract as of 2026-11-06.
 
-The built-in orchestration `wait_for` gates on its inner MCP probe, not on
-the polling wrapper. Worker `mcp_filter` rules apply before target resolution.
+The built-in orchestration `wait_for` checks its inner MCP probe's approval
+policy first, then falls back to the outer `wait_for` policy. Either match
+requires one approval. Worker `mcp_filter` rules apply before target resolution.
 The approval item uses the probe's tool name, namespace, and arguments, just
-as a direct call does. A polling note precedes the model's original
-`tool_call_intent`; it identifies the server and the effective poll interval
-and wait bound. `_aura_reasoning` stays out of executable arguments.
+as a direct call does. Its optional `polling` object carries `every_secs` and
+`for_up_to_secs`, using the effective poll interval and wait bound. The
+conversational pending event carries the same values, and the CLI displays
+them before asking for consent. `tool_call_intent` retains the model's
+original rationale. `_aura_reasoning` stays out of executable arguments.
 
 One approval covers repeated samples with fixed arguments for that polling
 invocation. A new invocation needs a new approval. The polling clock starts
 after approval; denial or approval failure executes no samples. Approver
 headers apply to every approved sample without leaking into later calls.
+Stdio probes with approver identity overrides fail before dispatch because
+stdio cannot deliver per-request headers.
 
-The durable approval stores the inner operation for governance and retains
-the outer `wait_for` invocation separately for continuation. Resume rejects
-changes to the approved operation or its resolved target.
+The durable approval contains the inner operation and a separate copy of the
+outer `wait_for` invocation for continuation. Resume requires an exact match
+with the stored target and disclosed polling scope.
 
-Patterns naming only the outer `wait_for` wrapper do not gate its probes.
-Operators must match the inner tool or its namespace instead. This rule is
-specific to the built-in polling tool; a separately supplied native tool
-named `wait_for` keeps the normal native-tool gate.
+Deploy the updated CLI alongside the server: older clients ignore the polling
+fields and cannot disclose repeated execution. Drain pending polling approvals
+before upgrading or rolling back; approvals without the structured polling
+scope cannot resume. Ordinary single-call records remain readable without it.
 
 ## The two routes in detail
 

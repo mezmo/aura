@@ -37,8 +37,8 @@ pub(crate) struct RecordedDecisions {
 impl RecordedDecisions {
     /// Record a decision for a key, appending to that key's recorded-order
     /// queue so two same-turn calls with identical arguments keep their own
-    /// decisions. Wired by the orchestrator continuation (P44 commit 3).
-    #[allow(dead_code)]
+    /// decisions.
+    #[cfg(test)]
     pub(crate) fn push(&self, key: CallKey, decision: ApprovalDecision) {
         self.push_bound(key, decision, None);
     }

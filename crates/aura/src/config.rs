@@ -109,7 +109,7 @@ pub struct AgentBuildContext {
 
     /// The `[hitl]` config gate as a tool middleware layer.
     pub hitl_gate_layer: Option<Arc<dyn ToolMiddleware>>,
-    /// The same gate, retained for delegated polling authorization.
+    /// The `[hitl]` config gate.
     pub hitl_gate: Option<Arc<crate::hitl::HitlApprovalWrapper>>,
 
     /// The run this build serves.

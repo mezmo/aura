@@ -269,18 +269,16 @@ pub(crate) async fn load_recorded_decisions(
             };
             let (tool_name, invocation_arguments) = match &parked.polling_target {
                 Some(target) => {
-                    let probe = &target.invocation_arguments["probe"];
-                    if item.tool_name != target.tool_name
-                        || item.tool_namespace.as_deref() != Some(target.namespace.as_str())
-                        || probe["tool"] != target.tool_name
-                        || probe["args"] != item.arguments
-                    {
+                    if !crate::orchestration::tools::WaitForTool::approval_matches(target, item) {
                         return Err(RehydrateError::Mismatch(format!(
                             "polling target for {} does not match the stored approval",
                             call.decision_id
                         )));
                     }
-                    ("wait_for", &target.invocation_arguments)
+                    (
+                        <crate::orchestration::tools::WaitForTool as rig::tool::Tool>::NAME,
+                        &target.invocation_arguments,
+                    )
                 }
                 None => (item.tool_name.as_str(), &item.arguments),
             };
@@ -421,6 +419,7 @@ mod tests {
                     tool_namespace: None,
                     arguments: args,
                     tool_call_intent: None,
+                    polling: None,
                 }],
             },
             registered_at: chrono::Utc::now(),
@@ -465,6 +464,10 @@ mod tests {
             let mut stored = approval(id, arguments);
             stored.request.items[0].tool_name = tool_name.to_owned();
             stored.request.items[0].tool_namespace = namespace.map(str::to_owned);
+            stored.request.items[0].polling = Some(crate::hitl::PollingScope {
+                every_secs: 2,
+                for_up_to_secs: 120,
+            });
             stored.polling_target = Some(crate::hitl::PollingTarget {
                 server_id: "server-id".to_owned(),
                 namespace: "test".to_owned(),

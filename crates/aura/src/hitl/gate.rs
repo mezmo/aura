@@ -271,7 +271,9 @@ impl HitlApprovalWrapper {
         target: &PollingTarget,
         item: ApprovalItem,
     ) -> Result<PreCallOutcome, ToolError> {
-        let matched = self.matched_pattern(&target.tool_name, Some(&target.namespace));
+        let matched = self
+            .matched_pattern(&target.tool_name, Some(&target.namespace))
+            .or_else(|| self.matched_pattern(&ctx.tool_name, ctx.tool_namespace.as_deref()));
         self.authorize(args, ctx, matched, Some(target), item).await
     }
 
@@ -312,9 +314,7 @@ impl HitlApprovalWrapper {
                 // never a fresh park: the recorded call no longer matches what
                 // the chain produced. Fail the call closed and let the resume
                 // stream fail.
-                None if recorded.is_strict(task_id)
-                    && (matched.is_some() || polling_target.is_some()) =>
-                {
+                None if recorded.is_strict(task_id) => {
                     return Err(ToolError::ToolCallError(
                         "resume mismatch".to_string().into(),
                     ));
@@ -380,6 +380,7 @@ impl ToolWrapper for HitlApprovalWrapper {
             tool_namespace: ctx.tool_namespace.clone(),
             arguments: args.clone(),
             tool_call_intent: ctx.tool_call_intent.clone(),
+            polling: None,
         };
         self.authorize(args, ctx, matched, None, item).await
     }

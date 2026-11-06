@@ -317,6 +317,13 @@ impl WaitForCall {
     pub fn budget(&self) -> WaitBudget {
         self.budget
     }
+
+    fn polling_scope(&self) -> crate::hitl::PollingScope {
+        crate::hitl::PollingScope {
+            every_secs: self.budget.poll().as_duration().as_secs(),
+            for_up_to_secs: self.budget.bound().as_secs(),
+        }
+    }
 }
 
 // ============================================================================
@@ -499,30 +506,32 @@ pub trait ProbeDispatcher: Send + Sync {
 }
 
 struct McpProbeDispatcher {
-    winners: Arc<BTreeMap<String, (String, McpClient)>>,
+    tool_servers: Arc<BTreeMap<String, (String, McpClient)>>,
+    stdio_servers: std::collections::BTreeSet<String>,
 }
 
 #[async_trait::async_trait]
 impl ProbeDispatcher for McpProbeDispatcher {
     async fn sample(&self, probe: &ProbeRequest) -> Result<String, ProbeSampleError> {
         let tool_name = probe.tool().as_str();
-        let (_, client) = self
-            .winners
+        let (server_id, client) = self
+            .tool_servers
             .get(tool_name)
             .ok_or(ProbeSampleError::UnknownTool)?;
         let args = serde_json::Value::Object(probe.args().clone());
-        Ok(execute_mcp_tool(
-            client,
-            tool_name,
-            args,
-            crate::approver_headers::current_approver_overrides(),
-        )
-        .await?)
+        let overrides = crate::approver_headers::current_approver_overrides();
+        if overrides.is_some() && self.stdio_servers.contains(server_id) {
+            crate::approver_headers::ensure_transport_delivers_overrides(
+                crate::approver_headers::McpTransportKind::Stdio,
+            )
+            .map_err(|error| rig::tool::ToolError::ToolCallError(Box::new(error)))?;
+        }
+        Ok(execute_mcp_tool(client, tool_name, args, overrides).await?)
     }
 }
 
 struct PollingApproval {
-    winners: Arc<BTreeMap<String, (String, McpClient)>>,
+    tool_servers: Arc<BTreeMap<String, (String, McpClient)>>,
     gate: Option<Arc<crate::hitl::HitlApprovalWrapper>>,
     hitl_configured: bool,
 }
@@ -567,7 +576,7 @@ impl ToolWrapper for PollingApproval {
                     .map_err(|error| rig::tool::ToolError::ToolCallError(Box::new(error)))
             })?;
         let tool_name = call.probe().tool().as_str();
-        let (server_id, client) = self.winners.get(tool_name).ok_or_else(|| {
+        let (server_id, client) = self.tool_servers.get(tool_name).ok_or_else(|| {
             rig::tool::ToolError::ToolCallError(
                 format!("probe tool '{tool_name}' is unavailable").into(),
             )
@@ -587,23 +596,12 @@ impl ToolWrapper for PollingApproval {
             tool_name: tool_name.to_owned(),
             invocation_arguments: args.clone(),
         };
-        let mut intent = format!(
-            "wait_for polling: call {}:{} on {} every {}s for up to {}s after approval. Approval covers this invocation only.",
-            target.namespace,
-            target.tool_name,
-            target.server_id,
-            call.budget().poll().as_duration().as_secs(),
-            call.budget().bound().as_secs(),
-        );
-        if let Some(original) = &ctx.tool_call_intent {
-            intent.push_str("\n\n");
-            intent.push_str(original);
-        }
         let item = crate::hitl::ApprovalItem {
             tool_name: target.tool_name.clone(),
             tool_namespace: Some(target.namespace.clone()),
             arguments: serde_json::Value::Object(call.probe().args().clone()),
-            tool_call_intent: Some(intent),
+            tool_call_intent: ctx.tool_call_intent.clone(),
+            polling: Some(call.polling_scope()),
         };
         gate.pre_call_polling(args, ctx, &target, item).await
     }
@@ -635,6 +633,24 @@ pub struct WaitForTool {
 }
 
 impl WaitForTool {
+    pub(crate) fn approval_matches(
+        target: &crate::hitl::PollingTarget,
+        item: &crate::hitl::ApprovalItem,
+    ) -> bool {
+        let Ok(args) = serde_json::from_value::<WaitForArgs>(target.invocation_arguments.clone())
+        else {
+            return false;
+        };
+        let Ok(call) = WaitForCall::parse(args) else {
+            return false;
+        };
+        item.tool_name == target.tool_name
+            && item.tool_namespace.as_deref() == Some(target.namespace.as_str())
+            && call.probe().tool().as_str() == target.tool_name
+            && serde_json::Value::Object(call.probe().args().clone()) == item.arguments
+            && item.polling.as_ref() == Some(&call.polling_scope())
+    }
+
     pub fn scoped(mcp: Arc<McpManager>, context: &AgentBuildContext) -> MiddlewareToolDyn {
         Self::with_sleeper(mcp, context, Arc::new(TokioSleeper))
     }
@@ -644,14 +660,18 @@ impl WaitForTool {
         context: &AgentBuildContext,
         sleeper: Arc<dyn Sleeper>,
     ) -> MiddlewareToolDyn {
-        let winners = Arc::new(mcp.resolve_winning_tools(|tool| context.tool_matches_filter(tool)));
+        let tool_servers =
+            Arc::new(mcp.resolve_winning_tools(|tool| context.tool_matches_filter(tool)));
         let guard = PollingApproval {
-            winners: Arc::clone(&winners),
+            tool_servers: Arc::clone(&tool_servers),
             gate: context.hitl_gate.clone(),
             hitl_configured: context.hitl.is_some(),
         };
         let tool = Self {
-            dispatcher: Arc::new(McpProbeDispatcher { winners }),
+            dispatcher: Arc::new(McpProbeDispatcher {
+                tool_servers,
+                stdio_servers: mcp.stdio_clients.keys().cloned().collect(),
+            }),
             sleeper,
             cancel: crate::run_context::current_run()
                 .map(|run| run.cancel_token().clone().into())
@@ -1015,7 +1035,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn polling_does_not_gate_on_the_outer_wait_for_name() {
+    async fn polling_gates_on_the_outer_wait_for_name() {
         let (server, manager) = polling_fixture().await;
         let route = Arc::new(crate::hitl::DecisionRoute::Webhook {
             client: crate::hitl::WebhookClient::new(
@@ -1027,10 +1047,66 @@ mod tests {
         let tool = WaitForTool::scoped(manager, &polling_context(route, "wait_for"));
         let mut args = polling_args();
         args["until"] = serde_json::json!({"matches": "ok"});
-        rig::tool::ToolDyn::call(&tool, args.to_string())
+        assert!(
+            rig::tool::ToolDyn::call(&tool, args.to_string())
+                .await
+                .is_err()
+        );
+        assert!(server.tool_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn polling_stdio_refuses_identity_overrides_before_dispatch() {
+        let (server, manager) = polling_fixture().await;
+        let dispatcher = McpProbeDispatcher {
+            tool_servers: Arc::new(manager.resolve_winning_tools(|_| true)),
+            stdio_servers: std::collections::BTreeSet::from(["server-id".to_owned()]),
+        };
+        let call = WaitForCall::parse(serde_json::from_value(polling_args()).unwrap()).unwrap();
+        let overrides =
+            crate::approver_headers::tests::captured_overrides("authorization", "Bearer approver");
+        let error = crate::approver_headers::APPROVER_OVERRIDES
+            .scope(Some(overrides), dispatcher.sample(call.probe()))
             .await
-            .unwrap();
+            .unwrap_err();
+        let ProbeSampleError::Call(rig::tool::ToolError::ToolCallError(source)) = error else {
+            panic!("expected a transport error");
+        };
+        assert!(matches!(
+            source.downcast_ref::<crate::approver_headers::OverrideApplicationError>(),
+            Some(
+                crate::approver_headers::OverrideApplicationError::TransportUnsupported {
+                    kind: crate::approver_headers::McpTransportKind::Stdio,
+                }
+            )
+        ));
+        assert!(server.tool_calls().is_empty());
+        dispatcher.sample(call.probe()).await.unwrap();
         assert_eq!(server.tool_calls().len(), 1);
+    }
+
+    #[test]
+    fn polling_scope_uses_effective_defaults_and_clamped_duration() {
+        for (bound, expected) in [
+            (None, MAX_WAIT_DEFAULT_SECS),
+            (Some(400), MAX_WAIT_HARD_CEILING_SECS),
+        ] {
+            let mut args = serde_json::json!({
+                "probe": {"tool": "probe_tool", "args": {}},
+                "until": {"matches": "ok"}
+            });
+            if let Some(bound) = bound {
+                args["max_wait_sec"] = bound.into();
+            }
+            let call = WaitForCall::parse(serde_json::from_value(args).unwrap()).unwrap();
+            assert_eq!(
+                call.polling_scope(),
+                crate::hitl::PollingScope {
+                    every_secs: POLL_DEFAULT_SECS,
+                    for_up_to_secs: expected,
+                }
+            );
+        }
     }
 
     #[tokio::test]
@@ -1067,6 +1143,13 @@ mod tests {
                 };
                 assert_eq!(pending.tool_name, "probe_tool");
                 assert_eq!(pending.arguments, polling_args()["probe"]["args"]);
+                assert_eq!(
+                    pending.polling,
+                    Some(aura_events::ApprovalPolling {
+                        every_secs: 1,
+                        for_up_to_secs: 3,
+                    })
+                );
                 let before = server.tool_calls().len();
                 if invocation == 0 {
                     assert_eq!(before, 0);
@@ -1095,6 +1178,93 @@ mod tests {
                 "no per-sample approval"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn polling_inner_outer_and_both_policies_raise_one_approval() {
+        for pattern in ["test:*", "wait_for", "*", "unrelated"] {
+            let (server, manager) = polling_fixture().await;
+            let registry = crate::hitl::PendingApprovals::new();
+            let route = Arc::new(crate::hitl::DecisionRoute::Conversational {
+                registry: registry.clone(),
+                timeout: Duration::from_secs(5),
+            });
+            let (run, mut events) =
+                crate::run_context::RunContext::channel(aura_events::RunId::mint());
+            let call = crate::run_context::with_run(run, async {
+                let tool = WaitForTool::scoped(manager, &polling_context(route, pattern));
+                let mut args = polling_args();
+                args["until"] = serde_json::json!({"matches": "ok"});
+                rig::tool::ToolDyn::call(&tool, args.to_string())
+                    .await
+                    .unwrap();
+            });
+            let approve = async {
+                if pattern == "unrelated" {
+                    return;
+                }
+                loop {
+                    let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if let aura_events::agent::AgentEventPayload::ApprovalPending(pending) =
+                        event.payload
+                    {
+                        assert!(server.tool_calls().is_empty());
+                        let id = crate::hitl::DecisionId::parse(&pending.decision_id).unwrap();
+                        registry
+                            .resolve(&id, crate::hitl::ApprovalDecision::Approved)
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                }
+            };
+            tokio::join!(call, approve);
+            assert_eq!(server.tool_calls().len(), 1);
+            while let Ok(event) = events.try_recv() {
+                assert!(
+                    !matches!(
+                        event.payload,
+                        aura_events::agent::AgentEventPayload::ApprovalPending(_)
+                            | aura_events::agent::AgentEventPayload::ApprovalRequested(_)
+                    ),
+                    "unexpected extra approval for {pattern}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn polling_replay_binds_disclosed_scope_to_the_effective_invocation() {
+        let args = polling_args();
+        let target = crate::hitl::PollingTarget {
+            server_id: "server-id".to_owned(),
+            namespace: "test".to_owned(),
+            tool_name: "probe_tool".to_owned(),
+            invocation_arguments: args.clone(),
+        };
+        let mut item = crate::hitl::ApprovalItem {
+            tool_name: "probe_tool".to_owned(),
+            tool_namespace: Some("test".to_owned()),
+            arguments: args["probe"]["args"].clone(),
+            tool_call_intent: None,
+            polling: Some(crate::hitl::PollingScope {
+                every_secs: 1,
+                for_up_to_secs: 3,
+            }),
+        };
+        assert!(WaitForTool::approval_matches(&target, &item));
+        item.polling.as_mut().unwrap().every_secs = 2;
+        assert!(!WaitForTool::approval_matches(&target, &item));
+        item.polling = Some(crate::hitl::PollingScope {
+            every_secs: 1,
+            for_up_to_secs: 4,
+        });
+        assert!(!WaitForTool::approval_matches(&target, &item));
+        item.polling = None;
+        assert!(!WaitForTool::approval_matches(&target, &item));
     }
 
     #[tokio::test]
@@ -1240,14 +1410,13 @@ mod tests {
         assert_eq!(item["tool_name"], "probe_tool");
         assert_eq!(item["tool_namespace"], "test");
         assert_eq!(item["arguments"], polling_args()["probe"]["args"]);
-        let (note, intent) = item["tool_call_intent"]
-            .as_str()
-            .unwrap()
-            .split_once("\n\n")
-            .unwrap();
-        assert_eq!(intent, reasoning);
-        assert!(note.contains("wait_for"));
-        assert!(note.contains("server-id"));
+        assert_eq!(item["tool_call_intent"], reasoning);
+        assert_eq!(
+            item["polling"],
+            serde_json::json!({
+                "every_secs": 1, "for_up_to_secs": 3,
+            })
+        );
     }
 
     #[tokio::test]

@@ -1352,6 +1352,10 @@ impl PreparedAgent {
             let submit_tool = crate::orchestration::SubmitResultTool::new(decision.clone());
             builder_state = builder_state.add_tool(submit_tool);
             if let Some(mcp) = mcp_manager {
+                wrapped_tools.push((
+                    None,
+                    <crate::orchestration::tools::WaitForTool as rig::tool::Tool>::NAME.to_owned(),
+                ));
                 builder_state = builder_state.add_tools_dyn(vec![Box::new(
                     crate::orchestration::tools::WaitForTool::scoped(
                         Arc::clone(mcp),
