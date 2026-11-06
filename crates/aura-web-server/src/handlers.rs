@@ -16,11 +16,588 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{Instrument, error};
 use uuid::Uuid;
 
+use aura::journal::JournalItem;
+use aura::runtime::{Attach, AttachError, Caller, StartError, StartRun, Subscription};
+use aura_events::run::{
+    LifecycleEvent, Liveness, LivenessPolicy, RunCancelReason, RunEnding, SessionEventPayload,
+};
+use futures_util::StreamExt;
+use futures_util::stream::BoxStream;
+
 use crate::streaming::{
-    StreamConfig, StreamOtelContext, StreamOutcome, StreamTermination, StreamingCallbacks,
-    TurnContext, collect_stream_to_completion, process_sse_stream_full,
+    HEARTBEAT_INTERVAL, SseProjector, StreamConfig, StreamOtelContext, StreamOutcome,
+    StreamTermination, StreamingCallbacks, Timeouts, TurnContext, collect_body,
+    collect_stream_to_completion, process_sse_stream_full, sse_body,
 };
 use crate::types::*;
+
+// ---------------------------------------------------------------------------
+// The runtime-backed chat path.
+// ---------------------------------------------------------------------------
+
+/// A parsed and resolved chat completion request. It holds what a run needs
+/// to start and what its response is built from.
+pub(crate) struct ChatRequest {
+    pub(crate) config: aura_config::Config,
+    pub(crate) session: aura::SessionId,
+    /// The headers of the request.
+    pub(crate) headers: HashMap<String, String>,
+    /// The turn the response renders: completion id, model, timestamp,
+    /// `max_tokens`, correlation.
+    pub(crate) turn: TurnContext,
+    pub(crate) prompt: String,
+    pub(crate) history: Vec<aura::Message>,
+    /// The client-side tools the request defined.
+    pub(crate) client_tools: Option<Vec<aura::builder::ClientTool>>,
+    pub(crate) user: Option<String>,
+    pub(crate) metadata: Option<HashMap<String, String>>,
+}
+
+impl ChatRequest {
+    /// Whether the request defined client-side tools.
+    pub(crate) fn has_client_tools(&self) -> bool {
+        self.client_tools.is_some()
+    }
+}
+
+/// A run started for a chat request. It holds the request's subscription to
+/// its session, and what the response still needs from the request.
+pub(crate) struct StartedRun {
+    pub(crate) run_id: aura::RunId,
+    pub(crate) subscription: Subscription,
+    /// The turn the response renders.
+    pub(crate) turn: TurnContext,
+    pub(crate) session: aura::SessionId,
+}
+
+/// A streaming completion served from the runtime: the SSE body, and the
+/// session id for the `x-chat-session-id` header.
+pub struct ChatStream {
+    pub(crate) session_id: aura::SessionId,
+    pub(crate) bytes: BoxStream<'static, Result<Bytes, std::io::Error>>,
+}
+
+impl ChatStream {
+    /// The SSE body.
+    pub fn into_bytes(self) -> BoxStream<'static, Result<Bytes, std::io::Error>> {
+        self.bytes
+    }
+}
+
+/// Why a run could not be started for a chat request.
+#[derive(Debug, thiserror::Error)]
+pub enum StartChatError {
+    /// The runtime refused the attach.
+    #[error(transparent)]
+    Attach(#[from] AttachError),
+    /// The runtime refused the start.
+    #[error(transparent)]
+    Start(#[from] StartError),
+    /// The run failed before its `Started` event. `error` is the run's own
+    /// error text.
+    #[error("the run failed before it started: {error}")]
+    FailedBeforeStart { error: String },
+    #[error(
+        "the run was cancelled before it started: {reason}{}",
+        .message.as_deref().map_or_else(String::new, |message| format!(" ({message})"))
+    )]
+    CancelledBeforeStart {
+        reason: RunCancelReason,
+        /// The message the cancel came with.
+        message: Option<String>,
+    },
+    #[error("the session's stream ended before the run started")]
+    EndedBeforeStart,
+}
+
+impl StartChatError {
+    /// The HTTP response for the refusal, in the OpenAI error envelope:
+    ///
+    /// - 409 `session_busy` when the session already has a live run, or
+    ///   another client holds its claim. Each case has its own message.
+    /// - 503 when the attach or the start is refused because the runtime is
+    ///   shutting down, or the run is cancelled for a shutdown before
+    ///   `Started`.
+    /// - 500 `internal_error` for everything else, with a message naming the
+    ///   refusal: a store failure, a failure or any other cancel before
+    ///   `Started`, a stream that ended before `Started`, and any refusal
+    ///   this crate does not know.
+    pub fn into_http_response(self) -> Response {
+        match &self {
+            Self::Start(StartError::RunInProgress(run)) => error_response(
+                StatusCode::CONFLICT,
+                format!(
+                    "the session is already running {run}; wait for it or use another chat_session_id"
+                ),
+                "session_busy",
+            ),
+            Self::Attach(AttachError::AlreadyClaimed { by }) => error_response(
+                StatusCode::CONFLICT,
+                format!(
+                    "another client holds this session (observer {by}); wait for it or use another chat_session_id"
+                ),
+                "session_busy",
+            ),
+            Self::Attach(AttachError::ShuttingDown)
+            | Self::Start(StartError::ShuttingDown)
+            | Self::CancelledBeforeStart {
+                reason: RunCancelReason::Shutdown,
+                ..
+            } => shutting_down_response(),
+            Self::Attach(_)
+            | Self::Start(_)
+            | Self::FailedBeforeStart { .. }
+            | Self::CancelledBeforeStart { .. }
+            | Self::EndedBeforeStart => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                self.to_string(),
+                "internal_error",
+            ),
+        }
+    }
+}
+
+/// Why a chat completion could not be served.
+#[derive(Debug)]
+pub enum ChatError {
+    Prepare(PrepareError),
+    Start(StartChatError),
+}
+
+impl From<PrepareError> for ChatError {
+    fn from(error: PrepareError) -> Self {
+        Self::Prepare(error)
+    }
+}
+
+impl From<StartChatError> for ChatError {
+    fn from(error: StartChatError) -> Self {
+        Self::Start(error)
+    }
+}
+
+impl ChatError {
+    pub fn into_http_response(self) -> Response {
+        match self {
+            Self::Prepare(error) => error.into_http_response(),
+            Self::Start(error) => error.into_http_response(),
+        }
+    }
+}
+
+impl std::fmt::Display for ChatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Prepare(error) => error.fmt(f),
+            Self::Start(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ChatError {}
+
+/// Parses and resolves a chat completion request. It finds the agent the
+/// request names, takes the prompt and history from its messages, collects
+/// its client tools, and sets up the turn its response renders. It does not
+/// build an agent.
+///
+/// The turn's correlation is read from the current span, so call this
+/// inside the request's span.
+pub(crate) fn parse_request(
+    state: &AppState,
+    req: ChatCompletionRequest,
+    session: aura::SessionId,
+    headers: HashMap<String, String>,
+) -> Result<ChatRequest, PrepareError> {
+    let config = state.resolve_config(req.model.as_deref()).ok_or_else(|| {
+        match req.model.as_deref().or(state.default_agent.as_deref()) {
+            Some(name) => PrepareError::NotFound(name.to_owned()),
+            None => PrepareError::BadRequest("you must provide a model parameter".to_owned()),
+        }
+    })?;
+    let serves_skills = !config.agent.skills.local.is_empty();
+    let (prompt, history) =
+        convert_chat_messages(&req.messages, req.tools.is_some(), serves_skills)?;
+    validate_hitl_delivery_mode(&config, &req)?;
+
+    let (provider, model) = config.agent.llm.model_info();
+    let turn = TurnContext::new(
+        format!("chatcmpl-{}", Uuid::new_v4()),
+        format!("{provider}/{model}"),
+        Utc::now().timestamp() as u64,
+        req.max_tokens,
+        session.as_str(),
+    );
+    let turn = if config.orchestration_enabled() {
+        turn.with_orchestration()
+    } else {
+        turn
+    };
+    let client_tools = req
+        .tools
+        .map(|tools| tools.iter().map(aura::builder::ClientTool::from).collect());
+
+    Ok(ChatRequest {
+        config,
+        session,
+        headers,
+        turn,
+        prompt,
+        history,
+        client_tools,
+        user: req.user,
+        metadata: req.metadata,
+    })
+}
+
+/// Attaches to the request's session as `attach` says, starts the run with
+/// the request's prompt, history and tools under `liveness`, and waits for
+/// the run's `Started` event before returning. A run that fails before it starts comes
+/// back as an error, not as a stream.
+///
+/// `run_span` creates the run's `agent.stream` span, which declares
+/// `run.id`. It is called only after the session is attached, so a request
+/// refused before that opens no span. The span is handed to the runtime,
+/// which records the run on it once the agent is prepared. If the start is
+/// refused, or the run ends before `Started`, the span may still be empty.
+/// In that case this function records the refusal on it (see
+/// [`record_refusal`]), plus the run's id when the start made one. A refused
+/// start made none, so the span gets no `run.id`: the run a `RunInProgress`
+/// names is another request's, and its text already says which. The run's
+/// id also goes on the current (request) span as `http.request_id`.
+pub(crate) async fn start_run(
+    state: &AppState,
+    request: ChatRequest,
+    attach: Attach,
+    liveness: Liveness,
+    run_span: impl FnOnce() -> tracing::Span,
+) -> Result<StartedRun, StartChatError> {
+    let ChatRequest {
+        config,
+        session,
+        headers,
+        turn,
+        prompt,
+        history,
+        client_tools,
+        user,
+        metadata,
+    } = request;
+    let mut subscription = state.runtime.attach(&session, attach).await?;
+    let span = run_span();
+    // If the start is refused, returning drops the subscription, which
+    // detaches it.
+    let started = state
+        .runtime
+        .start(StartRun {
+            agent: Some(config.agent_id().to_owned()),
+            req_headers: Some(headers),
+            client_tools,
+            run_tools: state.run_tools(&config),
+            session: Some(session.clone()),
+            continues: None,
+            prompt,
+            history,
+            timeout: optional_secs(state.streaming_timeout_secs),
+            liveness,
+            caller: Some(Caller { user, metadata }),
+            span: span.clone(),
+        })
+        .await;
+    let run = match started {
+        Ok(run) => run,
+        Err(refused) => {
+            let refused = StartChatError::from(refused);
+            record_refusal(&span, &refused);
+            return Err(refused);
+        }
+    };
+    aura::logging::set_span_attribute(
+        &tracing::Span::current(),
+        "http.request_id",
+        run.to_string(),
+    );
+
+    match read_to_started(&mut subscription, run).await {
+        Ok(()) => Ok(StartedRun {
+            run_id: run,
+            subscription,
+            turn,
+            session,
+        }),
+        Err(refused) => {
+            error!(run_id = %run, "{refused}");
+            span.record("run.id", tracing::field::display(run));
+            record_refusal(&span, &refused);
+            Err(refused)
+        }
+    }
+}
+
+/// Records on the run's `agent.stream` span why the run never started. A
+/// run cancelled before `Started` gets the ending its cancel stands for, as
+/// the runtime records an ending, so a shutdown or a client that left is
+/// not an error; the runtime may already have recorded the same ending.
+/// Any other refusal is an error with the refusal's text.
+fn record_refusal(span: &tracing::Span, refused: &StartChatError) {
+    match refused {
+        StartChatError::CancelledBeforeStart { reason, message } => {
+            let ending = RunEnding::Cancelled {
+                reason: *reason,
+                message: message.clone(),
+            };
+            aura::runtime::record_ending(span, &ending);
+        }
+        _ => aura::logging::set_span_error(span, refused.to_string()),
+    }
+}
+
+/// Reads `subscription` until it sees `run`'s `Started` event. The start
+/// counts as refused if the run ends first, or if the stream ends or skips
+/// events before `Started` arrives.
+async fn read_to_started(
+    subscription: &mut Subscription,
+    run: aura::RunId,
+) -> Result<(), StartChatError> {
+    while let Some(item) = subscription.next().await {
+        let event = match item {
+            JournalItem::Event(event) => event,
+            JournalItem::Gap { resumed_at } => {
+                tracing::warn!(run_id = %run, %resumed_at, "the session's stream skipped events before the run started");
+                return Err(StartChatError::EndedBeforeStart);
+            }
+            JournalItem::Unknown { .. } => continue,
+        };
+        if event.run_id != Some(run) {
+            continue;
+        }
+        let SessionEventPayload::Lifecycle(lifecycle) = &event.payload else {
+            continue;
+        };
+        if matches!(lifecycle, LifecycleEvent::Started { .. }) {
+            return Ok(());
+        }
+        match lifecycle.ending() {
+            Some(RunEnding::Failed { error }) => {
+                return Err(StartChatError::FailedBeforeStart { error });
+            }
+            Some(RunEnding::Cancelled { reason, message }) => {
+                return Err(StartChatError::CancelledBeforeStart { reason, message });
+            }
+            // A run finishes or parks only after it has streamed, and that
+            // comes after `Started`. This arm is defensive, and it counts as
+            // a stream that ended before the start.
+            Some(RunEnding::Finished | RunEnding::Parked) => {
+                return Err(StartChatError::EndedBeforeStart);
+            }
+            None => {}
+        }
+    }
+    Err(StartChatError::EndedBeforeStart)
+}
+
+/// The stream config for serving `request` from the runtime, built from
+/// `state`'s settings.
+fn runtime_stream_config(
+    state: &AppState,
+    request: &ChatRequest,
+    emit_custom_events: bool,
+    emit_reasoning: bool,
+) -> StreamConfig {
+    StreamConfig::new(
+        emit_custom_events,
+        emit_reasoning,
+        state.tool_result_mode,
+        state.tool_result_max_length,
+    )
+    .with_fallback_tool_parsing(request.config.is_fallback_tool_parsing_enabled())
+    .with_client_tools(request.has_client_tools())
+    .with_debug_provider_errors(state.debug_provider_errors)
+}
+
+/// Serves a streaming completion from the runtime. Returns the SSE body and
+/// the session id for its headers. The request claims its session, with
+/// presence, until the body has read the run's ending or the client stops
+/// reading. `run_span` creates the run's `agent.stream` span, as described
+/// on `start_run`.
+pub async fn stream_chat(
+    state: &AppState,
+    req: ChatCompletionRequest,
+    session: aura::SessionId,
+    headers: HashMap<String, String>,
+    run_span: impl FnOnce() -> tracing::Span,
+) -> Result<ChatStream, ChatError> {
+    let request = parse_request(state, req, session, headers)?;
+    let config = runtime_stream_config(
+        state,
+        &request,
+        state.aura_custom_events,
+        state.aura_emit_reasoning,
+    );
+    let StartedRun {
+        run_id,
+        subscription,
+        turn,
+        session,
+    } = start_run(
+        state,
+        request,
+        Attach::claiming().present(),
+        // Nobody else reads this run, so it stops once its client stops
+        // reading.
+        Liveness::default(),
+        run_span,
+    )
+    .await?;
+    let timeouts = Timeouts {
+        first_chunk: optional_secs(state.first_chunk_timeout_secs),
+        inactivity: optional_secs(state.stream_inactivity_timeout_secs),
+        heartbeat: Some(HEARTBEAT_INTERVAL),
+    };
+    let bytes = sse_body(
+        Arc::clone(&state.runtime),
+        subscription,
+        SseProjector::new(config, turn, run_id),
+        timeouts,
+    );
+    Ok(ChatStream {
+        session_id: session,
+        bytes,
+    })
+}
+
+/// Serves a non-streaming completion from the runtime. The request claims
+/// its session, without presence, until the run ends. A client that leaves
+/// before then lets go of the claim, and the run goes on to its ending.
+/// `run_span` creates the run's `agent.stream` span, as described on
+/// `start_run`.
+pub async fn complete_chat(
+    state: &AppState,
+    req: ChatCompletionRequest,
+    session: aura::SessionId,
+    headers: HashMap<String, String>,
+    run_span: impl FnOnce() -> tracing::Span,
+) -> Result<ChatCompletionResponse, ChatError> {
+    let request = parse_request(state, req, session, headers)?;
+    let config = runtime_stream_config(state, &request, false, false);
+    let StartedRun {
+        run_id,
+        subscription,
+        turn,
+        session,
+    } = start_run(
+        state,
+        request,
+        Attach::claiming(),
+        // Nothing is sent until the run ends, so a proxy's idle timeout can
+        // drop the connection partway through a long run. Stopping the run
+        // then could leave a tool call with side effects half done.
+        Liveness {
+            policy: LivenessPolicy::Continue,
+            grace: std::time::Duration::ZERO,
+        },
+        run_span,
+    )
+    .await?;
+    let response_ctx = ResponseContext {
+        completion_id: turn.completion_id.clone(),
+        model_str: turn.model_str.clone(),
+        created_timestamp: turn.created_timestamp,
+        chat_session_id: session,
+    };
+    let max_tokens = turn.max_tokens;
+    let outcome = collect_body(subscription, SseProjector::new(config, turn, run_id)).await;
+    // A run that ends without an answer reports no usage of its own, so what
+    // it billed stands in, as the hook's totals do on the request-bound
+    // path. With no final response, what a run billed is the hook's totals,
+    // and the run's facts give those whether or not the run's task has
+    // written its final facts yet.
+    let usage = outcome.usage.map_or_else(
+        || {
+            let billed = state
+                .runtime
+                .facts(&run_id)
+                .map(|facts| facts.usage)
+                .unwrap_or_default();
+            (
+                billed.prompt_tokens.get(),
+                billed.completion_tokens.get(),
+                billed.total_tokens.get(),
+            )
+        },
+        |usage| {
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+            )
+        },
+    );
+    Ok(completion_response(
+        response_ctx,
+        max_tokens,
+        outcome.content,
+        usage,
+    ))
+}
+
+/// Serves a chat completion from the runtime. The request runs under the
+/// same span the request-bound path opens for that kind of response
+/// (`streaming_completion` or `non_streaming_completion`). The run's
+/// `agent.stream` span is the root of its own trace.
+async fn serve_from_runtime(
+    state: &AppState,
+    req: ChatCompletionRequest,
+    session: aura::SessionId,
+    headers: HashMap<String, String>,
+) -> Response {
+    let agent_span =
+        || tracing::info_span!(parent: None, "agent.stream", run.id = tracing::field::Empty);
+    if req.stream == Some(true) {
+        let request_span = tracing::info_span!("streaming_completion", session.id = %session);
+        match stream_chat(state, req, session, headers, agent_span)
+            .instrument(request_span)
+            .await
+        {
+            Ok(stream) => {
+                let ChatStream {
+                    session_id, bytes, ..
+                } = stream;
+                (
+                    StatusCode::OK,
+                    [
+                        (axum::http::header::CONTENT_TYPE, "text/event-stream"),
+                        (axum::http::header::CACHE_CONTROL, "no-cache"),
+                        (
+                            axum::http::HeaderName::from_static("x-accel-buffering"),
+                            "no",
+                        ),
+                        (
+                            axum::http::HeaderName::from_static("x-chat-session-id"),
+                            session_id.as_str(),
+                        ),
+                    ],
+                    Body::from_stream(bytes),
+                )
+                    .into_response()
+            }
+            Err(error) => error.into_http_response(),
+        }
+    } else {
+        let request_span = tracing::info_span!("non_streaming_completion", session.id = %session);
+        match complete_chat(state, req, session, headers, agent_span)
+            .instrument(request_span)
+            .await
+        {
+            Ok(response) => Json(response).into_response(),
+            Err(error) => error.into_http_response(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The request-bound path.
+// ---------------------------------------------------------------------------
 
 /// Guard over a request's pending approvals.
 struct RequestResourceGuard {
@@ -451,6 +1028,10 @@ pub async fn chat_completions(
         .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
         .collect();
 
+    if state.runtime_chat_completions {
+        return serve_from_runtime(&state, req, chat_session_id, req_headers_map).await;
+    }
+
     let setup = match prepare_request(&state, &mut req, &chat_session_id, &req_headers_map).await {
         Ok(s) => s,
         Err(e) => return e.into_http_response(),
@@ -695,12 +1276,30 @@ fn build_json_response(
     collected: CollectedResult,
 ) -> Response {
     // Get usage: prefer stream outcome (from Final), fall back to UsageState from hook
-    let (prompt_tokens, completion_tokens, total_tokens) = collected
+    let usage = collected
         .outcome
         .usage
         .map(|u| (u.prompt_tokens, u.completion_tokens, u.total_tokens))
         .unwrap_or_else(|| collected.usage_state.get_final_usage());
 
+    Json(completion_response(
+        response_ctx,
+        max_tokens,
+        collected.outcome.content,
+        usage,
+    ))
+    .into_response()
+}
+
+/// Builds the body of a non-streaming completion from `content` and the
+/// usage as `(prompt, completion, total)`. The finish reason is `length`
+/// when the completion tokens reached `max_tokens`, and `stop` otherwise.
+fn completion_response(
+    response_ctx: ResponseContext,
+    max_tokens: Option<u32>,
+    content: String,
+    (prompt_tokens, completion_tokens, total_tokens): (u64, u64, u64),
+) -> ChatCompletionResponse {
     let finish_reason = if let Some(max) = max_tokens {
         if completion_tokens >= max as u64 {
             "length"
@@ -717,7 +1316,7 @@ fn build_json_response(
         response_ctx.chat_session_id.to_string(),
     );
 
-    let chat_response = ChatCompletionResponse {
+    ChatCompletionResponse {
         id: response_ctx.completion_id,
         object: "chat.completion".to_string(),
         created: response_ctx.created_timestamp,
@@ -726,7 +1325,7 @@ fn build_json_response(
             index: 0,
             message: ChatMessage {
                 role: Role::Assistant,
-                content: Some(collected.outcome.content),
+                content: Some(content),
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -739,9 +1338,7 @@ fn build_json_response(
             total_tokens,
         }),
         metadata: Some(response_metadata),
-    };
-
-    Json(chat_response).into_response()
+    }
 }
 
 #[tracing::instrument(name = "non_streaming_completion", skip_all, fields(session.id = %setup.chat_session_id))]
@@ -1441,6 +2038,16 @@ async fn verify_approval_ingress(
     }
 }
 
+/// The response to a request the server refuses because it is shutting
+/// down.
+pub(crate) fn shutting_down_response() -> Response {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Server is shutting down",
+        "service_unavailable",
+    )
+}
+
 /// The uniform 401 for every ingress verification failure: one wire shape
 /// regardless of which check failed (missing header, skew, mismatch, ...), so
 /// the response leaks nothing about the verification internals.
@@ -1992,27 +2599,7 @@ mod tests {
     // --- list_models tests ---
 
     fn make_state(configs: Vec<aura_config::Config>) -> Arc<AppState> {
-        Arc::new(AppState {
-            configs: Arc::new(configs),
-            tool_result_mode: crate::streaming::ToolResultMode::None,
-            tool_result_max_length: 0,
-            streaming_buffer_size: 32,
-            aura_custom_events: false,
-            aura_emit_reasoning: false,
-            debug_provider_errors: false,
-            streaming_timeout_secs: 0,
-            first_chunk_timeout_secs: 0,
-            stream_inactivity_timeout_secs: 0,
-            shutdown_token: tokio_util::sync::CancellationToken::new(),
-            stream_shutdown_token: tokio_util::sync::CancellationToken::new(),
-            active_requests: Arc::new(crate::types::ActiveRequestTracker::new()),
-            default_agent: None,
-            additional_tools: Arc::new(Vec::new),
-            slack_api: None,
-            pending_approvals: aura::hitl::PendingApprovals::new(),
-            hitl_webhook_hmac: None,
-            session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
-        })
+        Arc::new(AppState::for_tests(configs))
     }
 
     fn parse_config(toml: &str) -> aura_config::Config {
@@ -2109,27 +2696,10 @@ model = "gpt-4o"
         default_agent: Option<&str>,
         slack_api: Option<crate::slack::SlackApi>,
     ) -> Arc<AppState> {
-        Arc::new(AppState {
-            configs: Arc::new(configs),
-            tool_result_mode: crate::streaming::ToolResultMode::None,
-            tool_result_max_length: 0,
-            streaming_buffer_size: 32,
-            aura_custom_events: false,
-            aura_emit_reasoning: false,
-            streaming_timeout_secs: 0,
-            first_chunk_timeout_secs: 0,
-            stream_inactivity_timeout_secs: 0,
-            shutdown_token: tokio_util::sync::CancellationToken::new(),
-            stream_shutdown_token: tokio_util::sync::CancellationToken::new(),
-            active_requests: Arc::new(crate::types::ActiveRequestTracker::new()),
-            default_agent: default_agent.map(str::to_owned),
-            additional_tools: Arc::new(Vec::new),
-            slack_api,
-            debug_provider_errors: false,
-            pending_approvals: aura::hitl::PendingApprovals::new(),
-            hitl_webhook_hmac: None,
-            session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
-        })
+        let mut state =
+            AppState::for_tests(configs).with_default_agent(default_agent.map(str::to_owned));
+        state.slack_api = slack_api;
+        Arc::new(state)
     }
 
     async fn parse_info_response(resp: Response) -> ServerInfo {
@@ -2628,31 +3198,10 @@ url = "http://127.0.0.1:9"
         use axum::routing::post;
         use tower::ServiceExt;
 
-        use crate::streaming::ToolResultMode;
-        use crate::types::{ActiveRequestTracker, AppState};
+        use crate::types::AppState;
 
         fn test_app_state() -> Arc<AppState> {
-            Arc::new(AppState {
-                configs: Arc::new(vec![]),
-                tool_result_mode: ToolResultMode::default(),
-                tool_result_max_length: 0,
-                streaming_buffer_size: 0,
-                aura_custom_events: false,
-                aura_emit_reasoning: false,
-                debug_provider_errors: false,
-                streaming_timeout_secs: 0,
-                first_chunk_timeout_secs: 0,
-                stream_inactivity_timeout_secs: 0,
-                shutdown_token: tokio_util::sync::CancellationToken::new(),
-                stream_shutdown_token: tokio_util::sync::CancellationToken::new(),
-                active_requests: Arc::new(ActiveRequestTracker::default()),
-                default_agent: None,
-                additional_tools: Arc::new(Vec::new),
-                slack_api: None,
-                pending_approvals: aura::hitl::PendingApprovals::new(),
-                hitl_webhook_hmac: None,
-                session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
-            })
+            Arc::new(AppState::for_tests(vec![]))
         }
 
         fn approval_router(state: Arc<AppState>) -> Router {
@@ -3093,27 +3642,7 @@ source = '{}'
         }
 
         fn app_state(configs: Vec<aura_config::Config>) -> AppState {
-            AppState {
-                configs: Arc::new(configs),
-                tool_result_mode: ToolResultMode::default(),
-                tool_result_max_length: 0,
-                streaming_buffer_size: 0,
-                aura_custom_events: false,
-                aura_emit_reasoning: false,
-                debug_provider_errors: false,
-                streaming_timeout_secs: 0,
-                first_chunk_timeout_secs: 0,
-                stream_inactivity_timeout_secs: 0,
-                shutdown_token: CancellationToken::new(),
-                stream_shutdown_token: CancellationToken::new(),
-                active_requests: Arc::new(ActiveRequestTracker::default()),
-                default_agent: None,
-                additional_tools: Arc::new(Vec::new),
-                pending_approvals: aura::hitl::PendingApprovals::new(),
-                hitl_webhook_hmac: None,
-                slack_api: None,
-                session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
-            }
+            AppState::for_tests(configs)
         }
 
         /// The second turn of a conversation, routed to `model`.
@@ -3181,6 +3710,521 @@ source = '{}'
                     .unwrap();
             assert_eq!(setup.rehydrated_skills, ["shared"]);
             assert_eq!(setup.chat_history.len(), 4);
+        }
+    }
+
+    /// Chat completions served from the runtime through the router. The
+    /// runtime's runs use test agents.
+    mod runtime_path {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        use aura::runtime::{AgentForRun, AgentRuntime, Attach, RuntimeStores, StartRun};
+        use aura_events::{EmittingAgent, RunId, SessionId};
+        use aura_test_utils::mock_agent::{MockAgent, Step, items};
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::Response;
+        use axum::routing::post;
+        use serde_json::{Value, json};
+        use tower::ServiceExt;
+
+        use crate::types::AppState;
+
+        const SESSION: &str = "cs_runtime_path";
+
+        fn config(name: &str) -> aura_config::Config {
+            aura_config::Config {
+                agent: aura_config::AgentConfig {
+                    name: name.to_owned(),
+                    ..aura_config::AgentConfig::default()
+                },
+                ..aura_config::Config::default()
+            }
+        }
+
+        fn session() -> SessionId {
+            SessionId::new(SESSION).expect("a session id")
+        }
+
+        /// A state over `configs` with the runtime path on. Each run gets
+        /// the agent that `agents` returns.
+        fn state_over<F>(configs: Vec<aura_config::Config>, agents: F) -> Arc<AppState>
+        where
+            F: Fn(&aura_config::Config, RunId) -> Result<AgentForRun, aura::BuilderError>
+                + Send
+                + Sync
+                + 'static,
+        {
+            Arc::new(runtime_state(configs, agents))
+        }
+
+        fn runtime_state<F>(configs: Vec<aura_config::Config>, agents: F) -> AppState
+        where
+            F: Fn(&aura_config::Config, RunId) -> Result<AgentForRun, aura::BuilderError>
+                + Send
+                + Sync
+                + 'static,
+        {
+            let mut state = AppState::for_tests(configs);
+            state.runtime = Arc::new(AgentRuntime::over_agents(
+                Arc::clone(&state.configs),
+                state.default_agent.clone(),
+                RuntimeStores::in_memory(),
+                agents,
+            ));
+            state.runtime_chat_completions = true;
+            state
+        }
+
+        /// An agent for `run` that never answers.
+        fn pending(run: RunId) -> Result<AgentForRun, aura::BuilderError> {
+            Ok(AgentForRun {
+                agent: Arc::new(MockAgent::pending().for_run(run).with_run_context()),
+                attribution: EmittingAgent::single_agent(),
+            })
+        }
+
+        /// A state over one agent whose `n`th run answers `answer n`.
+        fn answering() -> Arc<AppState> {
+            let runs = AtomicUsize::new(0);
+            state_over(vec![config("solo")], move |_, run| {
+                let n = runs.fetch_add(1, Ordering::SeqCst) + 1;
+                let agent =
+                    MockAgent::scripted(vec![Step::item(items::text(&format!("answer {n}")))])
+                        .for_run(run)
+                        .with_run_context();
+                Ok(AgentForRun {
+                    agent: Arc::new(agent),
+                    attribution: EmittingAgent::single_agent(),
+                })
+            })
+        }
+
+        fn chat(model: Option<&str>, stream: bool) -> Value {
+            json!({
+                "model": model,
+                "stream": stream,
+                "messages": [{ "role": "user", "content": "hello" }],
+                "metadata": { "chat_session_id": SESSION },
+            })
+        }
+
+        async fn send(state: &Arc<AppState>, body: Value) -> Response {
+            Router::new()
+                .route("/v1/chat/completions", post(super::super::chat_completions))
+                .with_state(Arc::clone(state))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .expect("a request"),
+                )
+                .await
+                .expect("the router answers")
+        }
+
+        async fn body_text(response: Response) -> String {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("the body reads");
+            String::from_utf8(bytes.to_vec()).expect("UTF-8")
+        }
+
+        /// The status and the OpenAI error envelope's message and type.
+        async fn refusal(response: Response) -> (StatusCode, String, String) {
+            let status = response.status();
+            let body: Value =
+                serde_json::from_str(&body_text(response).await).expect("a JSON error");
+            (
+                status,
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                body["error"]["type"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        }
+
+        #[tokio::test]
+        async fn a_request_naming_no_agent_among_several_is_400() {
+            let state = state_over(vec![config("a"), config("b")], |_, run| pending(run));
+            let (status, message, kind) = refusal(send(&state, chat(None, true)).await).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(message, "you must provide a model parameter");
+            assert_eq!(kind, "invalid_request_error");
+        }
+
+        #[tokio::test]
+        async fn a_request_naming_an_unknown_agent_is_404() {
+            let state = state_over(vec![config("a"), config("b")], |_, run| pending(run));
+            let response = send(&state, chat(Some("nope"), true)).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert!(body_text(response).await.contains("nope"));
+        }
+
+        #[tokio::test]
+        async fn a_session_with_a_live_run_refuses_another_with_409() {
+            let state = state_over(vec![config("solo")], |_, run| pending(run));
+            let live = state
+                .runtime
+                .start(StartRun {
+                    session: Some(session()),
+                    ..StartRun::new("first")
+                })
+                .await
+                .expect("the first run starts");
+
+            let (status, message, kind) = refusal(send(&state, chat(None, true)).await).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(
+                message,
+                format!(
+                    "the session is already running {live}; wait for it or use another chat_session_id"
+                )
+            );
+            assert_eq!(kind, "session_busy");
+            state.runtime.drain(Duration::from_secs(1)).await;
+        }
+
+        #[tokio::test]
+        async fn a_session_another_client_claims_refuses_with_409() {
+            let state = state_over(vec![config("solo")], |_, run| pending(run));
+            let holder = state
+                .runtime
+                .attach(&session(), Attach::claiming())
+                .await
+                .expect("the holder claims the session");
+
+            let (status, message, kind) = refusal(send(&state, chat(None, true)).await).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(
+                message,
+                format!(
+                    "another client holds this session (observer {}); wait for it or use another chat_session_id",
+                    holder.observer().id
+                )
+            );
+            assert_eq!(kind, "session_busy");
+        }
+
+        #[tokio::test]
+        async fn a_runtime_shutting_down_refuses_with_503() {
+            let state = state_over(vec![config("solo")], |_, run| pending(run));
+            state.runtime.drain(Duration::ZERO).await;
+
+            let (status, message, kind) = refusal(send(&state, chat(None, true)).await).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(message, "Server is shutting down");
+            assert_eq!(kind, "service_unavailable");
+        }
+
+        /// The run fails before its `Started` event, so the request is
+        /// refused before any stream headers go out.
+        #[tokio::test]
+        async fn an_agent_that_fails_to_prepare_is_500_before_any_header() {
+            let state = state_over(vec![config("solo")], |_, _| {
+                Err(aura::BuilderError::AgentError("no provider".to_owned()))
+            });
+            let response = send(&state, chat(None, true)).await;
+            assert!(response.headers().get("x-chat-session-id").is_none());
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/json",
+                "an error envelope, not a stream"
+            );
+            let (status, message, kind) = refusal(response).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(
+                message.starts_with("the run failed before it started: ")
+                    && message.contains("no provider"),
+                "{message}"
+            );
+            assert_eq!(kind, "internal_error");
+        }
+
+        /// The runtime records a run on its span only after the agent is
+        /// prepared. When preparing fails, the handler records the refusal
+        /// on the span itself.
+        #[cfg(feature = "otel")]
+        #[tokio::test]
+        async fn a_run_that_never_starts_ends_its_span_with_an_error() {
+            let captured = aura::test_span_capture::CapturedSpans::default();
+            let _subscriber = captured.install();
+            // With only one dispatcher registered, tracing caches each
+            // callsite's interest from the first thread to reach it. That may
+            // be another test's thread, which has no subscriber. Registering
+            // a second dispatcher makes every callsite also check this
+            // thread's subscriber.
+            let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let state = state_over(vec![config("solo")], |_, _| {
+                Err(aura::BuilderError::AgentError("no provider".to_owned()))
+            });
+            let response = send(&state, chat(None, true)).await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+            for _ in 0..10_000 {
+                if captured.contains("agent.stream") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let spans = captured.spans();
+            let span = spans
+                .iter()
+                .find(|span| span.name == "agent.stream")
+                .expect("the run's span closed");
+            let opentelemetry::trace::Status::Error { description } = &span.status else {
+                panic!("the span ends in an error: {:?}", span.status);
+            };
+            assert!(description.contains("no provider"), "{description}");
+            assert!(
+                span.attributes
+                    .iter()
+                    .any(|kv| kv.key.as_str() == "run.id" && !kv.value.as_str().is_empty()),
+                "the span names the run: {:?}",
+                span.attributes
+            );
+        }
+
+        /// A run cancelled before `Started` records the ending its cancel
+        /// stands for, so a shutdown is not an error on the span, as it is
+        /// not on the request-bound path. Any other refusal is an error.
+        #[cfg(feature = "otel")]
+        #[test]
+        fn a_refusal_records_what_its_cancel_means_on_the_span() {
+            use super::super::StartChatError;
+            use aura_events::run::RunCancelReason;
+            use opentelemetry::trace::Status;
+
+            fn recorded(refused: StartChatError) -> (Status, Option<String>) {
+                let captured = aura::test_span_capture::CapturedSpans::default();
+                let _subscriber = captured.install();
+                // See `a_run_that_never_starts_ends_its_span_with_an_error`.
+                let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+                let span = tracing::info_span!("agent.stream", run.id = tracing::field::Empty);
+                super::super::record_refusal(&span, &refused);
+                drop(span);
+                let spans = captured.spans();
+                let span = spans
+                    .iter()
+                    .find(|span| span.name == "agent.stream")
+                    .expect("the span closed");
+                let termination = span
+                    .attributes
+                    .iter()
+                    .find(|kv| kv.key.as_str() == "stream.termination")
+                    .map(|kv| kv.value.as_str().into_owned());
+                (span.status.clone(), termination)
+            }
+
+            let (status, termination) = recorded(StartChatError::CancelledBeforeStart {
+                reason: RunCancelReason::Shutdown,
+                message: None,
+            });
+            assert_eq!(status, Status::Unset, "a shutdown is not an error");
+            assert_eq!(termination.as_deref(), Some("shutdown"));
+
+            let (status, termination) = recorded(StartChatError::FailedBeforeStart {
+                error: "no provider".to_owned(),
+            });
+            let Status::Error { description } = status else {
+                panic!("a failure is an error: {status:?}");
+            };
+            assert!(description.contains("no provider"), "{description}");
+            assert_eq!(termination, None);
+        }
+
+        /// Each turn's stream carries only its own run. The second turn does
+        /// not replay the first, and the first turn's claim is released in
+        /// time for the second.
+        #[tokio::test]
+        async fn a_second_turn_on_a_session_streams_only_its_own_run() {
+            let state = answering();
+
+            let first = send(&state, chat(None, true)).await;
+            assert_eq!(first.status(), StatusCode::OK);
+            assert_eq!(first.headers()["x-chat-session-id"], SESSION);
+            assert_eq!(first.headers()["content-type"], "text/event-stream");
+            let first = body_text(first).await;
+
+            let second = send(&state, chat(None, true)).await;
+            assert_eq!(second.status(), StatusCode::OK);
+            let second = body_text(second).await;
+
+            assert!(
+                first.contains("answer 1") && !first.contains("answer 2"),
+                "{first}"
+            );
+            assert!(
+                second.contains("answer 2") && !second.contains("answer 1"),
+                "{second}"
+            );
+            for body in [&first, &second] {
+                assert_eq!(body.matches("data: [DONE]").count(), 1, "{body}");
+            }
+        }
+
+        /// A cancel before `Started` is 503 for a shutdown and 500 otherwise.
+        /// The 500 message names the reason by its wire tag and includes the
+        /// cancel's message.
+        #[tokio::test]
+        async fn a_cancel_before_the_start_maps_by_its_reason() {
+            let shutdown = super::super::StartChatError::CancelledBeforeStart {
+                reason: aura_events::run::RunCancelReason::Shutdown,
+                message: None,
+            };
+            assert_eq!(
+                shutdown.into_http_response().status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+
+            let external = super::super::StartChatError::CancelledBeforeStart {
+                reason: aura_events::run::RunCancelReason::External,
+                message: Some("first chunk timeout".to_owned()),
+            };
+            let (status, message, kind) = refusal(external.into_http_response()).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(
+                message,
+                "the run was cancelled before it started: external (first chunk timeout)"
+            );
+            assert_eq!(kind, "internal_error");
+        }
+
+        #[tokio::test]
+        async fn a_non_streaming_request_answers_with_the_runs_content() {
+            let state = answering();
+            let response = send(&state, chat(None, false)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value = serde_json::from_str(&body_text(response).await).expect("JSON");
+            assert_eq!(body["object"], "chat.completion");
+            assert_eq!(body["choices"][0]["message"]["content"], "answer 1");
+            assert_eq!(body["choices"][0]["finish_reason"], "stop");
+            assert_eq!(body["metadata"]["chat_session_id"], SESSION);
+            assert_eq!(body["model"], "openai/gpt-4o");
+        }
+
+        /// The parity suite builds both paths from one `StreamConfig`, so
+        /// this is what checks that the handler builds its config from the
+        /// server's settings: the provider's error text reaches the client
+        /// only with `debug_provider_errors` on.
+        #[tokio::test]
+        async fn a_provider_error_shows_its_detail_only_with_debug_provider_errors() {
+            const DETAIL: &str = "upstream returned 502 Bad Gateway";
+            for stream in [true, false] {
+                for debug in [true, false] {
+                    let mut state = runtime_state(vec![config("solo")], |_, run| {
+                        let agent = MockAgent::scripted(vec![
+                            Step::item(items::text("Partial")),
+                            Step::item(Err(DETAIL.into())),
+                        ])
+                        .for_run(run)
+                        .with_run_context();
+                        Ok(AgentForRun {
+                            agent: Arc::new(agent),
+                            attribution: EmittingAgent::single_agent(),
+                        })
+                    });
+                    state.debug_provider_errors = debug;
+                    let state = Arc::new(state);
+
+                    let body = body_text(send(&state, chat(None, stream)).await).await;
+                    let case = format!("stream={stream} debug={debug}: {body}");
+                    if debug {
+                        assert!(
+                            body.contains(&format!("returned an error: {DETAIL}")),
+                            "{case}"
+                        );
+                    } else {
+                        assert!(
+                            body.contains(
+                                "returned an error and the request could not be completed"
+                            ),
+                            "{case}"
+                        );
+                        assert!(!body.contains(DETAIL), "{case}");
+                    }
+                }
+            }
+        }
+
+        /// A non-streaming client sees nothing until the run ends, so a
+        /// proxy's idle timeout can drop it partway through. The run goes
+        /// on without it, and the session stays busy until the run ends.
+        #[tokio::test]
+        async fn a_non_streaming_client_that_leaves_does_not_stop_the_run() {
+            use aura::runtime::AgentState;
+            use aura::session_store::{RunFilter, RunStatus};
+            use tokio::sync::Notify;
+
+            let release = Arc::new(Notify::new());
+            let gate = Arc::clone(&release);
+            let state = state_over(vec![config("solo")], move |_, run| {
+                let gate = Arc::clone(&gate);
+                let agent = MockAgent::scripted(vec![
+                    Step::effect(move |_| {
+                        let gate = Arc::clone(&gate);
+                        async move { gate.notified().await }
+                    }),
+                    Step::item(items::text("late answer")),
+                ])
+                .for_run(run)
+                .with_run_context();
+                Ok(AgentForRun {
+                    agent: Arc::new(agent),
+                    attribution: EmittingAgent::single_agent(),
+                })
+            });
+            let runs = || async {
+                state
+                    .runtime
+                    .list(&RunFilter {
+                        session: Some(session()),
+                        ..RunFilter::default()
+                    })
+                    .await
+                    .expect("the run store lists runs")
+            };
+
+            let mut request = Box::pin(send(&state, chat(None, false)));
+            let running = async {
+                while state.runtime.session_state(&session()) != Some(AgentState::Running) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            tokio::select! {
+                _ = &mut request => panic!("the request answered before the run was released"),
+                () = running => {}
+            }
+            // The client leaves.
+            drop(request);
+
+            let [listed] = runs().await.try_into().expect("one run on the session");
+            let run = listed.run_id;
+            let (status, message, _) = refusal(send(&state, chat(None, false)).await).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{message}");
+            assert!(message.contains(&run.to_string()), "{message}");
+
+            release.notify_one();
+            let ended = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let status = runs().await[0].status;
+                    if status.is_terminal() {
+                        return status;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the run ends");
+            assert_eq!(ended, RunStatus::Finished);
         }
     }
 }
