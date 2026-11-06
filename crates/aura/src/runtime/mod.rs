@@ -606,8 +606,7 @@ impl Shared {
     /// observer off again unless its attach reaches the stream. Holds
     /// `admission` only while it does this, so an attach and a start cannot
     /// both open the session, and a stalled append afterwards holds up only
-    /// this session. Until the guard is dropped, the session is not let go,
-    /// and its runs append neither `Started` nor an ending.
+    /// this session. Until the guard is dropped, the session is not let go.
     async fn register(
         self: &Arc<Self>,
         id: &SessionId,
