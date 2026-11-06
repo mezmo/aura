@@ -76,6 +76,10 @@ gemini-tokenizer = "0.2.0"
 [features]
 default = ["otel"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "dep:tonic"]
+# Test seams for other crates' tests: `AgentRuntime::over_agents`, a runtime
+# over agents the test supplies, and the public `test_span_capture` (with
+# `otel`). Enable it only from `[dev-dependencies]`.
+test-support = []
 # Integration test umbrella (mirrors aura-web-server pattern)
 integration = ["integration-stdio"]
 integration-stdio = []
