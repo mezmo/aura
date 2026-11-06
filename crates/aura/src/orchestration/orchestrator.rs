@@ -9320,10 +9320,13 @@ mod tests {
             .unwrap()
             .patterns = Arc::from(["*".into()]);
         orchestrator.mcp_manager = Some(manager_for("server-a"));
-        // Omitted poll_sec must display its effective default without changing replay arguments.
+        // Approval intent includes effective defaults; replay keeps the original arguments.
         let args = serde_json::json!({"probe": {"tool": "probe_tool", "args": {"query": "fixed"}}, "until": {"matches": "ok"}});
+        let reasoning = "Wait for the rollout to recover before continuing.";
+        let mut model_args = args.clone();
+        model_args["_aura_reasoning"] = reasoning.into();
         let model = test_rig::ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
-            ScriptedToolCall::new("poll-1", "wait_for", args.clone()).with_call_id("poll-call-id"),
+            ScriptedToolCall::new("poll-1", "wait_for", model_args).with_call_id("poll-call-id"),
         ])]);
         test_rig::install_worker_overrides(vec![WorkerOverride {
             model: model.clone(),
@@ -9356,8 +9359,18 @@ mod tests {
             stored.request.items[0].tool_namespace.as_deref(),
             Some("test")
         );
-        assert_eq!(stored.request.items[0].arguments["poll_sec"], 2);
-        assert_eq!(stored.request.items[0].arguments["max_wait_sec"], 120);
+        let item = &stored.request.items[0];
+        assert_eq!(item.tool_name, "probe_tool");
+        assert_eq!(item.arguments, args["probe"]["args"]);
+        let intent = item.tool_call_intent.as_deref().unwrap();
+        assert!(intent.contains("wait_for"));
+        assert!(intent.contains("2s"));
+        assert!(intent.contains("120s"));
+        assert!(intent.ends_with(reasoning));
+        assert_eq!(
+            stored.polling_target.as_ref().unwrap().invocation_arguments,
+            args
+        );
         orchestrator
             .park_run(
                 "poll",

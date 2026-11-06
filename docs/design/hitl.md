@@ -26,6 +26,31 @@ of `POST /v1/approvals/{id}`.
 - The Rust signatures and diagrams below describe intended design, not code that
   exists yet.
 
+## Polling probes
+
+This section records the polling contract as of 2026-11-05.
+
+The built-in orchestration `wait_for` gates on its inner MCP probe, not on
+the polling wrapper. Worker `mcp_filter` rules apply before target resolution.
+The approval item uses the probe's tool name, namespace, and arguments, just
+as a direct call does. A polling note precedes the model's original
+`tool_call_intent`; it identifies the server and the effective poll interval
+and wait bound. `_aura_reasoning` stays out of executable arguments.
+
+One approval covers repeated samples with fixed arguments for that polling
+invocation. A new invocation needs a new approval. The polling clock starts
+after approval; denial or approval failure executes no samples. Approver
+headers apply to every approved sample without leaking into later calls.
+
+The durable approval stores the inner operation for governance and retains
+the outer `wait_for` invocation separately for continuation. Resume rejects
+changes to the approved operation or its resolved target.
+
+Patterns naming only the outer `wait_for` wrapper do not gate its probes.
+Operators must match the inner tool or its namespace instead. This rule is
+specific to the built-in polling tool; a separately supplied native tool
+named `wait_for` keeps the normal native-tool gate.
+
 ## The two routes in detail
 
 ### Route A: webhook (unattended)
@@ -524,8 +549,9 @@ only the transports that read it back before serializing can deliver it:
 
 The override rides the one request value the gate released, inserted into that
 request's `Extensions` map and read back by the transport before the outbound
-POST. There is no keyed map and nothing to clean up: every tool execution
-re-enters `pre_call` and the gate mints a fresh `DecisionId` per call.
+POST. There is no keyed map and nothing to clean up: every direct tool execution
+re-enters `pre_call` and the gate mints a fresh `DecisionId` per call. For the
+scope of a polling invocation, see [Polling probes](#polling-probes).
 
 ### Application-time audit
 

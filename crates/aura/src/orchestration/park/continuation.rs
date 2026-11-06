@@ -267,11 +267,24 @@ pub(crate) async fn load_recorded_decisions(
                     call.decision_id
                 )));
             };
-            let invocation_arguments = parked
-                .polling_target
-                .as_ref()
-                .map_or(&item.arguments, |target| &target.invocation_arguments);
-            if item.tool_name != call.tool_name || *invocation_arguments != call.arguments {
+            let (tool_name, invocation_arguments) = match &parked.polling_target {
+                Some(target) => {
+                    let probe = &target.invocation_arguments["probe"];
+                    if item.tool_name != target.tool_name
+                        || item.tool_namespace.as_deref() != Some(target.namespace.as_str())
+                        || probe["tool"] != target.tool_name
+                        || probe["args"] != item.arguments
+                    {
+                        return Err(RehydrateError::Mismatch(format!(
+                            "polling target for {} does not match the stored approval",
+                            call.decision_id
+                        )));
+                    }
+                    ("wait_for", &target.invocation_arguments)
+                }
+                None => (item.tool_name.as_str(), &item.arguments),
+            };
+            if tool_name != call.tool_name || *invocation_arguments != call.arguments {
                 return Err(RehydrateError::Mismatch(format!(
                     "documented call {}({}) does not match the stored approval",
                     call.tool_name, call.decision_id
@@ -287,10 +300,9 @@ pub(crate) async fn load_recorded_decisions(
                 outstanding.push(call.decision_id);
                 continue;
             };
-            // The key's task id comes from the awaiting node, the tool name
-            // and arguments from the store's approval record.
+            // Polling resumes the outer invocation, not an individual sample.
             recorded.push_bound(
-                CallKey::new(node.task_id, &item.tool_name, invocation_arguments),
+                CallKey::new(node.task_id, tool_name, invocation_arguments),
                 decision,
                 parked.polling_target.clone(),
             );
@@ -426,6 +438,51 @@ mod tests {
             ),
             dir,
         )
+    }
+
+    #[tokio::test]
+    async fn polling_replay_rejects_an_item_that_differs_from_the_bound_probe() {
+        let args = serde_json::json!({
+            "probe": {"tool": "kubectl_apply", "args": {"namespace": "prod"}},
+            "until": {"matches": "ok"}
+        });
+        for (tool_name, namespace, arguments) in [
+            ("other", Some("test"), args["probe"]["args"].clone()),
+            ("kubectl_apply", None, args["probe"]["args"].clone()),
+            (
+                "kubectl_apply",
+                Some("other"),
+                args["probe"]["args"].clone(),
+            ),
+            (
+                "kubectl_apply",
+                Some("test"),
+                serde_json::json!({"namespace": "stage"}),
+            ),
+        ] {
+            let (registry, _dir) = file_store();
+            let id = DecisionId::generate();
+            let mut stored = approval(id, arguments);
+            stored.request.items[0].tool_name = tool_name.to_owned();
+            stored.request.items[0].tool_namespace = namespace.map(str::to_owned);
+            stored.polling_target = Some(crate::hitl::PollingTarget {
+                server_id: "server-id".to_owned(),
+                namespace: "test".to_owned(),
+                tool_name: "kubectl_apply".to_owned(),
+                invocation_arguments: args.clone(),
+            });
+            registry.register_durable(stored).await.unwrap();
+            registry
+                .resolve(&id, ApprovalDecision::Approved)
+                .await
+                .unwrap();
+            let mut pending = pending_call(id, args.clone());
+            pending.tool_name = "wait_for".to_owned();
+            assert!(matches!(
+                load_recorded_decisions(&registry, &parked_run(vec![pending])).await,
+                Err(RehydrateError::Mismatch(_))
+            ));
+        }
     }
 
     /// Entries are built from the store's approval record: a hit with the

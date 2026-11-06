@@ -165,7 +165,7 @@ impl HitlApprovalWrapper {
         args: &Value,
         ctx: &ToolCallContext,
         polling_target: Option<&PollingTarget>,
-        display_args: &Value,
+        item: ApprovalItem,
     ) -> Result<PreCallOutcome, ToolError> {
         // Park is worker-only: the scope carries the run and task identity.
         let AgentScope::Worker { run_id, .. } = &self.scope else {
@@ -201,12 +201,7 @@ impl HitlApprovalWrapper {
                 matched_pattern: matched.to_string(),
                 agent_name: self.agent_name.clone(),
             },
-            items: vec![ApprovalItem {
-                tool_name: ctx.tool_name.clone(),
-                tool_namespace: ctx.tool_namespace.clone(),
-                arguments: display_args.clone(),
-                tool_call_intent: ctx.tool_call_intent.clone(),
-            }],
+            items: vec![item],
         };
 
         // The store's own register, not the registry's park-anyway one: a
@@ -274,11 +269,10 @@ impl HitlApprovalWrapper {
         args: &Value,
         ctx: &ToolCallContext,
         target: &PollingTarget,
-        display_args: &Value,
+        item: ApprovalItem,
     ) -> Result<PreCallOutcome, ToolError> {
         let matched = self.matched_pattern(&target.tool_name, Some(&target.namespace));
-        self.authorize(args, ctx, matched, Some(target), display_args)
-            .await
+        self.authorize(args, ctx, matched, Some(target), item).await
     }
 
     async fn authorize(
@@ -287,7 +281,7 @@ impl HitlApprovalWrapper {
         ctx: &ToolCallContext,
         matched: Option<&str>,
         polling_target: Option<&PollingTarget>,
-        display_args: &Value,
+        item: ApprovalItem,
     ) -> Result<PreCallOutcome, ToolError> {
         // Recorded-decisions consult: a resumed worker's gated call may
         // already carry a stored decision. A hit maps through the same
@@ -335,7 +329,7 @@ impl HitlApprovalWrapper {
         };
         if let Some(park) = &self.park {
             return self
-                .park_pre_call(park, matched, args, ctx, polling_target, display_args)
+                .park_pre_call(park, matched, args, ctx, polling_target, item)
                 .await;
         }
         let run = self.run();
@@ -349,12 +343,7 @@ impl HitlApprovalWrapper {
                 matched_pattern: matched.to_string(),
                 agent_name: self.agent_name.clone(),
             },
-            items: vec![ApprovalItem {
-                tool_name: ctx.tool_name.clone(),
-                tool_namespace: ctx.tool_namespace.clone(),
-                arguments: display_args.clone(),
-                tool_call_intent: ctx.tool_call_intent.clone(),
-            }],
+            items: vec![item],
         };
         let cancel = run
             .as_ref()
@@ -386,7 +375,13 @@ impl ToolWrapper for HitlApprovalWrapper {
         if matched.is_none() {
             return Ok(PreCallOutcome::Proceed { overrides: None });
         }
-        self.authorize(args, ctx, matched, None, args).await
+        let item = ApprovalItem {
+            tool_name: ctx.tool_name.clone(),
+            tool_namespace: ctx.tool_namespace.clone(),
+            arguments: args.clone(),
+            tool_call_intent: ctx.tool_call_intent.clone(),
+        };
+        self.authorize(args, ctx, matched, None, item).await
     }
 }
 

@@ -14,7 +14,9 @@ use crate::config::AgentBuildContext;
 use crate::mcp::execute_mcp_tool;
 use crate::mcp::{McpClient, McpManager};
 use crate::tool_middleware::{MiddlewareStack, MiddlewareToolDyn, WrapperLayer};
-use crate::tool_wrapper::{PreCallOutcome, ToolCallContext, ToolWrapper};
+use crate::tool_wrapper::{
+    PreCallOutcome, ToolCallContext, ToolWrapper, TransformArgsResult, extracted_field, non_blank,
+};
 
 /// Hard ceiling on any single wait.
 pub const MAX_WAIT_HARD_CEILING_SECS: u64 = 300;
@@ -41,11 +43,7 @@ pub struct WaitForArgs {
     pub poll_sec: Option<u64>,
     #[serde(default)]
     pub max_wait_sec: Option<u64>,
-    /// The persistence wrapper teaches worker models to attach
-    /// `_aura_reasoning` to every call, so it arrives here too even though
-    /// this tool sits outside the wrapper. Accepted and ignored — same
-    /// contract as `request_approval` — so the strict parse rejects only
-    /// genuinely unknown fields.
+    /// Optional model-authored intent.
     #[serde(default, rename = "_aura_reasoning")]
     pub aura_reasoning: Option<String>,
 }
@@ -531,6 +529,32 @@ struct PollingApproval {
 
 #[async_trait::async_trait]
 impl ToolWrapper for PollingApproval {
+    fn wrap_schema(&self, mut schema: serde_json::Value) -> serde_json::Value {
+        crate::orchestration::persistence_wrapper::add_reasoning_to_schema(&mut schema);
+        schema
+    }
+
+    fn transform_args(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolCallContext,
+    ) -> TransformArgsResult {
+        let (reasoning, args) = crate::orchestration::persistence_wrapper::extract_reasoning(args);
+        TransformArgsResult {
+            args,
+            extracted: reasoning.map(|reasoning| serde_json::json!({"reasoning": reasoning})),
+        }
+    }
+
+    fn write_context(&self, extracted: Option<&serde_json::Value>, ctx: &mut ToolCallContext) {
+        if let Some(intent) = extracted_field(extracted, "reasoning")
+            .and_then(serde_json::Value::as_str)
+            .and_then(non_blank)
+        {
+            ctx.tool_call_intent = Some(intent.to_owned());
+        }
+    }
+
     async fn pre_call(
         &self,
         args: &serde_json::Value,
@@ -563,21 +587,25 @@ impl ToolWrapper for PollingApproval {
             tool_name: tool_name.to_owned(),
             invocation_arguments: args.clone(),
         };
-        let mut ctx = ctx.clone();
-        ctx.tool_namespace = Some(target.namespace.clone());
-        ctx.tool_call_intent = Some(format!(
-            "Repeated execution of {}:{} on server {} with the fixed probe.args below, every {}s for up to {}s after approval. Consent covers only this polling invocation.",
+        let mut intent = format!(
+            "wait_for polling: call {}:{} on {} every {}s for up to {}s after approval. Approval covers this invocation only.",
             target.namespace,
             target.tool_name,
             target.server_id,
             call.budget().poll().as_duration().as_secs(),
             call.budget().bound().as_secs(),
-        ));
-        let mut display_args = args.clone();
-        display_args["poll_sec"] = call.budget().poll().as_duration().as_secs().into();
-        display_args["max_wait_sec"] = call.budget().bound().as_secs().into();
-        gate.pre_call_polling(args, &ctx, &target, &display_args)
-            .await
+        );
+        if let Some(original) = &ctx.tool_call_intent {
+            intent.push_str("\n\n");
+            intent.push_str(original);
+        }
+        let item = crate::hitl::ApprovalItem {
+            tool_name: target.tool_name.clone(),
+            tool_namespace: Some(target.namespace.clone()),
+            arguments: serde_json::Value::Object(call.probe().args().clone()),
+            tool_call_intent: Some(intent),
+        };
+        gate.pre_call_polling(args, ctx, &target, item).await
     }
 }
 
@@ -899,8 +927,8 @@ mod tests {
         })
     }
 
-    fn polling_context(route: Arc<crate::hitl::DecisionRoute>) -> AgentBuildContext {
-        let patterns: Arc<[aura_config::GlobPattern]> = Arc::from(["test:*".into()]);
+    fn polling_context(route: Arc<crate::hitl::DecisionRoute>, pattern: &str) -> AgentBuildContext {
+        let patterns: Arc<[aura_config::GlobPattern]> = Arc::from([pattern.into()]);
         AgentBuildContext {
             hitl: Some(crate::hitl::HitlPolicy {
                 patterns: Arc::clone(&patterns),
@@ -951,7 +979,8 @@ mod tests {
             timeout: Duration::from_secs(1),
         });
         let manager = Arc::new(manager);
-        let tool_guard = WaitForTool::scoped(Arc::clone(&manager), &polling_context(route));
+        let tool_guard =
+            WaitForTool::scoped(Arc::clone(&manager), &polling_context(route, "test:*"));
         assert!(
             rig::tool::ToolDyn::call(&tool_guard, polling_args().to_string())
                 .await
@@ -986,6 +1015,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn polling_does_not_gate_on_the_outer_wait_for_name() {
+        let (server, manager) = polling_fixture().await;
+        let route = Arc::new(crate::hitl::DecisionRoute::Webhook {
+            client: crate::hitl::WebhookClient::new(
+                reqwest::Client::new(),
+                aura_config::WebhookUrl::new("http://127.0.0.1:9").unwrap(),
+            ),
+            timeout: Duration::from_secs(1),
+        });
+        let tool = WaitForTool::scoped(manager, &polling_context(route, "wait_for"));
+        let mut args = polling_args();
+        args["until"] = serde_json::json!({"matches": "ok"});
+        rig::tool::ToolDyn::call(&tool, args.to_string())
+            .await
+            .unwrap();
+        assert_eq!(server.tool_calls().len(), 1);
+    }
+
+    #[tokio::test]
     async fn polling_approval_covers_repeated_samples_but_not_the_next_invocation() {
         let (server, manager) = polling_fixture().await;
         let registry = crate::hitl::PendingApprovals::new();
@@ -995,7 +1043,7 @@ mod tests {
         });
         let (run, mut events) = crate::run_context::RunContext::channel(aura_events::RunId::mint());
         let calls = crate::run_context::with_run(run, async {
-            let tool = WaitForTool::scoped(manager, &polling_context(route));
+            let tool = WaitForTool::scoped(manager, &polling_context(route, "test:*"));
             let args = polling_args().to_string();
             for _ in 0..2 {
                 let output = rig::tool::ToolDyn::call(&tool, args.clone()).await.unwrap();
@@ -1017,6 +1065,8 @@ mod tests {
                         break pending;
                     }
                 };
+                assert_eq!(pending.tool_name, "probe_tool");
+                assert_eq!(pending.arguments, polling_args()["probe"]["args"]);
                 let before = server.tool_calls().len();
                 if invocation == 0 {
                     assert_eq!(before, 0);
@@ -1057,7 +1107,7 @@ mod tests {
         });
         let (run, mut events) = crate::run_context::RunContext::channel(aura_events::RunId::mint());
         let call = crate::run_context::with_run(run, async {
-            let tool = WaitForTool::scoped(manager, &polling_context(route));
+            let tool = WaitForTool::scoped(manager, &polling_context(route, "test:*"));
             let mut args = polling_args();
             args["until"] = serde_json::json!({"not_matches": "ok"});
             rig::tool::ToolDyn::call(&tool, args.to_string())
@@ -1151,9 +1201,17 @@ mod tests {
             None,
         );
         let (run, _events) = crate::run_context::RunContext::channel(aura_events::RunId::mint());
+        let reasoning = "Verify the rollout recovered.\nKeep the original rationale — verbatim.";
         crate::run_context::with_run(run, async {
-            let gated = WaitForTool::scoped(Arc::clone(&manager), &polling_context(policy.route));
-            rig::tool::ToolDyn::call(&gated, polling_args().to_string())
+            let gated = WaitForTool::scoped(
+                Arc::clone(&manager),
+                &polling_context(policy.route, "test:*"),
+            );
+            let definition = rig::tool::ToolDyn::definition(&gated, String::new()).await;
+            assert!(definition.parameters["properties"]["_aura_reasoning"].is_object());
+            let mut args = polling_args();
+            args["_aura_reasoning"] = reasoning.into();
+            rig::tool::ToolDyn::call(&gated, args.to_string())
                 .await
                 .unwrap();
             let gated_calls = server.tool_calls();
@@ -1179,15 +1237,17 @@ mod tests {
         );
         let request = webhook.await.unwrap();
         let item = &request["items"][0];
-        assert_eq!(item["tool_name"], "wait_for");
+        assert_eq!(item["tool_name"], "probe_tool");
         assert_eq!(item["tool_namespace"], "test");
-        assert_eq!(item["arguments"], polling_args());
-        assert!(
-            item["tool_call_intent"]
-                .as_str()
-                .unwrap()
-                .contains("server-id")
-        );
+        assert_eq!(item["arguments"], polling_args()["probe"]["args"]);
+        let (note, intent) = item["tool_call_intent"]
+            .as_str()
+            .unwrap()
+            .split_once("\n\n")
+            .unwrap();
+        assert_eq!(intent, reasoning);
+        assert!(note.contains("wait_for"));
+        assert!(note.contains("server-id"));
     }
 
     #[tokio::test]
