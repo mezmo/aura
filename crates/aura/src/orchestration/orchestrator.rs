@@ -766,6 +766,20 @@ const PARTIAL_OUTPUT_MARKER: &str = " before calling submit_result. Partial outp
 /// The start of a duplicate-call loop's failure, ahead of the worker's text.
 const DUPLICATE_LOOP_FAILURE: &str = "Worker blocked by duplicate call loop.";
 
+/// The start of an orphaned park's failure, which keeps no worker output.
+const ORPHANED_PARK_FAILURE: &str = "Worker stream ended before the parked approval snapshot";
+
+/// The warning for a plan with no ready task left to start.
+fn stalled_plan_warning(run_is_stopping: bool, pending: usize) -> String {
+    if run_is_stopping {
+        format!("Provider quota exhausted — {pending} task(s) not started")
+    } else {
+        "No ready tasks but plan not finished — blocked tasks remaining after failure \
+         (dependency chain broken)"
+            .to_string()
+    }
+}
+
 /// Whether a failure's text holds any of the worker's output, rather than only
 /// naming the failure.
 fn failure_kept_output(error: &str) -> bool {
@@ -773,6 +787,7 @@ fn failure_kept_output(error: &str) -> bool {
     !(error.is_empty()
         || error == EMPTY_WORKER_RESULT
         || error.ends_with(DUPLICATE_LOOP_FAILURE)
+        || error.contains(ORPHANED_PARK_FAILURE)
         || (error.ends_with(NO_OUTPUT_SUFFIX) && !error.contains(PARTIAL_OUTPUT_MARKER)))
 }
 
@@ -3856,17 +3871,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     for line in park_verdict_lines(plan) {
                         tracing::warn!("{line}");
                     }
-                } else if !exhausted.is_empty() {
-                    tracing::warn!(
-                        "Provider quota exhausted — {} task(s) not started",
-                        plan.pending_count(),
-                    );
                 } else {
-                    // No ready tasks but not finished - this shouldn't happen
-                    // with valid plans
-                    tracing::warn!(
-                        "No ready tasks but plan not finished — blocked tasks remaining after failure (dependency chain broken)"
-                    );
+                    let warning = stalled_plan_warning(run_is_stopping, plan.pending_count());
+                    tracing::warn!("{warning}");
                 }
                 break;
             }
@@ -4404,9 +4411,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             Ok(ForwardOutcome::Finished(_)) => String::new(),
                         };
                         stream_result = Err(format!(
-                            "Worker stream ended before the parked approval snapshot \
-                             was captured for task {task_id}; {} pending approval(s) \
-                             cancelled.{underlying}",
+                            "{ORPHANED_PARK_FAILURE} was captured for task {task_id}; {} \
+                             pending approval(s) cancelled.{underlying}",
                             pending.len()
                         )
                         .into());
@@ -8109,6 +8115,14 @@ mod tests {
                 FailureCategory::LoopDetected,
                 format!("Worker failed task 0 after 1 attempts: {DUPLICATE_LOOP_FAILURE}\n"),
             ),
+            (
+                FailureCategory::AgentTimeout,
+                format!(
+                    "Worker failed task 0 after 1 attempts: {ORPHANED_PARK_FAILURE} was captured \
+                     for task 0; 1 pending approval(s) cancelled. Underlying error: Worker task \
+                     timed out after 7s"
+                ),
+            ),
         ] {
             let mut plan = Plan::new("Investigate");
             let mut empty = Task::new(0, "Search logs", "Query the log index");
@@ -8123,6 +8137,14 @@ mod tests {
 
         let quoted = timed_out_message("timed out", "stopped before any output");
         assert!(failure_kept_output(&quoted), "{quoted}");
+    }
+
+    /// Only a stopping run blames the quota. A later plan that merely follows
+    /// a worker-account quota failure can stall on an ordinary dependency.
+    #[test]
+    fn a_stalled_plan_blames_the_quota_only_when_the_run_is_stopping() {
+        assert!(stalled_plan_warning(true, 2).contains("2 task(s) not started"));
+        assert!(stalled_plan_warning(false, 2).contains("dependency chain broken"));
     }
 
     /// A quota failure that reaches the short-circuit is on a worker's own

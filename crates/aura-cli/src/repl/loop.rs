@@ -546,6 +546,12 @@ fn approval_outcome_line(outcome: &aura_events::ApprovalOutcomeWire) -> (AuraSty
     (style, format!("⏺ Approval {label}{detail}"))
 }
 
+/// Header text for a completed task the REPL never saw start, or `None` for a
+/// task whose header is already on screen.
+fn unseen_task_header(seen: bool, task_id: &str, worker_id: &str) -> Option<String> {
+    (!seen).then(|| format!("Task {task_id} - Worker: {worker_id}"))
+}
+
 /// Live worker reasoning blocks, one per concurrently-executing task.
 /// Keyed by `task_id` so interleaved deltas from same-wave workers each
 /// update their own tree row instead of contending for a single block.
@@ -3333,6 +3339,18 @@ impl StreamHandler for ReplStreamHandler {
                             "done",
                         );
                     }
+                    if let Some(header) =
+                        unseen_task_header(task_info.is_some(), &task_id, &worker_id)
+                    {
+                        println!(
+                            "{} {}",
+                            "●"
+                                .with(bullet_color)
+                                .attribute(crossterm::style::Attribute::Bold),
+                            header.themed(AuraStyle::Muted),
+                        );
+                        crate::ui::prompt::increment_orch_scrollback();
+                    }
                     crate::ui::prompt::clear_orch_task_tools(&task_id);
                     // Blank line to separate from next task
                     println!();
@@ -3752,6 +3770,7 @@ mod tests {
     use super::{
         COMMAND_ALIASES, COMPACT_NUDGE_FILL, ReplTelemetryLifecycle, approval_outcome_line,
         approval_requested_line, command_hint, compaction_note, should_nudge_at_fill,
+        unseen_task_header,
     };
     use crate::repl::registry;
     use crate::ui::prompt::ContextWindowUsage;
@@ -3979,6 +3998,18 @@ mod tests {
             origin,
             scope: aura_events::AgentScopeWire::Single { session_id: None },
         }
+    }
+
+    /// A task can complete without a start the REPL saw: held back on an
+    /// exhausted account, or cancelled on a later request. It still gets a
+    /// header, and a task that already has one doesn't get a second.
+    #[test]
+    fn only_an_unseen_task_gets_a_header_on_completion() {
+        assert_eq!(
+            unseen_task_header(false, "3", "billing").as_deref(),
+            Some("Task 3 - Worker: billing"),
+        );
+        assert_eq!(unseen_task_header(true, "3", "billing"), None);
     }
 
     #[test]

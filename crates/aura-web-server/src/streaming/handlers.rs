@@ -1362,7 +1362,7 @@ fn handle_orchestrator_event(
                     config.debug_provider_errors,
                 ))
             } else {
-                std::borrow::Cow::Borrowed(result.as_str())
+                std::borrow::Cow::Borrowed(result)
             };
             OrchestrationStreamEvent::task_completed(
                 *task_id,
