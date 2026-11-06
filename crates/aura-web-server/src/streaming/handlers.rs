@@ -426,7 +426,7 @@ fn resolve_billed_usage(
 ///
 /// `custom_events` gates the tool telemetry only. Approvals are protocol, and
 /// a client that never sees one cannot answer it, so the run stalls.
-fn run_event_sse(
+pub(super) fn run_event_sse(
     event: aura_events::agent::AgentEvent,
     correlation: CorrelationContext,
     custom_events: bool,
@@ -464,6 +464,11 @@ fn run_event_sse(
             agent,
             correlation,
         )),
+
+        // An orchestrated agent's tool start also arrives on the item
+        // stream, which renders it as an orchestration frame. A frame here
+        // as well would show the call starting twice.
+        Payload::ToolStart { .. } if !agent.is_single_agent() => None,
 
         Payload::ToolStart {
             tool_call_id,
@@ -729,38 +734,46 @@ fn process_stream_next(
                 return NextItemResult::End(vec![]);
             }
 
-            tracing::error!("Stream error: {}", error_str);
-
-            // Capture for OTel span recording after loop ends
-            state.stream_error = Some(error_str.clone());
-
-            // Context overflow: provide actionable guidance
-            if is_context_overflow_error(&error_str) {
-                tracing::info!("Context overflow detected");
-                state.accumulated_content.push_str(CONTEXT_OVERFLOW_MESSAGE);
-                let chunk = build_text_chunk(ctx, CONTEXT_OVERFLOW_MESSAGE, state.is_first_chunk);
-                if let Ok(bytes) = format_sse_chunk(&chunk) {
-                    return NextItemResult::End(vec![bytes]);
-                }
-            } else {
-                let user_message = build_provider_error_message(
-                    &ctx.model_str,
-                    &error_str,
-                    config.debug_provider_errors,
-                );
-                state.accumulated_content.push_str(&user_message);
-                let chunk = build_text_chunk(ctx, &user_message, state.is_first_chunk);
-                if let Ok(bytes) = format_sse_chunk(&chunk) {
-                    return NextItemResult::End(vec![bytes]);
-                }
-            }
-            NextItemResult::End(vec![])
+            NextItemResult::End(handle_stream_error(config, ctx, state, &error_str))
         }
         None => {
             tracing::info!("Stream ended normally");
             NextItemResult::End(vec![])
         }
     }
+}
+
+/// Handle a run's error, returning the text the client reads in place of
+/// the rest of the answer.
+pub(super) fn handle_stream_error(
+    config: &StreamConfig,
+    ctx: &TurnContext,
+    state: &mut TurnState,
+    error_str: &str,
+) -> Vec<Bytes> {
+    tracing::error!("Stream error: {}", error_str);
+
+    // Capture for OTel span recording
+    state.stream_error = Some(error_str.to_owned());
+
+    // Context overflow: provide actionable guidance
+    if is_context_overflow_error(error_str) {
+        tracing::info!("Context overflow detected");
+        state.accumulated_content.push_str(CONTEXT_OVERFLOW_MESSAGE);
+        let chunk = build_text_chunk(ctx, CONTEXT_OVERFLOW_MESSAGE, state.is_first_chunk);
+        if let Ok(bytes) = format_sse_chunk(&chunk) {
+            return vec![bytes];
+        }
+    } else {
+        let user_message =
+            build_provider_error_message(&ctx.model_str, error_str, config.debug_provider_errors);
+        state.accumulated_content.push_str(&user_message);
+        let chunk = build_text_chunk(ctx, &user_message, state.is_first_chunk);
+        if let Ok(bytes) = format_sse_chunk(&chunk) {
+            return vec![bytes];
+        }
+    }
+    vec![]
 }
 
 /// Handle a single stream item, returning bytes to send.
@@ -913,7 +926,11 @@ fn handle_user_item(
 }
 
 /// Handle a text delta.
-fn handle_text_delta(ctx: &TurnContext, state: &mut TurnState, text: String) -> Vec<Bytes> {
+pub(super) fn handle_text_delta(
+    ctx: &TurnContext,
+    state: &mut TurnState,
+    text: String,
+) -> Vec<Bytes> {
     // Prepend newlines if resuming text after tool execution
     let content = if state.needs_separator {
         state.needs_separator = false;
@@ -958,7 +975,7 @@ fn handle_text_delta(ctx: &TurnContext, state: &mut TurnState, text: String) -> 
 }
 
 /// Handle a tool call.
-fn handle_tool_call(
+pub(super) fn handle_tool_call(
     config: &StreamConfig,
     ctx: &TurnContext,
     state: &mut TurnState,
@@ -1041,12 +1058,31 @@ fn handle_tool_call(
     output
 }
 
-/// Handle a tool result.
+/// How long a tool call took.
+pub(super) enum ToolDuration {
+    /// The time since the call's chunk was built.
+    SinceCall,
+    /// The duration the run reported, in milliseconds.
+    Reported(u64),
+}
+
+/// Handle a tool result, timing it from when its call's chunk was built.
 fn handle_tool_result(
     config: &StreamConfig,
     ctx: &TurnContext,
     state: &mut TurnState,
     tool_result: &ToolResult,
+) -> Vec<Bytes> {
+    handle_timed_tool_result(config, ctx, state, tool_result, ToolDuration::SinceCall)
+}
+
+/// Handle a tool result whose `aura.tool_complete` reports `duration`.
+pub(super) fn handle_timed_tool_result(
+    config: &StreamConfig,
+    ctx: &TurnContext,
+    state: &mut TurnState,
+    tool_result: &ToolResult,
+    duration: ToolDuration,
 ) -> Vec<Bytes> {
     tracing::info!(
         "Streaming tool result for call: {} (call_id: {:?})",
@@ -1090,11 +1126,13 @@ fn handle_tool_result(
 
     // Emit aura.tool_complete custom event (if enabled)
     if config.emit_custom_events {
-        let duration_ms = state
-            .tool_start_times
-            .remove(&tool_result.id)
-            .map(|start| start.elapsed().as_millis() as u64)
-            .unwrap_or(0);
+        let since_call = state.tool_start_times.remove(&tool_result.id);
+        let duration_ms = match duration {
+            ToolDuration::SinceCall => since_call
+                .map(|start| start.elapsed().as_millis() as u64)
+                .unwrap_or(0),
+            ToolDuration::Reported(duration_ms) => duration_ms,
+        };
 
         let tool_name = state
             .tool_call_map
@@ -1209,7 +1247,11 @@ fn handle_tool_result(
 }
 
 /// Handle reasoning content.
-fn handle_reasoning(config: &StreamConfig, ctx: &TurnContext, reasoning: String) -> Vec<Bytes> {
+pub(super) fn handle_reasoning(
+    config: &StreamConfig,
+    ctx: &TurnContext,
+    reasoning: String,
+) -> Vec<Bytes> {
     tracing::debug!("Received reasoning during streaming");
 
     if config.emit_custom_events && config.emit_reasoning {
@@ -1233,7 +1275,7 @@ fn maybe_truncate(s: &str, max_len: usize) -> Option<String> {
     }
 }
 
-fn handle_orchestrator_event(
+pub(super) fn handle_orchestrator_event(
     config: &StreamConfig,
     ctx: &TurnContext,
     event: &AgentEvent,
@@ -1575,7 +1617,11 @@ fn truncate_error_detail(detail: &str) -> String {
     format!("{truncated}…")
 }
 
-fn build_text_chunk(ctx: &TurnContext, content: &str, is_first: bool) -> ChatCompletionChunk {
+pub(super) fn build_text_chunk(
+    ctx: &TurnContext,
+    content: &str,
+    is_first: bool,
+) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: ctx.completion_id.clone(),
         object: CHUNK_OBJECT.to_string(),
@@ -1599,7 +1645,7 @@ fn build_text_chunk(ctx: &TurnContext, content: &str, is_first: bool) -> ChatCom
 }
 
 /// Build the final chunk with finish_reason.
-fn build_final_chunk(ctx: &TurnContext, state: &TurnState) -> Vec<Bytes> {
+pub(super) fn build_final_chunk(ctx: &TurnContext, state: &TurnState) -> Vec<Bytes> {
     let finish_reason = if state.has_passthrough_tool_calls {
         // The LLM invoked a client-side tool — tell the client to execute it
         // and follow up. Takes precedence over `length` because the request
@@ -1773,6 +1819,46 @@ mod tests {
             });
 
             assert!(run_event_sse(event, correlation(), false).is_none());
+        }
+
+        fn tool_start(agent: EmittingAgent, task_id: Option<usize>) -> AgentEvent {
+            AgentEvent::new(
+                agent,
+                AgentEventPayload::ToolStart {
+                    tool_call_id: "call_1".into(),
+                    tool_name: "search_logs".into(),
+                    progress_token: None,
+                    arguments: Some(serde_json::json!({"query": "errors"})),
+                    task_id,
+                },
+            )
+        }
+
+        /// An orchestrated agent's tool start reaches the client through the
+        /// item stream. Its copy on the run's channel gets no frame here, so
+        /// the client does not see the call start twice. This covers workers
+        /// and the coordinator's own calls, which carry the agent id `main`
+        /// with the coordinator as parent. A single agent's tool start does
+        /// get a frame here.
+        #[test]
+        fn only_a_single_agents_tool_start_has_a_frame() {
+            let worker = tool_start(EmittingAgent::orchestrated("log_worker"), Some(0));
+            let coordinator_call = tool_start(
+                EmittingAgent::worker(
+                    aura_events::CONVERSATION_AGENT_ID,
+                    None,
+                    aura_events::COORDINATOR_AGENT_ID,
+                ),
+                None,
+            );
+            let single = tool_start(EmittingAgent::single_agent(), None);
+
+            assert!(run_event_sse(worker, correlation(), true).is_none());
+            assert!(run_event_sse(coordinator_call, correlation(), true).is_none());
+            let frame = run_event_sse(single, correlation(), true)
+                .expect("a single agent's tool start has a frame")
+                .format_sse();
+            assert!(frame.contains(r#""tool_id":"call_1""#), "got: {frame}");
         }
 
         /// Content reaches consumers on the `StreamItem` stream, so the
