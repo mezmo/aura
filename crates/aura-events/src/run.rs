@@ -183,6 +183,21 @@ pub enum RunCancelReason {
     Unknown,
 }
 
+impl std::fmt::Display for RunCancelReason {
+    /// Writes the reason's wire tag, such as `shutdown`. A deadline also
+    /// shows its bound, as in `deadline after 30s`. A reason this version
+    /// does not know shows as `unknown`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Deadline { after } => write!(f, "deadline after {after:?}"),
+            Self::External => f.write_str("external"),
+            Self::Unclaimed => f.write_str("unclaimed"),
+            Self::Shutdown => f.write_str("shutdown"),
+            Self::Unknown => f.write_str("unknown"),
+        }
+    }
+}
+
 /// What happened to a session's run, or to the session itself, as distinct
 /// from what its agent did.
 ///
@@ -276,17 +291,47 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// How a run ended. Each variant matches a terminal lifecycle event, minus
+/// the usage that event carries on the stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunEnding {
+    Finished,
+    Parked,
+    Cancelled {
+        reason: RunCancelReason,
+        /// Text from the caller, for diagnostics only.
+        message: Option<String>,
+    },
+    Failed {
+        /// Text from the run describing the failure, for diagnostics only.
+        error: String,
+    },
+}
+
 impl LifecycleEvent {
-    /// Whether this ends its run: a park, a finish, a cancel, or a failure.
-    /// The session's stream goes on past it.
+    /// How this event ends its run, or `None` if it is not a terminal event.
+    /// A terminal event ends only its run. The session's stream goes on past
+    /// it.
+    pub fn ending(&self) -> Option<RunEnding> {
+        match self {
+            Self::Finished { .. } => Some(RunEnding::Finished),
+            Self::Parked { .. } => Some(RunEnding::Parked),
+            Self::Cancelled {
+                reason, message, ..
+            } => Some(RunEnding::Cancelled {
+                reason: *reason,
+                message: message.clone(),
+            }),
+            Self::Failed { error, .. } => Some(RunEnding::Failed {
+                error: error.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether this ends its run. See [`ending`](Self::ending).
     pub fn ends_run(&self) -> bool {
-        matches!(
-            self,
-            Self::Parked { .. }
-                | Self::Finished { .. }
-                | Self::Cancelled { .. }
-                | Self::Failed { .. }
-        )
+        self.ending().is_some()
     }
 }
 
@@ -642,6 +687,25 @@ mod tests {
         }
     }
 
+    /// A reason displays as its wire tag. A deadline also shows its bound.
+    #[test]
+    fn a_cancel_reason_displays_as_its_wire_tag() {
+        for (reason, shown) in [
+            (
+                RunCancelReason::Deadline {
+                    after: Duration::from_secs(30),
+                },
+                "deadline after 30s",
+            ),
+            (RunCancelReason::External, "external"),
+            (RunCancelReason::Unclaimed, "unclaimed"),
+            (RunCancelReason::Shutdown, "shutdown"),
+            (RunCancelReason::Unknown, "unknown"),
+        ] {
+            assert_eq!(reason.to_string(), shown);
+        }
+    }
+
     /// Durations go on the wire as whole milliseconds; anything finer is
     /// dropped, and nothing rounds up.
     #[test]
@@ -892,6 +956,73 @@ mod tests {
     fn a_minted_run_id_is_version_7() {
         assert_eq!(RunId::mint().as_uuid().get_version_num(), 7);
         assert_ne!(RunId::mint(), RunId::mint());
+    }
+
+    /// Each terminal event maps to its ending, with a cancel's reason and
+    /// message and a failure's error carried over. No other event has an
+    /// ending.
+    #[test]
+    fn every_terminal_event_has_an_ending_and_no_other_does() {
+        let expected = [
+            (
+                LifecycleEvent::Finished { usage: usage() },
+                RunEnding::Finished,
+            ),
+            (
+                LifecycleEvent::Parked {
+                    checkpoint: CheckpointRef::new("c").unwrap(),
+                    usage: usage(),
+                },
+                RunEnding::Parked,
+            ),
+            (
+                LifecycleEvent::Cancelled {
+                    reason: RunCancelReason::External,
+                    message: Some("operator stopped it".to_string()),
+                    usage: usage(),
+                },
+                RunEnding::Cancelled {
+                    reason: RunCancelReason::External,
+                    message: Some("operator stopped it".to_string()),
+                },
+            ),
+            (
+                LifecycleEvent::Failed {
+                    error: "boom".to_string(),
+                    usage: usage(),
+                },
+                RunEnding::Failed {
+                    error: "boom".to_string(),
+                },
+            ),
+        ];
+        for (event, ending) in expected {
+            assert_eq!(event.ending(), Some(ending), "{event:?}");
+        }
+
+        let ongoing = [
+            LifecycleEvent::Started {
+                agent: "sre".to_string(),
+                prompt: "hi".to_string(),
+                timeout: None,
+                liveness: Liveness::default(),
+                continues: None,
+            },
+            LifecycleEvent::ObserverAttached {
+                observer: observer(ObserverKind::Collecting, false),
+            },
+            LifecycleEvent::ObserverDetached {
+                observer: observer(ObserverKind::Collecting, false),
+                because: DetachCause::Released,
+            },
+            LifecycleEvent::ClaimsExhausted,
+            LifecycleEvent::LivenessDecided {
+                policy: LivenessPolicy::Continue,
+            },
+        ];
+        for event in ongoing {
+            assert_eq!(event.ending(), None, "{event:?}");
+        }
     }
 
     /// A consumer that closes a run's view on its last event must agree with

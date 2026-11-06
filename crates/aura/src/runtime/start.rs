@@ -28,6 +28,34 @@ pub struct StartRun {
     /// The longest the run may take.
     pub timeout: Option<Duration>,
     pub liveness: Liveness,
+    /// Who asked for the run.
+    pub caller: Option<Caller>,
+    /// The run's `agent.stream` span, which the caller creates, or
+    /// `Span::none()` for an untraced run.
+    pub span: tracing::Span,
+}
+
+/// Who asked for a run, as given by the request that started it.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Caller {
+    /// The OpenAI-compatible `user` field.
+    pub user: Option<String>,
+    /// The request's `metadata`.
+    pub metadata: Option<HashMap<String, String>>,
+}
+
+impl std::fmt::Debug for Caller {
+    /// Prints whether a user id is set and how many metadata keys there are,
+    /// but never the values, because a user id identifies an end user.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Caller")
+            .field("user", &self.user.is_some())
+            .field(
+                "metadata_keys",
+                &self.metadata.as_ref().map_or(0, HashMap::len),
+            )
+            .finish()
+    }
 }
 
 impl StartRun {
@@ -45,6 +73,8 @@ impl StartRun {
             history: Vec::new(),
             timeout: None,
             liveness: Liveness::default(),
+            caller: None,
+            span: tracing::Span::none(),
         }
     }
 }

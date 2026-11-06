@@ -49,6 +49,8 @@ impl AgentEvent {
 pub enum ToolOutcome {
     Success {
         result: String,
+        #[serde(default, skip_serializing_if = "ResultFormat::is_text")]
+        format: ResultFormat,
     },
     Failure {
         error: String,
@@ -56,6 +58,24 @@ pub enum ToolOutcome {
     /// A value this version of the crate does not know.
     #[serde(other, skip_serializing)]
     Unknown,
+}
+
+/// The format of a tool's result text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultFormat {
+    #[default]
+    Text,
+    Json,
+    /// A value this version of the crate does not know.
+    #[serde(other, skip_serializing)]
+    Unknown,
+}
+
+impl ResultFormat {
+    pub fn is_text(&self) -> bool {
+        matches!(self, Self::Text)
+    }
 }
 
 /// What an agent has to say about its own execution.
@@ -76,6 +96,12 @@ pub enum AgentEventPayload {
         servers: Vec<McpServerStatus>,
     },
 
+    /// The skill invocations put back into the run's history, one label
+    /// each.
+    SkillsRehydrated {
+        skills: Vec<String>,
+    },
+
     TextDelta {
         content: String,
     },
@@ -91,6 +117,9 @@ pub enum AgentEventPayload {
         tool_call_id: ToolCallId,
         tool_name: ToolName,
         arguments: serde_json::Value,
+        /// The provider's argument text that did not parse as JSON.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unparsed_arguments: Option<String>,
     },
 
     ToolStart {
@@ -391,17 +420,121 @@ mod tests {
     }
 
     #[test]
+    fn rehydrated_skills_survive_a_roundtrip() {
+        let json = serde_json::to_value(AgentEventPayload::SkillsRehydrated {
+            skills: vec!["deploy".to_string(), "rollback".to_string()],
+        })
+        .expect("should serialize");
+        assert_eq!(json["type"], "skills_rehydrated");
+        assert_eq!(json["skills"], json!(["deploy", "rollback"]));
+
+        let AgentEventPayload::SkillsRehydrated { skills } =
+            serde_json::from_value(json).expect("round-trips")
+        else {
+            panic!("expected SkillsRehydrated");
+        };
+        assert_eq!(skills, vec!["deploy", "rollback"]);
+    }
+
+    #[test]
     fn arguments_survive_a_roundtrip() {
         let payload = roundtrip(AgentEventPayload::ToolRequested {
             tool_call_id: ToolCallId::new("call_1"),
             tool_name: ToolName::new("list_files"),
             arguments: json!({ "path": "/mock", "depth": 2 }),
+            unparsed_arguments: None,
         });
 
-        let AgentEventPayload::ToolRequested { arguments, .. } = payload else {
+        let AgentEventPayload::ToolRequested {
+            arguments,
+            unparsed_arguments,
+            ..
+        } = payload
+        else {
             panic!("expected ToolRequested");
         };
         assert_eq!(arguments, json!({ "path": "/mock", "depth": 2 }));
+        assert_eq!(unparsed_arguments, None);
+    }
+
+    /// Arguments that do not parse are written as an empty `arguments`
+    /// object, with the provider's text kept in `unparsed_arguments`.
+    #[test]
+    fn unparsed_arguments_survive_a_roundtrip() {
+        let json = serde_json::to_value(AgentEventPayload::ToolRequested {
+            tool_call_id: ToolCallId::new("call_1"),
+            tool_name: ToolName::new("list_files"),
+            arguments: json!({}),
+            unparsed_arguments: Some(r#"{"path":"/mo"#.to_string()),
+        })
+        .expect("should serialize");
+        assert_eq!(json["arguments"], json!({}));
+        assert_eq!(json["unparsed_arguments"], r#"{"path":"/mo"#);
+
+        let AgentEventPayload::ToolRequested {
+            unparsed_arguments, ..
+        } = serde_json::from_value(json).expect("round-trips")
+        else {
+            panic!("expected ToolRequested");
+        };
+        assert_eq!(unparsed_arguments.as_deref(), Some(r#"{"path":"/mo"#));
+    }
+
+    /// Parsed arguments write no `unparsed_arguments` field, so an older
+    /// reader that does not know the field can still read the event.
+    #[test]
+    fn parsed_arguments_write_no_unparsed_text() {
+        let json = serde_json::to_value(AgentEventPayload::ToolRequested {
+            tool_call_id: ToolCallId::new("call_1"),
+            tool_name: ToolName::new("list_files"),
+            arguments: json!({ "path": "/mock" }),
+            unparsed_arguments: None,
+        })
+        .expect("should serialize");
+        assert!(json.get("unparsed_arguments").is_none(), "{json}");
+    }
+
+    /// A JSON result is written with `format: json`. A text result writes no
+    /// `format` field, so an older reader that does not know the field can
+    /// still read it.
+    #[test]
+    fn a_result_format_survives_a_roundtrip() {
+        let complete = |result: &str, format| AgentEventPayload::ToolComplete {
+            task_id: None,
+            tool_call_id: ToolCallId::new("call_1"),
+            tool_name: ToolName::new("stat"),
+            duration_ms: 3,
+            outcome: ToolOutcome::Success {
+                result: result.to_string(),
+                format,
+            },
+        };
+
+        let json = serde_json::to_value(complete(r#"{"files":11}"#, ResultFormat::Json))
+            .expect("should serialize");
+        assert_eq!(json["outcome"], "success");
+        assert_eq!(json["format"], "json");
+        let AgentEventPayload::ToolComplete {
+            outcome: ToolOutcome::Success { result, format },
+            ..
+        } = serde_json::from_value(json).expect("round-trips")
+        else {
+            panic!("expected a successful ToolComplete");
+        };
+        assert_eq!(result, r#"{"files":11}"#);
+        assert_eq!(format, ResultFormat::Json);
+
+        let json =
+            serde_json::to_value(complete("a.txt", ResultFormat::Text)).expect("should serialize");
+        assert!(json.get("format").is_none(), "{json}");
+        let AgentEventPayload::ToolComplete {
+            outcome: ToolOutcome::Success { format, .. },
+            ..
+        } = serde_json::from_value(json).expect("round-trips")
+        else {
+            panic!("expected a successful ToolComplete");
+        };
+        assert_eq!(format, ResultFormat::Text);
     }
 
     #[test]
@@ -517,6 +650,37 @@ mod tests {
         assert_eq!(tool_call_id, &ToolCallId::new("call_1"));
         assert!(matches!(outcome, ToolOutcome::Unknown));
         assert!(serde_json::to_value(&event).is_err());
+    }
+
+    /// A result format added by a newer producer keeps the `ToolComplete`
+    /// around it, so an older reader does not lose the event.
+    #[test]
+    fn an_unknown_result_format_reads_as_unknown_and_keeps_the_event() {
+        let event: AgentEvent = serde_json::from_value(json!({
+            "agent": serde_json::to_value(EmittingAgent::single_agent()).unwrap(),
+            "payload": {
+                "type": "tool_complete",
+                "tool_call_id": "call_1",
+                "tool_name": "list_files",
+                "duration_ms": 12,
+                "outcome": "success",
+                "result": "a: 1",
+                "format": "yaml"
+            }
+        }))
+        .expect("an unknown format should not fail the event");
+
+        let AgentEventPayload::ToolComplete { outcome, .. } = &event.payload else {
+            panic!("expected ToolComplete, got {:?}", event.payload);
+        };
+        assert!(matches!(
+            outcome,
+            ToolOutcome::Success {
+                result,
+                format: ResultFormat::Unknown,
+            } if result == "a: 1"
+        ));
+        assert!(serde_json::to_value(ResultFormat::Unknown).is_err());
     }
 
     /// An approval outcome added by a newer producer keeps the event around

@@ -14,6 +14,7 @@
 //! never handed out.
 
 mod observe;
+mod otel;
 mod prepare;
 mod record;
 mod recorder;
@@ -45,8 +46,12 @@ use crate::session_store::{
 };
 
 pub use observe::{Attach, AttachError, ObserverCounts, Subscription};
+pub use otel::record_ending;
+#[cfg(feature = "test-support")]
+pub use prepare::AgentForRun;
 pub use prepare::RigBuilderPreparer;
-pub use start::{StartError, StartRun};
+pub use record::RunActivity;
+pub use start::{Caller, StartError, StartRun};
 pub use state::{AgentState, BlockReason};
 
 use prepare::AgentPreparer;
@@ -87,6 +92,8 @@ struct Shared {
     pending_approvals: PendingApprovals,
     sessions: Mutex<HashMap<SessionId, Arc<SessionRecord>>>,
     runs: RwLock<HashMap<RunId, Arc<RunRecord>>>,
+    /// How many sessions have a live run.
+    live_runs: tokio::sync::watch::Sender<usize>,
     /// Guards finding or adding a session and claiming it for a run.
     admission: Mutex<()>,
     /// How long an ended run stays held.
@@ -131,6 +138,7 @@ impl AgentRuntime {
                 pending_approvals,
                 sessions: Mutex::new(HashMap::new()),
                 runs: RwLock::new(HashMap::new()),
+                live_runs: tokio::sync::watch::Sender::new(0),
                 admission: Mutex::new(()),
                 retention,
                 draining: AtomicBool::new(false),
@@ -138,6 +146,37 @@ impl AgentRuntime {
                 recorder: OnceLock::new(),
             }),
         }
+    }
+
+    /// A runtime that gets each run's agent from `agents` instead of building
+    /// it from `configs`. It is for tests that drive the runtime with a
+    /// scripted agent.
+    ///
+    /// `agents` is given the resolved config and the run's id. It returns the
+    /// agent for the run and the agent its events are attributed to, or the
+    /// error that preparing the agent would have failed with. Agent names
+    /// resolve as they do in [`RigBuilderPreparer`]. Approvals are kept in
+    /// memory, and ended runs are held for [`DEFAULT_RETENTION`].
+    #[cfg(feature = "test-support")]
+    pub fn over_agents<F>(
+        configs: Arc<Vec<Config>>,
+        default_agent: Option<String>,
+        stores: RuntimeStores,
+        agents: F,
+    ) -> Self
+    where
+        F: Fn(&Config, RunId) -> Result<AgentForRun, crate::error::BuilderError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let preparer = prepare::AgentFactoryPreparer::new(configs, default_agent, Box::new(agents));
+        Self::with_preparer(
+            Arc::new(preparer),
+            stores,
+            PendingApprovals::new(),
+            DEFAULT_RETENTION,
+        )
     }
 
     /// Starts a run and returns its id as soon as the run is recorded, in
@@ -187,6 +226,7 @@ impl AgentRuntime {
                 continues: start.continues,
             }));
             state.live = Some(Arc::clone(&record));
+            self.shared.live_runs.send_modify(|live| *live += 1);
             record
         };
         self.shared
@@ -195,12 +235,14 @@ impl AgentRuntime {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(run_id, Arc::clone(&record));
 
+        // The task prepares the agent under the caller's span.
         let task = tokio::spawn(task::run(
             Arc::clone(&self.shared),
             session,
             Arc::clone(&record),
             config,
             start,
+            tracing::Span::current(),
         ));
         record.hold_task(task);
         Ok(run_id)
@@ -213,6 +255,12 @@ impl AgentRuntime {
         self.shared
             .run(run)
             .is_some_and(|record| record.stop(reason, message))
+    }
+
+    /// Follows the activity of `run`, or `None` for a run this process does
+    /// not hold.
+    pub fn activity(&self, run: &RunId) -> Option<RunActivity> {
+        self.shared.run(run).map(|record| record.activity())
     }
 
     /// Shuts the runtime down, in four steps:
@@ -300,6 +348,18 @@ impl AgentRuntime {
         self.shared.stop_recorder();
         self.shared.shut_down.cancel();
         self.shared.lock_sessions().clear();
+    }
+
+    /// Resolves once no run is live on this runtime, meaning no session has
+    /// a run preparing or streaming, or once a drain has let every run go. A
+    /// run stops being live when its ending frees its session. That happens
+    /// before the run store has the run's final facts.
+    pub async fn idle(&self) {
+        let mut live = self.shared.live_runs.subscribe();
+        tokio::select! {
+            _ = live.wait_for(|live| *live == 0) => {}
+            () = self.shared.shut_down.cancelled() => {}
+        }
     }
 
     /// Attaches an observer to `session` and returns its `Subscription`: the

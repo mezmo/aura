@@ -16,28 +16,36 @@ use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+use tracing::Instrument;
 
 use crate::hitl::DecisionId;
 use crate::journal::SessionJournal;
 use crate::passthrough_tool::PASSTHROUGH_MARKER;
-use crate::provider_agent::{StreamError, StreamItem, StreamedUserContent};
+use crate::provider_agent::{FinalResponseInfo, StreamError, StreamItem, StreamedUserContent};
 use crate::session_store::{RunFacts, RunStatus, SessionStoreError, SkillLogKey};
 use crate::skill_tool::SkillInvocationRecorder;
-use crate::streaming::{RunOptions, StreamingAgent};
+use crate::streaming::{RunOptions, StreamingAgent, tee_run_events};
+use crate::streaming_request_hook::{BilledUsage, UsageState, resolve_billed_usage};
 
-use super::Shared;
-use super::StartRun;
+use super::otel::{RunMode, RunSpan};
 use super::prepare::{PrepareRequest, PreparedForRun};
 use super::record::{RunRecord, SessionRecord};
+use super::{Caller, Shared, StartRun};
 
 /// How long a stopped run's stream is given to end on its own.
 pub(super) const STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// How long a stopped run waits for its MCP calls to be cancelled and its
+/// connections closed.
+pub(super) const MCP_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How a run's execution came out, before its terminal event is written.
 #[derive(Default)]
 struct Outcome {
     /// The agent that ran.
     agent: Option<Arc<dyn StreamingAgent>>,
+    /// The agent the run's events are attributed to.
+    started: Option<EmittingAgent>,
     /// The error the run's stream failed with.
     error: Option<String>,
     /// The journal append that failed.
@@ -46,6 +54,8 @@ struct Outcome {
     parked: Option<Vec<DecisionId>>,
     /// Whether the run yielded to a tool its client executes.
     yielded: bool,
+    /// The run's final response.
+    response: Option<FinalResponseInfo>,
 }
 
 impl Outcome {
@@ -57,7 +67,13 @@ impl Outcome {
     }
 }
 
-/// Executes the run `record` on `session` and records how it ended.
+/// Executes the run `record` on `session` (see [`execute`] for how the agent
+/// is prepared and streamed under its spans) and records how it ended.
+///
+/// When the agent was prepared, the ending is written inside the run's span,
+/// `start.span`, and recorded on it. Otherwise nothing is recorded there.
+/// After the run's span closes, the tracer is flushed, and only then is the
+/// run held for the retention window.
 ///
 /// If executing the run panics, the run fails as it would on any other
 /// error: its ending is written and the session freed. If writing the ending
@@ -69,11 +85,20 @@ pub(super) async fn run(
     record: Arc<RunRecord>,
     config: Config,
     start: StartRun,
+    preparing: tracing::Span,
 ) {
-    let outcome = match AssertUnwindSafe(execute(&shared, &session, &record, &config, start))
-        .catch_unwind()
-        .await
-    {
+    let span = start.span.clone();
+    let mut traced = None;
+    let execution = execute(
+        &shared,
+        &session,
+        &record,
+        &config,
+        start,
+        preparing,
+        &mut traced,
+    );
+    let outcome = match AssertUnwindSafe(execution).catch_unwind().await {
         Ok(outcome) => outcome,
         Err(panic) => {
             let error = format!("the run's task panicked: {}", panic_message(&*panic));
@@ -81,15 +106,22 @@ pub(super) async fn run(
             Outcome::failed(error)
         }
     };
-    match AssertUnwindSafe(end(&shared, &session, &record, outcome))
-        .catch_unwind()
-        .await
-    {
+    let traced = traced.as_ref().map(|attributes| (attributes, &span));
+    let ending = AssertUnwindSafe(end(&shared, &session, &record, outcome, traced)).catch_unwind();
+    let ended = match traced {
+        Some(_) => ending.instrument(span.clone()).await,
+        None => ending.await,
+    };
+    // Close the span here, not after the retention window, so the flush
+    // below exports it.
+    drop(span);
+    crate::logging::flush_tracer().await;
+    match ended {
         Ok(true) => shared.retire(&session, &record).await,
         Ok(false) => {}
         Err(panic) => {
             tracing::error!(run_id = %record.id, "ending the run panicked: {}", panic_message(&*panic));
-            fail_without_ending(&session, &record);
+            fail_without_ending(&shared, &session, &record);
             record.settle();
             shared.retire(&session, &record).await;
         }
@@ -112,12 +144,11 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
 ///
 /// A panic after `release` changes nothing: the run already has the ending
 /// it reached, and `release` already counted it.
-fn fail_without_ending(session: &SessionRecord, record: &RunRecord) {
+fn fail_without_ending(shared: &Shared, session: &SessionRecord, record: &RunRecord) {
     let mut state = session.lock();
-    if state.live.as_ref().is_none_or(|live| live.id != record.id) {
+    if !free(shared, &mut state, record) {
         return;
     }
-    state.live = None;
     state.retained += 1;
     state.last_run = Some((record.id, RunStatus::Failed));
     record.update(|facts| {
@@ -125,6 +156,20 @@ fn fail_without_ending(session: &SessionRecord, record: &RunRecord) {
         facts.ended_at = Some(aura_events::Timestamp::now());
     });
     record.unbind_context();
+}
+
+/// If `record` is the session's live run, clears it from the session and
+/// takes one off the runtime's count of live runs. Returns whether `record`
+/// was the live run.
+fn free(shared: &Shared, state: &mut super::record::SessionState, record: &RunRecord) -> bool {
+    if state.live.as_ref().is_none_or(|live| live.id != record.id) {
+        return false;
+    }
+    state.live = None;
+    shared
+        .live_runs
+        .send_modify(|live| *live = live.saturating_sub(1));
+    true
 }
 
 /// When the run's timeout expires, and the timeout itself.
@@ -135,15 +180,26 @@ struct Deadline {
 }
 
 /// Writes the run to the run store, prepares the agent, and streams the run.
-/// Appends `Started`, the agent's session info and MCP status, and every
-/// event the run emits. Returns how the run came out; [`end`] writes the
-/// ending.
+/// Appends `Started`, then the agent's session info, the skills rehydrated
+/// into its history and its MCP status, then every event the run emits. For
+/// a single agent, the item stream also passes through `tee_run_events`,
+/// which copies the agent's content and tool results onto the run's event
+/// channel. Returns how the run came out. [`end`] writes the ending.
+///
+/// Preparing the agent runs inside the `preparing` span, so what it logs
+/// belongs to the caller's trace. Once the agent is prepared, the run's span
+/// records the run's id and its input, and is entered for the rest of the
+/// run. The caller has to declare the `run.id` field when it creates the
+/// span, because a span records only the fields it declares. `traced` is
+/// set to the attributes the span records.
 async fn execute(
     shared: &Shared,
     session: &SessionRecord,
     record: &RunRecord,
     config: &Config,
     start: StartRun,
+    preparing: tracing::Span,
+    traced: &mut Option<RunSpan>,
 ) -> Outcome {
     let StartRun {
         req_headers,
@@ -154,182 +210,263 @@ async fn execute(
         mut history,
         timeout,
         liveness,
+        caller,
+        span,
         ..
     } = start;
     let agent_id = config.agent_id().to_owned();
 
-    // Write the run as `Preparing` before preparing the agent, so the store
-    // lists it from the start.
-    put_facts(shared, record).await;
+    let ready: Result<_, Outcome> = async {
+        // Write the run as `Preparing` before preparing the agent, so the
+        // store lists it from the start.
+        put_facts(shared, record).await;
 
-    // Skill invocations are logged under this session and agent, so a later
-    // run of the same agent on the session can rehydrate them. Each one is
-    // anchored at this turn's position: after the history and the prompt.
-    let skill_log = SkillLogKey::new(session.id.clone(), agent_id.clone());
-    let skill_recorder = (!config.agent.skills.local.is_empty()).then(|| {
-        Arc::new(SkillInvocationRecorder::new(
-            Arc::clone(&shared.skill_store),
-            skill_log.clone(),
-            history.len() as u32 + 1,
-        ))
-    });
+        // Skill invocations are logged under this session and agent, so a
+        // later run of the same agent on the session can rehydrate them.
+        // Each one is anchored at this turn's position: after the history
+        // and the prompt.
+        let skill_log = SkillLogKey::new(session.id.clone(), agent_id.clone());
+        let skill_recorder = (!config.agent.skills.local.is_empty()).then(|| {
+            Arc::new(SkillInvocationRecorder::new(
+                Arc::clone(&shared.skill_store),
+                skill_log.clone(),
+                history.len() as u32 + 1,
+            ))
+        });
 
-    // A run stopped while its agent is being prepared ends without a
-    // `Started` event.
-    let prepared = tokio::select! {
-        biased;
-        () = record.cancel.cancelled() => return Outcome::default(),
-        prepared = shared.preparer.prepare(
-            config,
-            PrepareRequest {
-                session: &session.id,
-                run_id: record.id,
-                req_headers: req_headers.as_ref(),
-                client_tools,
-                run_tools,
-                skill_recorder: skill_recorder.clone(),
-            },
-        ) => prepared,
-    };
+        // A run stopped while its agent is being prepared ends without a
+        // `Started` event.
+        let prepared = tokio::select! {
+            biased;
+            () = record.cancel.cancelled() => return Err(Outcome::default()),
+            prepared = shared.preparer.prepare(
+                config,
+                PrepareRequest {
+                    session: &session.id,
+                    run_id: record.id,
+                    req_headers: req_headers.as_ref(),
+                    client_tools,
+                    run_tools,
+                    skill_recorder: skill_recorder.clone(),
+                },
+            ) => prepared,
+        };
 
-    let (agent, attribution): (Arc<dyn StreamingAgent>, EmittingAgent) = match prepared {
-        Err(error) => {
-            return Outcome::failed(format!("preparing agent `{agent_id}` failed: {error}"));
-        }
-        Ok(PreparedForRun::Prepared(prepared)) => {
-            match prepared.begin_run(record.id, req_headers.as_ref(), skill_recorder.clone()) {
-                Ok(agent) => (Arc::new(agent), EmittingAgent::single_agent()),
-                Err(error) => return Outcome::failed(format!("beginning the run failed: {error}")),
-            }
-        }
-        Ok(PreparedForRun::Built(agent)) => (agent, EmittingAgent::coordinator()),
-    };
+        // Only a prepared single agent has MCP tool schemas for the span.
+        let (agent, attribution, tools_json): (Arc<dyn StreamingAgent>, EmittingAgent, _) =
+            match prepared {
+                Err(error) => {
+                    return Err(Outcome::failed(format!(
+                        "preparing agent `{agent_id}` failed: {error}"
+                    )));
+                }
+                Ok(PreparedForRun::Prepared(prepared)) => {
+                    match prepared.begin_run(
+                        record.id,
+                        req_headers.as_ref(),
+                        skill_recorder.clone(),
+                    ) {
+                        Ok(agent) => (
+                            Arc::new(agent),
+                            EmittingAgent::single_agent(),
+                            prepared.otel_llm_tools(),
+                        ),
+                        Err(error) => {
+                            return Err(Outcome::failed(format!(
+                                "beginning the run failed: {error}"
+                            )));
+                        }
+                    }
+                }
+                Ok(PreparedForRun::Built { agent, attribution }) => {
+                    (agent, attribution, Vec::new())
+                }
+            };
 
-    // If the skill store cannot be read, the run goes ahead without the
-    // earlier skill invocations.
-    if skill_recorder.is_some() && !history.is_empty() {
-        match shared.skill_store.list(&skill_log).await {
-            Ok(records) => {
-                let rehydrated = crate::skill_rehydration::rehydrate_chat_history(
-                    &mut history,
-                    records,
-                    agent.skills(),
-                )
-                .await;
-                if !rehydrated.is_empty() {
-                    tracing::debug!(run_id = %record.id, skills = ?rehydrated, "rehydrated skill invocations");
+        // If the skill store cannot be read, the run goes ahead without the
+        // earlier skill invocations.
+        let mut rehydrated = Vec::new();
+        if skill_recorder.is_some() && !history.is_empty() {
+            match shared.skill_store.list(&skill_log).await {
+                Ok(records) => {
+                    rehydrated = crate::skill_rehydration::rehydrate_chat_history(
+                        &mut history,
+                        records,
+                        agent.skills(),
+                    )
+                    .await;
+                    if !rehydrated.is_empty() {
+                        tracing::debug!(run_id = %record.id, skills = ?rehydrated, "rehydrated skill invocations");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(run_id = %record.id, %error, "skipping skill rehydration: the skill store could not be read");
                 }
             }
-            Err(error) => {
-                tracing::warn!(run_id = %record.id, %error, "skipping skill rehydration: the skill store could not be read");
+        }
+        Ok((agent, attribution, tools_json, rehydrated))
+    }
+    .instrument(preparing)
+    .await;
+    let (agent, attribution, tools_json, rehydrated) = match ready {
+        Ok(ready) => ready,
+        Err(outcome) => return outcome,
+    };
+
+    // An empty `user` or `metadata` is left off the span, as the
+    // request-bound path leaves it off. The span's mode comes from the
+    // config, as it does on that path.
+    let Caller { user, metadata } = caller.unwrap_or_default();
+    let (provider, model) = agent.get_provider_info();
+    let attributes = RunSpan {
+        provider: provider.to_owned(),
+        model: model.to_owned(),
+        run: record.id,
+        session: session.id.clone(),
+        prompt: prompt.clone(),
+        user: user.filter(|user| !user.is_empty()),
+        metadata_json: metadata
+            .filter(|metadata| !metadata.is_empty())
+            .and_then(|metadata| serde_json::to_string(&metadata).ok()),
+        invocation_parameters: crate::logging::llm_invocation_parameters(&config.agent.llm),
+        history_len: history.len(),
+        system_prompt: agent.system_prompt().map(str::to_owned),
+        mode: if config.orchestration_enabled() {
+            RunMode::Orchestration
+        } else {
+            RunMode::SingleAgent { tools_json }
+        },
+    };
+    span.record("run.id", tracing::field::display(record.id));
+    attributes.record_input(&span);
+    *traced = Some(attributes);
+
+    async {
+        // Stopped after the agent was prepared but before it streams: end
+        // without a `Started` event.
+        if record.cancel.is_cancelled() {
+            return Outcome {
+                agent: Some(agent),
+                ..Outcome::default()
+            };
+        }
+
+        // The timeout starts now, so preparing the agent does not count
+        // against it. The agent is given the timeout too, because an
+        // orchestrator plans within it. Its token is a child of the
+        // record's, so stopping the record stops the run.
+        let deadline = timeout.map(|after| Deadline {
+            at: Instant::now() + after,
+            after,
+        });
+        // The run starts with the session's current attendance. Once the
+        // agent hands over its context, attaches and detaches keep it
+        // current (see `RunRecord::mirror`).
+        let attendance = session.lock().observers.attendance();
+        let mut run = agent
+            .stream(
+                &prompt,
+                history,
+                RunOptions::bounded(timeout)
+                    .cancelled_by(&record.cancel)
+                    .attended(attendance),
+                &record.id.to_string(),
+            )
+            .await;
+        record.track_usage(run.usage().clone());
+        let context = run.run_context().cloned();
+        if let Some(context) = &context {
+            // Under the session lock, so no attach or detach lands between
+            // reading the attendance and binding the context.
+            let state = session.lock();
+            record.bind_context(Arc::clone(context), state.observers.attendance());
+        }
+        let events = run.take_agent_events();
+        let items = run.into_events();
+        // A single agent's content, tool results and closing scratchpad
+        // reading only reach the run's event channel if they are copied from
+        // its items. An orchestrated run's emitter sends all of that to the
+        // channel itself, so copying its items as well would journal its
+        // content twice.
+        let items = match context {
+            Some(context) if attribution.is_single_agent() => {
+                tee_run_events(context, attribution.clone(), items)
+            }
+            _ => items,
+        };
+
+        // An observer attach or detach still being written goes on the
+        // stream first, so `Started` follows it.
+        session.observer_writes_done().await;
+        let journal = &session.journal;
+        let started = LifecycleEvent::Started {
+            agent: agent_id,
+            prompt,
+            timeout,
+            liveness,
+            continues,
+        };
+        let started = match journal
+            .append(Some(record.id), SessionEventPayload::Lifecycle(started))
+            .await
+        {
+            Ok(started) => started,
+            Err(journal_error) => {
+                return Outcome {
+                    agent: Some(agent),
+                    journal_error: Some(journal_error),
+                    ..Outcome::default()
+                };
+            }
+        };
+        record.update(|facts| {
+            facts.status = RunStatus::Running;
+            facts.first_seq = Some(started.seq);
+            facts.latest_seq = Some(started.seq);
+        });
+        put_facts(shared, record).await;
+
+        // These go in the order the request-bound path's stream opens with.
+        let (provider, model) = agent.get_provider_info();
+        let mut opening = vec![AgentEventPayload::SessionInfo {
+            model: format!("{provider}/{model}"),
+            model_context_limit: agent.context_window().map(TokenCount::new),
+        }];
+        if !rehydrated.is_empty() {
+            opening.push(AgentEventPayload::SkillsRehydrated { skills: rehydrated });
+        }
+        let servers = agent.mcp_server_status();
+        if !servers.is_empty() {
+            opening.push(AgentEventPayload::McpStatus { servers });
+        }
+        for payload in opening {
+            let event = AgentEvent::new(attribution.clone(), payload);
+            if let Err(journal_error) = append_agent_event(journal, record, event).await {
+                return Outcome {
+                    agent: Some(agent),
+                    started: Some(attribution),
+                    journal_error: Some(journal_error),
+                    ..Outcome::default()
+                };
             }
         }
-    }
 
-    // Stopped after the agent was prepared but before it streams: end
-    // without a `Started` event.
-    if record.cancel.is_cancelled() {
-        return Outcome {
-            agent: Some(agent),
-            ..Outcome::default()
-        };
-    }
-
-    // The timeout starts now, so preparing the agent does not count against
-    // it. The agent is given the timeout too, because an orchestrator plans
-    // within it. Its token is a child of the record's, so stopping the
-    // record stops the run.
-    let deadline = timeout.map(|after| Deadline {
-        at: Instant::now() + after,
-        after,
-    });
-    // The run starts with the session's current attendance. Once the agent
-    // hands over its context, attaches and detaches keep it current (see
-    // `RunRecord::mirror`).
-    let attendance = session.lock().observers.attendance();
-    let mut run = agent
-        .stream(
-            &prompt,
-            history,
-            RunOptions::bounded(timeout)
-                .cancelled_by(&record.cancel)
-                .attended(attendance),
-            &record.id.to_string(),
+        let mut outcome = drive(
+            shared,
+            journal,
+            record,
+            agent.as_ref(),
+            events,
+            items,
+            deadline,
         )
         .await;
-    record.track_usage(run.usage().clone());
-    if let Some(context) = run.run_context() {
-        // Under the session lock, so no attach or detach lands between
-        // reading the attendance and binding the context.
-        let state = session.lock();
-        record.bind_context(Arc::clone(context), state.observers.attendance());
+        outcome.agent = Some(agent);
+        outcome.started = Some(attribution);
+        outcome
     }
-    let events = run.take_agent_events();
-    let items = run.into_events();
-
-    // An observer attach or detach still being written goes on the stream
-    // first, so `Started` follows it.
-    session.observer_writes_done().await;
-    let journal = &session.journal;
-    let started = LifecycleEvent::Started {
-        agent: agent_id,
-        prompt,
-        timeout,
-        liveness,
-        continues,
-    };
-    let started = match journal
-        .append(Some(record.id), SessionEventPayload::Lifecycle(started))
-        .await
-    {
-        Ok(started) => started,
-        Err(journal_error) => {
-            return Outcome {
-                agent: Some(agent),
-                journal_error: Some(journal_error),
-                ..Outcome::default()
-            };
-        }
-    };
-    record.update(|facts| {
-        facts.status = RunStatus::Running;
-        facts.first_seq = Some(started.seq);
-        facts.latest_seq = Some(started.seq);
-    });
-    put_facts(shared, record).await;
-
-    let (provider, model) = agent.get_provider_info();
-    let mut opening = vec![AgentEventPayload::SessionInfo {
-        model: format!("{provider}/{model}"),
-        model_context_limit: agent.context_window().map(TokenCount::new),
-    }];
-    let servers = agent.mcp_server_status();
-    if !servers.is_empty() {
-        opening.push(AgentEventPayload::McpStatus { servers });
-    }
-    for payload in opening {
-        let event = AgentEvent::new(attribution.clone(), payload);
-        if let Err(journal_error) = append_agent_event(journal, record, event).await {
-            return Outcome {
-                agent: Some(agent),
-                journal_error: Some(journal_error),
-                ..Outcome::default()
-            };
-        }
-    }
-
-    let mut outcome = drive(
-        shared,
-        journal,
-        record,
-        agent.as_ref(),
-        events,
-        items,
-        deadline,
-    )
-    .await;
-    outcome.agent = Some(agent);
-    outcome
+    .instrument(span)
+    .await
 }
 
 /// Polls the run's item stream to its end, and appends every event the run
@@ -337,7 +474,7 @@ async fn execute(
 /// makes the agent do its work.
 ///
 /// Content reaches the event channel as it streams, so items are checked
-/// for only three things:
+/// for only four things:
 ///
 /// - An error. The first one is kept as what the run failed with.
 /// - A tool result holding the passthrough tool's marker. That means the run
@@ -347,6 +484,8 @@ async fn execute(
 /// - A `RunParked` event. A park can arrive as an item rather than on the
 ///   run's channel, and it decides how the run ends. It is observed, not
 ///   appended: the run's `Parked` ending records it.
+/// - The final response. The run's span records its content as the run's
+///   answer. Its usage, if it reports any, is what the run billed.
 ///
 /// The event channel never closes on its own, because the prepared agent
 /// keeps a sender. So when the item stream ends, the receiver is closed and
@@ -417,14 +556,21 @@ async fn drive(
                 }
             }
             // The run was stopped: cancel its MCP calls and start the grace.
+            // An MCP server that never answers the cancel would otherwise
+            // keep the run live, and its session busy, for as long as it
+            // hangs, so the close gets `MCP_CLOSE_TIMEOUT`. The grace starts
+            // only once the close is done, so the stream is dropped at most
+            // `MCP_CLOSE_TIMEOUT` plus `STOP_GRACE` after the stop.
             () = record.cancel.cancelled(), if !stop_seen && items.is_some() => {
                 stop_seen = true;
                 let label = record
                     .stopped()
                     .map_or("run cancelled", |(reason, _)| stop_label(&reason));
-                agent
-                    .cancel_and_close_mcp(&record.id.to_string(), label)
-                    .await;
+                let request_id = record.id.to_string();
+                let close = agent.cancel_and_close_mcp(&request_id, label);
+                if tokio::time::timeout(MCP_CLOSE_TIMEOUT, close).await.is_err() {
+                    tracing::warn!(run_id = %record.id, timeout = ?MCP_CLOSE_TIMEOUT, "closing the stopped run's MCP calls timed out");
+                }
                 stop_grace.as_mut().reset(Instant::now() + STOP_GRACE);
             }
             () = &mut stop_grace, if stop_seen && items.is_some() => {
@@ -438,42 +584,59 @@ async fn drive(
                     record.stop(RunCancelReason::Deadline { after: deadline.after }, None);
                 }
             }
-            item = next_item(&mut items), if items.is_some() => match item {
-                None => {
-                    items = None;
-                    close(&mut events);
-                    // A single agent that reaches the timeout ends its own
-                    // stream with an error. Count that as the deadline.
-                    if let Some(deadline) = deadline
-                        && outcome.error.is_some()
-                        && Instant::now() >= deadline.at
-                    {
-                        record.stop(RunCancelReason::Deadline { after: deadline.after }, None);
+            item = next_item(&mut items), if items.is_some() => {
+                if item.as_ref().is_some_and(shows_activity) {
+                    record.note_activity();
+                }
+                match item {
+                    None => {
+                        items = None;
+                        close(&mut events);
+                        // A single agent that reaches the timeout ends its own
+                        // stream with an error. Count that as the deadline.
+                        if let Some(deadline) = deadline
+                            && outcome.error.is_some()
+                            && Instant::now() >= deadline.at
+                        {
+                            record.stop(RunCancelReason::Deadline { after: deadline.after }, None);
+                        }
+                        record.close_to_stops();
                     }
-                    record.close_to_stops();
+                    // Keep the first error. Later ones follow from it.
+                    Some(Err(error)) => {
+                        outcome.error.get_or_insert_with(|| error.to_string());
+                    }
+                    Some(Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(result))))
+                        if result.result.contains(PASSTHROUGH_MARKER) =>
+                    {
+                        outcome.yielded = true;
+                    }
+                    Some(Ok(StreamItem::AgentEvent(event)))
+                        if matches!(event.payload, AgentEventPayload::RunParked { .. }) =>
+                    {
+                        approvals.observe(record.id, &event.payload);
+                    }
+                    Some(Ok(StreamItem::Final(response))) => {
+                        outcome.response = Some(response);
+                    }
+                    Some(Ok(_)) => {}
                 }
-                // Keep the first error. Later ones follow from it.
-                Some(Err(error)) => {
-                    outcome.error.get_or_insert_with(|| error.to_string());
-                }
-                Some(Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(result))))
-                    if result.result.contains(PASSTHROUGH_MARKER) =>
-                {
-                    outcome.yielded = true;
-                }
-                Some(Ok(StreamItem::AgentEvent(event)))
-                    if matches!(event.payload, AgentEventPayload::RunParked { .. }) =>
-                {
-                    approvals.observe(record.id, &event.payload);
-                }
-                Some(Ok(_)) => {}
-            },
+            }
             else => break,
         }
     }
 
     outcome.parked = approvals.parked;
     outcome
+}
+
+/// Whether `item` shows the run is still going, for whoever follows its
+/// [`RunActivity`](super::RunActivity). Every item does, including those that
+/// never become an event, such as a tool call's argument deltas, except an MCP
+/// status reading. An orchestrated run puts that reading on its stream before
+/// its provider has answered.
+fn shows_activity(item: &Result<StreamItem, StreamError>) -> bool {
+    !matches!(item, Ok(StreamItem::McpStatus(_)))
 }
 
 /// The next event on the run's channel, for a `select!` branch that is
@@ -580,14 +743,25 @@ fn decision_id(run: RunId, raw: &str) -> Option<DecisionId> {
         .ok()
 }
 
-/// Writes the run's ending: appends its terminal event, writes its final
-/// facts, cancels its leftover approvals, and frees the session for its next
-/// run. Returns `true` when it did. Returns `false`, doing nothing, if a
-/// drain abandoned the run first, because the drain then writes the ending.
+/// Writes the run's ending, in three steps:
+///
+/// - Appends the run's closing readings, then its terminal event.
+/// - Publishes the run's final facts and frees the session for its next run.
+/// - Writes the facts to the run store and cancels the run's leftover
+///   approvals.
+///
+/// Returns `true` when it wrote the ending. Returns `false` and does nothing
+/// if a drain abandoned the run first, because in that case the drain writes
+/// the ending.
+///
+/// What the run billed is worked out once, from its final response and its
+/// usage counters. The `Usage` reading, the terminal event and the facts all
+/// use that result, so they carry the same numbers.
 ///
 /// The first of these that applies decides the ending:
 ///
-/// 1. The journal refused one of the run's events: `Failed`.
+/// 1. The journal refused one of the run's events, including its closing
+///    readings: `Failed`.
 /// 2. The run was stopped: `Cancelled`, with the stop's reason.
 /// 3. The run yielded to a client tool: `Finished`.
 /// 4. The run's stream returned an error: `Failed`.
@@ -596,11 +770,16 @@ fn decision_id(run: RunId, raw: &str) -> Option<DecisionId> {
 ///
 /// A stopped run's stream ends with an error, and so does a yield's. That is
 /// why both come before the stream error.
+///
+/// `traced` holds the run's span and the attributes it records. Once the
+/// ending is decided, the ending and the run's answer are recorded on the
+/// span.
 async fn end(
     shared: &Shared,
     session: &SessionRecord,
     record: &RunRecord,
     outcome: Outcome,
+    traced: Option<(&RunSpan, &tracing::Span)>,
 ) -> bool {
     if !record.begin_ending() {
         return false;
@@ -608,12 +787,27 @@ async fn end(
     record.close_to_stops();
     let Outcome {
         agent,
+        started,
         error,
-        journal_error,
+        mut journal_error,
         parked,
         yielded,
+        response,
     } = outcome;
-    let usage = record.usage();
+    let no_counters = UsageState::new();
+    let billed = resolve_billed_usage(response.as_ref(), record.counters().unwrap_or(&no_counters));
+    // Skip the closing readings if the run never started, since there is no
+    // stream for them to close. Skip them too if the journal already refused
+    // an event, because it would refuse these as well.
+    if let Some(attribution) = &started
+        && journal_error.is_none()
+        && let Err(refused) =
+            append_closing_readings(session, record, attribution, agent.as_deref(), &billed).await
+    {
+        tracing::warn!(run_id = %record.id, %refused, "the session journal refused the run's closing readings");
+        journal_error = Some(refused);
+    }
+    let usage = billed.usage;
     let run_key = record.id.to_string();
 
     let (terminal, status) = if let Some(journal_error) = &journal_error {
@@ -637,12 +831,74 @@ async fn end(
     } else {
         (LifecycleEvent::Finished { usage }, RunStatus::Finished)
     };
+    if let Some((attributes, span)) = traced
+        && let Some(ending) = terminal.ending()
+    {
+        let answer = response.as_ref().map(|response| response.content.as_str());
+        attributes.record_output(span, &ending, answer);
+    }
     let (stamped, facts) = journal_ending(session, record, terminal, status, parked, usage).await;
     release(shared, session, record, stamped, facts, true).await;
     // Drop the agent now that its run has ended. For a single agent this
     // also drops the prepared agent and closes its MCP connections.
     drop(agent);
     true
+}
+
+/// Appends the readings that close a started run, just before its ending.
+/// They go in the order the request-bound path sends them after its stream
+/// has ended:
+///
+/// - What the run billed, as a `Usage` event attributed like the run's other
+///   events.
+/// - For a single agent, how full its context window was on its last turn,
+///   as a `ContextUsage` event. It is left out if the provider reported no
+///   context tokens. An orchestrated run's agents report their own context
+///   usage as they go.
+///
+/// Any observer attach or detach already being written goes on the stream
+/// first. One that starts after that can still land between the readings
+/// and the ending.
+async fn append_closing_readings(
+    session: &SessionRecord,
+    record: &RunRecord,
+    attribution: &EmittingAgent,
+    agent: Option<&dyn StreamingAgent>,
+    billed: &BilledUsage,
+) -> Result<(), SessionStoreError> {
+    session.observer_writes_done().await;
+    let billed = AgentEventPayload::Usage {
+        usage: billed.usage,
+        cache_read_input_tokens: billed.cache.map(|cache| cache.read),
+        cache_creation_input_tokens: billed.cache.map(|cache| cache.creation),
+    };
+    append_agent_event(
+        &session.journal,
+        record,
+        AgentEvent::new(attribution.clone(), billed),
+    )
+    .await?;
+
+    let (context_tokens, response_tokens) = record
+        .counters()
+        .map_or((0, 0), UsageState::get_context_usage);
+    if !attribution.is_single_agent() || context_tokens == 0 {
+        return Ok(());
+    }
+    let occupancy = AgentEventPayload::ContextUsage {
+        context_tokens: TokenCount::new(context_tokens),
+        response_tokens: TokenCount::new(response_tokens),
+        context_window: agent
+            .and_then(|agent| agent.context_window())
+            .map(TokenCount::new),
+    };
+    append_agent_event(
+        &session.journal,
+        record,
+        AgentEvent::new(EmittingAgent::single_agent(), occupancy),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Writes the ending for a run after a drain aborted its task. The ending is
@@ -729,9 +985,7 @@ async fn release(
 ) {
     {
         let mut state = session.lock();
-        if state.live.as_ref().is_some_and(|live| live.id == record.id) {
-            state.live = None;
-        }
+        free(shared, &mut state, record);
         state.last_run = Some((record.id, facts.status));
         if retained {
             state.retained += 1;

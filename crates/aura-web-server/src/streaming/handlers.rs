@@ -1334,7 +1334,7 @@ fn handle_orchestrator_event(
             outcome,
         } => {
             let (success, result): (bool, &str) = match outcome {
-                aura_events::agent::ToolOutcome::Success { result } => (true, result),
+                aura_events::agent::ToolOutcome::Success { result, .. } => (true, result),
                 aura_events::agent::ToolOutcome::Failure { error } => (false, error),
                 aura_events::agent::ToolOutcome::Unknown => (false, ""),
             };
@@ -1478,7 +1478,7 @@ fn handle_orchestrator_event(
             ..
         } => {
             let (success, result): (bool, &str) = match outcome {
-                aura_events::agent::ToolOutcome::Success { result } => (true, result),
+                aura_events::agent::ToolOutcome::Success { result, .. } => (true, result),
                 aura_events::agent::ToolOutcome::Failure { error } => (false, error),
                 aura_events::agent::ToolOutcome::Unknown => (false, ""),
             };
@@ -1891,6 +1891,7 @@ mod tests {
                 duration_ms: 42,
                 outcome: ToolOutcome::Success {
                     result: "ok".to_string(),
+                    format: aura_events::agent::ResultFormat::Text,
                 },
             },
         );
@@ -3102,6 +3103,7 @@ mod tests {
                         tool_call_id: ToolCallId::new(TOOL_ID),
                         tool_name: ToolName::new(TOOL_NAME),
                         arguments: json!({ "path": "/mock" }),
+                        unparsed_arguments: None,
                     }))
                     .await
                     .expect("tool event channel open");
