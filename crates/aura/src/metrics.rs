@@ -136,13 +136,17 @@ pub use imp::*;
 
 #[cfg(feature = "otel")]
 mod imp {
-    use std::sync::OnceLock;
+    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 
-    use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
+    use opentelemetry::metrics::{
+        Counter, Gauge, Histogram, Meter, MeterProvider as _, UpDownCounter,
+    };
     use opentelemetry::{KeyValue, global};
     use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
     use prometheus::Encoder;
+
+    use std::sync::Arc;
 
     use super::{InferenceLabels, Ingress, MetricsError, RunMeasure, TokenMeasure, provider_name};
 
@@ -370,6 +374,9 @@ mod imp {
     }
 
     static STATE: OnceLock<State> = OnceLock::new();
+    /// Held for the whole of `init`, so one caller builds the state and the
+    /// rest wait for it rather than racing it.
+    static INIT: Mutex<()> = Mutex::new(());
 
     fn instruments() -> Option<&'static Instruments> {
         STATE.get().map(|s| &s.instruments)
@@ -380,12 +387,15 @@ mod imp {
     /// `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT`
     /// is set. Must run inside a Tokio runtime (the OTLP reader spawns its
     /// export task on it) and before the first recording, since instruments
-    /// bind to whichever provider is global when they are created. A second
-    /// call is a no-op.
+    /// bind to the provider at creation. A second call is a no-op, and a
+    /// concurrent one waits for the first to finish; the instruments come
+    /// from the provider built here, not the global one, so a caller that
+    /// loses the race still records into the registry this serves.
     ///
     /// An OTLP exporter that fails to build is reported and skipped, so a
     /// bad collector address costs the push, not the scrape.
     pub fn init(otlp_push: bool) -> Result<(), MetricsError> {
+        let _serial = INIT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if STATE.get().is_some() {
             return Ok(());
         }
@@ -422,8 +432,8 @@ mod imp {
             },
         }
         let provider = builder.build();
+        let instruments = Instruments::new(&provider.meter(METER_NAME));
         global::set_meter_provider(provider.clone());
-        let instruments = Instruments::new(&global::meter(METER_NAME));
         let _ = STATE.set(State {
             registry,
             provider,
@@ -579,8 +589,12 @@ mod imp {
     pub fn record_token_usage(labels: &InferenceLabels, tokens: TokenMeasure) {
         let Some(i) = instruments() else { return };
         let attrs = inference_attrs(labels);
-        i.operation_input_tokens.record(tokens.input, &attrs);
-        i.operation_output_tokens.record(tokens.output, &attrs);
+        // A provider that reports no usage for a turn yields all zeros; the
+        // distributions skip it rather than count an empty sample.
+        if tokens.input > 0 || tokens.output > 0 {
+            i.operation_input_tokens.record(tokens.input, &attrs);
+            i.operation_output_tokens.record(tokens.output, &attrs);
+        }
         let mut usage_attrs = attrs;
         usage_attrs.push(kv(GEN_AI_TOKEN_MODALITY, "text"));
         i.usage_input_tokens.add(tokens.input, &usage_attrs);
@@ -665,7 +679,28 @@ mod imp {
         );
     }
 
-    pub fn hitl_pending_add(agent: &str, delta: i64) {
+    /// One approval awaiting a decision, counted in `aura.hitl.pending`
+    /// until dropped.
+    pub struct HitlPending {
+        agent: Arc<str>,
+    }
+
+    impl Drop for HitlPending {
+        fn drop(&mut self) {
+            hitl_pending_add(&self.agent, -1);
+        }
+    }
+
+    /// Count an approval as pending until the returned guard drops, which a
+    /// decision, a cancellation and a dropped future all do.
+    pub fn hitl_pending(agent: &str) -> HitlPending {
+        hitl_pending_add(agent, 1);
+        HitlPending {
+            agent: Arc::from(agent),
+        }
+    }
+
+    fn hitl_pending_add(agent: &str, delta: i64) {
         let Some(i) = instruments() else { return };
         i.hitl_pending.add(delta, &[kv(GEN_AI_AGENT_NAME, agent)]);
     }
@@ -709,7 +744,13 @@ mod stub {
     pub fn record_routing_decision(_: &str, _: &str) {}
     pub fn record_planning_cycles(_: &str, _: u64) {}
     pub fn record_task(_: &str, _: &str, _: &str, _: Duration) {}
-    pub fn hitl_pending_add(_: &str, _: i64) {}
+    pub struct HitlPending;
+    impl Drop for HitlPending {
+        fn drop(&mut self) {}
+    }
+    pub fn hitl_pending(_: &str) -> HitlPending {
+        HitlPending
+    }
     pub fn record_hitl_decision(_: &str, _: &str, _: Duration) {}
 }
 
@@ -773,7 +814,7 @@ mod tests {
         record_routing_decision("demo", "orchestrated");
         record_planning_cycles("demo", 2);
         record_task("demo", "logs", "completed", Duration::from_secs(4));
-        hitl_pending_add("demo", 1);
+        let pending = hitl_pending("demo");
         record_hitl_decision("demo", "approved", Duration::from_secs(30));
 
         let text = render_prometheus().expect("render");
@@ -805,5 +846,56 @@ mod tests {
         // Cache-write tokens were zero, so that counter has no series.
         assert!(!text.contains("gen_ai_client_inference_usage_cache_write_input_tokens_total{"));
         assert!(!text.contains("otel_scope_name"), "scope info is dropped");
+
+        // The pending approval leaves the gauge when its guard drops.
+        drop(pending);
+        let text = render_prometheus().expect("render");
+        assert!(
+            text.contains(r#"aura_hitl_pending{gen_ai_agent_name="demo"} 0"#),
+            "pending gauge must return to zero in:\n{text}"
+        );
+    }
+
+    /// A turn that reports no usage leaves the token distributions alone,
+    /// while the counters still take its zeros without effect.
+    #[test]
+    fn empty_usage_adds_no_distribution_sample() {
+        init(false).expect("metrics init");
+        let labels = InferenceLabels::new("silent", "openai", "gpt");
+        record_token_usage(
+            &labels,
+            TokenMeasure {
+                input: 0,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+            },
+        );
+        let text = render_prometheus().expect("render");
+        assert!(
+            !text.contains(
+                r#"gen_ai_client_inference_operation_input_tokens_count{gen_ai_agent_name="silent""#
+            ),
+            "no distribution sample for an empty turn in:\n{text}"
+        );
+    }
+
+    /// First calls from several threads must end on one registry: the
+    /// instruments every later record uses have to feed the registry the
+    /// endpoint renders, whichever caller built them.
+    #[test]
+    fn concurrent_first_calls_serve_one_registry() {
+        let callers: Vec<_> = (0..8).map(|_| std::thread::spawn(|| init(false))).collect();
+        for caller in callers {
+            caller.join().expect("init thread").expect("metrics init");
+        }
+        record_routing_decision("init-race", "direct_answer");
+        let text = render_prometheus().expect("render");
+        assert!(
+            text.contains(
+                r#"aura_orchestration_routing_total{aura_decision="direct_answer",gen_ai_agent_name="init-race"} 1"#
+            ),
+            "a record after concurrent init must reach the served registry in:\n{text}"
+        );
     }
 }

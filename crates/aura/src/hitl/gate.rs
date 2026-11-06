@@ -341,7 +341,7 @@ impl ToolWrapper for HitlApprovalWrapper {
             .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
         // `DecisionRoute` emits the lifecycle itself; the scope is how those
         // events find the run, since rig calls this off it.
-        crate::metrics::hitl_pending_add(&self.agent_name, 1);
+        let pending = crate::metrics::hitl_pending(&self.agent_name);
         let asked = std::time::Instant::now();
         let decision = match run {
             Some(run) => {
@@ -350,7 +350,7 @@ impl ToolWrapper for HitlApprovalWrapper {
             }
             None => self.route.decide_for_gate(request, &cancel).await,
         };
-        crate::metrics::hitl_pending_add(&self.agent_name, -1);
+        drop(pending);
         crate::metrics::record_hitl_decision(
             &self.agent_name,
             decision_metric_label(&decision),

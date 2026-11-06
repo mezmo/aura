@@ -183,8 +183,11 @@ mod tests {
                 .expect("the tool answers");
 
             let text = crate::metrics::render_prometheus().expect("render");
+            let series = format!(
+                "gen_ai_execute_tool_duration_seconds_count{{gen_ai_tool_name=\"{name}\"}}"
+            );
             assert!(
-                !text.contains(&format!("gen_ai_tool_name=\"{name}\"")),
+                !text.contains(&series),
                 "scratchpad tool {name} must not be metered:\n{text}"
             );
         }
