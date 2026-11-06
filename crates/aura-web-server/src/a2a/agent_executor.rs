@@ -822,35 +822,16 @@ fn convert_a2a_msg_to_aura(msg: &a2a::Message) -> Option<aura::Message> {
 mod tests {
     use super::*;
     use crate::a2a::SharedTaskStore;
-    use crate::streaming::ToolResultMode;
-    use crate::types::{ActiveRequestTracker, AppState};
+    use crate::types::AppState;
     use aura_test_utils::mock_agent::MockAgent;
 
     fn make_executor(
         configs: Vec<aura_config::Config>,
         default_agent: Option<&str>,
     ) -> AuraAgentExecutor {
-        let app_state = Arc::new(AppState {
-            configs: Arc::new(configs),
-            default_agent: default_agent.map(str::to_owned),
-            tool_result_mode: ToolResultMode::default(),
-            tool_result_max_length: 0,
-            streaming_buffer_size: 0,
-            aura_custom_events: false,
-            aura_emit_reasoning: false,
-            debug_provider_errors: false,
-            streaming_timeout_secs: 0,
-            first_chunk_timeout_secs: 0,
-            stream_inactivity_timeout_secs: 0,
-            shutdown_token: tokio_util::sync::CancellationToken::new(),
-            stream_shutdown_token: tokio_util::sync::CancellationToken::new(),
-            active_requests: Arc::new(ActiveRequestTracker::default()),
-            additional_tools: Arc::new(Vec::new),
-            slack_api: None,
-            pending_approvals: aura::hitl::PendingApprovals::new(),
-            hitl_webhook_hmac: None,
-            session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
-        });
+        let app_state = Arc::new(
+            AppState::for_tests(configs).with_default_agent(default_agent.map(str::to_owned)),
+        );
         AuraAgentExecutor::new(app_state, SharedTaskStore::default())
     }
 

@@ -30,8 +30,10 @@
 //! ).await;
 //! ```
 
+mod body;
 mod handlers;
 mod otel;
+mod projection;
 mod types;
 
 // Main streaming functions
@@ -42,6 +44,10 @@ pub use handlers::{
 
 // OTel context for agent.stream span
 pub use otel::StreamOtelContext;
+
+// The runtime-backed chat path
+pub use body::{HEARTBEAT_INTERVAL, Timeouts, collect_body, sse_body};
+pub use projection::{Ending, Projected, Pulse, SseProjector};
 
 // Streaming configuration and context
 pub use types::{StreamConfig, ToolResultMode, TurnContext};

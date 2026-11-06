@@ -138,6 +138,84 @@ pub struct AppState {
     pub hitl_webhook_hmac: Option<aura::hitl::WebhookHmac>,
     /// The session-state backend.
     pub session_store: Arc<dyn SessionStore>,
+    /// The runtime that owns this process's sessions and their runs.
+    pub runtime: Arc<aura::runtime::AgentRuntime>,
+    /// Whether chat completions are served from the runtime
+    /// (`AURA_RUNTIME_CHAT_COMPLETIONS`) or by the request-bound path.
+    pub runtime_chat_completions: bool,
+}
+
+/// Builds the runtime for a server or a standalone CLI from its loaded
+/// configs and session store. The runtime prepares agents through
+/// `RigBuilderPreparer`, and keeps runs, journals and skill invocations in
+/// the session store.
+pub fn build_runtime(
+    configs: &Arc<Vec<aura_config::Config>>,
+    default_agent: Option<String>,
+    pending_approvals: &aura::hitl::PendingApprovals,
+    hitl_webhook_hmac: Option<aura::hitl::WebhookHmac>,
+    session_store: &Arc<dyn SessionStore>,
+) -> Arc<aura::runtime::AgentRuntime> {
+    let preparer =
+        aura::runtime::RigBuilderPreparer::new(Arc::clone(configs), pending_approvals.clone())
+            .with_default_agent(default_agent)
+            .with_hitl_hmac(hitl_webhook_hmac);
+    let stores = aura::runtime::RuntimeStores {
+        runs: session_store.runs(),
+        journals: session_store.journals(),
+        skills: session_store.skills(),
+    };
+    Arc::new(aura::runtime::AgentRuntime::new(preparer, stores))
+}
+
+#[cfg(test)]
+impl AppState {
+    /// A state for tests over `configs`. It has an in-memory session store
+    /// and approvals, every setting off or zero, and no default agent. Its
+    /// runtime comes from `build_runtime`, as the server's does.
+    pub(crate) fn for_tests(configs: Vec<aura_config::Config>) -> Self {
+        let configs = Arc::new(configs);
+        let pending_approvals = aura::hitl::PendingApprovals::new();
+        let session_store: Arc<dyn SessionStore> =
+            Arc::new(crate::session_store::InMemorySessionStore::new());
+        Self {
+            runtime: build_runtime(&configs, None, &pending_approvals, None, &session_store),
+            runtime_chat_completions: false,
+            configs,
+            tool_result_mode: ToolResultMode::None,
+            tool_result_max_length: 0,
+            streaming_buffer_size: 32,
+            aura_custom_events: false,
+            aura_emit_reasoning: false,
+            debug_provider_errors: false,
+            streaming_timeout_secs: 0,
+            first_chunk_timeout_secs: 0,
+            stream_inactivity_timeout_secs: 0,
+            shutdown_token: CancellationToken::new(),
+            stream_shutdown_token: CancellationToken::new(),
+            active_requests: Arc::new(ActiveRequestTracker::new()),
+            default_agent: None,
+            additional_tools: Arc::new(Vec::new),
+            slack_api: None,
+            pending_approvals,
+            hitl_webhook_hmac: None,
+            session_store,
+        }
+    }
+
+    /// The same state with `default_agent` as its default agent. The runtime
+    /// is rebuilt so it uses the same default.
+    pub(crate) fn with_default_agent(mut self, default_agent: Option<String>) -> Self {
+        self.runtime = build_runtime(
+            &self.configs,
+            default_agent.clone(),
+            &self.pending_approvals,
+            self.hitl_webhook_hmac.clone(),
+            &self.session_store,
+        );
+        self.default_agent = default_agent;
+        self
+    }
 }
 
 impl AppState {
