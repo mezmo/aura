@@ -362,6 +362,7 @@ mod tests {
                     result: None,
                     error: None,
                     failure_category: None,
+                    kept_output: None,
                     attempt: Some(1),
                     history: None,
                     current_prompt: None,

@@ -73,8 +73,8 @@ use super::park::{
 use super::persistence::ExecutionPersistence;
 use super::types::{
     BlockedCell, CellOutcome, FailedTaskRecord, FailureCategory, FailureSummary, IterationContext,
-    IterationOutcome, IterationTimings, ParkSnapshot, PendingCall, Plan, PlanningResponse, Task,
-    TaskState, TaskStatus, truncate_kept_output,
+    IterationOutcome, IterationTimings, KEPT_OUTPUT_HEADING, ParkSnapshot, PendingCall, Plan,
+    PlanningResponse, Task, TaskState, TaskStatus, truncate_kept_output,
 };
 
 // ============================================================================
@@ -776,10 +776,6 @@ fn result_preview(task: &Task) -> Option<String> {
         .map(|s| s.summary.clone())
         .or_else(|| text.map(|t| safe_truncate(t, 200).0.to_string()))
 }
-
-/// The heading kept output appears under, wherever it is shown.
-const KEPT_OUTPUT_HEADING: &str =
-    "Output from an earlier attempt, which did not call submit_result:";
 
 const EMPTY_WORKER_RESULT: &str = "The worker produced no output and did not call submit_result.";
 
@@ -3972,9 +3968,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             .await;
                         tracing::warn!("Task {} timed out after {}ms", task_id, duration_ms);
                     }
-                    // The error and the output stay separate: the output is
-                    // worker text, which can quote a provider error, and
-                    // whatever replaces an error must not take it along.
+                    // The category comes from the error alone, since the output
+                    // is worker text that can quote a provider error. The output
+                    // is kept apart from the error, so code that rewrites the
+                    // error still keeps the output.
                     Ok(TaskOutcome::FailedWithOutput { error, output }) => {
                         let category = Self::categorize_failure_error(&error);
                         let output = self
@@ -4087,6 +4084,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     iteration,
                     worker: t.worker.clone(),
                     category: *category,
+                    kept_output: t.kept_output.clone(),
                 }),
                 _ => None,
             })
@@ -5889,8 +5887,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
     }
 
     /// The kept output of a run that failed on provider errors, or None if
-    /// no task kept any. Only the output is shown: the errors hold the
-    /// provider's raw response, which clients don't see on this path.
+    /// no task kept any. The cause appears as failure categories and only the
+    /// output is quoted: the errors hold the provider's raw response, which
+    /// clients don't see on this path.
     fn build_kept_output_results(plan: &Plan) -> Option<String> {
         let kept: Vec<String> = plan
             .tasks
@@ -5904,8 +5903,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
         if kept.is_empty() {
             return None;
         }
+        let mut causes: Vec<String> = plan
+            .tasks
+            .iter()
+            .filter_map(|t| match &t.state {
+                TaskState::Failed { category, .. } => Some(category.to_string()),
+                _ => None,
+            })
+            .collect();
+        causes.sort();
+        causes.dedup();
         Some(format!(
-            "Provider error: the run stopped (not retryable via replan). {KEPT_OUTPUT_HEADING}\n\n{}",
+            "Provider error ({}): the run stopped without a replan. {KEPT_OUTPUT_HEADING}\n\n{}",
+            causes.join(", "),
             kept.concat()
         ))
     }
@@ -7806,6 +7816,7 @@ mod tests {
             iteration: 1,
             worker: None,
             category,
+            kept_output: None,
         }
     }
 
@@ -10085,7 +10096,10 @@ mod tests {
         let Ok(IterationOutcome::FinalResult(raw)) = outcome else {
             panic!("kept output must end the run as a result, not an error");
         };
-        assert!(raw.starts_with("Provider error:"), "{raw}");
+        assert!(
+            raw.starts_with("Provider error (provider_auth_error):"),
+            "{raw}"
+        );
         assert!(raw.contains("found two idle nodes"), "{raw}");
         assert!(!raw.contains("req_011secret"), "{raw}");
     }
@@ -10101,6 +10115,47 @@ mod tests {
         task.kept_output = Some("found two idle nodes".to_string());
         assert_eq!(
             result_preview(&task).as_deref(),
+            Some("found two idle nodes")
+        );
+    }
+
+    /// The kept-output result names each cause once, including a task that
+    /// kept nothing.
+    #[test]
+    fn kept_output_results_name_each_failure_category_once() {
+        let mut plan = Plan::new("Inspect");
+        for (id, category) in [
+            (0, FailureCategory::ProviderOverloaded),
+            (1, FailureCategory::ProviderAuthError),
+            (2, FailureCategory::ProviderOverloaded),
+        ] {
+            let mut task = Task::new(id, "Inspect the pool", "r");
+            task.fail("refused", category);
+            plan.add_task(task);
+        }
+        plan.get_task_mut(0).unwrap().kept_output = Some("found two idle nodes".to_string());
+
+        let kept = Orchestrator::build_kept_output_results(&plan).unwrap();
+
+        assert!(
+            kept.starts_with("Provider error (provider_auth_error, provider_overloaded):"),
+            "{kept}"
+        );
+    }
+
+    /// A task's kept output reaches the failure history.
+    #[test]
+    fn failure_history_records_kept_output() {
+        let mut plan = Plan::new("Inspect");
+        let mut task = Task::new(0, "Inspect the pool", "r");
+        task.fail("context overflow", FailureCategory::ContextOverflow);
+        task.kept_output = Some("found two idle nodes".to_string());
+        plan.add_task(task);
+
+        let records = Orchestrator::collect_iteration_failures(&plan, 1);
+
+        assert_eq!(
+            records[0].kept_output.as_deref(),
             Some("found two idle nodes")
         );
     }
@@ -10123,15 +10178,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let orchestrator = retry_orchestrator(dir.path(), OrchestrationConfig::default()).await;
         let mut task = Task::new(0, "Inspect the pool", "r");
-        task.fail(
-            "provider refused the call. ".repeat(40),
-            FailureCategory::AgentError,
-        );
+        let length = orchestrator.config.result_summary_length();
+        task.fail("e".repeat(length + 1), FailureCategory::AgentError);
         task.kept_output = Some("found two idle nodes".to_string());
         let mut plan = Plan::new("Inspect");
         plan.add_task(task);
 
         let summary = orchestrator.build_execution_summary(&plan);
+        assert!(summary.contains("[truncated]"), "{summary}");
         assert!(summary.contains("found two idle nodes"), "{summary}");
         let raw = Orchestrator::build_raw_task_results(&plan, "note");
         assert!(raw.contains("found two idle nodes"), "{raw}");
@@ -10198,7 +10252,7 @@ mod tests {
         let (error, category) = failed(&run.plan);
         assert_eq!(category, FailureCategory::LoopDetected, "{error}");
         assert!(error.contains("the retry's findings"), "{error}");
-        assert!(!error.contains("found two idle nodes"), "{error}");
+        assert_eq!(run.plan.tasks[0].kept_output, None);
     }
 
     /// A first attempt too long to inline goes through the artifact flow, and

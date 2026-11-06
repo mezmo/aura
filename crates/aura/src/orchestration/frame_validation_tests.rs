@@ -241,6 +241,7 @@ fn test_continuation_full_scenario() {
             iteration: 1,
             worker: Some("sre".into()),
             category: FailureCategory::AgentError,
+            kept_output: None,
         },
         FailedTaskRecord {
             description: "Query deployment history for error window".into(),
@@ -248,6 +249,7 @@ fn test_continuation_full_scenario() {
             iteration: 2,
             worker: Some("sre".into()),
             category: FailureCategory::AgentError,
+            kept_output: None,
         },
     ];
 
@@ -1218,6 +1220,7 @@ fn test_continuation_failure_history_worker_none() {
         iteration: 1,
         worker: None,
         category: FailureCategory::AgentError,
+        kept_output: None,
     }];
 
     let ctx = IterationContext::new(1, plan, None, history, HashMap::new());
@@ -1249,6 +1252,7 @@ fn test_continuation_multiple_repeated_failure_patterns() {
             iteration: 1,
             worker: None,
             category: FailureCategory::AgentTimeout,
+            kept_output: None,
         },
         FailedTaskRecord {
             description: "First task".into(),
@@ -1256,6 +1260,7 @@ fn test_continuation_multiple_repeated_failure_patterns() {
             iteration: 2,
             worker: None,
             category: FailureCategory::AgentTimeout,
+            kept_output: None,
         },
         FailedTaskRecord {
             description: "Second task".into(),
@@ -1263,6 +1268,7 @@ fn test_continuation_multiple_repeated_failure_patterns() {
             iteration: 1,
             worker: None,
             category: FailureCategory::ProviderAuthError,
+            kept_output: None,
         },
         FailedTaskRecord {
             description: "Second task".into(),
@@ -1270,6 +1276,7 @@ fn test_continuation_multiple_repeated_failure_patterns() {
             iteration: 2,
             worker: None,
             category: FailureCategory::ProviderAuthError,
+            kept_output: None,
         },
     ];
 
@@ -1557,6 +1564,7 @@ fn test_continuation_section_ordering() {
         iteration: 1,
         worker: None,
         category: FailureCategory::AgentError,
+        kept_output: None,
     }];
 
     let ctx = IterationContext::new(1, plan, Some(fs), history, HashMap::new());
