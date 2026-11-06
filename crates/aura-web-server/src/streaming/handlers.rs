@@ -2925,6 +2925,7 @@ mod tests {
                                     tool_name: "dangerous_apply".into(),
                                     tool_namespace: None,
                                     arguments: serde_json::json!({}),
+                                    polling: None,
                                     origin: aura_events::ApprovalOriginWire::ConfigGate {
                                         matched_pattern: "dangerous_*".into(),
                                         agent_name: "test-agent".into(),

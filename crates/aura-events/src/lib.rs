@@ -1710,6 +1710,26 @@ mod tests {
     }
 
     #[test]
+    fn polling_approval_round_trips_and_formats_effective_seconds() {
+        let scope = ApprovalPolling {
+            every_secs: 7,
+            for_up_to_secs: 29,
+        };
+        let wire = serde_json::to_value(&scope).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({"every_secs": 7, "for_up_to_secs": 29})
+        );
+        assert_eq!(
+            serde_json::from_value::<ApprovalPolling>(wire).unwrap(),
+            scope
+        );
+        let rendered = scope.to_string();
+        assert!(rendered.contains("7s"));
+        assert!(rendered.contains("29s"));
+    }
+
+    #[test]
     fn approval_completed_error_roundtrip_and_event_name() {
         let event = AuraStreamEvent::ApprovalCompleted(ApprovalCompleted {
             decision_id: "019edead-beef-7000-8000-000000000001".to_string(),
@@ -1922,10 +1942,29 @@ pub struct ApprovalPending {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_namespace: Option<String>,
     pub arguments: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polling: Option<ApprovalPolling>,
     pub origin: ApprovalOriginWire,
     pub scope: AgentScopeWire,
     /// RFC3339 instant after which the pending approval expires.
     pub expires_at: String,
+}
+
+/// The cadence and effective duration of one polling invocation, in seconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalPolling {
+    pub every_secs: u64,
+    pub for_up_to_secs: u64,
+}
+
+impl std::fmt::Display for ApprovalPolling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Repeated calls every {}s for up to {}s after approval. Approval covers this invocation only.",
+            self.every_secs, self.for_up_to_secs,
+        )
+    }
 }
 
 /// `approval_completed`: terminal outcome (both routes; the outcome enum
