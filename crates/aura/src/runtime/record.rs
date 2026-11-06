@@ -210,6 +210,23 @@ pub(crate) struct RunRecord {
     ending: watch::Sender<Ending>,
     /// The run's context.
     context: Mutex<Option<Arc<RunContext>>>,
+    /// How many of the run's stream items have shown activity.
+    activity: watch::Sender<u64>,
+}
+
+/// Follows one run's activity.
+pub struct RunActivity(watch::Receiver<u64>);
+
+impl RunActivity {
+    /// Resolves once the run has shown activity since the last wait, or, on
+    /// the first wait, since the run began. Activity that comes while nothing
+    /// waits is reported once, by the next wait. Never resolves once the
+    /// runtime has let go of the run.
+    pub async fn next(&mut self) {
+        if self.0.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 /// Whether and why a run was stopped.
@@ -254,7 +271,22 @@ impl RunRecord {
             task: Mutex::new(None),
             ending: watch::Sender::new(Ending::Unclaimed),
             context: Mutex::new(None),
+            activity: watch::Sender::new(0),
         }
+    }
+
+    /// Records that the run showed activity.
+    pub(super) fn note_activity(&self) {
+        self.activity
+            .send_modify(|count| *count = count.wrapping_add(1));
+    }
+
+    pub(super) fn activity(&self) -> RunActivity {
+        let mut activity = self.activity.subscribe();
+        if *activity.borrow() > 0 {
+            activity.mark_changed();
+        }
+        RunActivity(activity)
     }
 
     fn context_slot(&self) -> MutexGuard<'_, Option<Arc<RunContext>>> {
@@ -314,6 +346,12 @@ impl RunRecord {
     /// Keeps the run's usage counters, which the run writes as it goes.
     pub(super) fn track_usage(&self, usage: UsageState) {
         let _ = self.usage.set(usage);
+    }
+
+    /// The run's usage counters. `None` until the agent starts streaming the
+    /// run.
+    pub(super) fn counters(&self) -> Option<&UsageState> {
+        self.usage.get()
     }
 
     fn stops(&self) -> MutexGuard<'_, Stops> {

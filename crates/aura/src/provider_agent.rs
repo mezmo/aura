@@ -682,6 +682,15 @@ impl ToolResult {
             ToolResultKind::Text | ToolResultKind::Json => None,
         }
     }
+
+    /// Whether the result's text is JSON or plain text. An error result is
+    /// plain text.
+    pub fn format(&self) -> aura_events::agent::ResultFormat {
+        match self.kind {
+            ToolResultKind::Json => aura_events::agent::ResultFormat::Json,
+            ToolResultKind::Text | ToolResultKind::Error => aura_events::agent::ResultFormat::Text,
+        }
+    }
 }
 
 /// Stream error type.

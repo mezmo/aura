@@ -281,6 +281,7 @@ async fn a_live_run_whose_last_claimant_leaves_is_cancelled_as_unclaimed() {
             "observer_detached",
             "observer_detached",
             "claims_exhausted",
+            "usage",
             "cancelled",
         ]
     );
@@ -473,8 +474,16 @@ async fn a_reopened_fenced_session_keeps_its_observers() {
     claim.detach().await;
     assert_eq!(h.ended(run).await.status, RunStatus::Cancelled);
     let events = h.journal(&s).await;
-    let tail: Vec<_> = kinds(&events).into_iter().rev().take(3).collect();
-    assert_eq!(tail, ["cancelled", "claims_exhausted", "observer_detached"]);
+    let tail: Vec<_> = kinds(&events).into_iter().rev().take(4).collect();
+    assert_eq!(
+        tail,
+        [
+            "cancelled",
+            "usage",
+            "claims_exhausted",
+            "observer_detached"
+        ]
+    );
 }
 
 /// A claimant that leaves while the run is writing its ending is recorded
@@ -514,6 +523,7 @@ async fn a_claimant_leaving_as_the_run_ends_does_not_name_it() {
             "observer_attached",
             "started",
             "session_info",
+            "usage",
             "finished",
             "observer_detached",
         ]
@@ -816,8 +826,16 @@ async fn losing_the_claim_stops_the_run_before_the_detach_is_written() {
     journal_gate.notify_one();
     assert_eq!(h.ended(run).await.status, RunStatus::Cancelled);
     let events = h.journal(&s).await;
-    let tail: Vec<_> = kinds(&events).into_iter().rev().take(3).collect();
-    assert_eq!(tail, ["cancelled", "claims_exhausted", "observer_detached"]);
+    let tail: Vec<_> = kinds(&events).into_iter().rev().take(4).collect();
+    assert_eq!(
+        tail,
+        [
+            "cancelled",
+            "usage",
+            "claims_exhausted",
+            "observer_detached"
+        ]
+    );
 }
 
 /// A detach stalled on its write does not keep the session's journal alive
