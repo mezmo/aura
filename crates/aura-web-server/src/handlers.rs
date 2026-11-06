@@ -1258,7 +1258,10 @@ pub async fn execute_completion(
         error_type: termination.error_type(),
         duration: started.elapsed(),
         inference_calls: Some(usage_state.llm_turns()),
-        // Worker tool calls count on the workers' own hooks, not here.
+        // An orchestrated run gets no per-run tool count: the hook that
+        // counts them is only on a single agent's stream, and worker and
+        // coordinator tool calls are measured per tool in
+        // gen_ai.execute_tool.duration instead.
         tool_calls: (!orchestration_enabled).then(|| usage_state.tool_calls()),
     });
 
