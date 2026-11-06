@@ -635,9 +635,11 @@ fn hitl_timeout_conflict_warning(hitl: &HitlConfig, per_call_timeout_secs: u64) 
     }
 }
 
-/// Reject a header table with two names equal ignoring ASCII case.
+/// Reject a header table with an invalid header name, or with two names equal
+/// ignoring case.
 ///
-/// Header names are lowercased before use, so such a pair collapses into one
+/// An invalid name would be dropped at connect time with only a warning. Header
+/// names are lowercased before use, so a case-only pair collapses into one
 /// entry and the value that survives depends on `HashMap` iteration order.
 fn validate_header_names_unique(
     headers: &HashMap<String, String>,
@@ -645,9 +647,14 @@ fn validate_header_names_unique(
 ) -> Result<(), crate::ConfigError> {
     let mut names: Vec<&str> = headers.keys().map(String::as_str).collect();
     names.sort_unstable();
-    let mut seen: HashMap<String, &str> = HashMap::with_capacity(names.len());
+    let mut seen: HashMap<http::header::HeaderName, &str> = HashMap::with_capacity(names.len());
     for name in names {
-        if let Some(first) = seen.insert(name.to_ascii_lowercase(), name) {
+        let parsed = http::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            crate::ConfigError::Validation(format!(
+                "'{name}' in [{location}] is not a valid header name"
+            ))
+        })?;
+        if let Some(first) = seen.insert(parsed, name) {
             return Err(crate::ConfigError::Validation(format!(
                 "Header names '{first}' and '{name}' in [{location}] differ only by case; keep one"
             )));
