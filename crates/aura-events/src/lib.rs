@@ -583,6 +583,11 @@ impl EmittingAgent {
             parent_agent_id: Some(parent_id.into()),
         }
     }
+
+    /// An agent of an orchestrated run, with the coordinator as its parent.
+    pub fn orchestrated(id: impl Into<String>) -> Self {
+        Self::worker(id, None, COORDINATOR_AGENT_ID)
+    }
 }
 
 /// Correlation context for OTEL/Phoenix tracing and session grouping.
@@ -1261,6 +1266,15 @@ mod tests {
                 "parent_agent_id": "coordinator",
             }),
         );
+    }
+
+    /// An orchestrated agent named `main`, as the coordinator's own readings
+    /// are, is not taken for a single agent, because it has a parent.
+    #[test]
+    fn an_orchestrated_agent_has_the_coordinator_as_its_parent() {
+        let agent = EmittingAgent::orchestrated(CONVERSATION_AGENT_ID);
+        assert_eq!(agent.parent_agent_id.as_deref(), Some(COORDINATOR_AGENT_ID));
+        assert!(!agent.is_single_agent());
     }
 
     #[test]

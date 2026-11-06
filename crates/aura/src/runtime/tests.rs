@@ -19,10 +19,11 @@ use aura_events::run::RunCancelReason;
 
 use super::prepare::{PrepareRequest, PreparedForRun};
 use super::record::RunRecord;
-use super::task::STOP_GRACE;
+use super::task::{MCP_CLOSE_TIMEOUT, STOP_GRACE};
 use super::*;
 use crate::builder::test_support::prepared_agent;
 use crate::builder::{ClientTool, no_run_tools};
+use crate::config::SkillConfig;
 use crate::error::BuilderError;
 use crate::forwarded_headers::ForwardedHeaders;
 use crate::hitl::DecisionId;
@@ -35,6 +36,7 @@ use crate::run_context::{Attendance, RunContext};
 use crate::session_store::JournalEntry;
 use crate::streaming::{AgentRun, RunOptions, StreamingAgent};
 use crate::streaming_request_hook::UsageState;
+use aura_events::McpServerStatus;
 
 mod observe;
 
@@ -54,11 +56,17 @@ enum Step {
     Wait(Arc<Notify>),
     /// Waits forever, whatever happens to the run.
     Stall,
+    /// Makes the agent's `cancel_and_close_mcp` never return.
+    CloseHangs,
     /// Makes an MCP call, which returns only once the run's MCP calls are
     /// cancelled.
     McpCall,
     /// Calls a tool the client executes.
     ClientToolCall,
+    /// Yields an item.
+    Item(Box<StreamItem>),
+    /// Records one provider turn on the run's usage counters.
+    Bill { prompt: u64, completion: u64 },
     /// Panics.
     Panic,
 }
@@ -67,6 +75,9 @@ enum Step {
 struct FakeAgent {
     run_id: RunId,
     steps: Vec<Step>,
+    skills: Vec<SkillConfig>,
+    servers: Vec<McpServerStatus>,
+    context_window: Option<u64>,
     /// Every `cancel_and_close_mcp` call: the request id and the reason.
     closed: Arc<Mutex<Vec<(String, String)>>>,
     /// Woken by `cancel_and_close_mcp`.
@@ -102,6 +113,8 @@ impl StreamingAgent for FakeAgent {
         let steps = self.steps.clone();
         let token = cancel.clone();
         let mcp_cancelled = Arc::clone(&self.mcp_cancelled);
+        let usage = UsageState::new();
+        let counters = usage.clone();
         let items = async_stream::stream! {
             for step in steps {
                 match step {
@@ -127,6 +140,7 @@ impl StreamingAgent for FakeAgent {
                         }
                     }
                     Step::Stall => std::future::pending::<()>().await,
+                    Step::CloseHangs => {}
                     // A tool call waits on its server whatever happens to the
                     // run's token, and returns, with an error, once the run's
                     // MCP calls are cancelled.
@@ -151,15 +165,31 @@ impl StreamingAgent for FakeAgent {
                         yield Err(error);
                         return;
                     }
+                    Step::Item(item) => yield Ok(*item),
+                    Step::Bill { prompt, completion } => {
+                        counters.store_usage(prompt, completion, prompt + completion, false);
+                    }
                     Step::Panic => panic!("the fake agent panicked"),
                 }
             }
         };
         let items: futures::stream::BoxStream<'static, Result<StreamItem, StreamError>> =
             Box::pin(items);
-        AgentRun::new(items, cancel, UsageState::new())
+        AgentRun::new(items, cancel, usage)
             .observed_by(events)
             .within(context)
+    }
+
+    fn context_window(&self) -> Option<u64> {
+        self.context_window
+    }
+
+    fn mcp_server_status(&self) -> Vec<McpServerStatus> {
+        self.servers.clone()
+    }
+
+    fn skills(&self) -> &[SkillConfig] {
+        &self.skills
     }
 
     async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize {
@@ -168,6 +198,13 @@ impl StreamingAgent for FakeAgent {
             .unwrap()
             .push((request_id.to_owned(), reason.to_owned()));
         self.mcp_cancelled.notify_one();
+        if self
+            .steps
+            .iter()
+            .any(|step| matches!(step, Step::CloseHangs))
+        {
+            std::future::pending::<()>().await;
+        }
         0
     }
 }
@@ -176,10 +213,43 @@ impl StreamingAgent for FakeAgent {
 enum Prepared {
     /// A prepared agent over a model playing these turns.
     Scripted(Vec<ScriptedTurn>),
-    /// A fake agent following these steps.
+    /// A fake agent following these steps, attributed to the coordinator.
     Fake(Vec<Step>),
+    /// A fake agent built from a `Fake`.
+    Described(Fake),
     /// A failure to prepare.
     Fail(String),
+}
+
+/// A fake agent's steps, the agent its events are attributed to, and what it
+/// reports about itself: its skills, MCP servers and context window.
+struct Fake {
+    steps: Vec<Step>,
+    attribution: aura_events::EmittingAgent,
+    skills: Vec<SkillConfig>,
+    servers: Vec<McpServerStatus>,
+    context_window: Option<u64>,
+}
+
+impl Fake {
+    /// A fake standing in for a single agent.
+    fn single(steps: Vec<Step>) -> Self {
+        Self {
+            steps,
+            attribution: aura_events::EmittingAgent::single_agent(),
+            skills: Vec::new(),
+            servers: Vec::new(),
+            context_window: None,
+        }
+    }
+
+    /// A fake standing in for an orchestrated run.
+    fn coordinator(steps: Vec<Step>) -> Self {
+        Self {
+            attribution: aura_events::EmittingAgent::coordinator(),
+            ..Self::single(steps)
+        }
+    }
 }
 
 /// A preparer with one config per agent name, handing back the agents a test
@@ -213,6 +283,29 @@ impl TestPreparer {
         self.gate = Some(gate);
         self
     }
+
+    fn fake(&self, run_id: RunId, fake: Fake) -> PreparedForRun {
+        let Fake {
+            steps,
+            attribution,
+            skills,
+            servers,
+            context_window,
+        } = fake;
+        PreparedForRun::Built {
+            agent: Arc::new(FakeAgent {
+                run_id,
+                steps,
+                skills,
+                servers,
+                context_window,
+                closed: Arc::clone(&self.closed),
+                mcp_cancelled: Arc::default(),
+                attended: Arc::clone(&self.attended),
+            }),
+            attribution,
+        }
+    }
 }
 
 fn config(name: &str) -> Config {
@@ -236,13 +329,15 @@ impl AgentPreparer for TestPreparer {
             .ok_or_else(|| StartError::NoSuchAgent(name.to_owned()))
     }
 
-    /// Waits for the gate, if there is one, then hands back the next queued
-    /// agent.
+    /// Opens and closes a `test.prepare` span, so a test can check which span
+    /// the agent is prepared under. Then waits for the gate, if there is one,
+    /// and hands back the next queued agent.
     async fn prepare(
         &self,
         config: &Config,
         request: PrepareRequest<'_>,
     ) -> Result<PreparedForRun, BuilderError> {
+        drop(tracing::info_span!("test.prepare"));
         if let Some(gate) = &self.gate {
             gate.notified().await;
         }
@@ -267,13 +362,8 @@ impl AgentPreparer for TestPreparer {
                 prepared.turn_nudge = None;
                 Ok(PreparedForRun::Prepared(Arc::new(prepared)))
             }
-            Prepared::Fake(steps) => Ok(PreparedForRun::Built(Arc::new(FakeAgent {
-                run_id: request.run_id,
-                steps,
-                closed: Arc::clone(&self.closed),
-                mcp_cancelled: Arc::default(),
-                attended: Arc::clone(&self.attended),
-            }))),
+            Prepared::Fake(steps) => Ok(self.fake(request.run_id, Fake::coordinator(steps))),
+            Prepared::Described(fake) => Ok(self.fake(request.run_id, fake)),
             Prepared::Fail(error) => Err(BuilderError::AgentError(error)),
         }
     }
@@ -595,9 +685,14 @@ fn kind(event: &SessionEvent) -> &'static str {
         },
         SessionEventPayload::Agent(agent) => match &agent.payload {
             AgentEventPayload::SessionInfo { .. } => "session_info",
+            AgentEventPayload::SkillsRehydrated { .. } => "skills_rehydrated",
             AgentEventPayload::McpStatus { .. } => "mcp_status",
             AgentEventPayload::TextDelta { .. } => "text_delta",
+            AgentEventPayload::ToolRequested { .. } => "tool_requested",
+            AgentEventPayload::ToolComplete { .. } => "tool_complete",
             AgentEventPayload::Completed { .. } => "completed",
+            AgentEventPayload::Usage { .. } => "usage",
+            AgentEventPayload::ContextUsage { .. } => "context_usage",
             AgentEventPayload::ApprovalRequested(_) => "approval_requested",
             AgentEventPayload::ApprovalCompleted(_) => "approval_completed",
             AgentEventPayload::RunParked { .. } => "run_parked",
@@ -696,9 +791,17 @@ async fn a_run_journals_its_lifecycle_around_the_agents_events() {
     let kinds = kinds(&events);
     assert_eq!(kinds.first(), Some(&"started"), "{kinds:?}");
     assert_eq!(kinds.get(1), Some(&"session_info"), "{kinds:?}");
-    assert_eq!(kinds.last(), Some(&"finished"), "{kinds:?}");
+    assert_eq!(
+        kinds[kinds.len() - 3..],
+        ["usage", "context_usage", "finished"],
+        "{kinds:?}"
+    );
     assert!(kinds.contains(&"text_delta"), "{kinds:?}");
     assert!(kinds.contains(&"completed"), "{kinds:?}");
+    assert!(
+        !kinds.contains(&"skills_rehydrated"),
+        "nothing was rehydrated, so nothing says so: {kinds:?}"
+    );
     for (n, event) in events.iter().enumerate() {
         assert_eq!(event.seq.get(), n as u64 + 1, "numbers are dense");
         assert_eq!(event.run_id, Some(run));
@@ -1562,8 +1665,6 @@ async fn an_abandoned_run_keeps_the_reason_it_was_first_stopped_for() {
     );
 }
 
-/// A run caught writing its own ending when the grace period runs out is
-/// not abandoned: the drain waits for the ending, and the run keeps the one
 /// A session is free for its next run as soon as the last run's ending is
 /// journaled, while that run's facts are still being written to the store.
 #[tokio::test]
@@ -1597,7 +1698,9 @@ async fn the_next_start_is_admitted_while_the_last_run_writes_its_facts() {
     assert!(next.is_ok(), "{next:?}");
 }
 
-/// it was writing.
+/// A run that is still writing its own ending when the grace period runs
+/// out is not abandoned. The drain waits for that ending, and the run keeps
+/// it.
 #[tokio::test(start_paused = true)]
 async fn drain_waits_for_a_run_already_writing_its_ending() {
     let gate = Arc::new(Notify::new());
@@ -1934,6 +2037,52 @@ async fn a_stopped_run_whose_stream_does_not_end_is_dropped_after_the_grace() {
     );
 }
 
+/// A stopped run whose MCP close never returns still ends: the close gets
+/// `MCP_CLOSE_TIMEOUT`, then the stream gets the stop grace.
+#[tokio::test(start_paused = true)]
+async fn a_stopped_run_whose_mcp_close_hangs_still_ends() {
+    let h = harness(TestPreparer::new(
+        &["a"],
+        vec![Prepared::Fake(vec![Step::CloseHangs, Step::Stall])],
+    ));
+    let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
+    eventually("the run is running", || {
+        h.runtime.facts(&run).unwrap().status == RunStatus::Running
+    })
+    .await;
+    let stopped_at = tokio::time::Instant::now();
+
+    assert!(h.runtime.cancel(&run, RunCancelReason::External, None));
+    // Longer than `Harness::ended` waits, which is the close and the grace
+    // together.
+    let record = h
+        .runtime
+        .shared
+        .run(&run)
+        .expect("the runtime holds the run");
+    let mut watch = record.watch();
+    let facts = tokio::time::timeout(
+        MCP_CLOSE_TIMEOUT + STOP_GRACE + PATIENCE,
+        watch.wait_for(|facts| facts.status.is_terminal()),
+    )
+    .await
+    .expect("the run ends in time")
+    .expect("the run's record is alive")
+    .clone();
+
+    assert_eq!(facts.status, RunStatus::Cancelled);
+    assert!(
+        stopped_at.elapsed() >= MCP_CLOSE_TIMEOUT + STOP_GRACE,
+        "the close and then the stream were each given their time: {:?}",
+        stopped_at.elapsed()
+    );
+    assert_eq!(h.preparer.closed.lock().unwrap().len(), 1);
+    assert_eq!(
+        h.runtime.session_state(&SessionId::new("s1").unwrap()),
+        Some(AgentState::Done)
+    );
+}
+
 /// A session whose journal another writer fenced is reopened for its next
 /// run, continuing from what the other writer wrote.
 #[tokio::test]
@@ -2116,4 +2265,890 @@ async fn a_run_whose_ending_panics_before_its_session_is_freed_fails() {
         None,
         "the session goes once it holds nothing"
     );
+}
+
+// ---------------------------------------------------------------------------
+// What the chat stream reads off the journal
+// ---------------------------------------------------------------------------
+
+/// A skill named `name` in its own directory under `dir`.
+fn skill(dir: &std::path::Path, name: &str) -> SkillConfig {
+    let skill_dir = dir.join(name);
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {name} skill\n---\nDeploy with care."),
+    )
+    .unwrap();
+    SkillConfig {
+        name: crate::config::SkillName::new(name).unwrap(),
+        description: format!("{name} skill"),
+        path: skill_dir,
+    }
+}
+
+fn server() -> McpServerStatus {
+    McpServerStatus {
+        server_name: "files".to_owned(),
+        transport: "stdio".to_owned(),
+        status: "connected".to_owned(),
+        tools_count: 3,
+        reason: None,
+    }
+}
+
+fn item(item: StreamItem) -> Step {
+    Step::Item(Box::new(item))
+}
+
+fn said(content: &str) -> StreamItem {
+    StreamItem::StreamAssistantItem(crate::provider_agent::StreamedAssistantContent::Text(
+        content.to_owned(),
+    ))
+}
+
+fn answered(content: &str, input: u64, output: u64, cache: Option<(u64, u64)>) -> StreamItem {
+    StreamItem::Final(crate::provider_agent::FinalResponseInfo {
+        content: content.to_owned(),
+        usage: rig::completion::Usage {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input + output,
+        },
+        cache_usage: cache.map(|(read, creation)| rig::completion::CacheUsage {
+            cache_read_input_tokens: read,
+            cache_creation_input_tokens: creation,
+        }),
+    })
+}
+
+fn tokens(prompt: u64, completion: u64) -> TokenUsage {
+    TokenUsage {
+        prompt_tokens: TokenCount::new(prompt),
+        completion_tokens: TokenCount::new(completion),
+        total_tokens: TokenCount::new(prompt + completion),
+    }
+}
+
+/// The agent event inside `event`. Panics if `event` is not an agent event.
+fn agent_event(event: &SessionEvent) -> &AgentEvent {
+    match &event.payload {
+        SessionEventPayload::Agent(agent) => agent,
+        other => panic!("not an agent event: {other:?}"),
+    }
+}
+
+/// The usage carried by `event`, which must be a terminal event.
+fn ending_usage(event: &SessionEvent) -> TokenUsage {
+    match &event.payload {
+        SessionEventPayload::Lifecycle(
+            LifecycleEvent::Finished { usage }
+            | LifecycleEvent::Failed { usage, .. }
+            | LifecycleEvent::Cancelled { usage, .. }
+            | LifecycleEvent::Parked { usage, .. },
+        ) => *usage,
+        other => panic!("not an ending: {other:?}"),
+    }
+}
+
+/// Waits until the run store holds `run` with a terminal status, and returns
+/// its facts.
+async fn stored(h: &Harness, run: RunId) -> RunFacts {
+    tokio::time::timeout(PATIENCE, async {
+        loop {
+            if let Some(facts) = h.runs.get(&run).await.unwrap()
+                && facts.status.is_terminal()
+            {
+                return facts;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the run store has the run's ending")
+}
+
+/// A run opens with its session info, then the skills put back into its
+/// history, then its MCP servers' status. That is the order the
+/// request-bound path opens a stream with.
+#[tokio::test]
+async fn a_run_opens_with_session_info_then_rehydrated_skills_then_mcp_status() {
+    use crate::session_store::{
+        SKILL_INVOCATION_RECORD_VERSION, SkillInvocation, SkillInvocationRecord, SkillLogKey,
+    };
+
+    let skills = tempfile::TempDir::new().unwrap();
+    let mut preparer = TestPreparer::new(
+        &["a"],
+        vec![Prepared::Described(Fake {
+            skills: vec![skill(skills.path(), "deploy")],
+            servers: vec![server()],
+            ..Fake::single(Vec::new())
+        })],
+    );
+    preparer.configs[0]
+        .agent
+        .skills
+        .local
+        .push(aura_config::LocalSkillSource {
+            source: skills.path().to_path_buf(),
+        });
+    let h = harness(preparer);
+    let session = SessionId::new("s1").unwrap();
+    h.runtime
+        .shared
+        .skill_store
+        .record(
+            &SkillLogKey::new(session.clone(), "a"),
+            SkillInvocationRecord {
+                version: SKILL_INVOCATION_RECORD_VERSION,
+                invocation: SkillInvocation::LoadSkill {
+                    name: "deploy".to_owned(),
+                },
+                tool_call_id: "call_skill".to_owned(),
+                anchor: 1,
+                seq: 0,
+                invoked_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let run = h
+        .runtime
+        .start(StartRun {
+            history: vec![Message::user("deploy it"), Message::assistant("deployed")],
+            ..on_session("s1", "again")
+        })
+        .await
+        .unwrap();
+    h.ended(run).await;
+
+    let events = h.journal(&session).await;
+    assert_eq!(
+        kinds(&events)[..4],
+        ["started", "session_info", "skills_rehydrated", "mcp_status"]
+    );
+    assert!(matches!(
+        &agent_event(&events[2]).payload,
+        AgentEventPayload::SkillsRehydrated { skills } if skills == &["deploy"]
+    ));
+}
+
+/// Before its ending, a single agent's run appends a `Usage` event for what
+/// it billed, then a `ContextUsage` event for how full its context window
+/// was on its last turn. The billed usage comes from the final response,
+/// which counts every turn, while the usage counters here missed a turn.
+/// The ending and the run's facts carry the same billed usage.
+#[tokio::test]
+async fn a_single_agent_closes_with_what_it_billed_then_its_context_occupancy() {
+    let h = harness(TestPreparer::new(
+        &["a"],
+        vec![Prepared::Described(Fake {
+            context_window: Some(128_000),
+            ..Fake::single(vec![
+                item(said("Done.")),
+                Step::Bill {
+                    prompt: 7_000,
+                    completion: 200,
+                },
+                item(answered("Done.", 12_000, 250, Some((9_000, 2_000)))),
+            ])
+        })],
+    ));
+
+    let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
+    let facts = h.ended(run).await;
+    let events = h.journal(&SessionId::new("s1").unwrap()).await;
+
+    assert_eq!(
+        kinds(&events),
+        [
+            "started",
+            "session_info",
+            "text_delta",
+            "completed",
+            "usage",
+            "context_usage",
+            "finished"
+        ]
+    );
+    let billed = tokens(12_000, 250);
+    let usage = agent_event(&events[4]);
+    assert_eq!(usage.agent, aura_events::EmittingAgent::single_agent());
+    assert!(
+        matches!(
+            usage.payload,
+            AgentEventPayload::Usage {
+                usage,
+                cache_read_input_tokens: Some(read),
+                cache_creation_input_tokens: Some(creation),
+            } if usage == billed && read.get() == 9_000 && creation.get() == 2_000
+        ),
+        "{:?}",
+        usage.payload
+    );
+    let occupancy = agent_event(&events[5]);
+    assert_eq!(occupancy.agent, aura_events::EmittingAgent::single_agent());
+    assert!(
+        matches!(
+            occupancy.payload,
+            AgentEventPayload::ContextUsage {
+                context_tokens,
+                response_tokens,
+                context_window: Some(window),
+            } if context_tokens.get() == 7_000
+                && response_tokens.get() == 200
+                && window.get() == 128_000
+        ),
+        "{:?}",
+        occupancy.payload
+    );
+    assert_eq!(ending_usage(&events[6]), billed);
+    assert_eq!(facts.usage, billed);
+    assert_eq!(stored(&h, run).await.usage, billed);
+}
+
+/// A prepared agent's tool turn produces no text, so the usage counters
+/// never see it. The final response does count it, so the run is billed for
+/// both turns. The streaming hook sends the tool call's `ToolRequested`, and
+/// the copy of the run's items sends its `ToolComplete`.
+#[tokio::test]
+async fn a_prepared_agent_is_billed_for_a_tool_turn_its_counters_missed() {
+    let h = harness(TestPreparer::new(
+        &["a"],
+        vec![Prepared::Scripted(vec![
+            ScriptedTurn::tool_calls(vec![crate::orchestration::ScriptedToolCall::new(
+                "call_0",
+                "lookup",
+                serde_json::json!({ "q": "x" }),
+            )]),
+            ScriptedTurn::text("found it"),
+        ])],
+    ));
+
+    let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
+    let facts = h.ended(run).await;
+    let events = h.journal(&SessionId::new("s1").unwrap()).await;
+
+    let kinds = kinds(&events);
+    let requested = kinds.iter().position(|kind| *kind == "tool_requested");
+    let completed = kinds.iter().position(|kind| *kind == "tool_complete");
+    assert!(
+        requested.is_some() && completed > requested,
+        "the call is requested, then completed: {kinds:?}"
+    );
+    assert_eq!(
+        kinds[kinds.len() - 3..],
+        ["usage", "context_usage", "finished"]
+    );
+    let billed = tokens(20, 10);
+    assert!(matches!(
+        agent_event(&events[events.len() - 3]).payload,
+        AgentEventPayload::Usage { usage, .. } if usage == billed
+    ));
+    assert!(matches!(
+        agent_event(&events[events.len() - 2]).payload,
+        AgentEventPayload::ContextUsage { context_tokens, response_tokens, context_window: None }
+            if context_tokens.get() == 10 && response_tokens.get() == 5
+    ));
+    assert_eq!(ending_usage(events.last().unwrap()), billed);
+    assert_eq!(facts.usage, billed);
+}
+
+/// An orchestrated run closes with one `Usage` event, attributed to the
+/// coordinator. The usage comes from its usage counters, because its final
+/// response reports none. There is no `ContextUsage` event, because its
+/// agents report their own as they go. Its items are not copied onto the
+/// channel either, because its emitter sends its content there itself.
+#[tokio::test]
+async fn an_orchestrated_run_closes_with_what_it_billed_alone() {
+    let h = harness(TestPreparer::new(
+        &["a"],
+        vec![Prepared::Fake(vec![
+            Step::Bill {
+                prompt: 5_000,
+                completion: 300,
+            },
+            item(said("The answer.")),
+            item(answered("The answer.", 0, 0, None)),
+        ])],
+    ));
+
+    let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
+    let facts = h.ended(run).await;
+    let events = h.journal(&SessionId::new("s1").unwrap()).await;
+
+    assert_eq!(
+        kinds(&events),
+        ["started", "session_info", "usage", "finished"]
+    );
+    let billed = tokens(5_000, 300);
+    let usage = agent_event(&events[2]);
+    assert_eq!(usage.agent, aura_events::EmittingAgent::coordinator());
+    assert!(matches!(
+        usage.payload,
+        AgentEventPayload::Usage { usage, cache_read_input_tokens: None, .. } if usage == billed
+    ));
+    assert_eq!(ending_usage(&events[3]), billed);
+    assert_eq!(facts.usage, billed);
+}
+
+/// `idle` resolves at once when no run is live. Otherwise it resolves once
+/// the last live run, on any session, has freed its session.
+#[tokio::test]
+async fn idle_resolves_once_the_last_live_run_ends() {
+    use futures::FutureExt;
+
+    let first_gate = Arc::new(Notify::new());
+    let second_gate = Arc::new(Notify::new());
+    let h = harness(TestPreparer::new(
+        &["a"],
+        vec![
+            Prepared::Fake(vec![Step::Wait(Arc::clone(&first_gate))]),
+            Prepared::Fake(vec![Step::Wait(Arc::clone(&second_gate))]),
+        ],
+    ));
+    tokio::time::timeout(PATIENCE, h.runtime.idle())
+        .await
+        .expect("nothing is live");
+
+    let first = h.runtime.start(on_session("s1", "q")).await.unwrap();
+    eventually("the first run is running", || {
+        h.runtime.facts(&first).unwrap().status == RunStatus::Running
+    })
+    .await;
+    let second = h.runtime.start(on_session("s2", "q")).await.unwrap();
+    let idle = h.runtime.idle();
+    tokio::pin!(idle);
+    assert!(idle.as_mut().now_or_never().is_none(), "two runs are live");
+
+    first_gate.notify_one();
+    h.ended(first).await;
+    assert!(
+        idle.as_mut().now_or_never().is_none(),
+        "the second run is still live"
+    );
+
+    second_gate.notify_one();
+    h.ended(second).await;
+    tokio::time::timeout(PATIENCE, idle)
+        .await
+        .expect("idle once both runs have ended");
+}
+
+/// A run whose agent cannot be prepared frees its session like any other
+/// run. A run that a drain abandons does too. Neither one keeps `idle`
+/// waiting. After a drain `idle` resolves whether or not the runs were
+/// freed, so the drain's half also checks that no run is counted live.
+#[tokio::test(start_paused = true)]
+async fn idle_resolves_after_a_failed_preparation_and_a_drain() {
+    use futures::FutureExt;
+
+    let h = harness(TestPreparer::new(
+        &["a"],
+        vec![
+            Prepared::Fail("no provider".to_owned()),
+            Prepared::Fake(vec![Step::Stall]),
+        ],
+    ));
+    let failed = h.runtime.start(on_session("s1", "q")).await.unwrap();
+    h.ended(failed).await;
+    tokio::time::timeout(PATIENCE, h.runtime.idle())
+        .await
+        .expect("a run that failed to prepare is not live");
+
+    let stalled = h.runtime.start(on_session("s1", "q")).await.unwrap();
+    eventually("the run is running", || {
+        h.runtime.facts(&stalled).unwrap().status == RunStatus::Running
+    })
+    .await;
+    assert!(h.runtime.idle().now_or_never().is_none(), "the run is live");
+    h.runtime.drain(Duration::from_secs(1)).await;
+    assert_eq!(
+        *h.runtime.shared.live_runs.borrow(),
+        0,
+        "the abandoned run freed its session"
+    );
+    tokio::time::timeout(PATIENCE, h.runtime.idle())
+        .await
+        .expect("a drained runtime has no live run");
+}
+
+// ---------------------------------------------------------------------------
+// The run's span
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "otel")]
+mod spans {
+    use opentelemetry::trace::{SpanId, Status};
+    use opentelemetry_sdk::export::trace::SpanData;
+    use tracing::Instrument;
+
+    use super::*;
+    use crate::test_span_capture::CapturedSpans;
+
+    /// The span a caller hands a run. It is a root `agent.stream` span that
+    /// declares the `run.id` field for the runtime to record.
+    fn agent_stream() -> tracing::Span {
+        tracing::info_span!(parent: None, "agent.stream", run.id = tracing::field::Empty)
+    }
+
+    /// Waits until the span named `name` is exported, and returns it.
+    async fn exported(captured: &CapturedSpans, name: &str) -> SpanData {
+        eventually(&format!("`{name}` is exported"), || captured.contains(name)).await;
+        captured
+            .spans()
+            .iter()
+            .find(|span| span.name == name)
+            .cloned()
+            .expect("the span was exported")
+    }
+
+    /// The spans in `root`'s trace, as sorted pairs of span name and parent
+    /// name.
+    fn tree(captured: &CapturedSpans, root: &SpanData) -> Vec<(String, Option<String>)> {
+        let spans = captured.spans();
+        let names: HashMap<SpanId, &str> = spans
+            .iter()
+            .map(|span| (span.span_context.span_id(), span.name.as_ref()))
+            .collect();
+        let mut tree: Vec<_> = spans
+            .iter()
+            .filter(|span| span.span_context.trace_id() == root.span_context.trace_id())
+            .map(|span| {
+                (
+                    span.name.to_string(),
+                    names
+                        .get(&span.parent_span_id)
+                        .map(|parent| (*parent).to_owned()),
+                )
+            })
+            .collect();
+        tree.sort();
+        tree
+    }
+
+    /// Asserts that the run's `agent.stream` span has the run's id, has
+    /// `termination` as its `stream.termination` attribute, and ends with
+    /// `status`.
+    async fn assert_ends(
+        captured: &CapturedSpans,
+        run: RunId,
+        termination: Option<&str>,
+        status: Status,
+    ) {
+        let span = exported(captured, "agent.stream").await;
+        assert_eq!(
+            captured.attribute("agent.stream", "run.id"),
+            Some(run.to_string())
+        );
+        assert_eq!(
+            captured
+                .attribute("agent.stream", "stream.termination")
+                .as_deref(),
+            termination
+        );
+        assert_eq!(span.status, status);
+    }
+
+    fn running(h: &Harness, run: RunId) -> impl FnMut() -> bool + '_ {
+        move || h.runtime.facts(&run).unwrap().status == RunStatus::Running
+    }
+
+    /// The span handed to a run stays a root span. Once the agent is
+    /// prepared, the span gets the run's id and input, and the agent's own
+    /// spans nest under it. It ends with the answer and an ok status. The
+    /// agent is prepared under the caller's span, and that span gets none of
+    /// the run's attributes.
+    #[tokio::test]
+    async fn a_run_records_its_input_and_answer_on_the_span_it_was_handed() {
+        let captured = CapturedSpans::default();
+        let _capturing = captured.install();
+        let h = harness(TestPreparer::new(
+            &["a"],
+            vec![Prepared::Scripted(vec![ScriptedTurn::text("hello")])],
+        ));
+
+        let request = tracing::info_span!("chat_completions");
+        let start = StartRun {
+            history: vec![Message::user("earlier")],
+            caller: Some(Caller {
+                user: Some("u-1".to_owned()),
+                metadata: Some(HashMap::from([("team".to_owned(), "sre".to_owned())])),
+            }),
+            span: agent_stream(),
+            ..on_session("s1", "q")
+        };
+        let run = h
+            .runtime
+            .start(start)
+            .instrument(request.clone())
+            .await
+            .unwrap();
+        drop(request);
+        assert_eq!(h.ended(run).await.status, RunStatus::Finished);
+        let stream = exported(&captured, "agent.stream").await;
+        let request = exported(&captured, "chat_completions").await;
+
+        assert_eq!(
+            stream.parent_span_id,
+            SpanId::INVALID,
+            "the span stays a root"
+        );
+        assert_eq!(
+            tree(&captured, &stream),
+            [
+                ("agent.stream".to_owned(), None),
+                ("agent.turn".to_owned(), Some("agent.stream".to_owned())),
+                ("chat_streaming".to_owned(), Some("agent.turn".to_owned())),
+            ]
+        );
+        let attribute = |key| captured.attribute("agent.stream", key);
+        let run_id = Some(run.to_string());
+        assert_eq!(attribute("run.id"), run_id);
+        assert_eq!(attribute("http.request_id"), run_id);
+        assert_eq!(attribute("session.id").as_deref(), Some("s1"));
+        for key in ["llm.system", "llm.provider", "llm.model_name"] {
+            assert_eq!(attribute(key).as_deref(), Some("scripted"), "{key}");
+        }
+        assert_eq!(
+            attribute(crate::logging::ATTR_AURA_VERSION).as_deref(),
+            Some(crate::logging::AURA_VERSION)
+        );
+        assert_eq!(attribute("aura.mode").as_deref(), Some("single-agent"));
+        assert_eq!(attribute("user.id").as_deref(), Some("u-1"));
+        assert_eq!(attribute("metadata").as_deref(), Some(r#"{"team":"sre"}"#));
+        assert_eq!(
+            attribute("llm.invocation_parameters"),
+            crate::logging::llm_invocation_parameters(&config("a").agent.llm)
+        );
+        assert_eq!(attribute("message_count").as_deref(), Some("2"));
+        assert_eq!(attribute("input.mime_type").as_deref(), Some("text/plain"));
+        assert_eq!(attribute("input.length").as_deref(), Some("1"));
+        assert_eq!(attribute("output.mime_type").as_deref(), Some("text/plain"));
+        assert_eq!(attribute("output.length").as_deref(), Some("5"));
+        // The input and output text is recorded only while content recording
+        // is on. That is a process-wide switch, so the test accepts either
+        // case, but any text that is recorded must be the run's.
+        assert!(matches!(
+            attribute("input.value").as_deref(),
+            None | Some("q")
+        ));
+        assert!(matches!(
+            attribute("output.value").as_deref(),
+            None | Some("hello")
+        ));
+        assert_eq!(attribute("stream.termination"), None);
+        assert_eq!(stream.status, Status::Ok);
+
+        let prepare = exported(&captured, "test.prepare").await;
+        assert_eq!(prepare.parent_span_id, request.span_context.span_id());
+        assert_ne!(
+            request.span_context.trace_id(),
+            stream.span_context.trace_id()
+        );
+        for key in ["run.id", "http.request_id", "session.id", "aura.mode"] {
+            assert_eq!(captured.attribute("chat_completions", key), None, "{key}");
+        }
+    }
+
+    /// A run given `Span::none()` is untraced. The runtime opens no span of
+    /// its own and records nothing on the caller's span.
+    #[tokio::test]
+    async fn an_untraced_run_opens_no_span_of_its_own() {
+        let captured = CapturedSpans::default();
+        let _capturing = captured.install();
+        let h = harness(TestPreparer::new(&["a"], vec![Prepared::Fake(Vec::new())]));
+
+        let request = tracing::info_span!("chat_completions");
+        let run = h
+            .runtime
+            .start(on_session("s1", "q"))
+            .instrument(request.clone())
+            .await
+            .unwrap();
+        drop(request);
+        assert_eq!(h.ended(run).await.status, RunStatus::Finished);
+        let request = exported(&captured, "chat_completions").await;
+        let prepare = exported(&captured, "test.prepare").await;
+
+        assert_eq!(prepare.parent_span_id, request.span_context.span_id());
+        let mut names: Vec<_> = captured
+            .spans()
+            .iter()
+            .map(|span| span.name.to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["chat_completions", "test.prepare"]);
+        for key in ["run.id", "http.request_id", "session.id", "aura.mode"] {
+            assert_eq!(captured.attribute("chat_completions", key), None, "{key}");
+        }
+    }
+
+    /// If a run's agent is never prepared, nothing is recorded on the run's
+    /// span: no id, no input and no status.
+    #[tokio::test]
+    async fn a_run_whose_agent_is_never_prepared_records_nothing_on_its_span() {
+        let captured = CapturedSpans::default();
+        let _capturing = captured.install();
+        let h = harness(TestPreparer::new(
+            &["a"],
+            vec![Prepared::Fail("no provider".to_owned())],
+        ));
+
+        let run = h
+            .runtime
+            .start(StartRun {
+                span: agent_stream(),
+                ..on_session("s1", "q")
+            })
+            .await
+            .unwrap();
+        assert_eq!(h.ended(run).await.status, RunStatus::Failed);
+        let stream = exported(&captured, "agent.stream").await;
+
+        for key in [
+            "run.id",
+            "http.request_id",
+            "aura.mode",
+            "stream.termination",
+        ] {
+            assert_eq!(captured.attribute("agent.stream", key), None, "{key}");
+        }
+        assert_eq!(stream.status, Status::Unset);
+    }
+
+    /// An empty `user` or `metadata` is not recorded as an attribute.
+    #[tokio::test]
+    async fn an_empty_user_or_metadata_records_nothing() {
+        let captured = CapturedSpans::default();
+        let _capturing = captured.install();
+        let h = harness(TestPreparer::new(&["a"], vec![Prepared::Fake(Vec::new())]));
+
+        let run = h
+            .runtime
+            .start(StartRun {
+                caller: Some(Caller {
+                    user: Some(String::new()),
+                    metadata: Some(HashMap::new()),
+                }),
+                span: agent_stream(),
+                ..on_session("s1", "q")
+            })
+            .await
+            .unwrap();
+        h.ended(run).await;
+        exported(&captured, "agent.stream").await;
+
+        assert_eq!(captured.attribute("agent.stream", "user.id"), None);
+        assert_eq!(captured.attribute("agent.stream", "metadata"), None);
+        assert_eq!(
+            captured.attribute("agent.stream", "aura.mode").as_deref(),
+            Some("single-agent")
+        );
+    }
+
+    /// A failed run's span ends with an error status holding the failure's
+    /// text, and records no answer.
+    #[tokio::test]
+    async fn a_failed_run_records_its_error() {
+        let captured = CapturedSpans::default();
+        let _capturing = captured.install();
+        let h = harness(TestPreparer::new(
+            &["a"],
+            vec![Prepared::Scripted(Vec::new())],
+        ));
+
+        let run = h
+            .runtime
+            .start(StartRun {
+                span: agent_stream(),
+                ..on_session("s1", "q")
+            })
+            .await
+            .unwrap();
+        assert_eq!(h.ended(run).await.status, RunStatus::Failed);
+        let LifecycleEvent::Failed { error, .. } =
+            last_lifecycle(&h.journal(&SessionId::new("s1").unwrap()).await).clone()
+        else {
+            panic!("the run failed");
+        };
+
+        assert_ends(
+            &captured,
+            run,
+            None,
+            Status::error(crate::logging::truncate_for_otel(&error)),
+        )
+        .await;
+        assert_eq!(captured.attribute("agent.stream", "output.length"), None);
+    }
+
+    /// A run whose task panics still records its failure on its span.
+    #[tokio::test]
+    async fn a_panicking_run_records_its_failure() {
+        let captured = CapturedSpans::default();
+        let _capturing = captured.install();
+        let h = harness(TestPreparer::new(
+            &["a"],
+            vec![Prepared::Fake(vec![Step::Panic])],
+        ));
+
+        let run = h
+            .runtime
+            .start(StartRun {
+                span: agent_stream(),
+                ..on_session("s1", "q")
+            })
+            .await
+            .unwrap();
+        assert_eq!(h.ended(run).await.status, RunStatus::Failed);
+
+        assert_ends(
+            &captured,
+            run,
+            None,
+            Status::error("the run's task panicked: the fake agent panicked"),
+        )
+        .await;
+    }
+
+    /// A run its caller cancels records `stream.termination` as `cancelled`,
+    /// with no error status.
+    #[tokio::test]
+    async fn a_cancelled_run_records_cancelled() {
+        let captured = CapturedSpans::default();
+        let _capturing = captured.install();
+        let h = harness(TestPreparer::new(
+            &["a"],
+            vec![Prepared::Fake(vec![Step::Wait(Arc::new(Notify::new()))])],
+        ));
+
+        let run = h
+            .runtime
+            .start(StartRun {
+                span: agent_stream(),
+                ..on_session("s1", "q")
+            })
+            .await
+            .unwrap();
+        eventually("the run is running", running(&h, run)).await;
+        assert!(h.runtime.cancel(&run, RunCancelReason::External, None));
+        assert_eq!(h.ended(run).await.status, RunStatus::Cancelled);
+
+        assert_ends(&captured, run, Some("cancelled"), Status::Unset).await;
+    }
+
+    /// A run past its timeout ends with the `timeout` error status.
+    #[tokio::test]
+    async fn a_run_past_its_deadline_records_a_timeout() {
+        let captured = CapturedSpans::default();
+        let _capturing = captured.install();
+        let h = harness(TestPreparer::new(
+            &["a"],
+            vec![Prepared::Fake(vec![Step::Wait(Arc::new(Notify::new()))])],
+        ));
+
+        let run = h
+            .runtime
+            .start(StartRun {
+                timeout: Some(Duration::from_millis(20)),
+                span: agent_stream(),
+                ..on_session("s1", "q")
+            })
+            .await
+            .unwrap();
+        assert_eq!(h.ended(run).await.status, RunStatus::Cancelled);
+
+        assert_ends(&captured, run, None, Status::error("timeout")).await;
+    }
+
+    /// A run a drain stops records `stream.termination` as `shutdown`, with
+    /// no error status.
+    #[tokio::test]
+    async fn a_drained_run_records_shutdown() {
+        let captured = CapturedSpans::default();
+        let _capturing = captured.install();
+        let h = harness(TestPreparer::new(
+            &["a"],
+            vec![Prepared::Fake(vec![Step::Wait(Arc::new(Notify::new()))])],
+        ));
+
+        let run = h
+            .runtime
+            .start(StartRun {
+                span: agent_stream(),
+                ..on_session("s1", "q")
+            })
+            .await
+            .unwrap();
+        eventually("the run is running", running(&h, run)).await;
+        h.runtime.drain(PATIENCE).await;
+
+        assert_ends(&captured, run, Some("shutdown"), Status::Unset).await;
+    }
+
+    /// A run whose last claimant leaves records `stream.termination` as
+    /// `disconnected`, with no error status.
+    #[tokio::test]
+    async fn a_run_whose_claimant_leaves_records_disconnected() {
+        let captured = CapturedSpans::default();
+        let _capturing = captured.install();
+        let h = harness(TestPreparer::new(
+            &["a"],
+            vec![Prepared::Fake(vec![Step::Wait(Arc::new(Notify::new()))])],
+        ));
+        let session = SessionId::new("s1").unwrap();
+
+        let claim = h
+            .runtime
+            .attach(&session, Attach::claiming())
+            .await
+            .unwrap();
+        let run = h
+            .runtime
+            .start(StartRun {
+                span: agent_stream(),
+                ..on_session("s1", "q")
+            })
+            .await
+            .unwrap();
+        eventually("the run is running", running(&h, run)).await;
+        claim.detach().await;
+        assert_eq!(h.ended(run).await.status, RunStatus::Cancelled);
+
+        assert_ends(&captured, run, Some("disconnected"), Status::Unset).await;
+    }
+
+    /// A run that parks records `stream.termination` as `parked`, with no
+    /// error status.
+    #[tokio::test]
+    async fn a_parked_run_records_parked() {
+        let captured = CapturedSpans::default();
+        let _capturing = captured.install();
+        let h = harness(TestPreparer::new(
+            &["a"],
+            vec![Prepared::Fake(vec![Step::Emit(Box::new(
+                AgentEventPayload::RunParked {
+                    run_id: "ignored".to_owned(),
+                    decision_ids: vec![DecisionId::generate().to_string()],
+                    expires_at: "2026-10-21T00:00:00Z".to_owned(),
+                    iteration: 1,
+                },
+            ))])],
+        ));
+
+        let run = h
+            .runtime
+            .start(StartRun {
+                span: agent_stream(),
+                ..on_session("s1", "q")
+            })
+            .await
+            .unwrap();
+        assert_eq!(h.ended(run).await.status, RunStatus::Parked);
+
+        assert_ends(&captured, run, Some("parked"), Status::Unset).await;
+    }
 }

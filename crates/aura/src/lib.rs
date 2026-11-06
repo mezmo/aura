@@ -42,8 +42,8 @@ pub mod stream_events;
 pub mod streaming;
 pub mod streaming_request_hook;
 pub(crate) mod string_utils;
-#[cfg(all(test, feature = "otel"))]
-pub(crate) mod test_span_capture;
+#[cfg(all(feature = "otel", any(test, feature = "test-support")))]
+pub mod test_span_capture;
 pub mod tool_call_observer;
 pub mod tool_error_detection;
 pub mod tool_middleware;
@@ -114,7 +114,9 @@ pub use stream_events::{
     AuraStreamEvent, CorrelationContext, CorrelationContextExt, EmittingAgent, WorkerPhase,
     format_named_sse,
 };
-pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};
+pub use streaming_request_hook::{
+    BilledUsage, CacheSplit, ResponseContent, StreamingRequestHook, UsageState,
+};
 pub use tool_call_observer::{ToolCallObserver, ToolEvent};
 pub use tool_middleware::{
     CallFailure, MiddlewareStack, MiddlewareTool, Next, ToolMiddleware, ToolReply, ToolRequest,
