@@ -597,11 +597,15 @@ fn worker_rig_inner(turns: Vec<ScriptedTurn>, stalled: bool) -> WorkerRig {
     if stalled {
         tool = tool.with_stall(stall.clone());
     }
-    let agent = rig::agent::AgentBuilder::new(model.clone())
-        .name("rig-worker")
-        .preamble("test worker preamble")
-        .tool(tool)
-        .build();
+    // The tool goes in the way every agent's tools do, so the rig keeps
+    // whatever `BuilderState` puts around them.
+    let agent = crate::provider_agent::BuilderState::Initial(
+        rig::agent::AgentBuilder::new(model.clone())
+            .name("rig-worker")
+            .preamble("test worker preamble"),
+    )
+    .add_tool(tool)
+    .build();
     WorkerRig {
         agent,
         model,
@@ -802,6 +806,8 @@ pub(crate) async fn park_orchestrator_in(
 /// final result text survived.
 #[tokio::test]
 async fn smoke_scripted_worker_ungated_tool_round_trip() {
+    #[cfg(feature = "otel")]
+    crate::metrics::init(false).expect("metrics init");
     let rig = worker_rig(vec![
         ScriptedTurn::tool_calls(vec![
             ScriptedToolCall::new(
@@ -867,6 +873,17 @@ async fn smoke_scripted_worker_ungated_tool_round_trip() {
     // turn's usage — inert otherwise: no blocked cell was registered, so the
     // stream ran to completion instead of parking.
     assert_eq!(run.usage_state.get_final_usage(), (10, 5, 15));
+
+    // A worker's tool call reaches the tool-execution metric: the hookless
+    // worker stream is exactly the path the hook-timed version missed.
+    #[cfg(feature = "otel")]
+    {
+        let text = crate::metrics::render_prometheus().expect("render");
+        let needle = format!(
+            "gen_ai_execute_tool_duration_seconds_count{{gen_ai_tool_name=\"{ECHO_TOOL_NAME}\"}}"
+        );
+        assert!(text.contains(&needle), "missing {needle} in:\n{text}");
+    }
 }
 
 /// The provider-error trigger commit 3's dual-trigger orphan coverage needs:

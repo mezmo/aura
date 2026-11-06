@@ -484,8 +484,6 @@ pub struct StreamingRequestHook {
     /// LLM-reported per-turn input/output tokens into the budget as ground
     /// truth so `remaining()` reflects actual context pressure.
     scratchpad_budget: Option<ContextBudget>,
-    /// When the tool call in flight began.
-    tool_started: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 impl StreamingRequestHook {
@@ -518,7 +516,6 @@ impl StreamingRequestHook {
             request_id: request_id.into(),
             usage_state: usage_state.clone(),
             scratchpad_budget,
-            tool_started: Arc::new(Mutex::new(None)),
         };
         (hook, cancel, usage_state)
     }
@@ -666,14 +663,10 @@ where
         // makes the matching skip so push/pop stay symmetric. Cancellation
         // is still checked.
         let publish_event = Self::should_publish_tool_event(&tool_name);
-        // The tool metrics follow the event surface: a suppressed scratchpad
+        // The tool count follows the event surface: a suppressed scratchpad
         // read is context management, not a tool call the model made.
         if publish_event {
             self.usage_state.count_tool_call();
-            // One slot, not a map: rig runs a turn's tools one after another
-            // (the FIFO assumption `RunContext` documents), so the result
-            // that arrives next is this call's.
-            *self.tool_started.lock().unwrap() = Some(std::time::Instant::now());
         }
         async move {
             // Stash the call id so the park arm can record it on the cell entry.
@@ -727,7 +720,7 @@ where
         tool_name: &str,
         id: Option<String>,
         _args: &str,
-        result: &str,
+        _result: &str,
         cancel_sig: CancelSignal,
     ) -> impl Future<Output = ()> + Send {
         let tool_name = tool_name.to_string();
@@ -735,21 +728,6 @@ where
         let tool_call_id = id.clone();
         let had_tool_call_id = id.is_some();
         let usage_state = self.usage_state.clone();
-        // The tool as the agent saw it, middleware and approval waits
-        // included; a call's error and an output that reports one are both
-        // failed calls. A suppressed tool never set the slot, so it records
-        // nothing here.
-        if let Some(started) = self.tool_started.lock().unwrap().take() {
-            let (output, kind) = crate::provider_agent::read_tool_result(&rig::OneOrMany::one(
-                rig::message::ToolResultContent::text(result),
-            ));
-            let error_type = match kind {
-                crate::provider_agent::ToolResultKind::Error => Some("tool_call_error"),
-                _ if crate::tool_error_detection::is_reported_error(&output) => Some("tool_error"),
-                _ => None,
-            };
-            crate::metrics::record_tool_execution(&tool_name, error_type, started.elapsed());
-        }
         // Mirror the suppression in `on_tool_call`: skip pop + pending-id
         // tracking for scratchpad tools so the FIFO queue stays symmetric
         // and these tools don't surface in `aura.tool_usage` correlations.

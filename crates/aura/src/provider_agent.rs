@@ -17,6 +17,7 @@ use rig::streaming::{StreamingChat, StreamingPrompt};
 use std::collections::HashSet;
 use std::pin::Pin;
 
+use crate::metered_tool::MeteredTool;
 use crate::scratchpad::ContextBudget;
 use crate::streaming_request_hook::StreamingRequestHook;
 use aura_events::agent::AgentEvent;
@@ -815,6 +816,9 @@ pub(crate) fn read_tool_result(
 ///
 /// After the first `.tool()` call, `AgentBuilder<M>` transitions to
 /// `AgentBuilderSimple<M>`. This enum handles both states uniformly.
+///
+/// Every tool an agent gets, native or MCP, single-agent or orchestration,
+/// is added through here, which is what lets `add_tools_dyn` meter them all.
 pub(crate) enum BuilderState<M: CompletionModel> {
     Initial(AgentBuilder<M>),
     WithTools(AgentBuilderSimple<M>),
@@ -829,20 +833,23 @@ where
     where
         T: rig::tool::Tool + Send + Sync + 'static,
     {
-        match self {
-            BuilderState::Initial(builder) => BuilderState::WithTools(builder.tool(tool)),
-            BuilderState::WithTools(builder) => BuilderState::WithTools(builder.tool(tool)),
-        }
+        self.add_tools_dyn(vec![Box::new(tool)])
     }
 
     /// Add multiple dynamic tools to the agent builder.
     ///
     /// This accepts pre-boxed `ToolDyn` objects, which is useful for adding
-    /// tools from external crates that implement `rig::tool::Tool`.
+    /// tools from external crates that implement `rig::tool::Tool`. Each
+    /// tool is registered behind a [`MeteredTool`], so every call it gets
+    /// lands in the tool-execution metric.
     pub fn add_tools_dyn(self, tools: Vec<Box<dyn rig::tool::ToolDyn>>) -> BuilderState<M> {
         if tools.is_empty() {
             return self;
         }
+        let tools = tools
+            .into_iter()
+            .map(|tool| Box::new(MeteredTool::new(tool)) as Box<dyn rig::tool::ToolDyn>)
+            .collect();
         match self {
             BuilderState::Initial(builder) => BuilderState::WithTools(builder.tools(tools)),
             BuilderState::WithTools(builder) => BuilderState::WithTools(builder.tools(tools)),
