@@ -32,6 +32,9 @@ pub struct Config {
     /// Governance integration for catalog sync and policy endpoints.
     #[serde(default)]
     pub governance: Option<GovernanceConfig>,
+    /// Remote agents reachable over A2A.
+    #[serde(default)]
+    pub a2a: Option<crate::a2a::A2aConfig>,
 }
 
 /// Reasoning effort level for GPT-5 models
@@ -433,6 +436,41 @@ impl Config {
 
         if let Some(orch) = &self.orchestration {
             orch.validate_worker_names()?;
+        }
+
+        if let Some(a2a) = &self.a2a {
+            a2a.validate()?;
+        }
+
+        // A worker's `remotes` must name `[a2a.remote]` entries: the worker's
+        // `ask_agent` is built from exactly those, so an unknown name would
+        // otherwise surface only when the planner assigns it work.
+        if let Some(orch) = &self.orchestration {
+            for (worker, cfg) in &orch.workers {
+                for remote in &cfg.remotes {
+                    let known = self
+                        .a2a
+                        .as_ref()
+                        .is_some_and(|a2a| a2a.remote.contains_key(remote));
+                    if !known {
+                        return Err(crate::ConfigError::Validation(format!(
+                            "orchestration.worker.{worker}.remotes names {remote:?}, \
+                             which is not an [a2a.remote.<name>] entry"
+                        )));
+                    }
+                }
+            }
+        }
+
+        // A zero connect timeout fires `tokio::time::timeout` immediately, so
+        // every server would fail at startup; reject it instead of silently
+        // disabling MCP.
+        if let Some(mcp) = &self.mcp
+            && mcp.connect_timeout_secs == 0
+        {
+            return Err(crate::ConfigError::Validation(
+                "mcp.connect_timeout_secs must be at least 1".to_string(),
+            ));
         }
 
         Ok(())

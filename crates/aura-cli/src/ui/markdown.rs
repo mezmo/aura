@@ -81,7 +81,9 @@ fn clamp_code_block_padding(text: &mut FmtText<'_, '_>, width: usize) {
 
 /// Render markdown text to stdout using termimad, with a left indent on each line
 /// so the body aligns with the text after the "● " marker.
-pub fn render_markdown(text: &str) {
+/// Returns the number of terminal rows printed; the text is wrapped to the
+/// terminal width, so each printed line is one row.
+pub fn render_markdown(text: &str) -> usize {
     let skin = make_skin();
     let trimmed = text.trim_start_matches('\n');
     let width = crossterm::terminal::size()
@@ -90,9 +92,12 @@ pub fn render_markdown(text: &str) {
     let mut fmt_text = skin.text(trimmed, Some(width));
     clamp_code_block_padding(&mut fmt_text, width);
     let rendered = format!("{fmt_text}");
+    let mut rows = 0;
     for line in rendered.lines() {
         println!("{INDENT}{line}");
+        rows += 1;
     }
+    rows
 }
 
 fn summary_text_width(term_w: usize) -> usize {
