@@ -12,12 +12,39 @@ COMPOSE_BUILD ?= --build
 test-integration: $(REPORT_DIR) ## run CI test suite via docker compose
 	docker compose -p aura-test-$(BUILD_SLUG) -f compose/base.yml -f compose/test.yml up --remove-orphans --exit-code-from aura-integration-test $(COMPOSE_BUILD)
 
+# CI runner and its steps; see compose/test-ci.yml.
+TEST_CI_COMPOSE = docker compose -p aura-test-$(BUILD_SLUG) \
+	-f compose/base.yml \
+	-f compose/test.yml \
+	-f compose/test-ci.yml
+TEST_CI_EXEC = $(TEST_CI_COMPOSE) exec -T aura-integration-test
+
+.PHONY:test-integration-up
+test-integration-up: $(REPORT_DIR) ## Start the CI test environment with an idle test runner
+	@# --no-deps: the runner starts alone; the server and mock-mcp come up
+	@# in test-integration-server-up, after the build.
+	$(TEST_CI_COMPOSE) up -d --wait --remove-orphans --no-deps $(COMPOSE_BUILD) \
+		aura-integration-test
+
+CI_BIN_DIR := .ci-bin
+
+.PHONY:test-integration-server-up
+test-integration-server-up: ## Start the CI web server on the runner's aura binary (needs build-rust-ci first)
+	@mkdir -p $(CI_BIN_DIR)
+	$(TEST_CI_COMPOSE) cp aura-integration-test:/usr/src/app/target/debug/aura $(CI_BIN_DIR)/aura
+	@# Without --no-deps, compose also starts mock-mcp and waits for it to
+	@# be healthy, as the server's depends_on requires.
+	$(TEST_CI_COMPOSE) up -d --wait $(COMPOSE_BUILD) aura-web-server
+
+.PHONY:test-integration-ci
+test-integration-ci: $(REPORT_DIR) ## Run the CI test suite inside the running test container
+	@date +'test-integration-ci exec at %T'
+	$(TEST_CI_EXEC) make coverage
+
 .PHONY:test-integration-down
 test-integration-down:  ## Cleanup integration test containers
-	-docker compose -p aura-test-$(BUILD_SLUG) \
-		-f compose/base.yml \
-		-f compose/test.yml \
-		down --remove-orphans --volumes --rmi=local 2>/dev/null || true
+	-$(TEST_CI_COMPOSE) down --remove-orphans --volumes --rmi=local 2>/dev/null || true
+	rm -rf $(CI_BIN_DIR)
 	@$(MAKE) clean-preloaded-images
 
 # Hooked into clean:: because a build that fails before the integration lane

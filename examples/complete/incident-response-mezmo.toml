@@ -21,11 +21,11 @@ description = "PagerDuty incident management, on-call schedules, and escalation"
 [mcp.servers.pagerduty.headers]
 Authorization = "Token {{ env.PAGERDUTY_API_TOKEN | default: '' }}"
 
-# Mezmo — log analysis and export
+# Mezmo — log analysis and pipeline monitoring
 [mcp.servers.mezmo]
 transport = "http_streamable"
 url = "https://mcp.mezmo.com/mcp"
-description = "Mezmo log analysis, export, and pipeline monitoring"
+description = "Mezmo log analysis and pipeline monitoring"
 
 [mcp.servers.mezmo.headers]
 Authorization = "Bearer {{ env.MEZMO_API_KEY | default: '' }}"

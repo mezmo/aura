@@ -317,6 +317,7 @@ mezmo/aura|3uq7JmasvnKF|raw||null|0"
     [ "${got}" = "${want}" ] || { echo "selftest: day_before is timezone-sensitive: ${got}, want ${want}" >&2; exit 1; }
 
     hogql_retry_selftest "${tmp}"
+    hogql_unavailable_selftest "${tmp}"
 
     echo "selftest: ok"
 }

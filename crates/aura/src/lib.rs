@@ -79,7 +79,7 @@ pub use orchestration::{
 pub use passthrough_tool::{PASSTHROUGH_MARKER, PassthroughTool};
 pub use provider_agent::{
     FinalResponseInfo, StreamError, StreamItem, StreamedAssistantContent, StreamedUserContent,
-    ToolCall, ToolResult,
+    ToolCall, ToolResult, ToolResultKind,
 };
 pub use rig::completion::{Message, ToolDefinition as RigToolDefinition};
 pub use rig::message::{AssistantContent, ToolCall as RigToolCall, ToolResultContent, UserContent};
@@ -111,8 +111,7 @@ pub use stream_events::{
     format_named_sse,
 };
 pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};
-pub use tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent, ToolOutcome};
-pub use tool_error_detection::{DetectedToolError, ToolResultStatus, detect_tool_error};
+pub use tool_call_observer::{ToolCallObserver, ToolEvent};
 pub use tool_middleware::{
     CallFailure, MiddlewareStack, MiddlewareTool, Next, ToolMiddleware, ToolReply, ToolRequest,
     WrapperLayer,

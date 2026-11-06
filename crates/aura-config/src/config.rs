@@ -555,10 +555,10 @@ fn inactivity_vs_per_call_warning(
 /// Warn when a HITL route timeout >= orchestration per-call timeout.
 ///
 /// A parked tool call that outlives its task budget gets killed by the
-/// per-call timeout instead of the approval's own timeout, with a misleading
-/// "LLM provider did not respond" error. Returns `None` when there is no
-/// conflict: no HITL config, per-call timeout disabled (0), or route timeout
-/// strictly less than per-call timeout.
+/// per-call timeout instead of the approval's own timeout, so the task
+/// fails as a worker timeout rather than an approval timeout. Returns `None`
+/// when there is no conflict: no HITL config, per-call timeout disabled (0),
+/// or route timeout strictly less than per-call timeout.
 fn hitl_timeout_conflict_warning(hitl: &HitlConfig, per_call_timeout_secs: u64) -> Option<String> {
     if per_call_timeout_secs == 0 {
         return None;
@@ -569,7 +569,7 @@ fn hitl_timeout_conflict_warning(hitl: &HitlConfig, per_call_timeout_secs: u64) 
     };
     if route_timeout >= per_call_timeout_secs {
         Some(format!(
-            "hitl route timeout ({route_timeout}s) is greater than or equal to the orchestration per-call timeout ({per_call_timeout_secs}s); parked approvals may be killed by the per-call timeout before they fire, producing a misleading 'LLM provider did not respond' error"
+            "hitl route timeout ({route_timeout}s) is greater than or equal to the orchestration per-call timeout ({per_call_timeout_secs}s); parked approvals may be killed by the per-call timeout before they fire, failing the task as a worker timeout"
         ))
     } else {
         None
@@ -952,10 +952,7 @@ pub struct AgentConfig {
     /// Example: `mcp_filter = ["sin", "cos", "degreesToRadians"]`
     #[serde(default)]
     pub mcp_filter: Option<Vec<GlobPattern>>,
-    /// Whether this agent (single-agent or orchestration coordinator) may
-    /// invoke client-side tools advertised on the request. When false
-    /// (default), client tools are not attached even if the request
-    /// supplied them.
+    /// Whether this agent may invoke client-side tools advertised on the request.
     #[serde(default)]
     pub enable_client_tools: bool,
     /// Glob patterns selecting which client-side tools this agent can call.
@@ -1075,8 +1072,8 @@ pub struct AgentSettings {
     /// workers that don't provide an override).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scratchpad: Option<ScratchpadConfig>,
-    /// Whether this agent (single-agent or orchestration coordinator) may
-    /// invoke client-side tools advertised on the request.
+    /// Whether this agent may invoke client-side tools advertised on the
+    /// request.
     #[serde(default)]
     pub enable_client_tools: bool,
     /// Glob patterns selecting which client-side tools this agent can call.
@@ -1278,7 +1275,7 @@ mod tests {
         };
         let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
         assert!(msg.contains("60s"));
-        assert!(msg.contains("LLM provider did not respond"));
+        assert!(msg.contains("failing the task as a worker timeout"));
     }
 
     #[test]
@@ -1297,7 +1294,7 @@ mod tests {
         let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
         assert!(msg.contains("120s"));
         assert!(msg.contains("60s"));
-        assert!(msg.contains("LLM provider did not respond"));
+        assert!(msg.contains("failing the task as a worker timeout"));
     }
 
     #[test]

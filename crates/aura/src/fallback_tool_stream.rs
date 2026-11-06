@@ -34,6 +34,7 @@ use crate::fallback_tool_parser::parse_fallback_tool_calls;
 use crate::mcp::McpManager;
 use crate::provider_agent::{
     StreamError, StreamItem, StreamedAssistantContent, StreamedUserContent, ToolCall, ToolResult,
+    ToolResultKind,
 };
 use crate::string_utils::truncate_for_log;
 use futures::stream::{BoxStream, StreamExt};
@@ -189,6 +190,7 @@ impl FallbackToolExecutor {
                                             StreamedUserContent::ToolResult(ToolResult {
                                                 id: tool_call_id.clone(),
                                                 call_id: Some(tool_call_id),
+                                                kind: output_kind(&result),
                                                 result,
                                             })
                                         ));
@@ -196,12 +198,12 @@ impl FallbackToolExecutor {
                                     Err(e) => {
                                         warn!(tool = %parsed_call.name, error = %e, "Fallback tool execution failed");
 
-                                        // Emit error as tool result
                                         yield Ok(StreamItem::StreamUserItem(
                                             StreamedUserContent::ToolResult(ToolResult {
                                                 id: tool_call_id.clone(),
                                                 call_id: Some(tool_call_id),
-                                                result: format!("Error: {}", e),
+                                                result: e,
+                                                kind: ToolResultKind::Error,
                                             })
                                         ));
                                     }
@@ -278,9 +280,50 @@ impl StreamState {
     }
 }
 
+/// What a fallback call's output holds. The output is the MCP tool's own
+/// text, not rig's encoding, so JSON other than a string stays JSON.
+fn output_kind(output: &str) -> ToolResultKind {
+    match serde_json::from_str::<serde_json::Value>(output) {
+        Ok(serde_json::Value::String(_)) | Err(_) => ToolResultKind::Text,
+        Ok(_) => ToolResultKind::Json,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_failed_fallback_call_yields_a_tool_error() {
+        let executor = FallbackToolExecutor::new(
+            Arc::new(McpManager::new()),
+            vec!["does_not_exist".to_string()],
+            None,
+        );
+        let model_output = futures::stream::iter([
+            Ok(StreamItem::StreamAssistantItem(
+                StreamedAssistantContent::Text(
+                    r#"{"name": "does_not_exist", "parameters": {}}"#.to_string(),
+                ),
+            )),
+            Ok(StreamItem::FinalMarker),
+        ])
+        .boxed();
+
+        let results: Vec<ToolResult> = executor
+            .wrap_stream(model_output)
+            .filter_map(|item| async move {
+                match item {
+                    Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(r))) => Some(r),
+                    _ => None,
+                }
+            })
+            .collect()
+            .await;
+
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(results[0].kind, ToolResultKind::Error, "{:?}", results[0]);
+    }
 
     #[test]
     fn test_might_contain_tool_call_json() {

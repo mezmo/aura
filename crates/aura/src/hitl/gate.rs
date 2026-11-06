@@ -21,6 +21,9 @@ use crate::orchestration::{
 };
 use crate::tool_wrapper::{PreCallOutcome, ToolCallContext, ToolWrapper};
 
+/// The start of the tool result a denied call returns.
+pub(crate) const DENIAL_PREFIX: &str = "Tool call blocked by human approval denial: ";
+
 /// The placeholder tool result a parked call returns.
 const PARK_SENTINEL: &str =
     "This tool call is parked pending human approval. It has not run. Do not retry.";
@@ -357,7 +360,7 @@ fn approval_result_to_pre_call(
         Ok(GateDecision::Approved { overrides }) => Ok(PreCallOutcome::Proceed { overrides }),
         Ok(GateDecision::Denied { reason }) => Ok(PreCallOutcome::ShortCircuit {
             output: format!(
-                "Tool call blocked by human approval denial: {}. Do not execute this action.",
+                "{DENIAL_PREFIX}{}. Do not execute this action.",
                 reason.unwrap_or_else(|| "no reason provided".to_string())
             ),
         }),
@@ -497,10 +500,10 @@ mod tests {
         );
     }
 
-    /// A denial is feedback the model can act on, not a tool error: the
-    /// mapping short-circuits the call with the denial reason.
+    /// A denial reaches the model as a short-circuited result carrying the
+    /// reason, not as an `Err`, so the model can act on it.
     #[test]
-    fn approval_result_mapping_denial_is_feedback_not_error() {
+    fn approval_result_mapping_denial_short_circuits_with_the_reason() {
         let outcome = approval_result_to_pre_call(Ok(GateDecision::Denied {
             reason: Some("too risky".to_string()),
         }))
@@ -513,6 +516,20 @@ mod tests {
                     .to_string()
             }
         )
+    }
+
+    #[test]
+    fn a_denial_is_reported_as_a_tool_error() {
+        let Ok(PreCallOutcome::ShortCircuit { output }) =
+            approval_result_to_pre_call(Ok(GateDecision::Denied { reason: None }))
+        else {
+            panic!("a denial must short-circuit");
+        };
+
+        assert!(
+            crate::tool_error_detection::is_reported_error(&output),
+            "{output}"
+        );
     }
 
     // ====================================================================

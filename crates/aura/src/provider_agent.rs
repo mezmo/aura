@@ -651,6 +651,37 @@ pub struct ToolResult {
     pub id: String,
     pub call_id: Option<String>,
     pub result: String,
+    pub kind: ToolResultKind,
+}
+
+/// What a tool result's text holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolResultKind {
+    /// The tool's output, as text.
+    Text,
+    /// The tool's output, as JSON text.
+    Json,
+    /// The call's error.
+    Error,
+}
+
+impl ToolResult {
+    /// The call's failure as text to show people, or `None` when the call
+    /// produced output. A call fails with an error, or with output that
+    /// reports one (an MCP error result or a HITL denial).
+    pub fn failure(&self) -> Option<&str> {
+        match self.kind {
+            ToolResultKind::Error => Some(crate::tool_error_detection::tool_error_message(
+                &self.result,
+            )),
+            ToolResultKind::Text | ToolResultKind::Json
+                if crate::tool_error_detection::is_reported_error(&self.result) =>
+            {
+                Some(&self.result)
+            }
+            ToolResultKind::Text | ToolResultKind::Json => None,
+        }
+    }
 }
 
 /// Stream error type.
@@ -709,11 +740,15 @@ fn map_stream_item<R: rig::completion::GetTokenUsage>(
         }
         Ok(MultiTurnStreamItem::StreamUserItem(content)) => {
             let mapped = match content {
-                RigUser::ToolResult(tr) => StreamedUserContent::ToolResult(ToolResult {
-                    call_id: tr.call_id.clone(),
-                    id: tr.id.clone(),
-                    result: format_tool_result_content(&tr.content),
-                }),
+                RigUser::ToolResult(tr) => {
+                    let (result, kind) = read_tool_result(&tr.content);
+                    StreamedUserContent::ToolResult(ToolResult {
+                        call_id: tr.call_id.clone(),
+                        id: tr.id.clone(),
+                        result,
+                        kind,
+                    })
+                }
             };
             Ok(StreamItem::StreamUserItem(mapped))
         }
@@ -731,16 +766,37 @@ fn map_stream_item<R: rig::completion::GetTokenUsage>(
     }
 }
 
-/// Format tool result content to a string.
-fn format_tool_result_content(content: &rig::OneOrMany<ToolResultContent>) -> String {
-    content
+/// A rig tool result's text and what it holds.
+///
+/// Rig JSON-encodes a tool's output and passes a call's error as its plain
+/// display text, which is never JSON. A string output is decoded to its text;
+/// any other JSON output is kept as it is.
+fn read_tool_result(content: &rig::OneOrMany<ToolResultContent>) -> (String, ToolResultKind) {
+    let mut kind = ToolResultKind::Text;
+    let text = content
         .iter()
         .map(|c| match c {
-            ToolResultContent::Text(text) => text.text.clone(),
+            ToolResultContent::Text(text) => {
+                if let Ok(output) = serde_json::from_str::<String>(&text.text) {
+                    output
+                } else {
+                    if serde_json::from_str::<serde::de::IgnoredAny>(&text.text).is_err() {
+                        kind = ToolResultKind::Error;
+                    } else if kind == ToolResultKind::Text {
+                        kind = ToolResultKind::Json;
+                    }
+                    text.text.clone()
+                }
+            }
             ToolResultContent::Image(_) => "[Image content]".to_string(),
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    // Joined items are no longer one JSON value.
+    if kind == ToolResultKind::Json && content.len() > 1 {
+        kind = ToolResultKind::Text;
+    }
+    (text, kind)
 }
 
 /// Builder state enum for handling AgentBuilder type transitions.
@@ -787,5 +843,166 @@ where
             BuilderState::Initial(builder) => builder.build(),
             BuilderState::WithTools(builder) => builder.build(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read(raw: &str) -> (String, ToolResultKind) {
+        read_tool_result(&rig::OneOrMany::one(ToolResultContent::text(raw)))
+    }
+
+    fn result(text: &str, kind: ToolResultKind) -> ToolResult {
+        ToolResult {
+            id: "call_1".into(),
+            call_id: None,
+            result: text.into(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn a_string_output_is_decoded_from_rigs_json_encoding() {
+        assert_eq!(
+            read(r#""line one\nline two""#),
+            ("line one\nline two".into(), ToolResultKind::Text)
+        );
+    }
+
+    #[test]
+    fn other_json_output_is_kept_as_it_is() {
+        assert_eq!(
+            read(r#"{"files": []}"#),
+            (r#"{"files": []}"#.into(), ToolResultKind::Json)
+        );
+    }
+
+    #[test]
+    fn text_that_is_not_json_is_the_calls_error() {
+        assert_eq!(
+            read("Toolset error: ToolCallError: boom"),
+            (
+                "Toolset error: ToolCallError: boom".into(),
+                ToolResultKind::Error
+            )
+        );
+    }
+
+    /// Reading a result's kind depends on how rig carries a tool's output
+    /// and a call's error, so run real tools through rig's tool server.
+    #[tokio::test]
+    async fn rig_carries_output_as_json_and_an_error_as_plain_text() {
+        use rig::tool::server::ToolServer;
+        use rig::tool::{Tool, ToolError};
+
+        #[derive(Clone)]
+        struct Echo;
+
+        impl Tool for Echo {
+            const NAME: &'static str = "echo";
+            type Error = ToolError;
+            type Args = serde_json::Value;
+            type Output = String;
+
+            async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+                rig::completion::ToolDefinition {
+                    name: Self::NAME.into(),
+                    description: String::new(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+
+            async fn call(&self, _args: Self::Args) -> Result<String, ToolError> {
+                Ok("Tool execution failed: disk full on node-3".into())
+            }
+        }
+
+        #[derive(Clone)]
+        struct Listing;
+
+        impl Tool for Listing {
+            const NAME: &'static str = "listing";
+            type Error = ToolError;
+            type Args = serde_json::Value;
+            type Output = serde_json::Value;
+
+            async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+                rig::completion::ToolDefinition {
+                    name: Self::NAME.into(),
+                    description: String::new(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+
+            async fn call(&self, _args: Self::Args) -> Result<serde_json::Value, ToolError> {
+                Ok(serde_json::json!({"files": ["a.txt"]}))
+            }
+        }
+
+        #[derive(Clone)]
+        struct Failing;
+
+        impl Tool for Failing {
+            const NAME: &'static str = "failing";
+            type Error = ToolError;
+            type Args = serde_json::Value;
+            type Output = String;
+
+            async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+                rig::completion::ToolDefinition {
+                    name: Self::NAME.into(),
+                    description: String::new(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+
+            async fn call(&self, _args: Self::Args) -> Result<String, ToolError> {
+                Err(ToolError::ToolCallError("42".into()))
+            }
+        }
+
+        let handle = ToolServer::new()
+            .tool(Echo)
+            .tool(Listing)
+            .tool(Failing)
+            .run();
+        let text_of = |raw: String| read(&raw);
+
+        let echoed = handle.call_tool("echo", "{}").await.unwrap();
+        assert_eq!(
+            text_of(echoed),
+            (
+                "Tool execution failed: disk full on node-3".into(),
+                ToolResultKind::Text
+            )
+        );
+
+        let listed = handle.call_tool("listing", "{}").await.unwrap();
+        assert_eq!(text_of(listed).1, ToolResultKind::Json);
+
+        let failed = handle.call_tool("failing", "{}").await.unwrap_err();
+        assert_eq!(text_of(failed.to_string()).1, ToolResultKind::Error);
+    }
+
+    #[test]
+    fn a_failure_is_an_error_or_output_that_reports_one() {
+        assert_eq!(
+            result("Toolset error: ToolCallError: boom", ToolResultKind::Error).failure(),
+            Some("boom")
+        );
+        assert_eq!(
+            result("Tool returned an error: 401", ToolResultKind::Text).failure(),
+            Some("Tool returned an error: 401")
+        );
+        assert_eq!(
+            result("Tool execution failed: disk full", ToolResultKind::Text).failure(),
+            None
+        );
+        assert_eq!(
+            result(r#"{"ok": true}"#, ToolResultKind::Json).failure(),
+            None
+        );
     }
 }

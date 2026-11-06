@@ -88,6 +88,8 @@ pub(crate) struct ScriptedTurn {
     /// stream without another `on_completion_call`, which is the
     /// provider-error orphan window.
     stream_failed: bool,
+    /// The turn stalls after its text: a provider gone silent mid-stream.
+    stalled: bool,
 }
 
 impl ScriptedTurn {
@@ -95,8 +97,16 @@ impl ScriptedTurn {
     pub(crate) fn text(text: impl Into<String>) -> Self {
         Self {
             text: Some(text.into()),
-            tool_calls: Vec::new(),
-            stream_failed: false,
+            ..Self::default()
+        }
+    }
+
+    /// A turn that streams `text` and then goes silent without ending.
+    pub(crate) fn text_then_stall(text: impl Into<String>) -> Self {
+        Self {
+            text: Some(text.into()),
+            stalled: true,
+            ..Self::default()
         }
     }
 
@@ -104,9 +114,8 @@ impl ScriptedTurn {
     /// next turn).
     pub(crate) fn tool_calls(calls: Vec<ScriptedToolCall>) -> Self {
         Self {
-            text: None,
             tool_calls: calls,
-            stream_failed: false,
+            ..Self::default()
         }
     }
 
@@ -116,14 +125,13 @@ impl ScriptedTurn {
     /// run (the pinned loop's mid-turn error break).
     pub(crate) fn tool_calls_then_stream_failure(calls: Vec<ScriptedToolCall>) -> Self {
         Self {
-            text: None,
             tool_calls: calls,
             stream_failed: true,
+            ..Self::default()
         }
     }
 
     /// Attach text alongside this turn's tool calls.
-    #[allow(dead_code)] // reserved: text+tool-call turn scripts, not yet consumed
     pub(crate) fn with_text(mut self, text: impl Into<String>) -> Self {
         self.text = Some(text.into());
         self
@@ -237,10 +245,18 @@ impl ScriptedCompletionModel {
             items.push(Err(CompletionError::ProviderError(
                 "scripted model: provider stream failed mid-turn".to_string(),
             )));
-        } else {
+        } else if !turn.stalled {
             items.push(Ok(RawStreamingChoice::FinalResponse(ScriptedFinalResponse)));
         }
-        StreamingCompletionResponse::stream(Box::pin(futures::stream::iter(items)))
+        let items = futures::stream::iter(items);
+        if turn.stalled {
+            // Hold the stream open after the text, with no FinalResponse,
+            // so the turn never finishes.
+            return StreamingCompletionResponse::stream(Box::pin(
+                items.chain(futures::stream::pending()),
+            ));
+        }
+        StreamingCompletionResponse::stream(Box::pin(items))
     }
 
     fn turn_choice(turn: &ScriptedTurn) -> rig::OneOrMany<AssistantContent> {
@@ -487,6 +503,10 @@ impl rig::tool::Tool for RecordingTool {
     type Error = std::convert::Infallible;
     type Args = FreeformArgs;
     type Output = String;
+
+    fn name(&self) -> String {
+        self.registered_name.clone()
+    }
 
     async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
         rig::completion::ToolDefinition {

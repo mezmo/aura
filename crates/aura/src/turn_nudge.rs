@@ -15,7 +15,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::mcp::CallOutcome;
 use crate::run_context::BoundRun;
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper, TransformOutputResult};
 
@@ -207,7 +206,7 @@ impl ToolWrapper for TurnNudgeWrapper {
     async fn transform_output(
         &self,
         output: String,
-        _outcome: &CallOutcome,
+        _is_error: bool,
         ctx: &ToolCallContext,
         _extracted: Option<&Value>,
     ) -> TransformOutputResult {

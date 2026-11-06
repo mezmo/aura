@@ -1,5 +1,126 @@
 ## Changelog
 
+## [0.2.20](https://github.com/mezmo/aura/compare/v0.2.19...v0.2.20) (2026-10-30)
+
+
+### Bug Fixes
+
+* **agent**: check the session id once, where each request comes in [030b3d6](https://github.com/mezmo/aura/commit/030b3d60e32c8ad434aa7ac21cb682e20ae7627e) - Justin Gross
+
+* **agents**: match a run's id by its spelling [0f520c6](https://github.com/mezmo/aura/commit/0f520c60340d08cff9e73148c58b57226c4e451b) - Justin Gross
+
+* **agents**: refuse a stream under another run's id or a second time [f108da8](https://github.com/mezmo/aura/commit/f108da86cd3a139e363733ada85453979f45382d) - Justin Gross
+
+* **events**: read a null liveness as the default [8a782e3](https://github.com/mezmo/aura/commit/8a782e3f07168913db6d50bf3678446192e46a83) - Justin Gross
+
+* **events**: refuse a whitespace-only identifier as blank [65c4b01](https://github.com/mezmo/aura/commit/65c4b01534bd370eafd59eaf6d6a385b0d157ffd) - Justin Gross
+
+* **events**: refuse an empty session id [27e5093](https://github.com/mezmo/aura/commit/27e50932da95e0bb0365d6844fd871e40caa5e88) - Justin Gross
+
+* **hilt**: Additional model guidance for self HITL approval [f53a238](https://github.com/mezmo/aura/commit/f53a238c2d40a43921f7fde1e110209041ab4054) - Dan Hable [#306](https://github.com/mezmo/aura/issues/306)
+
+* **hitl**: accept per-item decisions on a webhook answer [ccc1d23](https://github.com/mezmo/aura/commit/ccc1d2380a40e9f7d7ca020266c0c75712f89841) - Tony Rogers [#843](https://github.com/mezmo/aura/issues/843)
+
+* **logging**: keep the message past a long span prefix [99778af](https://github.com/mezmo/aura/commit/99778af1be07fb23dd01ec136e37ada164e0e006) - Justin Gross
+
+* **logging**: print span context in verbose console lines [809be18](https://github.com/mezmo/aura/commit/809be18ddccbb9a2e331d2980a050b15e80aeef4) - Justin Gross
+
+* **orchestration**: accept create_plan steps sent as a string [15d736d](https://github.com/mezmo/aura/commit/15d736d08e43485cbea05afc29326cfbd7744031) - Justin Gross
+
+* **orchestration**: answer malformed create_plan steps with guidance [a8d0919](https://github.com/mezmo/aura/commit/a8d0919c52a9e7627b0deeadaf49b5df43761a0c) - Justin Gross
+
+* **orchestration**: bound read_artifact output without a scratchpad [aa188b6](https://github.com/mezmo/aura/commit/aa188b6a875b252a545c174220fc310a21dc56d4) - Dan Hable [#596](https://github.com/mezmo/aura/issues/596)
+
+* **orchestration**: name an unscoped orchestration by one run id [3e9084a](https://github.com/mezmo/aura/commit/3e9084a81acf12fb44057f1f3bcd53cb6fa0da76) - Justin Gross
+
+* **orchestration**: name the failure when a worker returns nothing [3fa39bb](https://github.com/mezmo/aura/commit/3fa39bb319027903de4ad5171370d15a028bfb5e) - Justin Gross [INFRA-7835](https://mezmo.atlassian.net/browse/INFRA-7835)
+
+* **orchestration**: route coordinator read_artifact through scratchpad [e996c27](https://github.com/mezmo/aura/commit/e996c272c41d402c6a4b7753bbe42ae679970327) - Dan Hable [#596](https://github.com/mezmo/aura/issues/596)
+
+* **orchestration**: share one unscoped run across an orchestration [b61744f](https://github.com/mezmo/aura/commit/b61744f5e904d3133bddce6a3fda292fc239b6b1) - Justin Gross
+
+* preserve worker confidence when synthesising the final answer [e845942](https://github.com/mezmo/aura/commit/e8459429a4de8ba3394cad377ebc7a7fcaee3678) - Justin Gross
+
+* **server**: root an a2a task in its own span, tested from execute [bbfa80a](https://github.com/mezmo/aura/commit/bbfa80a8673b785852aac1153ddb86bb33f7b508) - Justin Gross
+
+* **server**: tie a run's id to its origin on the agent span [1423cb5](https://github.com/mezmo/aura/commit/1423cb58c082008bf94c322c84896ff8574cfe1c) - Justin Gross
+
+* surface failed tasks' artifacts in the continuation prompt [c6a5fe7](https://github.com/mezmo/aura/commit/c6a5fe7e4348b2117e14d66ae75d3a3498e50148) - Justin Gross
+
+* tag worker confidence in the raw task-result fallback [d708ac5](https://github.com/mezmo/aura/commit/d708ac5cb359fad6806539e9d88064977f46338a) - Justin Gross
+
+
+
+### Code Refactoring
+
+* **agent**: give the hooks their own stop reason [ee06396](https://github.com/mezmo/aura/commit/ee06396bee70b589bc42a7098ebb6df08bc1b3d5) - Justin Gross
+
+* **agents**: name a run by its RunId [3d276eb](https://github.com/mezmo/aura/commit/3d276eb93d83c3658dace664b078daea128ccc0f) - Justin Gross
+
+* **aura**: run tool wrappers as a middleware stack [9f07cf4](https://github.com/mezmo/aura/commit/9f07cf4b70f6592b10bc574b4544a09457682b32) - Dan Hable [#596](https://github.com/mezmo/aura/issues/596)
+
+* **cli**: use the shared duration_ms serde module [b85e022](https://github.com/mezmo/aura/commit/b85e022fcc8267c11628f39aa47c23c3d0bb13ba) - Justin Gross
+
+* **config**: rename agent runtime config to agent build context [2c778c8](https://github.com/mezmo/aura/commit/2c778c8912947dba974b84bbbf251e1d61c7194a) - Justin Gross [#578](https://github.com/mezmo/aura/issues/578) [#780](https://github.com/mezmo/aura/issues/780)
+
+* **events**: rename agent context to emitting agent [3f86d1d](https://github.com/mezmo/aura/commit/3f86d1dc3e09d0fe8c1b017f2b8f1352059ca11c) - Justin Gross
+
+* **events**: share the string newtype surface and millisecond cast [7594d6d](https://github.com/mezmo/aura/commit/7594d6d36a0f70fcfff327f07c1e4a90ea6074c9) - Justin Gross
+
+* **events**: share timestamp, sequence number, and duration_ms [49b3503](https://github.com/mezmo/aura/commit/49b35033a4bb2facb2526f67325058f679f7057c) - Justin Gross
+
+* **hitl**: rename hitl runtime to hitl policy [e308883](https://github.com/mezmo/aura/commit/e3088837fca4831d1caab6835137027647347173) - Justin Gross [#780](https://github.com/mezmo/aura/issues/780)
+
+* **orchestration**: drop provider-specific create_plan repairs [be5440f](https://github.com/mezmo/aura/commit/be5440fe983e5553d54155c6ea27edc9d71e4915) - Justin Gross
+
+* **orchestration**: type persistence's run id apart from the run's [c72831c](https://github.com/mezmo/aura/commit/c72831c10c85650bfcf48fd1a1851cf7a0ad7401) - Justin Gross
+
+* **scratchpad**: intercept large output in a shared middleware [2513467](https://github.com/mezmo/aura/commit/2513467ad044c9b23d4a308b6da5cac742087a71) - Dan Hable [#596](https://github.com/mezmo/aura/issues/596)
+
+
+
+### Documentation
+
+* **events**: drop the claim that no second run id travels [ba4b039](https://github.com/mezmo/aura/commit/ba4b039832f4ad503e758da557fe9a96111b133e) - Justin Gross
+
+* **events**: keep type comments to what a value is [0e6f09d](https://github.com/mezmo/aura/commit/0e6f09dfa9b64f5d11c098deb7620de8e22efe9d) - Justin Gross
+
+* **events**: say what a false from follows() covers [0081c2e](https://github.com/mezmo/aura/commit/0081c2e5d11ffa6ba8eb774ffb6e1acad9b6c5c4) - Justin Gross
+
+* **mcp**: drop export from the Mezmo MCP description [a63f151](https://github.com/mezmo/aura/commit/a63f151262896cb5243caadbf3f7e18282fc79c4) - Sven Delmas [LOG-25050](https://mezmo.atlassian.net/browse/LOG-25050)
+
+* **orchestration**: describe only the factory's own run choice [f4d162f](https://github.com/mezmo/aura/commit/f4d162f61967408ce47076a75ea6687ffa79184d) - Justin Gross
+
+* **server**: state the request id's spelling once [3a904b8](https://github.com/mezmo/aura/commit/3a904b82385eefe98b9a84d67d3a75efd081d98c) - Justin Gross
+
+
+
+### Features
+
+* **events**: carry usage on every terminal lifecycle event [e1c8830](https://github.com/mezmo/aura/commit/e1c8830bba2fcc591b73abf7f22733a459a97c2c) - Justin Gross
+
+* **events**: give a session an event envelope carrying run lifecycle [b71c961](https://github.com/mezmo/aura/commit/b71c961576c813a128453ce3f899ad9e56f10a10) - Justin Gross
+
+* **events**: let a start name the run it continues [05a6e1d](https://github.com/mezmo/aura/commit/05a6e1dce77850375cee6355043b33ca2ab3f857) - Justin Gross
+
+* **events**: read an unknown variant as unknown rather than failing [4207ad3](https://github.com/mezmo/aura/commit/4207ad3ba0857e7152cb4e1728ccd525a2863e5b) - Justin Gross
+
+* **events**: refuse empty and nil identifiers [98a6ea6](https://github.com/mezmo/aura/commit/98a6ea67b8d5107d3fbf271959871b8bfaeb821f) - Justin Gross
+
+* **journal**: give each session an event journal with replay [d4a824d](https://github.com/mezmo/aura/commit/d4a824d21423bec4a2cc6e6bb0ef8cef32343ab6) - Justin Gross
+
+* **session-store**: store each session's journal behind a capability [ca3e974](https://github.com/mezmo/aura/commit/ca3e974d5c1b132e9f5bb4223b23b963b83930b0) - Justin Gross
+
+
+
+### Miscellaneous
+
+* 2026-10-09, Version 0.2.19 [skip ci] [3c1ed5c](https://github.com/mezmo/aura/commit/3c1ed5cbc41c8b3c86ba57449e33d0a8089db291) - Jacob Hull
+
+* Merge pull request #834 from mezmo/docs/mezmo-mcp-drop-export-nightly [7e01909](https://github.com/mezmo/aura/commit/7e0190900afd226054209bc799feec21662c70ef) - GitHub [#834](https://github.com/mezmo/aura/issues/834)
+
+* Merge pull request #846 from mezmo/nightly [b113e33](https://github.com/mezmo/aura/commit/b113e33d9a9715160ffe9bdcefa6b7e8aa5dfd49) - GitHub [#846](https://github.com/mezmo/aura/issues/846)
+
 ## [0.2.19](https://github.com/mezmo/aura/compare/v0.2.18...v0.2.19) (2026-10-09)
 
 

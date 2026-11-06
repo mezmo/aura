@@ -86,10 +86,23 @@ RUN cargo chef prepare --recipe-path recipe.json
 # The single dependency cook behind every CI compile on change requests.
 FROM core AS cook-debug
 WORKDIR /usr/src/app
+# The test image runs as uid 1000 and writes into this target dir, so the
+# cook runs as that uid rather than being chowned afterwards: a recursive
+# chown would copy the whole cooked target into a second layer. The base
+# image leaves CARGO_HOME and RUSTUP_HOME world-writable.
+RUN chown 1000:1000 /usr/src/app
+USER 1000:1000
 COPY --from=planner /usr/src/app/recipe.json recipe.json
 ENV RUSTFLAGS="--allow=warnings -Cinstrument-coverage"
 ENV CARGO_TARGET_DIR=/usr/src/app/target
-RUN cargo chef cook --workspace --all-targets --features integration --recipe-path recipe.json
+# The --check cook gives clippy its metadata-only dependency builds, so CI
+# lint compiles only the workspace crates. cargo metadata (which nextest
+# runs) wants every lockfile package, optional ones included; fetching them
+# against the cook's skeleton manifests keeps that from downloading on
+# every test run.
+RUN cargo chef cook --workspace --all-targets --features integration --recipe-path recipe.json \
+ && cargo chef cook --check --workspace --all-targets --features integration --recipe-path recipe.json \
+ && cargo fetch --locked
 
 ### 005 Runner
 # Mounted-workspace Cargo commands need the native dependencies from core.
@@ -202,13 +215,8 @@ EOR
 # Install tools before source COPY so source changes keep this layer cached.
 FROM cook-debug AS test-tools
 
-USER 0
-# cook-debug writes these paths as root.
-RUN chown -R 1000:1000 /usr/local/cargo /usr/src/app
-
 COPY --from=sccache-dl /usr/local/bin/sccache /usr/local/bin/sccache
 
-USER 1000
 # Prebuilt tool binaries — nothing compiles from source in the PR image.
 # ARG defaults cover direct docker builds; make build-images passes the
 # pins from .makefiles/rust.mk, the source of truth.
@@ -344,10 +352,14 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 CMD ["./aura", "webserver"]
 
 ### 013 Server
-# Integration-lane server image (debug profile).
+# Local integration-lane server image (debug profile).
 FROM runtime AS server
 
 COPY --from=debug-build /usr/src/app/target/debug/aura /app/
+
+### 013b Server-ci
+# CI integration-lane server image: the runtime alone (see compose/test-ci.yml).
+FROM runtime AS server-ci
 
 ### 014 Release
 # Published image. Must stay the final stage: the feature-build and

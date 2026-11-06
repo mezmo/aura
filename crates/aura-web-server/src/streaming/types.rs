@@ -259,20 +259,6 @@ pub use openai::{
     MessageRole, ToolCallChunk,
 };
 
-/// Error prefix patterns from Rig's tool error handling. The first is also
-/// `MCP_ERROR_PREFIX` in `aura::mcp::response`; both must stay in step with
-/// `McpToolError` in rig's `tool/mod.rs`.
-const ERROR_PREFIXES: &[(&str, &str)] = &[
-    ("Tool returned an error: ", "ToolError"),
-    ("Tool execution failed: ", "ExecutionError"),
-    ("Tool not found: ", "NotFoundError"),
-    ("Invalid tool arguments: ", "ArgumentError"),
-    ("MCP error: ", "McpError"),
-    ("HTTP error: ", "HttpError"),
-    ("JSON error: ", "JsonError"),
-    ("Timeout: ", "TimeoutError"),
-];
-
 /// Truncate to approximately `max_length` bytes (0 = no truncation).
 /// Respects UTF-8 character boundaries to avoid panics on multi-byte characters.
 pub fn truncate_result(result: &str, max_length: usize) -> String {
@@ -292,50 +278,6 @@ pub fn format_sse_chunk<T: serde::Serialize>(value: &T) -> Result<bytes::Bytes, 
     buffer.push_str(&json);
     buffer.push_str("\n\n");
     Ok(bytes::Bytes::from(buffer))
-}
-
-#[derive(Debug)]
-pub enum ToolResultStatus {
-    Success,
-    Error(ToolError),
-}
-
-#[derive(Debug)]
-pub struct ToolError {
-    error_type: String,
-    message: String,
-}
-
-impl ToolError {
-    pub fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            error_type: error_type.into(),
-            message: message.into(),
-        }
-    }
-
-    pub fn error_type(&self) -> &str {
-        &self.error_type
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-
-    pub fn full_message(&self) -> String {
-        format!("{}: {}", self.error_type, self.message)
-    }
-}
-
-/// Detect if a tool result is an error based on Rig's error prefix patterns.
-pub fn detect_tool_error(result_text: &str) -> ToolResultStatus {
-    for (prefix, error_type) in ERROR_PREFIXES {
-        if result_text.starts_with(prefix) {
-            let message = result_text.strip_prefix(prefix).unwrap_or(result_text);
-            return ToolResultStatus::Error(ToolError::new(*error_type, message));
-        }
-    }
-    ToolResultStatus::Success
 }
 
 #[cfg(test)]
@@ -394,23 +336,5 @@ mod tests {
         // Truncate at byte 10 (just after emoji) should include it
         let result = truncate_result(input, 10);
         assert_eq!(result, "Hello 🎉... [truncated]");
-    }
-
-    #[test]
-    fn test_detect_tool_error_success() {
-        let status = detect_tool_error("Normal result data");
-        assert!(matches!(status, ToolResultStatus::Success));
-    }
-
-    #[test]
-    fn test_detect_tool_error_failure() {
-        let status = detect_tool_error("Tool returned an error: Connection refused");
-        match status {
-            ToolResultStatus::Error(err) => {
-                assert_eq!(err.error_type(), "ToolError");
-                assert_eq!(err.message(), "Connection refused");
-            }
-            _ => panic!("Expected error status"),
-        }
     }
 }

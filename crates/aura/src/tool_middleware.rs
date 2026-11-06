@@ -28,7 +28,7 @@ use serde_json::Value;
 
 use crate::approver_headers::{APPROVER_OVERRIDES, ApproverHeaders, OverrideApplicationError};
 use crate::config::ToolContextFactory;
-use crate::mcp::CallOutcome;
+use crate::tool_error_detection::is_reported_error;
 use crate::tool_wrapper::{PreCallOutcome, ToolCallContext, ToolWrapper, TransformArgsResult};
 
 /// A prepared tool call.
@@ -64,11 +64,8 @@ impl ToolRequest {
 /// The result of a call that produced one.
 #[non_exhaustive]
 pub enum ToolReply {
-    /// The inner tool's output, with the classification of its raw output.
-    Tool {
-        output: String,
-        outcome: CallOutcome,
-    },
+    /// The inner tool's output, and whether its raw output reports a failure.
+    Tool { output: String, is_error: bool },
     /// A layer's answer in place of the inner tool's.
     ShortCircuit { output: String },
 }
@@ -222,8 +219,8 @@ where
         }
         match result {
             Ok(output) => {
-                let outcome = CallOutcome::classify_from_output(&output);
-                Ok(ToolReply::Tool { output, outcome })
+                let is_error = is_reported_error(&output);
+                Ok(ToolReply::Tool { output, is_error })
             }
             Err(error) => Err(CallFailure::Tool(error)),
         }
@@ -410,17 +407,17 @@ impl ToolMiddleware for WrapperLayer {
         let ctx = Arc::clone(&req.ctx);
         let extracted = req.extracted.clone();
         match next.run(req).await {
-            Ok(ToolReply::Tool { output, outcome }) => {
+            Ok(ToolReply::Tool { output, is_error }) => {
                 let transformed = self
                     .0
-                    .transform_output(output, &outcome, &ctx, extracted.as_deref())
+                    .transform_output(output, is_error, &ctx, extracted.as_deref())
                     .await;
                 if let Some(warning) = &transformed.warning {
                     tracing::warn!("Tool wrapper warning for {}: {}", ctx.tool_name, warning);
                 }
                 Ok(ToolReply::Tool {
                     output: transformed.output,
-                    outcome,
+                    is_error,
                 })
             }
             Ok(short_circuit) => Ok(short_circuit),
@@ -527,6 +524,116 @@ where
     }
 }
 
+/// A native tool, which arrives as a boxed [`ToolDyn`], run through a
+/// [`MiddlewareStack`].
+///
+/// [`MiddlewareTool`] needs a `Clone` rig `Tool`, and native run tools (the
+/// Slack tools) are registered as `Box<dyn ToolDyn>`. This
+/// implements `ToolDyn` itself rather than `Tool`: rig's blanket `ToolDyn`
+/// impl serializes a `Tool`'s output, which would quote the inner tool's
+/// already-serialized output a second time. The output is returned as the
+/// inner tool produced it.
+///
+/// [`ToolDyn`]: rig::tool::ToolDyn
+pub struct MiddlewareToolDyn {
+    tool: MiddlewareTool<SharedToolDyn>,
+}
+
+impl MiddlewareToolDyn {
+    pub fn new(
+        inner: Box<dyn rig::tool::ToolDyn>,
+        stack: MiddlewareStack,
+        context_factory: Option<ToolContextFactory>,
+    ) -> Self {
+        Self {
+            tool: MiddlewareTool {
+                inner: SharedToolDyn(Arc::from(inner)),
+                stack,
+                context_factory,
+            },
+        }
+    }
+}
+
+impl rig::tool::ToolDyn for MiddlewareToolDyn {
+    fn name(&self) -> String {
+        RigTool::name(&self.tool)
+    }
+
+    fn definition<'a>(
+        &'a self,
+        prompt: String,
+    ) -> Pin<Box<dyn Future<Output = ToolDefinition> + Send + 'a>> {
+        RigTool::definition(&self.tool, prompt)
+    }
+
+    fn call<'a>(
+        &'a self,
+        args: String,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
+        Box::pin(async move {
+            let args: Value = serde_json::from_str(&args).map_err(ToolError::JsonError)?;
+            RigTool::call(&self.tool, args).await
+        })
+    }
+}
+
+/// A shared [`ToolDyn`](rig::tool::ToolDyn) as the `Clone` rig `Tool` that
+/// [`run_call`] drives. Its `call` hands the inner tool's output back
+/// unchanged.
+#[derive(Clone)]
+struct SharedToolDyn(Arc<dyn rig::tool::ToolDyn>);
+
+impl RigTool for SharedToolDyn {
+    type Error = ToolError;
+    type Args = Value;
+    type Output = String;
+
+    const NAME: &'static str = "shared_tool_dyn";
+
+    fn name(&self) -> String {
+        self.0.name()
+    }
+
+    /// `Tool` wants a `Sync` future and `ToolDyn`'s is only `Send`, so the
+    /// inner future is polled under a mutex.
+    #[allow(refining_impl_trait)]
+    fn definition(
+        &self,
+        prompt: String,
+    ) -> Pin<Box<dyn Future<Output = ToolDefinition> + Send + Sync + '_>> {
+        let inner = Arc::clone(&self.0);
+        let pending =
+            std::sync::Mutex::new(Box::pin(async move { inner.definition(prompt).await })
+                as Pin<Box<dyn Future<Output = ToolDefinition> + Send>>);
+        Box::pin(std::future::poll_fn(move |cx| {
+            pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+                .poll(cx)
+        }))
+    }
+
+    #[allow(refining_impl_trait)]
+    fn call(
+        &self,
+        args: Self::Args,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send + '_>> {
+        Box::pin(self.0.call(args.to_string()))
+    }
+}
+
+/// What `on_complete` is told about a reply. A reply that reports a failure
+/// completes as `Err`, so no layer has to classify the text again.
+fn reported(output: &str, is_error: bool) -> Result<String, String> {
+    if is_error {
+        Err(output.to_string())
+    } else {
+        Ok(output.to_string())
+    }
+}
+
 /// Drive one call through the three phases.
 ///
 /// The onion runs on a task of its own, under the caller's span, so a gate
@@ -589,13 +696,19 @@ where
             let duration_ms = elapsed_ms();
             let caller_present = || !caller_gone.load(Ordering::SeqCst);
             match result {
-                Ok(ToolReply::Tool { output, .. }) => {
-                    onion_stack.complete(ctx, extracted, Ok(output.clone()), duration_ms);
+                Ok(ToolReply::Tool { output, is_error }) => {
+                    onion_stack.complete(ctx, extracted, reported(&output, is_error), duration_ms);
                     Ok(output)
                 }
                 Ok(ToolReply::ShortCircuit { output }) => {
                     if caller_present() {
-                        onion_stack.complete(ctx, extracted, Ok(output.clone()), duration_ms);
+                        let is_error = is_reported_error(&output);
+                        onion_stack.complete(
+                            ctx,
+                            extracted,
+                            reported(&output, is_error),
+                            duration_ms,
+                        );
                     }
                     Ok(output)
                 }
@@ -647,7 +760,6 @@ mod parity {
         WrapperLayer,
     };
     use crate::approver_headers::tests::captured_overrides;
-    use crate::mcp::CallOutcome;
     use crate::tool_wrapper::{
         ComposedWrapper, PreCallOutcome, ToolCallContext, ToolWrapper, TransformArgsResult,
         TransformOutputResult, WrappedTool,
@@ -781,17 +893,13 @@ mod parity {
         async fn transform_output(
             &self,
             output: String,
-            outcome: &CallOutcome,
+            is_error: bool,
             _ctx: &ToolCallContext,
             _extracted: Option<&Value>,
         ) -> TransformOutputResult {
             note(
                 &self.log,
-                format!(
-                    "{}.out({})",
-                    self.id,
-                    if outcome.is_error() { "err" } else { "ok" }
-                ),
+                format!("{}.out({})", self.id, if is_error { "err" } else { "ok" }),
             );
             match &self.script.post {
                 Post::Pass => {}
@@ -1339,9 +1447,9 @@ mod parity {
             let reply = next.run(req).await;
             note(&self.log, "n.out");
             match reply {
-                Ok(ToolReply::Tool { output, outcome }) => Ok(ToolReply::Tool {
+                Ok(ToolReply::Tool { output, is_error }) => Ok(ToolReply::Tool {
                     output: format!("{output}<n"),
-                    outcome,
+                    is_error,
                 }),
                 other => other,
             }

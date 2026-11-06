@@ -254,15 +254,14 @@ where
                     {
                         let elapsed = Duration::from_millis(duration_ms);
                         tool_timers.remove(&tool_id);
-                        handler.on_tool_complete(&tool_id, &tool_name, elapsed, result.as_deref());
 
-                        // Cache server-side result by tool_call_id for hybrid mode.
-                        // For failures, cache the error message so the model sees the
-                        // real failure instead of a bogus "executed successfully" fallback.
-                        if let Some(res) = result {
-                            server_results.insert(tool_id, res);
-                        } else if let Some(err) = error {
-                            server_results.insert(tool_id, format!("Error: {err}"));
+                        // A failure is shown, and cached for hybrid mode, as
+                        // "Error: ..." so neither the user nor the model takes
+                        // it for output or falls back to "executed successfully".
+                        let text = result.or_else(|| error.map(|err| format!("Error: {err}")));
+                        handler.on_tool_complete(&tool_id, &tool_name, elapsed, text.as_deref());
+                        if let Some(text) = text {
+                            server_results.insert(tool_id, text);
                         }
                     }
                 }
@@ -500,6 +499,7 @@ mod tests {
     #[derive(Default)]
     struct Captures {
         tokens: Vec<String>,
+        approvals_pending: Vec<String>,
         tools_requested: Vec<(String, String, BTreeMap<String, serde_json::Value>)>,
         tools_started: Vec<(String, String)>,
         tools_completed: Vec<(String, String, Option<String>)>,
@@ -563,6 +563,9 @@ mod tests {
             self.reasoning
                 .push((content.to_string(), agent_id.to_string()));
         }
+        fn on_approval_pending(&mut self, pending: &ApprovalPending) {
+            self.approvals_pending.push(pending.decision_id.clone());
+        }
         fn on_raw_event(&mut self, event_name: &str, data: &str) {
             self.raw_events
                 .push((event_name.to_string(), data.to_string()));
@@ -591,6 +594,26 @@ mod tests {
     // -----------------------------------------------------------------------
     // Text response tests
     // -----------------------------------------------------------------------
+
+    /// An `approval_pending` from a newer server must still reach the handler:
+    /// dropping it leaves the user unasked until the approval times out.
+    #[tokio::test]
+    async fn approval_pending_with_an_unknown_origin_and_scope_reaches_the_handler() {
+        let pending = serde_json::json!({
+            "decision_id": "d-1",
+            "tool_name": "deploy",
+            "arguments": {},
+            "origin": {"kind": "policy_engine"},
+            "scope": {"kind": "subagent"},
+            "expires_at": "2026-11-04T00:00:00Z",
+        })
+        .to_string();
+
+        let (result, caps) = run_stream(vec![sse(event_names::APPROVAL_PENDING, &pending)]).await;
+
+        result.unwrap();
+        assert_eq!(caps.approvals_pending, vec!["d-1"]);
+    }
 
     #[tokio::test]
     async fn text_only_response() {
@@ -827,7 +850,12 @@ mod tests {
             ),
             sse("", "[DONE]"),
         ];
-        let (result, _) = run_stream(events).await;
+        let (result, caps) = run_stream(events).await;
+        assert_eq!(
+            caps.tools_completed[0].2.as_deref(),
+            Some("Error: command not found"),
+            "the handler is shown the error"
+        );
         match result.unwrap() {
             StreamResult::ToolCalls { server_results, .. } => {
                 assert_eq!(
