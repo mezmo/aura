@@ -23,7 +23,8 @@ pub use error::ConfigError;
 pub use globpattern::*;
 pub use loader::ConfigLoader;
 pub use orchestration::{
-    ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,
+    ArtifactsConfig, JevQuestion, JevWorkerConfig, LlmWorkerConfig, OrchestrationConfig,
+    TimeoutsConfig, ToolVisibility, WorkerConfig,
 };
 pub use scratchpad::{ScratchpadConfig, ScratchpadRule, ScratchpadRules, ScratchpadToolEntry};
 pub use session_store::{

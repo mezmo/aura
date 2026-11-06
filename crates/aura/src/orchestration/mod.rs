@@ -51,6 +51,7 @@ mod duplicate_call_guard;
 mod factory;
 #[cfg(test)]
 mod frame_validation_tests;
+pub mod jev;
 mod observer_wrapper;
 mod orchestrator;
 mod overview;
@@ -67,8 +68,9 @@ mod types;
 
 pub use aura_events::orchestration::RoutingMode;
 pub use config::{
-    ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,
-    build_coordinator_preamble, build_vector_store_context, build_worker_preamble,
+    ArtifactsConfig, JevQuestion, JevWorkerConfig, LlmWorkerConfig, OrchestrationConfig,
+    TimeoutsConfig, ToolVisibility, WorkerConfig, build_coordinator_preamble,
+    build_vector_store_context, build_worker_preamble,
 };
 pub use factory::OrchestratorFactory;
 pub use observer_wrapper::ObserverWrapper;

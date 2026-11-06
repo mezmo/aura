@@ -442,7 +442,10 @@ fn run_setup(
     config.agent.system_prompt.push_str(&addition);
     if let Some(orchestration) = config.orchestration.as_mut() {
         for worker in orchestration.workers.values_mut() {
-            worker.preamble.push_str(&addition);
+            // A Jev worker takes no prompt; the context line is for LLMs.
+            if let aura_config::WorkerConfig::Llm(worker) = worker {
+                worker.preamble.push_str(&addition);
+            }
         }
         orchestration
             .worker_system_prompt
@@ -873,7 +876,7 @@ mod tests {
 
         let (with, _) = run_setup(&orchestrated, &api, &inbound(Some("tok")));
         let orchestration = with.orchestration.unwrap();
-        let preamble = &orchestration.workers["finder"].preamble;
+        let preamble = &orchestration.workers["finder"].as_llm().unwrap().preamble;
         assert!(preamble.starts_with("You search."));
         assert!(preamble.contains("<#C1>"));
         assert!(preamble.ends_with(search::CITATION_PROMPT));
@@ -882,7 +885,8 @@ mod tests {
         assert!(unnamed.ends_with(search::CITATION_PROMPT));
 
         let (plain, _) = run_setup(&orchestrated, &api, &inbound(None));
-        let preamble = &plain.orchestration.unwrap().workers["finder"].preamble;
+        let plain = plain.orchestration.unwrap();
+        let preamble = &plain.workers["finder"].as_llm().unwrap().preamble;
         assert!(preamble.contains("<#C1>"));
         assert!(!preamble.contains("slack_search"));
     }
