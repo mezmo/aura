@@ -816,9 +816,6 @@ pub(crate) fn read_tool_result(
 ///
 /// After the first `.tool()` call, `AgentBuilder<M>` transitions to
 /// `AgentBuilderSimple<M>`. This enum handles both states uniformly.
-///
-/// Every tool an agent gets, native or MCP, single-agent or orchestration,
-/// is added through here, which is what lets `add_tools_dyn` meter them all.
 pub(crate) enum BuilderState<M: CompletionModel> {
     Initial(AgentBuilder<M>),
     WithTools(AgentBuilderSimple<M>),

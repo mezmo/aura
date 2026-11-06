@@ -69,6 +69,7 @@ pub struct RunMeasure<'a> {
 /// The agent and model behind a run's LLM turns, as the inference metrics
 /// label them.
 #[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "otel"), allow(dead_code))]
 pub struct InferenceLabels {
     agent: Arc<str>,
     provider: Arc<str>,

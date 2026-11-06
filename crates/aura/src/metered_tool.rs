@@ -68,8 +68,6 @@ fn error_type(result: &Result<String, ToolError>) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rig::tool::Tool;
-    use serde::{Deserialize, Serialize};
 
     #[test]
     fn error_type_tells_answered_errors_from_failures() {
@@ -92,97 +90,103 @@ mod tests {
         );
     }
 
-    #[derive(Deserialize)]
-    struct Args {
-        fail: bool,
-    }
+    /// The wrapper itself, which needs the instruments to exist.
+    #[cfg(feature = "otel")]
+    mod metered {
+        use super::*;
+        use rig::tool::Tool;
+        use serde::{Deserialize, Serialize};
 
-    #[derive(Serialize)]
-    struct Out(String);
-
-    #[derive(Debug, thiserror::Error)]
-    #[error("asked to fail")]
-    struct Asked;
-
-    /// A tool under a name of the caller's choosing, failing on request.
-    struct Named(&'static str);
-
-    impl Tool for Named {
-        const NAME: &'static str = "named";
-        type Error = Asked;
-        type Args = Args;
-        type Output = Out;
-
-        fn name(&self) -> String {
-            self.0.to_string()
+        #[derive(Deserialize)]
+        struct Args {
+            fail: bool,
         }
 
-        async fn definition(&self, _prompt: String) -> ToolDefinition {
-            ToolDefinition {
-                name: self.0.to_string(),
-                description: String::new(),
-                parameters: serde_json::json!({"type": "object"}),
+        #[derive(Serialize)]
+        struct Out(String);
+
+        #[derive(Debug, thiserror::Error)]
+        #[error("asked to fail")]
+        struct Asked;
+
+        /// A tool under a name of the caller's choosing, failing on request.
+        struct Named(&'static str);
+
+        impl Tool for Named {
+            const NAME: &'static str = "named";
+            type Error = Asked;
+            type Args = Args;
+            type Output = Out;
+
+            fn name(&self) -> String {
+                self.0.to_string()
+            }
+
+            async fn definition(&self, _prompt: String) -> ToolDefinition {
+                ToolDefinition {
+                    name: self.0.to_string(),
+                    description: String::new(),
+                    parameters: serde_json::json!({"type": "object"}),
+                }
+            }
+
+            async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+                if args.fail {
+                    Err(Asked)
+                } else {
+                    Ok(Out("done".into()))
+                }
             }
         }
 
-        async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-            if args.fail {
-                Err(Asked)
-            } else {
-                Ok(Out("done".into()))
+        #[tokio::test]
+        async fn metered_tool_records_each_call_with_its_outcome() {
+            crate::metrics::init(false).expect("metrics init");
+            let tool = MeteredTool::new(Box::new(Named("metered_probe")));
+
+            tool.call(r#"{"fail": false}"#.to_string())
+                .await
+                .expect("the tool answers");
+            tool.call(r#"{"fail": true}"#.to_string())
+                .await
+                .expect_err("the tool fails on request");
+            tool.call("not json".to_string())
+                .await
+                .expect_err("rig rejects the arguments");
+
+            let text = crate::metrics::render_prometheus().expect("render");
+            for needle in [
+                r#"gen_ai_execute_tool_duration_seconds_count{gen_ai_tool_name="metered_probe"} 1"#,
+                r#"gen_ai_execute_tool_duration_seconds_count{error_type="tool_call_error",gen_ai_tool_name="metered_probe"} 1"#,
+                r#"gen_ai_execute_tool_duration_seconds_count{error_type="json_error",gen_ai_tool_name="metered_probe"} 1"#,
+            ] {
+                assert!(text.contains(needle), "missing {needle} in:\n{text}");
             }
         }
-    }
 
-    #[cfg(feature = "otel")]
-    #[tokio::test]
-    async fn metered_tool_records_each_call_with_its_outcome() {
-        crate::metrics::init(false).expect("metrics init");
-        let tool = MeteredTool::new(Box::new(Named("metered_probe")));
+        /// A scratchpad read goes through unmetered, as it goes through the
+        /// event surface unpublished.
+        #[tokio::test]
+        async fn metered_tool_leaves_scratchpad_reads_out() {
+            crate::metrics::init(false).expect("metrics init");
+            let name = crate::scratchpad::all_tool_definitions()
+                .into_iter()
+                .next()
+                .expect("the scratchpad has tools")
+                .name;
+            assert!(crate::scratchpad::is_scratchpad_tool(&name));
+            let name: &'static str = Box::leak(name.into_boxed_str());
+            let tool = MeteredTool::new(Box::new(Named(name)));
 
-        tool.call(r#"{"fail": false}"#.to_string())
-            .await
-            .expect("the tool answers");
-        tool.call(r#"{"fail": true}"#.to_string())
-            .await
-            .expect_err("the tool fails on request");
-        tool.call("not json".to_string())
-            .await
-            .expect_err("rig rejects the arguments");
+            tool.call(r#"{"fail": false}"#.to_string())
+                .await
+                .expect("the tool answers");
 
-        let text = crate::metrics::render_prometheus().expect("render");
-        for needle in [
-            r#"gen_ai_execute_tool_duration_seconds_count{gen_ai_tool_name="metered_probe"} 1"#,
-            r#"gen_ai_execute_tool_duration_seconds_count{error_type="tool_call_error",gen_ai_tool_name="metered_probe"} 1"#,
-            r#"gen_ai_execute_tool_duration_seconds_count{error_type="json_error",gen_ai_tool_name="metered_probe"} 1"#,
-        ] {
-            assert!(text.contains(needle), "missing {needle} in:\n{text}");
+            let text = crate::metrics::render_prometheus().expect("render");
+            assert!(
+                !text.contains(&format!("gen_ai_tool_name=\"{name}\"")),
+                "scratchpad tool {name} must not be metered:\n{text}"
+            );
         }
-    }
-
-    /// A scratchpad read goes through unmetered, as it goes through the
-    /// event surface unpublished.
-    #[cfg(feature = "otel")]
-    #[tokio::test]
-    async fn metered_tool_leaves_scratchpad_reads_out() {
-        crate::metrics::init(false).expect("metrics init");
-        let name = crate::scratchpad::all_tool_definitions()
-            .into_iter()
-            .next()
-            .expect("the scratchpad has tools")
-            .name;
-        assert!(crate::scratchpad::is_scratchpad_tool(&name));
-        let name: &'static str = Box::leak(name.into_boxed_str());
-        let tool = MeteredTool::new(Box::new(Named(name)));
-
-        tool.call(r#"{"fail": false}"#.to_string())
-            .await
-            .expect("the tool answers");
-
-        let text = crate::metrics::render_prometheus().expect("render");
-        assert!(
-            !text.contains(&format!("gen_ai_tool_name=\"{name}\"")),
-            "scratchpad tool {name} must not be metered:\n{text}"
-        );
     }
 }
