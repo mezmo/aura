@@ -3131,7 +3131,7 @@
           "sort": "desc"
         }
       },
-      "description": "gen_ai.execute_tool.duration count: tool calls as the agent loop sees them, HITL wait and middleware included. Single agents and the coordinator; worker tool calls appear in the MCP panels only."
+      "description": "gen_ai.execute_tool.duration count: tool calls as the agent made them, HITL wait and middleware included, native tools and MCP tools alike. Every agent: single, worker and coordinator."
     },
     {
       "type": "timeseries",
