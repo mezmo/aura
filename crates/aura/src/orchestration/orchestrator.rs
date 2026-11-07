@@ -4038,7 +4038,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
     }
 
     /// If result exceeds artifact threshold, write full result to artifact file
-    /// and return a summary. Otherwise return the original result unchanged.
+    /// and return a summary. Otherwise, or with persistence disabled, return
+    /// the original result unchanged.
     async fn maybe_create_artifact(
         &self,
         task_id: usize,
@@ -4052,6 +4053,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         let summary_len = self.config.result_summary_length();
         let persistence = self.persistence.lock().await;
+        if !persistence.is_enabled() {
+            return result;
+        }
         let iteration = persistence.current_iteration();
 
         match persistence
@@ -10349,6 +10353,40 @@ mod coordinator_artifact_tests {
 
     fn big_artifact() -> String {
         (0..20_000).map(|i| format!("log line {i}\n")).collect()
+    }
+
+    /// With no `memory_dir` there is no artifact to hold the rest of a long
+    /// result, so none of it is cut.
+    #[tokio::test]
+    async fn a_long_result_stays_whole_without_a_memory_dir() {
+        let orchestrator = Orchestrator::new(AgentBuildContext::default())
+            .await
+            .unwrap();
+        let result = big_artifact();
+
+        let kept = orchestrator
+            .maybe_create_artifact(0, Some("files"), result.clone())
+            .await;
+
+        assert_eq!(kept, result);
+    }
+
+    #[tokio::test]
+    async fn a_long_result_is_cut_once_an_artifact_holds_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let orchestrator = orchestrator(temp.path(), None, None).await;
+        let result = big_artifact();
+
+        let kept = orchestrator
+            .maybe_create_artifact(0, Some("files"), result.clone())
+            .await;
+
+        assert!(kept.len() < result.len());
+        assert!(
+            kept.ends_with("saved to artifact: task-0-files-iter-1-result.txt]"),
+            "{}",
+            &kept[kept.len() - 80..]
+        );
     }
 
     /// The coordinator's artifact tools with their run bound, as
