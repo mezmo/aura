@@ -742,6 +742,14 @@ fn process_stream_next(
                 if let Ok(bytes) = format_sse_chunk(&chunk) {
                     return NextItemResult::End(vec![bytes]);
                 }
+            } else if aura::provider_error::is_quota_exhausted(&error_str) {
+                let user_message =
+                    build_quota_exhausted_message(&error_str, config.debug_provider_errors);
+                state.accumulated_content.push_str(&user_message);
+                let chunk = build_text_chunk(ctx, &user_message, state.is_first_chunk);
+                if let Ok(bytes) = format_sse_chunk(&chunk) {
+                    return NextItemResult::End(vec![bytes]);
+                }
             } else {
                 let user_message = build_provider_error_message(
                     &ctx.model_str,
@@ -1332,6 +1340,7 @@ fn handle_orchestrator_event(
             duration_ms,
             orchestrator_id,
             outcome,
+            quota_exhausted,
         } => {
             let (success, result): (bool, &str) = match outcome {
                 aura_events::agent::ToolOutcome::Success { result } => (true, result),
@@ -1344,13 +1353,24 @@ fn handle_orchestrator_event(
                 success,
                 duration_ms
             );
+            // A quota failure carries the provider's raw body and request id,
+            // which reach the client as they do on the stream-error path: only
+            // with `debug_provider_errors`.
+            let result = if *quota_exhausted {
+                std::borrow::Cow::Owned(build_quota_exhausted_message(
+                    result,
+                    config.debug_provider_errors,
+                ))
+            } else {
+                std::borrow::Cow::Borrowed(result)
+            };
             OrchestrationStreamEvent::task_completed(
                 *task_id,
                 success,
                 *duration_ms,
                 orchestrator_id,
                 worker_id.as_str(),
-                maybe_truncate(result, config.tool_result_max_length),
+                maybe_truncate(&result, config.tool_result_max_length),
                 event_context,
             )
         }
@@ -1561,6 +1581,21 @@ fn build_provider_error_message(model: &str, error_str: &str, debug: bool) -> St
              could not be completed. Please try again or contact support if the \
              issue persists."
         )
+    }
+}
+
+/// The message for a provider account out of credit or quota: what happened
+/// and what to do, which the generic provider message leaves out. The raw
+/// error is appended only when `debug` allows it, as for any provider error.
+fn build_quota_exhausted_message(error_str: &str, debug: bool) -> String {
+    if debug {
+        format!(
+            "{}\n\nProvider error: {}",
+            aura::provider_error::QUOTA_EXHAUSTED_MESSAGE,
+            truncate_error_detail(error_str.trim())
+        )
+    } else {
+        aura::provider_error::QUOTA_EXHAUSTED_MESSAGE.to_string()
     }
 }
 
@@ -1908,6 +1943,70 @@ mod tests {
                 "the {label} frame must name the worker, got: {frame}"
             );
         }
+    }
+
+    /// A task that failed on an exhausted quota reaches the client in its
+    /// `task_completed` frame under the plain quota message, with the
+    /// provider's body and request id only when `debug_provider_errors` is on.
+    /// Other task failures pass through unchanged.
+    #[test]
+    fn a_quota_task_failure_hides_the_provider_body_unless_debugging() {
+        use aura_events::agent::{AgentEvent, AgentEventPayload, ToolOutcome};
+
+        let ctx = test_turn_ctx();
+        let failed = |error: &str, quota_exhausted: bool| {
+            AgentEvent::new(
+                aura_events::EmittingAgent::worker("log-analyst", None, "coordinator"),
+                AgentEventPayload::TaskCompleted {
+                    task_id: 0,
+                    duration_ms: 42,
+                    orchestrator_id: "coordinator".into(),
+                    outcome: ToolOutcome::Failure {
+                        error: error.to_string(),
+                    },
+                    quota_exhausted,
+                },
+            )
+        };
+        let render = |config: &StreamConfig, event: AgentEvent| {
+            handle_orchestrator_event(config, &ctx, &event)
+                .iter()
+                .filter_map(|b| std::str::from_utf8(b).ok().map(str::to_owned))
+                .collect::<String>()
+        };
+        let quota = r#"ProviderError: Invalid status code 400 Bad Request with message: {"error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."},"request_id":"req_011secret"}"#;
+
+        let config = StreamConfig::new(true, false, ToolResultMode::None, 10_000);
+        let frame = render(&config, failed(quota, true));
+        assert!(
+            frame.contains(aura::provider_error::QUOTA_EXHAUSTED_MESSAGE),
+            "{frame}"
+        );
+        assert!(!frame.contains("req_011secret"), "{frame}");
+
+        let debug = StreamConfig::new(true, false, ToolResultMode::None, 10_000)
+            .with_debug_provider_errors(true);
+        let frame = render(&debug, failed(quota, true));
+        assert!(
+            frame.contains(aura::provider_error::QUOTA_EXHAUSTED_MESSAGE),
+            "{frame}"
+        );
+        assert!(frame.contains("req_011secret"), "{frame}");
+
+        let frame = render(&config, failed("tool read_file failed: not found", false));
+        assert!(
+            frame.contains("tool read_file failed: not found"),
+            "{frame}"
+        );
+
+        // A worker's own text quoting a quota error is not a quota failure.
+        let quoted = "soft failure: the logs show insufficient_quota at 09:14";
+        let frame = render(&config, failed(quoted, false));
+        assert!(frame.contains(quoted), "{frame}");
+        assert!(
+            !frame.contains(aura::provider_error::QUOTA_EXHAUSTED_MESSAGE),
+            "{frame}"
+        );
     }
 
     /// The `arguments` of the result delta OpenWebUI mode sends for `result`.
@@ -2449,6 +2548,28 @@ mod tests {
         );
     }
 
+    const ANTHROPIC_NO_CREDIT: &str = r#"Provider quota exhausted (not retryable via replan): CompletionError: ProviderError: SSE Error: Invalid status code 400 Bad Request with message: {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."},"request_id":"req_011CeNSF5BZ7CQWKKVgGqHv7"}"#;
+
+    /// mezmo/aura#593: an exhausted quota tells the user what to do, and a
+    /// default server keeps the provider's body and request id to itself.
+    #[test]
+    fn quota_exhausted_message_is_actionable_and_hides_detail_by_default() {
+        let msg = build_quota_exhausted_message(ANTHROPIC_NO_CREDIT, false);
+        assert_eq!(msg, aura::provider_error::QUOTA_EXHAUSTED_MESSAGE);
+        assert!(msg.contains("Add credit"), "{msg}");
+        assert!(!msg.contains("req_011"), "request id leaked: {msg}");
+    }
+
+    #[test]
+    fn quota_exhausted_message_includes_detail_in_debug_mode() {
+        let msg = build_quota_exhausted_message(ANTHROPIC_NO_CREDIT, true);
+        assert!(
+            msg.starts_with(aura::provider_error::QUOTA_EXHAUSTED_MESSAGE),
+            "{msg}"
+        );
+        assert!(msg.contains("credit balance is too low"), "{msg}");
+    }
+
     #[test]
     fn provider_error_debug_caps_long_raw() {
         let raw = format!("ProviderError: {}", "x".repeat(2000));
@@ -2460,6 +2581,36 @@ mod tests {
         );
         assert!(msg.contains('…'), "expected ellipsis marker: {msg}");
         assert!(msg.contains("test-model"), "model missing: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_collect_stream_quota_error_uses_the_quota_message() {
+        let config = StreamConfig::new(false, false, ToolResultMode::None, 0);
+        let ctx = TurnContext::new(
+            "test-id".to_string(),
+            "test-model".to_string(),
+            0,
+            None,
+            "test-session",
+        );
+
+        let items: Vec<Result<StreamItem, StreamError>> = vec![Err(
+            r#"Invalid status code 400 Bad Request with message: {"error":{"message":"Your credit balance is too low to access the Anthropic API."},"request_id":"req_011secret"}"#
+                .into(),
+        )];
+        let stream = futures_util::stream::iter(items);
+
+        let (outcome, termination) = collect_stream_to_completion(&config, &ctx, stream).await;
+
+        assert_eq!(
+            outcome.content,
+            aura::provider_error::QUOTA_EXHAUSTED_MESSAGE
+        );
+        assert!(
+            matches!(&termination, StreamTermination::StreamError(_)),
+            "Expected StreamError termination, got: {:?}",
+            termination
+        );
     }
 
     #[tokio::test]
