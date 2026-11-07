@@ -965,8 +965,8 @@ impl IterationContext {
     /// `.md` template in `crates/aura/src/prompts/continuation_prompt.md`.
     ///
     /// Per-task completed results are inlined fully when no artifact was
-    /// created (result ≤ threshold). When the result was spilled to an
-    /// artifact, shows summary + artifact pointer instead.
+    /// created. When the result was spilled to an artifact, shows summary +
+    /// artifact pointer instead.
     pub fn build_continuation_prompt(
         &self,
         max_iterations: usize,
@@ -1004,7 +1004,7 @@ impl IterationContext {
                             t.id, t.description, confidence, body
                         ));
                     } else {
-                        // Result fits in context — inline it fully.
+                        // No artifact, so inline it fully.
                         let confidence = t
                             .structured_output
                             .as_ref()
