@@ -769,26 +769,53 @@ const DUPLICATE_LOOP_FAILURE: &str = "Worker blocked by duplicate call loop.";
 /// The start of an orphaned park's failure, which keeps no worker output.
 const ORPHANED_PARK_FAILURE: &str = "Worker stream ended before the parked approval snapshot";
 
-/// The warning for a plan with no ready task left to start.
-fn stalled_plan_warning(run_is_stopping: bool, pending: usize) -> String {
-    if run_is_stopping {
-        format!("Provider quota exhausted — {pending} task(s) not started")
+/// The warning for a plan with no ready task left to start, or `None` when the
+/// hold-back on an exhausted account just finished it.
+fn stalled_plan_warning(plan: &Plan, run_is_stopping: bool) -> Option<String> {
+    if plan.is_finished() {
+        None
+    } else if run_is_stopping {
+        Some(format!(
+            "Provider quota exhausted — {} task(s) not started",
+            plan.pending_count()
+        ))
     } else {
-        "No ready tasks but plan not finished — blocked tasks remaining after failure \
-         (dependency chain broken)"
-            .to_string()
+        Some(
+            "No ready tasks but plan not finished — blocked tasks remaining after failure \
+             (dependency chain broken)"
+                .to_string(),
+        )
     }
+}
+
+/// The failure of a worker whose stream ended before its parked approvals were
+/// captured.
+fn orphaned_park_error(task_id: usize, pending: usize, underlying: &str) -> String {
+    format!(
+        "{ORPHANED_PARK_FAILURE} was captured for task {task_id}; {pending} pending \
+         approval(s) cancelled.{underlying}"
+    )
 }
 
 /// Whether a failure's text holds any of the worker's output, rather than only
 /// naming the failure.
 fn failure_kept_output(error: &str) -> bool {
-    let error = error.trim_end();
+    let error = failure_detail(error).trim_end();
     !(error.is_empty()
         || error == EMPTY_WORKER_RESULT
-        || error.ends_with(DUPLICATE_LOOP_FAILURE)
-        || error.contains(ORPHANED_PARK_FAILURE)
+        || error == DUPLICATE_LOOP_FAILURE
+        || error.starts_with(ORPHANED_PARK_FAILURE)
         || (error.ends_with(NO_OUTPUT_SUFFIX) && !error.contains(PARTIAL_OUTPUT_MARKER)))
+}
+
+/// The text after a failed worker's `Worker failed task N after M attempts: `
+/// prefix, or all of `error` when it has none. Worker output can quote aura's
+/// own messages, so a failure's kind is only read from here.
+fn failure_detail(error: &str) -> &str {
+    error
+        .strip_prefix("Worker failed task ")
+        .and_then(|rest| rest.split_once(" attempts: "))
+        .map_or(error, |(_, detail)| detail)
 }
 
 /// Why a parked worker's approvals are cancelled when its stream ended before
@@ -3871,8 +3898,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     for line in park_verdict_lines(plan) {
                         tracing::warn!("{line}");
                     }
-                } else {
-                    let warning = stalled_plan_warning(run_is_stopping, plan.pending_count());
+                } else if let Some(warning) = stalled_plan_warning(plan, run_is_stopping) {
                     tracing::warn!("{warning}");
                 }
                 break;
@@ -4410,12 +4436,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             }
                             Ok(ForwardOutcome::Finished(_)) => String::new(),
                         };
-                        stream_result = Err(format!(
-                            "{ORPHANED_PARK_FAILURE} was captured for task {task_id}; {} \
-                             pending approval(s) cancelled.{underlying}",
-                            pending.len()
-                        )
-                        .into());
+                        stream_result =
+                            Err(orphaned_park_error(task_id, pending.len(), &underlying).into());
                     }
                     CellOutcome::Normal => {}
                 }
@@ -4744,13 +4766,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     }
                     Ok(ForwardOutcome::Finished(_)) => String::new(),
                 };
-                return Err(format!(
-                    "Worker resume stream ended before the parked approval snapshot \
-                     was captured for task {task_id}; {} pending approval(s) \
-                     cancelled.{underlying}",
-                    pending.len()
-                )
-                .into());
+                return Err(orphaned_park_error(task_id, pending.len(), &underlying).into());
             }
             CellOutcome::Normal => {}
         }
@@ -8118,11 +8134,11 @@ mod tests {
             (
                 FailureCategory::AgentTimeout,
                 format!(
-                    "Worker failed task 0 after 1 attempts: {ORPHANED_PARK_FAILURE} was captured \
-                     for task 0; 1 pending approval(s) cancelled. Underlying error: Worker task \
-                     timed out after 7s"
+                    "Worker failed task 0 after 1 attempts: {}",
+                    orphaned_park_error(0, 1, " Underlying error: Worker task timed out after 7s")
                 ),
             ),
+            (FailureCategory::AgentTimeout, orphaned_park_error(0, 1, "")),
         ] {
             let mut plan = Plan::new("Investigate");
             let mut empty = Task::new(0, "Search logs", "Query the log index");
@@ -8139,12 +8155,51 @@ mod tests {
         assert!(failure_kept_output(&quoted), "{quoted}");
     }
 
+    /// Worker output that quotes aura's own failure messages, as a worker
+    /// reading aura's logs can, is still output.
+    #[test]
+    fn a_failure_quoting_a_kept_nothing_message_counts_as_output() {
+        for quoted in [ORPHANED_PARK_FAILURE, DUPLICATE_LOOP_FAILURE] {
+            let soft = format!("The log shows: {quoted}");
+            assert!(failure_kept_output(&soft), "{soft}");
+
+            let hard = format!("Worker failed task 0 after 1 attempts: The log shows: {quoted}");
+            assert!(failure_kept_output(&hard), "{hard}");
+        }
+    }
+
     /// Only a stopping run blames the quota. A later plan that merely follows
     /// a worker-account quota failure can stall on an ordinary dependency.
     #[test]
     fn a_stalled_plan_blames_the_quota_only_when_the_run_is_stopping() {
-        assert!(stalled_plan_warning(true, 2).contains("2 task(s) not started"));
-        assert!(stalled_plan_warning(false, 2).contains("dependency chain broken"));
+        use super::super::types::Task;
+
+        let mut plan = Plan::new("Investigate");
+        plan.add_task(Task::new(0, "Search logs", "Query the log index"));
+        plan.add_task(Task::new(1, "Summarize", "Report what was found"));
+
+        let stopping = stalled_plan_warning(&plan, true).unwrap();
+        assert!(stopping.contains("2 task(s) not started"), "{stopping}");
+        let stalled = stalled_plan_warning(&plan, false).unwrap();
+        assert!(stalled.contains("dependency chain broken"), "{stalled}");
+    }
+
+    /// The hold-back can fail every task left, which finishes the plan rather
+    /// than stalling it.
+    #[test]
+    fn a_plan_the_hold_back_finished_has_no_stall_warning() {
+        use super::super::types::Task;
+
+        let mut plan = Plan::new("Investigate");
+        let mut task = Task::new(0, "Search logs", "Query the log index");
+        task.fail(
+            "Not started: quota".to_string(),
+            FailureCategory::ProviderQuotaExhausted,
+        );
+        plan.add_task(task);
+
+        assert_eq!(stalled_plan_warning(&plan, false), None);
+        assert_eq!(stalled_plan_warning(&plan, true), None);
     }
 
     /// A quota failure that reaches the short-circuit is on a worker's own
