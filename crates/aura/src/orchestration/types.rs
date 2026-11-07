@@ -1249,15 +1249,15 @@ pub(super) const KEPT_OUTPUT_HEADING: &str =
     "Output from an earlier attempt, which did not call submit_result:";
 
 /// `output` cut to `max_length`, with its artifact footer kept so the filename
-/// survives the cut. A footer the cut leaves in place needs no second copy.
+/// survives the cut.
 pub(super) fn truncate_kept_output(output: &str, max_length: usize) -> String {
     let (truncated, was_truncated) = crate::string_utils::safe_truncate(output, max_length);
     if !was_truncated {
         return output.to_string();
     }
-    let footer = extract_artifact_footer(output)
-        .filter(|footer| output.len() - footer.len() >= truncated.len());
-    match footer {
+    match extract_artifact_footer(output) {
+        // The cut would only split the footer, so nothing is dropped.
+        Some(footer) if output.len() - footer.len() <= truncated.len() => output.to_string(),
         Some(footer) => format!("{truncated} [truncated]\n{footer}"),
         None => format!("{truncated} [truncated]"),
     }
@@ -3063,17 +3063,27 @@ mod tests {
         assert!(!kept.contains("and more text"), "{kept}");
     }
 
-    /// A footer ending the output but split by the cut isn't appended whole
-    /// beside its own first half.
+    /// A cut that would only split the output's own footer drops nothing, so
+    /// the output stays whole.
     #[test]
-    fn test_truncate_kept_output_ignores_a_footer_the_cut_splits() {
+    fn test_truncate_kept_output_keeps_a_footer_the_cut_splits() {
         let footer = "[Full result (5000 chars) saved to artifact: task-0-sre-iter-1-result.txt]";
         let output = format!("{}{footer}", "f".repeat(90));
 
-        assert_eq!(
-            truncate_kept_output(&output, 100),
-            format!("{} [truncated]", &output[..100])
-        );
+        assert_eq!(truncate_kept_output(&output, 100), output);
+    }
+
+    /// A preview stepping back to a character boundary stops short of the
+    /// limit, which puts the cut inside the footer.
+    #[test]
+    fn test_truncate_kept_output_keeps_the_footer_after_a_multibyte_preview() {
+        let footer = "[Full result (5000 chars) saved to artifact: task-0-sre-iter-1-result.txt]";
+        let crabs = "🦀".repeat(50);
+        let (preview, _) = crate::string_utils::safe_truncate(&crabs, 99);
+        let output = format!("{preview}\n\n{footer}");
+
+        assert_eq!(preview.len(), 96);
+        assert_eq!(truncate_kept_output(&output, 99), output);
     }
 
     /// Output kept in an earlier iteration still reaches the prompt, and this

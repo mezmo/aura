@@ -5568,7 +5568,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
                 self.write_run_manifest(&plan, iteration, None).await;
                 return Err(format!(
-                    "Provider error: all tasks failed due to provider issues (not retryable via replan):\n{}",
+                    "Provider error: all tasks failed due to provider issues, so the run stopped without a replan:\n{}",
                     summary
                 ).into());
             }
