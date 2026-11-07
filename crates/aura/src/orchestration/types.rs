@@ -366,6 +366,8 @@ pub struct Task {
     pub structured_output: Option<StructuredTaskOutput>,
     /// Run artifact filenames attached to this task.
     pub artifacts: Vec<String>,
+    /// Output of an earlier attempt of this failed task.
+    pub kept_output: Option<String>,
 }
 
 impl Serialize for Task {
@@ -399,6 +401,9 @@ impl Serialize for Task {
         if !self.artifacts.is_empty() {
             map.serialize_entry("artifacts", &self.artifacts)?;
         }
+        if let Some(ref output) = self.kept_output {
+            map.serialize_entry("kept_output", output)?;
+        }
         map.end()
     }
 }
@@ -426,6 +431,8 @@ impl<'de> Deserialize<'de> for Task {
             structured_output: Option<StructuredTaskOutput>,
             #[serde(default)]
             artifacts: Vec<String>,
+            #[serde(default)]
+            kept_output: Option<String>,
         }
         let h = TaskHelper::deserialize(deserializer)?;
         let state = match h.status {
@@ -451,6 +458,7 @@ impl<'de> Deserialize<'de> for Task {
             rationale: h.rationale,
             structured_output: h.structured_output,
             artifacts: h.artifacts,
+            kept_output: h.kept_output,
         })
     }
 }
@@ -475,6 +483,7 @@ impl Task {
             rationale: rationale.into(),
             structured_output: None,
             artifacts: Vec::new(),
+            kept_output: None,
         }
     }
 
@@ -900,6 +909,9 @@ pub struct FailedTaskRecord {
     /// Structured failure classification.
     #[serde(default)]
     pub category: FailureCategory,
+    /// Output of an earlier attempt of the failed task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_output: Option<String>,
 }
 
 /// Context from a previous iteration, used for the post-execute
@@ -1047,6 +1059,12 @@ impl IterationContext {
                         }
                     };
                     redesign_lines.push(line);
+                    if let Some(output) = &t.kept_output {
+                        redesign_lines.push(format!(
+                            "    {KEPT_OUTPUT_HEADING}\n{}",
+                            indent_lines(&truncate_kept_output(output, content_max_length))
+                        ));
+                    }
                     // A task can fail after its tools succeeded — a timeout or
                     // depth limit reached before submit_result. Those artifacts
                     // are on disk and readable, so list them as for completed
@@ -1136,6 +1154,17 @@ impl IterationContext {
                     truncated_error,
                     suffix,
                 ));
+                // This iteration's kept output is in the section for its plan.
+                if let Some(output) = record
+                    .kept_output
+                    .as_ref()
+                    .filter(|_| record.iteration < self.iteration)
+                {
+                    fh.push_str(&format!(
+                        "\n    {KEPT_OUTPUT_HEADING}\n{}",
+                        indent_lines(&truncate_kept_output(output, content_max_length))
+                    ));
+                }
             }
 
             // Identify repeated failures — group by (description, category)
@@ -1204,12 +1233,34 @@ impl IterationContext {
     }
 }
 
-/// Extract the artifact footer from a result string, if present.
+/// Extract the artifact footer that ends a result string, if there is one.
 ///
 /// Returns the full `[Full result (N chars) saved to artifact: FILE]` string.
+/// A footer quoted earlier in the text, as a worker can do with a dependency's,
+/// is not this result's own.
 fn extract_artifact_footer(result: &str) -> Option<&str> {
     const FOOTER_PREFIX: &str = "[Full result (";
-    result.rfind(FOOTER_PREFIX).map(|idx| &result[idx..])
+    let footer = &result[result.rfind(FOOTER_PREFIX)?..];
+    (footer.find(']') == Some(footer.len() - 1)).then_some(footer)
+}
+
+/// The heading above a task's kept output.
+pub(super) const KEPT_OUTPUT_HEADING: &str =
+    "Output from an earlier attempt, which did not call submit_result:";
+
+/// `output` cut to `max_length`, with its artifact footer kept so the filename
+/// survives the cut.
+pub(super) fn truncate_kept_output(output: &str, max_length: usize) -> String {
+    let (truncated, was_truncated) = crate::string_utils::safe_truncate(output, max_length);
+    if !was_truncated {
+        return output.to_string();
+    }
+    match extract_artifact_footer(output) {
+        // The cut would only split the footer, so nothing is dropped.
+        Some(footer) if output.len() - footer.len() <= truncated.len() => output.to_string(),
+        Some(footer) => format!("{truncated} [truncated]\n{footer}"),
+        None => format!("{truncated} [truncated]"),
+    }
 }
 
 /// Indent each line of `text` by 4 spaces for nesting under a task header.
@@ -1925,6 +1976,7 @@ mod tests {
             iteration: 1,
             worker: Some("operations".to_string()),
             category: FailureCategory::AgentTimeout,
+            kept_output: None,
         }];
 
         let ctx = IterationContext::new(1, plan, Some(fs), failures, HashMap::new());
@@ -1956,6 +2008,7 @@ mod tests {
                 iteration: 1,
                 worker: None,
                 category: FailureCategory::AgentError,
+                kept_output: None,
             },
             FailedTaskRecord {
                 description: "Fetch data".to_string(),
@@ -1963,6 +2016,7 @@ mod tests {
                 iteration: 2,
                 worker: None,
                 category: FailureCategory::AgentError,
+                kept_output: None,
             },
         ];
 
@@ -2626,6 +2680,7 @@ mod tests {
             iteration: 2,
             worker: Some("math".into()),
             category: FailureCategory::AgentError,
+            kept_output: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         let deserialized: FailedTaskRecord = serde_json::from_str(&json).unwrap();
@@ -2655,6 +2710,7 @@ mod tests {
                 iteration: 1,
                 worker: None,
                 category: FailureCategory::AgentError,
+                kept_output: None,
             }],
             HashMap::new(),
         );
@@ -2720,6 +2776,7 @@ mod tests {
             iteration: 1,
             worker: None,
             category: FailureCategory::AgentError,
+            kept_output: None,
         }];
         let fs = FailureSummary {
             reasoning: "Failed".into(),
@@ -2749,6 +2806,7 @@ mod tests {
             iteration: 1,
             worker: None,
             category: FailureCategory::ContextOverflow,
+            kept_output: None,
         }];
         let fs = FailureSummary {
             reasoning: "Failed".into(),
@@ -2788,6 +2846,7 @@ mod tests {
                 iteration: 1,
                 worker: None,
                 category: FailureCategory::AgentTimeout,
+                kept_output: None,
             },
             FailedTaskRecord {
                 description: "Fetch data".to_string(),
@@ -2795,6 +2854,7 @@ mod tests {
                 iteration: 2,
                 worker: None,
                 category: FailureCategory::AgentError,
+                kept_output: None,
             },
         ];
         let fs = FailureSummary {
@@ -2819,6 +2879,7 @@ mod tests {
             iteration: 1,
             worker: None,
             category: FailureCategory::ContextOverflow,
+            kept_output: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(
@@ -2919,6 +2980,145 @@ mod tests {
         }
     }
 
+    /// Kept output survives a saved plan, and a plan saved before it existed
+    /// still loads.
+    #[test]
+    fn test_kept_output_serde_roundtrip() {
+        let mut task = Task::new(0, "Inspect", "r");
+        task.fail("401", FailureCategory::ProviderAuthError);
+        task.kept_output = Some("found two idle nodes".to_string());
+
+        let json = serde_json::to_value(&task).unwrap();
+        assert_eq!(json["error"], "401");
+        assert_eq!(json["kept_output"], "found two idle nodes");
+        let back: Task = serde_json::from_value(json).unwrap();
+        assert_eq!(back.kept_output.as_deref(), Some("found two idle nodes"));
+
+        let plain = serde_json::to_value(Task::new(1, "Plain", "r")).unwrap();
+        assert!(plain.get("kept_output").is_none());
+        let legacy: Task = serde_json::from_value(plain).unwrap();
+        assert_eq!(legacy.kept_output, None);
+    }
+
+    /// Kept output long enough to be saved as an artifact keeps the filename
+    /// through the same cut that made its preview.
+    #[test]
+    fn test_continuation_prompt_keeps_a_kept_outputs_artifact_filename() {
+        let footer = "[Full result (5000 chars) saved to artifact: task-0-sre-iter-1-result.txt]";
+        let mut task = Task::new(0, "Inspect", "r");
+        task.fail("context overflow", FailureCategory::ContextOverflow);
+        task.kept_output = Some(format!("{}\n\n{footer}", "finding ".repeat(50)));
+        let mut plan = Plan::new("Inspect");
+        plan.add_task(task);
+
+        let prompt = IterationContext::new(1, plan, None, vec![], HashMap::new())
+            .build_continuation_prompt(3, false, 100);
+
+        assert!(prompt.contains("[truncated]"), "{prompt}");
+        assert!(prompt.contains(footer), "{prompt}");
+    }
+
+    /// The continuation prompt shows kept output on its own line, however long
+    /// the error is.
+    #[test]
+    fn test_continuation_prompt_shows_kept_output() {
+        let mut task = Task::new(0, "Inspect", "r");
+        task.fail(
+            "provider refused. ".repeat(100),
+            FailureCategory::AgentError,
+        );
+        task.kept_output = Some("found two idle nodes".to_string());
+        let mut plan = Plan::new("Inspect");
+        plan.add_task(task);
+
+        let prompt = IterationContext::new(1, plan, None, vec![], HashMap::new())
+            .build_continuation_prompt(3, false, 200);
+
+        assert!(prompt.contains(KEPT_OUTPUT_HEADING), "{prompt}");
+        assert!(prompt.contains("found two idle nodes"), "{prompt}");
+    }
+
+    /// A footer quoted before the cut stays where it is, with no second copy.
+    #[test]
+    fn test_truncate_kept_output_leaves_a_quoted_footer_in_place() {
+        let footer = "[Full result (5000 chars) saved to artifact: task-0-sre-iter-1-result.txt]";
+        let output = format!("{footer} {}", "finding ".repeat(50));
+
+        let kept = truncate_kept_output(&output, 100);
+
+        assert_eq!(kept.matches(footer).count(), 1, "{kept}");
+        assert!(kept.ends_with(" [truncated]"), "{kept}");
+    }
+
+    /// A footer quoted past the cut isn't the output's own, so it and the text
+    /// after it are cut with the rest.
+    #[test]
+    fn test_truncate_kept_output_cuts_a_footer_with_text_after_it() {
+        let footer = "[Full result (5000 chars) saved to artifact: task-0-sre-iter-1-result.txt]";
+        let output = format!("{} {footer} and more text", "finding ".repeat(50));
+
+        let kept = truncate_kept_output(&output, 100);
+
+        assert!(!kept.contains(footer), "{kept}");
+        assert!(!kept.contains("and more text"), "{kept}");
+    }
+
+    /// A cut that would only split the output's own footer drops nothing, so
+    /// the output stays whole.
+    #[test]
+    fn test_truncate_kept_output_keeps_a_footer_the_cut_splits() {
+        let footer = "[Full result (5000 chars) saved to artifact: task-0-sre-iter-1-result.txt]";
+        let output = format!("{}{footer}", "f".repeat(90));
+
+        assert_eq!(truncate_kept_output(&output, 100), output);
+    }
+
+    /// A preview stepping back to a character boundary stops short of the
+    /// limit, which puts the cut inside the footer.
+    #[test]
+    fn test_truncate_kept_output_keeps_the_footer_after_a_multibyte_preview() {
+        let footer = "[Full result (5000 chars) saved to artifact: task-0-sre-iter-1-result.txt]";
+        let crabs = "🦀".repeat(50);
+        let (preview, _) = crate::string_utils::safe_truncate(&crabs, 99);
+        let output = format!("{preview}\n\n{footer}");
+
+        assert_eq!(preview.len(), 96);
+        assert_eq!(truncate_kept_output(&output, 99), output);
+    }
+
+    /// Output kept in an earlier iteration still reaches the prompt, and this
+    /// iteration's appears once, under its plan.
+    #[test]
+    fn test_continuation_prompt_failure_history_shows_earlier_kept_output() {
+        let record = |iteration, output: &str| FailedTaskRecord {
+            description: "Inspect".to_string(),
+            error: "context overflow".to_string(),
+            iteration,
+            worker: None,
+            category: FailureCategory::ContextOverflow,
+            kept_output: Some(output.to_string()),
+        };
+        let mut task = Task::new(0, "Inspect", "r");
+        task.fail("context overflow", FailureCategory::ContextOverflow);
+        task.kept_output = Some("found three idle nodes".to_string());
+        let mut plan = Plan::new("Inspect");
+        plan.add_task(task);
+        let history = vec![
+            record(1, "found two idle nodes"),
+            record(2, "found three idle nodes"),
+        ];
+
+        let prompt = IterationContext::new(2, plan, None, history, HashMap::new())
+            .build_continuation_prompt(3, false, 2000);
+
+        assert!(prompt.contains("found two idle nodes"), "{prompt}");
+        assert_eq!(
+            prompt.matches("found three idle nodes").count(),
+            1,
+            "{prompt}"
+        );
+    }
+
     #[test]
     fn test_failed_task_record_legacy_json_defaults_category() {
         let json = r#"{"description":"test","error":"boom","iteration":1,"worker":null}"#;
@@ -2928,6 +3128,7 @@ mod tests {
             FailureCategory::AgentError,
             "missing category should default to AgentError"
         );
+        assert_eq!(record.kept_output, None);
     }
 
     #[test]
@@ -2944,6 +3145,7 @@ mod tests {
                 iteration: 1,
                 worker: None,
                 category: FailureCategory::AgentTimeout,
+                kept_output: None,
             },
             FailedTaskRecord {
                 description: "Fetch data".to_string(),
@@ -2951,6 +3153,7 @@ mod tests {
                 iteration: 2,
                 worker: None,
                 category: FailureCategory::AgentTimeout,
+                kept_output: None,
             },
         ];
         let fs = FailureSummary {
