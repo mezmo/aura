@@ -250,6 +250,7 @@ impl ChatClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn model_not_found_keyword() {
@@ -292,5 +293,61 @@ mod tests {
     fn empty_error_returns_false() {
         let err = anyhow::anyhow!("");
         assert!(!is_model_error(&err));
+    }
+
+    /// Answer one request with `body`, the way `GET /aura/info` would.
+    async fn serve_once(body: &'static str) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let read = socket.read(&mut request).await.unwrap();
+            assert!(read > 0, "the client should send a request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn server_info_survives_an_unknown_mcp_transport() {
+        let addr = serve_once(
+            r#"{"agents":[{"id":"ops","model":"gpt-4o","mcp_servers":{
+                "future":{"transport":"websocket","url":"wss://mcp.example.com"},
+                "local":{"transport":"stdio","command":"fs-server"}
+            }}]}"#,
+        )
+        .await;
+        let client = ChatClient::new(AppConfig {
+            api_url: format!("http://{addr}"),
+            api_key: None,
+            model: None,
+            system_prompt: None,
+            query: None,
+            resume: None,
+            extra_headers: vec![],
+            force: false,
+            enable_client_tools: true,
+            enable_final_response_summary: false,
+            style: None,
+            pretty: false,
+            log_file: None,
+            telemetry: None,
+            status_line_segments: None,
+        });
+
+        let info = client
+            .server_info()
+            .await
+            .expect("an unknown transport should keep the overview");
+
+        let servers = info.agents[0].mcp_servers.as_ref().unwrap();
+        assert_eq!(info.agents[0].id, "ops");
+        assert_eq!(servers.len(), 2);
     }
 }

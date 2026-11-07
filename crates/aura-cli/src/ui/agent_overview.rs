@@ -320,4 +320,15 @@ mod tests {
             assert_eq!(lines.join(" "), "What should we work on?");
         }
     }
+
+    #[test]
+    fn an_unknown_transport_counts_as_a_configured_server() {
+        let mut agent = agent("orch", Vec::new());
+        agent.mcp_servers = Some(BTreeMap::from([(
+            "future".to_string(),
+            McpServerOverview::Unknown,
+        )]));
+        let lines = plain(&startup_cta_lines(&agent, 80));
+        assert_eq!(lines.join(" "), "What should we work on?");
+    }
 }
