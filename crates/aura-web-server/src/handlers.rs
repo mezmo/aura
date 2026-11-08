@@ -1225,8 +1225,13 @@ async fn native_tool_overviews(factory: aura::RunToolFactory) -> Vec<NativeToolO
 /// the result reflects that caller's authorization. Agents are swept
 /// concurrently, but the response still costs a full round of MCP connections —
 /// callers that only need the config view should omit the parameter.
+///
+/// With auth enabled, "visible" also honors the caller's agent allowlist (the
+/// same filter as `/v1/models`): forbidden agents are neither described nor
+/// connected to for tool discovery.
 pub async fn info(
     State(state): State<Arc<AppState>>,
+    auth: Option<axum::Extension<crate::auth::AuthContext>>,
     headers: HeaderMap,
     Query(query): Query<InfoQuery>,
 ) -> Response {
@@ -1237,7 +1242,31 @@ pub async fn info(
         }
     };
 
-    let visible = state.configs.iter().filter(|config| !config.agent.hidden);
+    let visible = state
+        .configs
+        .iter()
+        .filter(|config| !config.agent.hidden)
+        .filter(|config| match &auth {
+            // With auth on, agents the principal may not invoke must not be
+            // discoverable here — including via `detail=tools`, which would
+            // otherwise connect to their MCP servers with configured
+            // credentials and enumerate their tools.
+            Some(axum::Extension(ctx)) => {
+                ctx.allows(&config.agent.name, config.agent.alias.as_deref())
+            }
+            None => true,
+        });
+
+    // The default agent's name would otherwise leak a forbidden agent's
+    // existence even though it is absent from the list.
+    let default_agent = state.default_agent.clone().filter(|name| match &auth {
+        Some(axum::Extension(ctx)) => state
+            .configs
+            .iter()
+            .find(|c| &c.agent.name == name || c.agent.alias.as_deref() == Some(name.as_str()))
+            .is_none_or(|c| ctx.allows(&c.agent.name, c.agent.alias.as_deref())),
+        None => true,
+    });
 
     let agents: Vec<AgentInfo> = if detail == ToolDetail::None {
         visible.map(aura::agent_info).collect()
@@ -1270,7 +1299,7 @@ pub async fn info(
     };
 
     Json(ServerInfo {
-        default_agent: state.default_agent.clone(),
+        default_agent,
         agents,
     })
     .into_response()
@@ -2249,7 +2278,13 @@ model = "gpt-4o-mini"
     #[tokio::test]
     async fn test_info_returns_agents_with_workers() {
         let state = make_info_state(vec![orch_info_config()], None);
-        let resp = info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await;
+        let resp = info(
+            State(state),
+            None::<axum::Extension<crate::auth::AuthContext>>,
+            HeaderMap::new(),
+            Query(InfoQuery::default()),
+        )
+        .await;
         let info = parse_info_response(resp).await;
 
         assert_eq!(info.agents.len(), 1);
@@ -2276,7 +2311,13 @@ model = "gpt-4o-mini"
             None,
         );
         let info = parse_info_response(
-            info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await,
+            info(
+                State(state),
+                None::<axum::Extension<crate::auth::AuthContext>>,
+                HeaderMap::new(),
+                Query(InfoQuery::default()),
+            )
+            .await,
         )
         .await;
 
@@ -2312,7 +2353,13 @@ url = "http://127.0.0.1:9"
             None,
         );
         let info = parse_info_response(
-            info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await,
+            info(
+                State(state),
+                None::<axum::Extension<crate::auth::AuthContext>>,
+                HeaderMap::new(),
+                Query(InfoQuery::default()),
+            )
+            .await,
         )
         .await;
         let servers_of = |id: &str| {
@@ -2356,12 +2403,44 @@ url = "http://127.0.0.1:9"
             ],
             Some("visible-agent"),
         );
-        let resp = info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await;
+        let resp = info(
+            State(state),
+            None::<axum::Extension<crate::auth::AuthContext>>,
+            HeaderMap::new(),
+            Query(InfoQuery::default()),
+        )
+        .await;
         let info = parse_info_response(resp).await;
 
         let ids: Vec<_> = info.agents.iter().map(|agent| agent.id.as_str()).collect();
         assert_eq!(ids, ["visible-agent"]);
         assert_eq!(info.default_agent.as_deref(), Some("visible-agent"));
+    }
+
+    #[tokio::test]
+    async fn test_info_filters_agents_by_principal_allowlist() {
+        let state = make_info_state(
+            vec![solo_info_config("alpha"), solo_info_config("beta")],
+            Some("beta"),
+        );
+        let auth = axum::Extension(crate::auth::AuthContext {
+            name: "restricted".to_string(),
+            allowed_agents: vec!["alpha".to_string()],
+        });
+        let resp = info(
+            State(state),
+            Some(auth),
+            HeaderMap::new(),
+            Query(InfoQuery::default()),
+        )
+        .await;
+        let info = parse_info_response(resp).await;
+
+        // Forbidden agents are not discoverable, and the default-agent field
+        // does not leak the forbidden name either.
+        let ids: Vec<_> = info.agents.iter().map(|agent| agent.id.as_str()).collect();
+        assert_eq!(ids, ["alpha"]);
+        assert_eq!(info.default_agent, None);
     }
 
     #[test]
@@ -2392,6 +2471,7 @@ url = "http://127.0.0.1:9"
         let state = make_info_state(vec![solo_info_config("solo")], None);
         let resp = info(
             State(state),
+            None::<axum::Extension<crate::auth::AuthContext>>,
             HeaderMap::new(),
             Query(InfoQuery {
                 detail: Some("bogus".to_string()),
@@ -2424,7 +2504,13 @@ url = "http://127.0.0.1:9"
             )],
             None,
         );
-        let resp = info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await;
+        let resp = info(
+            State(state),
+            None::<axum::Extension<crate::auth::AuthContext>>,
+            HeaderMap::new(),
+            Query(InfoQuery::default()),
+        )
+        .await;
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -2459,8 +2545,16 @@ url = "http://127.0.0.1:9"
         };
 
         let state = info_state(configs(), None, Some(api.clone()));
-        let parsed =
-            parse_info_response(info(State(state), HeaderMap::new(), tools_query()).await).await;
+        let parsed = parse_info_response(
+            info(
+                State(state),
+                None::<axum::Extension<crate::auth::AuthContext>>,
+                HeaderMap::new(),
+                tools_query(),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(names(&parsed.agents[0]), [crate::slack::POST_TOOL_NAME]);
         assert!(
             parsed.agents[0].tools[0]
@@ -2472,7 +2566,13 @@ url = "http://127.0.0.1:9"
         assert!(names(&parsed.agents[1]).is_empty());
 
         let state = info_state(configs(), None, Some(api));
-        let resp = info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await;
+        let resp = info(
+            State(state),
+            None::<axum::Extension<crate::auth::AuthContext>>,
+            HeaderMap::new(),
+            Query(InfoQuery::default()),
+        )
+        .await;
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -2480,8 +2580,16 @@ url = "http://127.0.0.1:9"
         assert!(body["agents"][0].get("tools").is_none(), "{body}");
 
         let state = info_state(configs(), None, None);
-        let parsed =
-            parse_info_response(info(State(state), HeaderMap::new(), tools_query()).await).await;
+        let parsed = parse_info_response(
+            info(
+                State(state),
+                None::<axum::Extension<crate::auth::AuthContext>>,
+                HeaderMap::new(),
+                tools_query(),
+            )
+            .await,
+        )
+        .await;
         assert!(parsed.agents.iter().all(|agent| agent.tools.is_empty()));
     }
 
@@ -2504,6 +2612,7 @@ url = "http://127.0.0.1:9"
             );
             let resp = info(
                 State(state),
+                None::<axum::Extension<crate::auth::AuthContext>>,
                 HeaderMap::new(),
                 Query(InfoQuery {
                     detail: Some(detail.to_string()),
