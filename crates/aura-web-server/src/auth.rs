@@ -41,20 +41,23 @@ pub struct AuthContext {
 }
 
 impl AuthContext {
-    /// Whether this principal may invoke the agent identified by `agent_id`.
-    pub fn allows(&self, agent_id: &str) -> bool {
+    /// Whether this principal may invoke the agent identified by `name`
+    /// (with its optional alias). Entries are matched against both, so a
+    /// config may list an agent either way; `"*"` allows all.
+    pub fn allows(&self, name: &str, alias: Option<&str>) -> bool {
         self.allowed_agents
             .iter()
-            .any(|a| a == "*" || a == agent_id)
+            .any(|a| a == "*" || a == name || alias.is_some_and(|alias| a == alias))
     }
 }
 
 tokio::task_local! {
     /// The authenticated principal for the current request task, set by
-    /// [`require_auth`]. Unlike axum request extensions, this reaches code
-    /// the HTTP handler delegates to — notably the A2A executor, which runs
-    /// deep inside the a2a framework's handler with no access to the
-    /// request parts.
+    /// [`require_auth`]. Read by the A2A request-handler wrapper, which runs
+    /// in the request task. NOTE: the a2a framework spawns execution into a
+    /// fresh tokio task, so this does NOT reach the executor — the wrapper
+    /// forwards the principal through `service_params` instead (see
+    /// `a2a::request_handler`).
     static CURRENT_AUTH: AuthContext;
 }
 
@@ -62,6 +65,12 @@ tokio::task_local! {
 /// enabled and the request authenticated.
 pub fn current_auth() -> Option<AuthContext> {
     CURRENT_AUTH.try_with(|ctx| ctx.clone()).ok()
+}
+
+/// Run `fut` with `ctx` installed as the current principal. Used by the
+/// middleware and by tests that need to simulate an authenticated scope.
+pub async fn with_current_auth<F: std::future::Future>(ctx: AuthContext, fut: F) -> F::Output {
+    CURRENT_AUTH.scope(ctx, fut).await
 }
 
 /// Namespace a client-supplied session id under the authenticated principal
@@ -310,6 +319,9 @@ impl OidcValidator {
         validation.set_issuer(&[&self.cfg.issuer]);
         validation.set_audience(&[&self.cfg.audience]);
         validation.leeway = self.cfg.clock_skew_secs;
+        // jsonwebtoken defaults `validate_nbf` to false; the config docs
+        // promise `exp`/`nbf` enforcement, so opt in explicitly.
+        validation.validate_nbf = true;
 
         let Ok(data) = jsonwebtoken::decode::<serde_json::Map<String, serde_json::Value>>(
             token,
@@ -690,6 +702,15 @@ pub fn build_authenticator(configs: &[Config]) -> Result<Option<Arc<Authenticato
             let Some(oidc) = config.auth.as_ref().and_then(|a| a.oidc.clone()) else {
                 continue;
             };
+            if seen == 0 {
+                // The config crate allows plaintext http (a local test IdP
+                // is legitimate); flag non-local plaintext here, where an
+                // operator is watching.
+                warn_if_plaintext(&oidc.issuer, "issuer");
+                if let Some(url) = &oidc.jwks_url {
+                    warn_if_plaintext(url, "jwks_url");
+                }
+            }
             seen += 1;
             if seen == 1 {
                 return Ok(Some(Arc::new(Authenticator::Oidc(Box::new(
@@ -705,6 +726,29 @@ pub fn build_authenticator(configs: &[Config]) -> Result<Option<Arc<Authenticato
         return Err("mode = \"oidc\" but no [auth.oidc] table found".to_string());
     }
     KeyRing::from_configs(configs).map(|ring| ring.map(|r| Arc::new(Authenticator::ApiKeys(r))))
+}
+
+/// Warn when an OIDC endpoint travels over plaintext http off-localhost.
+fn warn_if_plaintext(url: &str, field: &str) {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return;
+    };
+    let host = rest
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    if !matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+        warn!(
+            "[auth.oidc].{field} uses plaintext http ({url}); tokens and key \
+             material cross the network unencrypted — use https in production"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -824,13 +868,16 @@ mod tests {
             name: "k".into(),
             allowed_agents: vec!["incident-response".into()],
         };
-        assert!(ctx.allows("incident-response"));
-        assert!(!ctx.allows("other"));
+        assert!(ctx.allows("incident-response", None));
+        assert!(!ctx.allows("other", None));
+        // Name and alias both match.
+        assert!(ctx.allows("underlying-name", Some("incident-response")));
+        assert!(!ctx.allows("underlying-name", None));
         let all = AuthContext {
             name: "k".into(),
             allowed_agents: vec!["*".into()],
         };
-        assert!(all.allows("anything"));
+        assert!(all.allows("anything", None));
     }
 
     #[test]
@@ -1102,7 +1149,7 @@ mod oidc_tests {
             other => panic!("expected authenticated, got {other:?}"),
         };
         assert_eq!(ctx.name, "alice@example.com");
-        assert!(ctx.allows("any-agent"));
+        assert!(ctx.allows("any-agent", None));
     }
 
     #[tokio::test]
@@ -1165,6 +1212,30 @@ mod oidc_tests {
         // not a JWT at all
         assert!(matches!(
             validator.authenticate("not-a-jwt").await,
+            AuthOutcome::Rejected
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_token_with_future_nbf() {
+        let server = mock_idp().await;
+        let issuer = server.uri();
+        let validator = OidcValidator::new(oidc_cfg(
+            issuer.clone(),
+            Some(format!("{issuer}/jwks.json")),
+        ));
+        validator.warm().await.unwrap();
+        // nbf five minutes ahead with zero skew: must not be accepted yet.
+        let future = now_unix() as i64 + 300;
+        assert!(matches!(
+            validator
+                .authenticate(&token(
+                    &issuer,
+                    AUDIENCE,
+                    600,
+                    serde_json::json!({"nbf": future}),
+                ))
+                .await,
             AuthOutcome::Rejected
         ));
     }

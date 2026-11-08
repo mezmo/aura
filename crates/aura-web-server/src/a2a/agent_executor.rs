@@ -221,11 +221,10 @@ impl AgentExecutor for AuraAgentExecutor {
             .get("x-aura-model")
             .and_then(|v| v.first())
             .cloned();
-        // The auth middleware stores the principal in a task-local because
-        // the a2a framework gives the executor no access to request
-        // extensions. Enforce the same per-principal agent allowlist the
-        // chat path applies, and namespace the session below.
-        let auth = crate::auth::current_auth();
+        // The principal rides in via service_params, injected (and forged
+        // values stripped) by AuraRequestHandler in the request task. A
+        // task-local cannot reach here: the framework spawns execution.
+        let auth = super::request_handler::principal_from_service_params(&ctx.service_params);
         let config = match self
             .app_state
             .resolve_config(model_requested_model.as_deref())
@@ -242,7 +241,7 @@ impl AgentExecutor for AuraAgentExecutor {
             }
         };
         if let Some(auth) = &auth
-            && !auth.allows(config.agent_id())
+            && !auth.allows(&config.agent.name, config.agent.alias.as_deref())
         {
             let msg = format!(
                 "the authenticated principal `{}` does not have access to agent '{}'",

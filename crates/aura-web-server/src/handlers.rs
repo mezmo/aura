@@ -283,7 +283,7 @@ pub async fn prepare_request(
     // Per-key agent allowlist: the key authenticated at the middleware layer,
     // but may not be permitted to invoke this agent.
     if let Some(auth) = auth
-        && !auth.allows(config.agent_id())
+        && !auth.allows(&config.agent.name, config.agent.alias.as_deref())
     {
         return Err(PrepareError::Forbidden {
             key_name: auth.name.clone(),
@@ -1292,7 +1292,7 @@ pub async fn list_models(
         .filter(|config| match &auth {
             // With auth on, only list agents the key may invoke.
             Some(axum::Extension(ctx)) => {
-                ctx.allows(config.agent.alias.as_deref().unwrap_or(&config.agent.name))
+                ctx.allows(&config.agent.name, config.agent.alias.as_deref())
             }
             None => true,
         })
