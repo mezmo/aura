@@ -596,11 +596,14 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         .layer(axum::extract::Extension(handlers::IngressHmac(
             ingress_hmac,
         )))
-        .layer(TraceLayer::new_for_http())
+        // require_auth inside TraceLayer so auth rejections (401/403/503)
+        // still produce HTTP spans, but outside nothing else: shutdown_guard
+        // stays outermost so draining answers 503 before auth challenges.
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
             crate::auth::require_auth,
         ))
+        .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
             shutdown_guard,

@@ -49,6 +49,50 @@ impl AuthContext {
     }
 }
 
+tokio::task_local! {
+    /// The authenticated principal for the current request task, set by
+    /// [`require_auth`]. Unlike axum request extensions, this reaches code
+    /// the HTTP handler delegates to — notably the A2A executor, which runs
+    /// deep inside the a2a framework's handler with no access to the
+    /// request parts.
+    static CURRENT_AUTH: AuthContext;
+}
+
+/// The authenticated principal for the current request task, when auth is
+/// enabled and the request authenticated.
+pub fn current_auth() -> Option<AuthContext> {
+    CURRENT_AUTH.try_with(|ctx| ctx.clone()).ok()
+}
+
+/// Namespace a client-supplied session id under the authenticated principal
+/// so two callers that share or guess the same client-side id cannot share
+/// conversation state, skill logs, or orchestration history.
+///
+/// The prefix is a hash of the principal (not the raw name): OIDC
+/// `principal_claim` values are IdP-controlled and may contain the delimiter,
+/// which a name-based prefix could not disambiguate. Idempotent — the
+/// namespaced id echoed back to the client (e.g. `X-Chat-Session-Id`) stays
+/// stable when the client sends it back on the next turn.
+pub fn namespace_session(principal: &str, session_id: &str) -> String {
+    let prefix = session_prefix(principal);
+    if session_id.starts_with(&prefix) {
+        session_id.to_string()
+    } else {
+        format!("{prefix}{session_id}")
+    }
+}
+
+fn session_prefix(principal: &str) -> String {
+    use std::fmt::Write;
+    let digest = sha256(principal.as_bytes());
+    let mut out = String::with_capacity(17);
+    for byte in &digest[..8] {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out.push(':');
+    out
+}
+
 /// One keyring entry: a principal and the 32-byte SHA-256 digests it accepts
 /// (current plus, during rotation, previous).
 #[derive(Debug)]
@@ -145,10 +189,23 @@ pub enum Authenticator {
     Oidc(Box<OidcValidator>),
 }
 
+/// The result of one authentication attempt. `Unavailable` distinguishes an
+/// infrastructure failure (e.g. the IdP is unreachable) from a bad
+/// credential, so the middleware can answer 503 instead of a misleading 401.
+#[derive(Debug)]
+pub enum AuthOutcome {
+    Authenticated(AuthContext),
+    Rejected,
+    Unavailable,
+}
+
 impl Authenticator {
-    async fn authenticate(&self, raw: &str) -> Option<AuthContext> {
+    async fn authenticate(&self, raw: &str) -> AuthOutcome {
         match self {
-            Self::ApiKeys(ring) => ring.authenticate(raw),
+            Self::ApiKeys(ring) => match ring.authenticate(raw) {
+                Some(ctx) => AuthOutcome::Authenticated(ctx),
+                None => AuthOutcome::Rejected,
+            },
             Self::Oidc(validator) => validator.authenticate(raw).await,
         }
     }
@@ -168,13 +225,22 @@ impl Authenticator {
     }
 }
 
-/// The JWKS cache: the last fetched key set, the URL it came from (config or
-/// discovery), and when it was fetched.
+/// The JWKS cache: the last fetched key set (shared via `Arc` so per-token
+/// validation is a refcount bump), the URL it came from (config or
+/// discovery), when it was fetched, and when a fetch last failed.
 #[derive(Debug, Default)]
 struct JwksCache {
-    set: Option<JwkSet>,
+    set: Option<Arc<JwkSet>>,
     resolved_url: Option<String>,
     fetched_at: Option<Instant>,
+    last_failure: Option<Instant>,
+}
+
+/// Why JWKS-backed validation could not proceed. Only one reason today; the
+/// enum keeps the call site honest about unavailable-vs-invalid.
+#[derive(Debug)]
+enum JwksError {
+    Unavailable,
 }
 
 /// Validates OIDC bearer JWTs: signature against the issuer's JWKS, plus
@@ -192,6 +258,11 @@ pub struct OidcValidator {
 /// with random kids cannot turn into a flood of IdP requests.
 const FORCED_REFRESH_FLOOR: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Minimum gap between JWKS fetch attempts after a failure, so a down IdP
+/// does not turn every request into a fresh (mutex-serialized, timeout-bound)
+/// fetch.
+const FETCH_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl OidcValidator {
     pub fn new(cfg: OidcConfig) -> Self {
         Self {
@@ -205,17 +276,35 @@ impl OidcValidator {
     }
 
     /// Fetch the JWKS once so a broken issuer/URL fails at startup rather
-    /// than on the first user token.
+    /// than on the first user token, and leave the set cached so the first
+    /// real token does not re-fetch.
     pub async fn warm(&self) -> Result<(), String> {
-        self.fetch_jwks().await.map(|_| ())
+        let (url, set) = self.fetch_jwks().await?;
+        let mut cache = self.cache.lock().await;
+        cache.resolved_url = Some(url);
+        cache.set = Some(Arc::new(set));
+        cache.fetched_at = Some(Instant::now());
+        cache.last_failure = None;
+        Ok(())
     }
 
-    async fn authenticate(&self, token: &str) -> Option<AuthContext> {
-        let header = jsonwebtoken::decode_header(token).ok()?;
-        let jwks = self.jwks_for_kid(header.kid.as_deref()).await.ok()?;
-        let jwk = select_jwk(&jwks, header.kid.as_deref())?;
-        let algorithm = jwk_algorithm(jwk)?;
-        let key = DecodingKey::from_jwk(jwk).ok()?;
+    async fn authenticate(&self, token: &str) -> AuthOutcome {
+        let Some(header) = jsonwebtoken::decode_header(token).ok() else {
+            return AuthOutcome::Rejected;
+        };
+        let jwks = match self.jwks_for_kid(header.kid.as_deref()).await {
+            Ok(jwks) => jwks,
+            Err(JwksError::Unavailable) => return AuthOutcome::Unavailable,
+        };
+        let Some(jwk) = select_jwk(&jwks, header.kid.as_deref()) else {
+            return AuthOutcome::Rejected;
+        };
+        let Some(algorithm) = jwk_algorithm(jwk) else {
+            return AuthOutcome::Rejected;
+        };
+        let Ok(key) = DecodingKey::from_jwk(jwk) else {
+            return AuthOutcome::Rejected;
+        };
 
         let mut validation = Validation::new(algorithm);
         validation.set_issuer(&[&self.cfg.issuer]);
@@ -227,7 +316,7 @@ impl OidcValidator {
             &key,
             &validation,
         ) else {
-            return None;
+            return AuthOutcome::Rejected;
         };
         let claims = data.claims;
 
@@ -236,14 +325,17 @@ impl OidcValidator {
                 sub = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("?"),
                 "OIDC token rejected by [auth.oidc] claim gate"
             );
-            return None;
+            return AuthOutcome::Rejected;
         }
 
-        let name = claims
+        let Some(name) = claims
             .get(&self.cfg.principal_claim)
             .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())?;
-        Some(AuthContext {
+            .filter(|s| !s.is_empty())
+        else {
+            return AuthOutcome::Rejected;
+        };
+        AuthOutcome::Authenticated(AuthContext {
             name: name.to_string(),
             allowed_agents: self.cfg.allowed_agents.clone(),
         })
@@ -273,29 +365,53 @@ impl OidcValidator {
     }
 
     /// The cached key set, refreshed when absent, stale, or (rate-limited)
-    /// when `kid` is unknown to the current set.
-    async fn jwks_for_kid(&self, kid: Option<&str>) -> Result<JwkSet, String> {
+    /// when `kid` is unknown to the current set. A failed refresh never
+    /// invalidates a cached set: stale keys beat no keys, and the failure is
+    /// recorded so subsequent requests back off instead of serializing every
+    /// caller behind a failing fetch.
+    async fn jwks_for_kid(&self, kid: Option<&str>) -> Result<Arc<JwkSet>, JwksError> {
         let mut cache = self.cache.lock().await;
+        let refresh_interval = Duration::from_secs(self.cfg.jwks_refresh_secs);
         let stale = cache
             .fetched_at
-            .is_none_or(|t| t.elapsed() >= Duration::from_secs(self.cfg.jwks_refresh_secs));
+            .is_none_or(|t| t.elapsed() >= refresh_interval);
         let kid_missing = match (kid, &cache.set) {
             (Some(kid), Some(set)) => set.find(kid).is_none(),
             _ => false,
         };
-        let forced_floor =
-            FORCED_REFRESH_FLOOR.min(Duration::from_secs(self.cfg.jwks_refresh_secs));
+        let forced_floor = FORCED_REFRESH_FLOOR.min(refresh_interval);
         let forced_floor_ok = cache.fetched_at.is_none_or(|t| t.elapsed() >= forced_floor);
+        let backoff_ok = cache
+            .last_failure
+            .is_none_or(|t| t.elapsed() >= FETCH_BACKOFF);
         if cache.set.is_none() || stale || (kid_missing && forced_floor_ok) {
-            let (url, set) = self.fetch_jwks().await?;
-            cache.resolved_url = Some(url);
-            cache.set = Some(set);
-            cache.fetched_at = Some(Instant::now());
+            if backoff_ok {
+                match self.fetch_jwks().await {
+                    Ok((url, set)) => {
+                        cache.resolved_url = Some(url);
+                        cache.set = Some(Arc::new(set));
+                        cache.fetched_at = Some(Instant::now());
+                        cache.last_failure = None;
+                    }
+                    Err(e) => {
+                        cache.last_failure = Some(Instant::now());
+                        if cache.set.is_none() {
+                            warn!("JWKS unavailable and nothing cached yet: {e}");
+                            return Err(JwksError::Unavailable);
+                        }
+                        warn!("JWKS refresh failed, serving stale key set: {e}");
+                    }
+                }
+            } else if cache.set.is_none() {
+                // No cache and a very recent failure: answer unavailable
+                // without re-probing the IdP on every request.
+                return Err(JwksError::Unavailable);
+            }
         }
-        cache
-            .set
-            .clone()
-            .ok_or_else(|| "no JWKS available".to_string())
+        match &cache.set {
+            Some(set) => Ok(Arc::clone(set)),
+            None => Err(JwksError::Unavailable),
+        }
     }
 
     /// Resolve the JWKS URL (explicit config, else OIDC discovery) and fetch
@@ -480,27 +596,44 @@ pub async fn require_auth(
     }
     let outcome = match candidate_key(request.headers()) {
         Some(key) => authenticator.authenticate(key).await,
-        None => None,
+        None => AuthOutcome::Rejected,
     };
     match outcome {
-        Some(ctx) => {
-            request.extensions_mut().insert(ctx);
-            next.run(request).await
+        AuthOutcome::Authenticated(ctx) => {
+            // The task-local makes the principal reachable from code paths
+            // the axum extensions cannot reach — notably the A2A executor,
+            // which runs deep inside the a2a framework's handler.
+            request.extensions_mut().insert(ctx.clone());
+            CURRENT_AUTH.scope(ctx, next.run(request)).await
         }
-        None => {
+        AuthOutcome::Unavailable => {
+            warn!(
+                path = request.uri().path(),
+                "identity provider unreachable; rejecting request"
+            );
+            auth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The identity provider is unreachable; the request could not be authenticated. Retry shortly.",
+                "identity_provider_unreachable",
+            )
+        }
+        AuthOutcome::Rejected => {
             warn!(
                 path = request.uri().path(),
                 "rejected unauthenticated request"
             );
-            let message = match authenticator.as_ref() {
-                Authenticator::ApiKeys(_) => {
-                    "Invalid API key provided. Provide your key via the `Authorization: Bearer` header."
-                }
-                Authenticator::Oidc(_) => {
-                    "Invalid or expired bearer token. Provide a valid OIDC access token via the `Authorization: Bearer` header."
-                }
-            };
-            auth_error(StatusCode::UNAUTHORIZED, message, "invalid_api_key")
+            match authenticator.as_ref() {
+                Authenticator::ApiKeys(_) => auth_error(
+                    StatusCode::UNAUTHORIZED,
+                    "Invalid API key provided. Provide your key via the `Authorization: Bearer` header.",
+                    "invalid_api_key",
+                ),
+                Authenticator::Oidc(_) => auth_error(
+                    StatusCode::UNAUTHORIZED,
+                    "Invalid or expired bearer token. Provide a valid OIDC access token via the `Authorization: Bearer` header.",
+                    "invalid_token",
+                ),
+            }
         }
     }
 }
@@ -961,10 +1094,13 @@ mod oidc_tests {
             Some(format!("{issuer}/jwks.json")),
         ));
         validator.warm().await.expect("warm");
-        let ctx = validator
+        let ctx = match validator
             .authenticate(&token(&issuer, AUDIENCE, 300, serde_json::json!({})))
             .await
-            .expect("valid token");
+        {
+            AuthOutcome::Authenticated(ctx) => ctx,
+            other => panic!("expected authenticated, got {other:?}"),
+        };
         assert_eq!(ctx.name, "alice@example.com");
         assert!(ctx.allows("any-agent"));
     }
@@ -983,12 +1119,12 @@ mod oidc_tests {
         let issuer = server.uri();
         let validator = OidcValidator::new(oidc_cfg(issuer.clone(), None));
         validator.warm().await.expect("discovery warm");
-        assert!(
+        assert!(matches!(
             validator
                 .authenticate(&token(&issuer, AUDIENCE, 300, serde_json::json!({})))
-                .await
-                .is_some()
-        );
+                .await,
+            AuthOutcome::Authenticated(_)
+        ));
     }
 
     #[tokio::test]
@@ -1001,21 +1137,21 @@ mod oidc_tests {
         ));
         validator.warm().await.unwrap();
         // expired (beyond zero skew)
-        assert!(
+        assert!(matches!(
             validator
                 .authenticate(&token(&issuer, AUDIENCE, -300, serde_json::json!({})))
-                .await
-                .is_none()
-        );
+                .await,
+            AuthOutcome::Rejected
+        ));
         // wrong audience
-        assert!(
+        assert!(matches!(
             validator
                 .authenticate(&token(&issuer, "someone-else", 300, serde_json::json!({})))
-                .await
-                .is_none()
-        );
+                .await,
+            AuthOutcome::Rejected
+        ));
         // wrong issuer
-        assert!(
+        assert!(matches!(
             validator
                 .authenticate(&token(
                     "http://mallory.invalid",
@@ -1023,11 +1159,14 @@ mod oidc_tests {
                     300,
                     serde_json::json!({})
                 ))
-                .await
-                .is_none()
-        );
+                .await,
+            AuthOutcome::Rejected
+        ));
         // not a JWT at all
-        assert!(validator.authenticate("not-a-jwt").await.is_none());
+        assert!(matches!(
+            validator.authenticate("not-a-jwt").await,
+            AuthOutcome::Rejected
+        ));
     }
 
     #[tokio::test]
@@ -1046,7 +1185,10 @@ mod oidc_tests {
             300,
             serde_json::json!({"groups": ["sre", "other"]}),
         );
-        assert!(validator.authenticate(&passing).await.is_some());
+        assert!(matches!(
+            validator.authenticate(&passing).await,
+            AuthOutcome::Authenticated(_)
+        ));
 
         let failing = token(
             &issuer,
@@ -1054,17 +1196,26 @@ mod oidc_tests {
             300,
             serde_json::json!({"groups": ["docs"]}),
         );
-        assert!(validator.authenticate(&failing).await.is_none());
+        assert!(matches!(
+            validator.authenticate(&failing).await,
+            AuthOutcome::Rejected
+        ));
 
         let missing = token(&issuer, AUDIENCE, 300, serde_json::json!({}));
-        assert!(validator.authenticate(&missing).await.is_none());
+        assert!(matches!(
+            validator.authenticate(&missing).await,
+            AuthOutcome::Rejected
+        ));
 
         let string_claim = token(&issuer, AUDIENCE, 300, serde_json::json!({"groups": "sre"}));
-        assert!(validator.authenticate(&string_claim).await.is_some());
+        assert!(matches!(
+            validator.authenticate(&string_claim).await,
+            AuthOutcome::Authenticated(_)
+        ));
     }
 
     #[tokio::test]
-    async fn unknown_kid_triggers_refresh_after_floor() {
+    async fn refresh_picks_up_rotated_keys() {
         let server = mock_idp().await;
         let issuer = server.uri();
         let mut cfg = oidc_cfg(issuer.clone(), Some(format!("{issuer}/jwks.json")));
@@ -1072,7 +1223,9 @@ mod oidc_tests {
         let validator = OidcValidator::new(cfg);
         validator.warm().await.unwrap();
 
-        // Swap the served key set to one without the token's kid: rejected.
+        // Swap the served key set to one without the token's kid. Once the
+        // refresh interval elapses, the next validation refreshes, finds no
+        // matching key, and rejects.
         server.reset().await;
         Mock::given(method("GET"))
             .and(path("/jwks.json"))
@@ -1080,18 +1233,25 @@ mod oidc_tests {
             .mount(&server)
             .await;
         let tok = token(&issuer, AUDIENCE, 300, serde_json::json!({}));
-        assert!(validator.authenticate(&tok).await.is_none());
-
-        // Serve the key again after the refresh floor elapses: the unknown-kid
-        // refresh picks it up without waiting for the full interval.
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(matches!(
+            validator.authenticate(&tok).await,
+            AuthOutcome::Rejected
+        ));
+
+        // Serve the key again: after the next interval the refresh picks the
+        // rotated key up and validation succeeds again.
         server.reset().await;
         Mock::given(method("GET"))
             .and(path("/jwks.json"))
             .respond_with(ResponseTemplate::new(200).set_body_json(idp().jwks.clone()))
             .mount(&server)
             .await;
-        assert!(validator.authenticate(&tok).await.is_some());
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(matches!(
+            validator.authenticate(&tok).await,
+            AuthOutcome::Authenticated(_)
+        ));
     }
 
     #[test]
@@ -1145,5 +1305,126 @@ mod oidc_tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"alice@example.com");
+    }
+
+    #[tokio::test]
+    async fn warm_populates_the_cache() {
+        let server = mock_idp().await;
+        let issuer = server.uri();
+        let validator = OidcValidator::new(oidc_cfg(
+            issuer.clone(),
+            Some(format!("{issuer}/jwks.json")),
+        ));
+        validator.warm().await.unwrap();
+        // Kill the endpoint: with the warm set cached and not yet stale,
+        // validation must succeed without any fetch.
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        assert!(matches!(
+            validator
+                .authenticate(&token(&issuer, AUDIENCE, 300, serde_json::json!({})))
+                .await,
+            AuthOutcome::Authenticated(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn serves_stale_jwks_when_refresh_fails() {
+        let server = mock_idp().await;
+        let issuer = server.uri();
+        let mut cfg = oidc_cfg(issuer.clone(), Some(format!("{issuer}/jwks.json")));
+        cfg.jwks_refresh_secs = 1;
+        let validator = OidcValidator::new(cfg);
+        validator.warm().await.unwrap();
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        // Past the refresh interval: the refresh fails, but the cached set
+        // must keep validating tokens instead of locking everyone out.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(matches!(
+            validator
+                .authenticate(&token(&issuer, AUDIENCE, 300, serde_json::json!({})))
+                .await,
+            AuthOutcome::Authenticated(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn idp_down_without_cache_reports_unavailable() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let issuer = server.uri();
+        let validator = OidcValidator::new(oidc_cfg(
+            issuer.clone(),
+            Some(format!("{issuer}/jwks.json")),
+        ));
+        assert!(matches!(
+            validator
+                .authenticate(&token(&issuer, AUDIENCE, 300, serde_json::json!({})))
+                .await,
+            AuthOutcome::Unavailable
+        ));
+        // A second attempt inside the backoff window must not re-probe the
+        // IdP; it short-circuits to Unavailable. (Verified behaviorally: the
+        // request still fails closed, fast.)
+        assert!(matches!(
+            validator
+                .authenticate(&token(&issuer, AUDIENCE, 300, serde_json::json!({})))
+                .await,
+            AuthOutcome::Unavailable
+        ));
+    }
+
+    #[tokio::test]
+    async fn middleware_answers_503_when_idp_unreachable() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let issuer = server.uri();
+        let validator = OidcValidator::new(oidc_cfg(
+            issuer.clone(),
+            Some(format!("{issuer}/jwks.json")),
+        ));
+        let state =
+            super::tests::test_state(Some(Arc::new(Authenticator::Oidc(Box::new(validator)))));
+        let app = super::tests::app_with_auth(state);
+        let jwt = token(&issuer, AUDIENCE, 300, serde_json::json!({}));
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            super::tests::request("/v1/models", &[("authorization", format!("Bearer {jwt}"))]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn namespace_session_is_idempotent_and_collision_free() {
+        // Idempotent: echoing the namespaced id back keeps the same session.
+        let once = namespace_session("alice", "cs_1");
+        assert_eq!(namespace_session("alice", &once), once);
+        // Delimiter collisions across principals are impossible: `a` + `b:x`
+        // must not equal `a:b` + `x`.
+        assert_ne!(namespace_session("a", "b:x"), namespace_session("a:b", "x"));
+        // Distinct principals get distinct namespaces for the same id.
+        assert_ne!(
+            namespace_session("alice", "cs_1"),
+            namespace_session("bob", "cs_1")
+        );
     }
 }

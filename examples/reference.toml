@@ -274,6 +274,10 @@ model = "gpt-5.2"
 # Keys are stored as SHA-256 hashes so raw secrets never live in this file:
 #   printf '%s' "$MY_SECRET_KEY" | sha256sum
 # Hashes can come from the environment via {{ env.* }} templating.
+# Raw keys must be high-entropy (e.g. `openssl rand -hex 32`): the hashes are
+# unsalted SHA-256, so a low-entropy secret is offline-brute-forceable from
+# the config. Note: enabling auth on a running deployment orphans existing
+# chat sessions (they become keyed under the principal's namespace).
 #
 # [auth]
 # mode = "api-keys"        # default when the table is present; "off" disables

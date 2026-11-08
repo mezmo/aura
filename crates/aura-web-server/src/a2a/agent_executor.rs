@@ -221,6 +221,11 @@ impl AgentExecutor for AuraAgentExecutor {
             .get("x-aura-model")
             .and_then(|v| v.first())
             .cloned();
+        // The auth middleware stores the principal in a task-local because
+        // the a2a framework gives the executor no access to request
+        // extensions. Enforce the same per-principal agent allowlist the
+        // chat path applies, and namespace the session below.
+        let auth = crate::auth::current_auth();
         let config = match self
             .app_state
             .resolve_config(model_requested_model.as_deref())
@@ -236,6 +241,18 @@ impl AgentExecutor for AuraAgentExecutor {
                 }));
             }
         };
+        if let Some(auth) = &auth
+            && !auth.allows(config.agent_id())
+        {
+            let msg = format!(
+                "the authenticated principal `{}` does not have access to agent '{}'",
+                auth.name,
+                config.agent_id()
+            );
+            return Box::pin(futures_util::stream::once(async move {
+                Err::<StreamResponse, A2AError>(A2AError::invalid_params(msg))
+            }));
+        }
         let stream_shutdown_token = self.app_state.stream_shutdown_token.clone();
         let task_cancel_state = self.task_cancel_state.clone();
         let active_request_tracker = self.app_state.active_requests.clone();
@@ -308,7 +325,24 @@ impl AgentExecutor for AuraAgentExecutor {
 
             // Run a blank contextId without a session. Using it as-is would put
             // every client that sends a blank contextId in the same session.
-            let session_id = aura::SessionId::non_empty(context_id.clone());
+            //
+            // Namespace the agent-facing session per principal so shared or
+            // guessed `context_id`s cannot cross conversation state. The
+            // protocol-visible `context_id` in events stays as the client
+            // sent it. NOTE: the A2A task store itself is still shared
+            // across principals (tasks are keyed by unguessable task ids);
+            // history listed by `context_id` below therefore remains
+            // context-scoped, not principal-scoped. See CLAUDE.md.
+            let session_id = aura::SessionId::non_empty(context_id.clone()).map(|sid| {
+                match &auth {
+                    Some(auth) => aura::SessionId::new(crate::auth::namespace_session(
+                        &auth.name,
+                        sid.as_str(),
+                    ))
+                    .expect("namespaced session id is non-blank"),
+                    None => sid,
+                }
+            });
             let builder = RigBuilder::new(config, pending_approvals).with_hitl_hmac(hitl_hmac);
             let agent = match builder
                 .build_streaming_agent_with_tools(

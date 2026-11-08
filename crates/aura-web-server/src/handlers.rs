@@ -474,8 +474,14 @@ pub async fn chat_completions(
     // With auth enabled, namespace sessions per principal: two callers that
     // happen to use the same client-side session id (or guess one) must not
     // share conversation state, skill logs, or orchestration history.
+    // Idempotent, so a client that adopts the echoed `X-Chat-Session-Id`
+    // keeps the same session across turns.
     let chat_session_id = match &auth {
-        Some(axum::Extension(ctx)) => format!("{}:{}", ctx.name, chat_session_id),
+        Some(axum::Extension(ctx)) => aura::SessionId::new(crate::auth::namespace_session(
+            &ctx.name,
+            chat_session_id.as_str(),
+        ))
+        .expect("namespaced session id is non-blank"),
         None => chat_session_id,
     };
 
@@ -3220,10 +3226,15 @@ source = '{}'
 
             // The client keeps the session id and switches to agent B, which
             // configures a skill of the same name it never loaded.
-            let setup =
-                prepare_request(&state, &mut follow_up("agent-b"), &session, &HashMap::new(), None)
-                    .await
-                    .unwrap();
+            let setup = prepare_request(
+                &state,
+                &mut follow_up("agent-b"),
+                &session,
+                &HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
             assert!(
                 setup.rehydrated_skills.is_empty(),
                 "agent B must not replay agent A's invocations, got {:?}",
@@ -3232,10 +3243,15 @@ source = '{}'
             assert_eq!(setup.chat_history.len(), 2);
 
             // Agent A, back on the same session, still gets its own.
-            let setup =
-                prepare_request(&state, &mut follow_up("agent-a"), &session, &HashMap::new(), None)
-                    .await
-                    .unwrap();
+            let setup = prepare_request(
+                &state,
+                &mut follow_up("agent-a"),
+                &session,
+                &HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
             assert_eq!(setup.rehydrated_skills, ["shared"]);
             assert_eq!(setup.chat_history.len(), 4);
         }
