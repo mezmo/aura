@@ -261,6 +261,10 @@ pub struct OidcValidator {
     cfg: OidcConfig,
     http: reqwest::Client,
     cache: tokio::sync::Mutex<JwksCache>,
+    /// Serializes JWKS fetches so the (slow, timeout-bound) network call does
+    /// not hold the cache lock — requests whose `kid` is already cached never
+    /// wait on an in-flight refresh.
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 /// Floor between forced (unknown-`kid`) JWKS refreshes, so a flood of tokens
@@ -281,6 +285,7 @@ impl OidcValidator {
                 .build()
                 .expect("default client builder"),
             cache: tokio::sync::Mutex::new(JwksCache::default()),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -369,7 +374,9 @@ impl OidcValidator {
             _ => return false,
         };
         if self.cfg.require_claim_values.is_empty() {
-            return !strings.is_empty();
+            // "Present and non-empty": an IdP may emit `""` or `[""]` for
+            // missing membership; those must not satisfy the gate.
+            return strings.iter().any(|s| !s.is_empty());
         }
         strings
             .iter()
@@ -380,9 +387,25 @@ impl OidcValidator {
     /// when `kid` is unknown to the current set. A failed refresh never
     /// invalidates a cached set: stale keys beat no keys, and the failure is
     /// recorded so subsequent requests back off instead of serializing every
-    /// caller behind a failing fetch.
+    /// caller behind a failing fetch. The fetch runs under `refresh_lock`,
+    /// not the cache lock, so cached-key requests never queue behind a slow
+    /// or timing-out IdP.
     async fn jwks_for_kid(&self, kid: Option<&str>) -> Result<Arc<JwkSet>, JwksError> {
-        let mut cache = self.cache.lock().await;
+        if self.refresh_needed(kid).await {
+            // Serialize refreshes, then re-check: whoever won the race may
+            // have completed the refresh while we waited.
+            let _refresh = self.refresh_lock.lock().await;
+            if self.refresh_needed(kid).await {
+                self.refresh_once().await;
+            }
+        }
+        self.cached_set().await.ok_or(JwksError::Unavailable)
+    }
+
+    /// Whether the cached set is unusable for `kid` and a fetch should be
+    /// attempted, subject to the failure backoff.
+    async fn refresh_needed(&self, kid: Option<&str>) -> bool {
+        let cache = self.cache.lock().await;
         let refresh_interval = Duration::from_secs(self.cfg.jwks_refresh_secs);
         let stale = cache
             .fetched_at
@@ -396,34 +419,35 @@ impl OidcValidator {
         let backoff_ok = cache
             .last_failure
             .is_none_or(|t| t.elapsed() >= FETCH_BACKOFF);
-        if cache.set.is_none() || stale || (kid_missing && forced_floor_ok) {
-            if backoff_ok {
-                match self.fetch_jwks().await {
-                    Ok((url, set)) => {
-                        cache.resolved_url = Some(url);
-                        cache.set = Some(Arc::new(set));
-                        cache.fetched_at = Some(Instant::now());
-                        cache.last_failure = None;
-                    }
-                    Err(e) => {
-                        cache.last_failure = Some(Instant::now());
-                        if cache.set.is_none() {
-                            warn!("JWKS unavailable and nothing cached yet: {e}");
-                            return Err(JwksError::Unavailable);
-                        }
-                        warn!("JWKS refresh failed, serving stale key set: {e}");
-                    }
+        backoff_ok && (cache.set.is_none() || stale || (kid_missing && forced_floor_ok))
+    }
+
+    /// Fetch the JWKS and update the cache. A failure records the attempt for
+    /// the backoff but never clears a cached set; with nothing cached,
+    /// callers see [`JwksError::Unavailable`] via [`Self::jwks_for_kid`].
+    async fn refresh_once(&self) {
+        match self.fetch_jwks().await {
+            Ok((url, set)) => {
+                let mut cache = self.cache.lock().await;
+                cache.resolved_url = Some(url);
+                cache.set = Some(Arc::new(set));
+                cache.fetched_at = Some(Instant::now());
+                cache.last_failure = None;
+            }
+            Err(e) => {
+                let mut cache = self.cache.lock().await;
+                cache.last_failure = Some(Instant::now());
+                if cache.set.is_none() {
+                    warn!("JWKS unavailable and nothing cached yet: {e}");
+                } else {
+                    warn!("JWKS refresh failed, serving stale key set: {e}");
                 }
-            } else if cache.set.is_none() {
-                // No cache and a very recent failure: answer unavailable
-                // without re-probing the IdP on every request.
-                return Err(JwksError::Unavailable);
             }
         }
-        match &cache.set {
-            Some(set) => Ok(Arc::clone(set)),
-            None => Err(JwksError::Unavailable),
-        }
+    }
+
+    async fn cached_set(&self) -> Option<Arc<JwkSet>> {
+        self.cache.lock().await.set.clone()
     }
 
     /// Resolve the JWKS URL (explicit config, else OIDC discovery) and fetch
@@ -496,8 +520,16 @@ fn jwk_algorithm(jwk: &jsonwebtoken::jwk::Jwk) -> Option<Algorithm> {
         _ => None,
     });
     let inferred = match &jwk.algorithm {
+        // RS256 is the conventional default for bare RSA JWKs; EC keys have
+        // no such default — the algorithm must follow the curve, or a P-384
+        // key without `alg` would reject its own valid ES384 tokens.
         AlgorithmParameters::RSA(_) => Some(Algorithm::RS256),
-        AlgorithmParameters::EllipticCurve(_) => Some(Algorithm::ES256),
+        AlgorithmParameters::EllipticCurve(params) => match params.curve {
+            jsonwebtoken::jwk::EllipticCurve::P256 => Some(Algorithm::ES256),
+            jsonwebtoken::jwk::EllipticCurve::P384 => Some(Algorithm::ES384),
+            // P-521 (ES512) and Ed25519 are not supported by jsonwebtoken.
+            _ => None,
+        },
         _ => None,
     };
     asymmetric_algorithm(declared.or(inferred)?)
@@ -670,7 +702,8 @@ pub fn forbidden_response(key_name: &str, agent_id: &str) -> Response {
 }
 
 /// Compile the `[auth]` tables of all loaded configs into the deployment
-/// authenticator, warning once about mixed-mode setups. Modes are
+/// authenticator, warning once about mixed-mode setups. Returns `None` when
+/// no loaded config enables auth. Modes are
 /// deployment-wide and mutually exclusive: a server is either api-keys or
 /// oidc, never both.
 pub fn build_authenticator(configs: &[Config]) -> Result<Option<Arc<Authenticator>>, String> {
@@ -699,7 +732,16 @@ pub fn build_authenticator(configs: &[Config]) -> Result<Option<Arc<Authenticato
     if enabled_modes.first() == Some(&AuthMode::Oidc) {
         let mut seen = 0usize;
         for config in configs {
-            let Some(oidc) = config.auth.as_ref().and_then(|a| a.oidc.clone()) else {
+            // Only configs that *enable* OIDC contribute settings: a config
+            // with `mode = "off"` and a leftover `[auth.oidc]` table passes
+            // validation, and must not shadow the enabled config's issuer,
+            // audience, claim gate, or agent allowlist.
+            let Some(oidc) = config
+                .auth
+                .as_ref()
+                .filter(|a| a.mode == AuthMode::Oidc)
+                .and_then(|a| a.oidc.clone())
+            else {
                 continue;
             };
             if seen == 0 {
@@ -1283,6 +1325,19 @@ mod oidc_tests {
             validator.authenticate(&string_claim).await,
             AuthOutcome::Authenticated(_)
         ));
+
+        // "Present and non-empty": IdPs emit `""` / `[""]` for missing
+        // membership; those must not satisfy the gate.
+        let empty_string = token(&issuer, AUDIENCE, 300, serde_json::json!({"groups": ""}));
+        assert!(matches!(
+            validator.authenticate(&empty_string).await,
+            AuthOutcome::Rejected
+        ));
+        let empty_array = token(&issuer, AUDIENCE, 300, serde_json::json!({"groups": [""]}));
+        assert!(matches!(
+            validator.authenticate(&empty_array).await,
+            AuthOutcome::Rejected
+        ));
     }
 
     #[tokio::test]
@@ -1497,5 +1552,62 @@ mod oidc_tests {
             namespace_session("alice", "cs_1"),
             namespace_session("bob", "cs_1")
         );
+    }
+
+    #[test]
+    fn disabled_oidc_table_does_not_shadow_enabled_config() {
+        // A config with `mode = "off"` and a leftover [auth.oidc] table
+        // passes validation; it must never contribute settings.
+        let mut disabled = oidc_cfg("https://mallory.invalid".into(), None);
+        disabled.audience = "not-aura".into();
+        let configs = vec![
+            aura_config::Config {
+                auth: Some(AuthConfig {
+                    mode: AuthMode::Off,
+                    keys: vec![],
+                    oidc: Some(disabled),
+                }),
+                ..Default::default()
+            },
+            aura_config::Config {
+                auth: Some(AuthConfig {
+                    mode: AuthMode::Oidc,
+                    keys: vec![],
+                    oidc: Some(oidc_cfg("https://idp.invalid".into(), None)),
+                }),
+                ..Default::default()
+            },
+        ];
+        let auth = build_authenticator(&configs).unwrap().unwrap();
+        match auth.as_ref() {
+            Authenticator::Oidc(v) => assert_eq!(v.cfg.issuer, "https://idp.invalid"),
+            other => panic!("expected oidc authenticator, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ec_algorithm_is_inferred_from_the_curve() {
+        // A bare EC JWK has no `alg`; the algorithm must follow the curve,
+        // or a P-384 key would reject its own valid ES384 tokens.
+        for (crv, expected) in [
+            ("P-256", Some(Algorithm::ES256)),
+            ("P-384", Some(Algorithm::ES384)),
+        ] {
+            let len = if crv == "P-256" { 32 } else { 48 };
+            let c = "AAAA".repeat(len / 4);
+            let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_str(&format!(
+                r#"{{"kty":"EC","crv":"{crv}","kid":"k1","x":"{c}","y":"{c}"}}"#
+            ))
+            .expect("valid EC JWK");
+            assert_eq!(jwk_algorithm(&jwk), expected, "crv={crv}");
+        }
+        // P-521 is unsupported by jsonwebtoken (ring): rejected, not
+        // silently validated with the wrong algorithm.
+        let c = "AAAA".repeat(22); // 66 bytes, P-521 coordinate length
+        let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_str(&format!(
+            r#"{{"kty":"EC","crv":"P-521","kid":"k1","x":"{c}","y":"{c}"}}"#
+        ))
+        .expect("valid EC JWK");
+        assert_eq!(jwk_algorithm(&jwk), None);
     }
 }

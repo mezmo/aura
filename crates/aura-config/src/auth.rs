@@ -38,15 +38,13 @@ pub enum AuthMode {
 /// The `[auth]` TOML table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
-    /// Authentication mode. Defaults to `api-keys` when the table is present;
-    /// set `"off"` to keep the table but disable auth (e.g. checked-in default
-    /// overridden per environment).
+    /// Authentication mode for this config.
     #[serde(default)]
     pub mode: AuthMode,
-    /// The keyring. Required (non-empty) when `mode = "api-keys"`.
+    /// The static API key entries.
     #[serde(default)]
     pub keys: Vec<ApiKeyConfig>,
-    /// OIDC settings. Required when `mode = "oidc"`, rejected otherwise.
+    /// The OIDC settings.
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
 }
@@ -85,8 +83,6 @@ pub struct OidcConfig {
     #[serde(default = "default_clock_skew_secs")]
     pub clock_skew_secs: u64,
     /// Minimum interval between JWKS refreshes, in seconds (default: 3600).
-    /// An unknown `kid` in a token triggers an off-schedule refresh once per
-    /// this window, which is how key rotation is picked up.
     #[serde(default = "default_jwks_refresh_secs")]
     pub jwks_refresh_secs: u64,
 }
@@ -160,7 +156,12 @@ pub fn decode_key_hash(hash: &str) -> Result<[u8; 32], String> {
 }
 
 impl AuthConfig {
-    /// Validate the table: a usable mode/keyring combination.
+    /// Validate the table: a usable mode/keyring combination. Presence of the
+    /// table is what enables auth at the server level; `mode = "off"` keeps
+    /// the table (e.g. a checked-in default overridden per environment) but
+    /// disables auth and skips the rest of validation. `mode = "api-keys"`
+    /// requires at least one `[[auth.keys]]` entry and rejects `[auth.oidc]`;
+    /// `mode = "oidc"` requires the `[auth.oidc]` table and rejects keys.
     pub fn validate(&self) -> Result<(), ConfigError> {
         match self.mode {
             AuthMode::Off => return Ok(()),
