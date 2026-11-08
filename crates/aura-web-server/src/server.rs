@@ -493,7 +493,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
 
     // HTTP API-key auth ([auth] table, any config): compiled once at startup.
     // A malformed keyring fails the boot, not the first request.
-    let keyring = match crate::auth::build_keyring(&configs_arc) {
+    let keyring = match crate::auth::build_authenticator(&configs_arc) {
         Ok(ring) => ring,
         Err(e) => {
             error!("Invalid [auth] configuration: {e}");
@@ -503,11 +503,16 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             ));
         }
     };
+    // With OIDC, fetch the JWKS now so a broken issuer/URL fails startup
+    // rather than the first user token.
+    if let Some(crate::auth::Authenticator::Oidc(validator)) = keyring.as_deref()
+        && let Err(e) = validator.warm().await
+    {
+        error!("OIDC warm-up failed: {e}");
+        return Err(std::io::Error::other(format!("OIDC warm-up failed: {e}")));
+    }
     match &keyring {
-        Some(ring) => info!(
-            "API-key auth enabled ({} principal(s))",
-            ring.principal_count()
-        ),
+        Some(authenticator) => info!("{}", authenticator.describe()),
         None => info!("API-key auth disabled (no [auth] table)"),
     }
 

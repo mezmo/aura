@@ -288,3 +288,20 @@ model = "gpt-5.2"
 # name = "librechat"
 # key_hash = "{{ env.AURA_KEY_LIBRECHAT_SHA256 }}"
 # agents = ["incident-response"]        # allowlist: also filters /v1/models
+
+# OIDC alternative: validate bearer JWTs from your identity provider instead
+# of static keys (mutually exclusive with [[auth.keys]]).
+#
+# [auth]
+# mode = "oidc"
+#
+# [auth.oidc]
+# issuer = "https://idp.example.com/"   # expected `iss`; also the discovery base
+# audience = "aura"                     # required `aud`
+# # jwks_url = "https://idp.example.com/jwks"  # else discovered from the issuer
+# # principal_claim = "sub"             # claim naming the principal (logs, sessions)
+# # allowed_agents = ["*"]              # agents OIDC principals may invoke
+# # require_claim = "groups"            # optional claim gate...
+# # require_claim_values = ["sre"]      # ...string or array claim must match one
+# # clock_skew_secs = 60
+# # jwks_refresh_secs = 3600            # unknown `kid` forces an earlier refresh

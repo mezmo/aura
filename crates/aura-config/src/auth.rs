@@ -31,6 +31,8 @@ pub enum AuthMode {
     /// Static bearer keys from [`AuthConfig::keys`].
     #[default]
     ApiKeys,
+    /// OIDC bearer JWTs validated against [`AuthConfig::oidc`].
+    Oidc,
 }
 
 /// The `[auth]` TOML table.
@@ -44,6 +46,61 @@ pub struct AuthConfig {
     /// The keyring. Required (non-empty) when `mode = "api-keys"`.
     #[serde(default)]
     pub keys: Vec<ApiKeyConfig>,
+    /// OIDC settings. Required when `mode = "oidc"`, rejected otherwise.
+    #[serde(default)]
+    pub oidc: Option<OidcConfig>,
+}
+
+/// The `[auth.oidc]` TOML table: bearer JWTs from an external identity
+/// provider, validated by signature (JWKS), issuer, and audience.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcConfig {
+    /// Expected token issuer (`iss` claim). Also the OIDC discovery base when
+    /// `jwks_url` is unset: `{issuer}/.well-known/openid-configuration`.
+    pub issuer: String,
+    /// Expected audience (`aud` claim; the token must list it).
+    pub audience: String,
+    /// Explicit JWKS endpoint. Defaults to the issuer's published
+    /// `jwks_uri` from its discovery document.
+    #[serde(default)]
+    pub jwks_url: Option<String>,
+    /// Claim whose value names the principal in logs and session namespacing
+    /// (default: `"sub"`).
+    #[serde(default = "default_principal_claim")]
+    pub principal_claim: String,
+    /// Agent names/aliases OIDC principals may invoke. `"*"` allows all.
+    /// Defaults to `["*"]`; an explicit empty list allows none.
+    #[serde(default = "default_agents")]
+    pub allowed_agents: Vec<String>,
+    /// Optional claim used to gate access (e.g. `"groups"` or `"roles"`):
+    /// the claim's value must be this string, or a list containing one of
+    /// [`OidcConfig::require_claim_values`].
+    #[serde(default)]
+    pub require_claim: Option<String>,
+    /// Accepted values for [`OidcConfig::require_claim`]. Non-empty only
+    /// when `require_claim` is set.
+    #[serde(default)]
+    pub require_claim_values: Vec<String>,
+    /// Clock-skew allowance for `exp`/`nbf`, in seconds (default: 60).
+    #[serde(default = "default_clock_skew_secs")]
+    pub clock_skew_secs: u64,
+    /// Minimum interval between JWKS refreshes, in seconds (default: 3600).
+    /// An unknown `kid` in a token triggers an off-schedule refresh once per
+    /// this window, which is how key rotation is picked up.
+    #[serde(default = "default_jwks_refresh_secs")]
+    pub jwks_refresh_secs: u64,
+}
+
+fn default_principal_claim() -> String {
+    "sub".to_string()
+}
+
+fn default_clock_skew_secs() -> u64 {
+    60
+}
+
+fn default_jwks_refresh_secs() -> u64 {
+    3600
 }
 
 /// One `[[auth.keys]]` entry.
@@ -105,8 +162,31 @@ pub fn decode_key_hash(hash: &str) -> Result<[u8; 32], String> {
 impl AuthConfig {
     /// Validate the table: a usable mode/keyring combination.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.mode != AuthMode::ApiKeys {
-            return Ok(());
+        match self.mode {
+            AuthMode::Off => return Ok(()),
+            AuthMode::ApiKeys => {
+                if self.oidc.is_some() {
+                    return Err(ConfigError::Validation(
+                        "[auth.oidc] is only valid with mode = \"oidc\"".to_string(),
+                    ));
+                }
+            }
+            AuthMode::Oidc => {
+                if !self.keys.is_empty() {
+                    return Err(ConfigError::Validation(
+                        "[[auth.keys]] is only valid with mode = \"api-keys\"".to_string(),
+                    ));
+                }
+                return self
+                    .oidc
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ConfigError::Validation(
+                            "[auth] mode = \"oidc\" requires a [auth.oidc] table".to_string(),
+                        )
+                    })
+                    .and_then(|o| o.validate());
+            }
         }
         if self.keys.is_empty() {
             return Err(ConfigError::Validation(
@@ -143,6 +223,60 @@ impl AuthConfig {
         }
         Ok(())
     }
+}
+
+impl OidcConfig {
+    /// Validate the OIDC settings: parseable URLs and a coherent claim gate.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        validate_http_url("issuer", &self.issuer)?;
+        if let Some(url) = &self.jwks_url {
+            validate_http_url("jwks_url", url)?;
+        }
+        if self.audience.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "[auth.oidc].audience must not be empty".to_string(),
+            ));
+        }
+        if self.principal_claim.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "[auth.oidc].principal_claim must not be empty".to_string(),
+            ));
+        }
+        if self.require_claim.is_none() && !self.require_claim_values.is_empty() {
+            return Err(ConfigError::Validation(
+                "[auth.oidc].require_claim_values requires require_claim to be set".to_string(),
+            ));
+        }
+        for agent in &self.allowed_agents {
+            if agent.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    "[auth.oidc].allowed_agents must not contain empty entries".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Reject anything that is not an absolute http(s) URL with a host. Plaintext
+/// http is allowed (a local test IdP is legitimate) but the web server warns
+/// at startup when it points off-localhost.
+fn validate_http_url(field: &str, url: &str) -> Result<(), ConfigError> {
+    let parsed = url.parse::<http::Uri>().map_err(|e| {
+        ConfigError::Validation(format!("[auth.oidc].{field} is not a valid URL: {e}"))
+    })?;
+    let scheme = parsed.scheme_str().unwrap_or_default();
+    if scheme != "http" && scheme != "https" {
+        return Err(ConfigError::Validation(format!(
+            "[auth.oidc].{field} must be an http(s) URL, got scheme {scheme:?}"
+        )));
+    }
+    if parsed.host().is_none() {
+        return Err(ConfigError::Validation(format!(
+            "[auth.oidc].{field} must be an absolute URL with a host"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -269,5 +403,84 @@ agents = ["a", "b"]
         assert_eq!(bytes[31], 0x55);
         assert!(decode_key_hash(&GOOD_HASH[..63]).is_err());
         assert!(decode_key_hash(&format!("{}g", &GOOD_HASH[..63])).is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // [auth.oidc]
+    // -------------------------------------------------------------------
+
+    fn oidc_toml(body: &str) -> String {
+        toml_with_keys(&format!("mode = \"oidc\"\n\n[auth.oidc]\n{body}"))
+    }
+
+    #[test]
+    fn oidc_parses_with_defaults() {
+        let toml = oidc_toml(
+            r#"
+issuer = "https://idp.example.com/"
+audience = "aura"
+"#,
+        );
+        let config = parse_and_validate(&toml).unwrap();
+        let oidc = config.auth.unwrap().oidc.unwrap();
+        assert_eq!(oidc.principal_claim, "sub");
+        assert_eq!(oidc.allowed_agents, vec!["*".to_string()]);
+        assert_eq!(oidc.clock_skew_secs, 60);
+        assert_eq!(oidc.jwks_refresh_secs, 3600);
+        assert!(oidc.jwks_url.is_none());
+    }
+
+    #[test]
+    fn oidc_requires_the_table() {
+        let toml = toml_with_keys("mode = \"oidc\"\n");
+        let err = parse_and_validate(&toml).expect_err("missing [auth.oidc] must fail");
+        assert!(err.contains("requires a [auth.oidc] table"), "{err}");
+    }
+
+    #[test]
+    fn oidc_rejects_keys_and_apikeys_rejects_oidc() {
+        let toml = toml_with_keys(&format!(
+            "mode = \"oidc\"\n\n[[auth.keys]]\nname = \"x\"\nkey_hash = \"{GOOD_HASH}\"\n\n[auth.oidc]\nissuer = \"https://idp.example.com\"\naudience = \"aura\"\n"
+        ));
+        let err = parse_and_validate(&toml).expect_err("keys with oidc must fail");
+        assert!(err.contains("only valid with mode"), "{err}");
+
+        let toml = toml_with_keys(&format!(
+            "[[auth.keys]]\nname = \"ops\"\nkey_hash = \"{GOOD_HASH}\"\n\n[auth.oidc]\nissuer = \"https://idp.example.com\"\naudience = \"aura\"\n"
+        ));
+        let err = parse_and_validate(&toml).expect_err("oidc table with api-keys must fail");
+        assert!(err.contains("only valid with mode"), "{err}");
+    }
+
+    #[test]
+    fn oidc_rejects_bad_urls_and_empty_audience() {
+        let err = parse_and_validate(&oidc_toml("issuer = \"not-a-url\"\naudience = \"aura\"\n"))
+            .expect_err("bad issuer must fail");
+        assert!(err.contains("issuer"), "{err}");
+
+        let err = parse_and_validate(&oidc_toml(
+            "issuer = \"ftp://idp.example.com\"\naudience = \"aura\"\n",
+        ))
+        .expect_err("non-http scheme must fail");
+        assert!(err.contains("scheme"), "{err}");
+
+        let err = parse_and_validate(&oidc_toml(
+            "issuer = \"https://idp.example.com\"\naudience = \"\"\n",
+        ))
+        .expect_err("empty audience must fail");
+        assert!(err.contains("audience"), "{err}");
+    }
+
+    #[test]
+    fn oidc_claim_gate_requires_a_claim_name() {
+        let err = parse_and_validate(&oidc_toml(
+            r#"
+issuer = "https://idp.example.com"
+audience = "aura"
+require_claim_values = ["sre"]
+"#,
+        ))
+        .expect_err("values without a claim name must fail");
+        assert!(err.contains("require_claim"), "{err}");
     }
 }

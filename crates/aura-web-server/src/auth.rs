@@ -13,17 +13,20 @@
 //! enforce per-key agent allowlists and namespace sessions per principal.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use aura_config::{AuthMode, Config};
+use aura_config::{AuthMode, Config, OidcConfig};
 
 use crate::types::AppState;
 
@@ -133,6 +136,256 @@ impl KeyRing {
     }
 }
 
+/// The deployment authenticator: exactly one mechanism, chosen by
+/// `[auth].mode`. Both arms produce the same [`AuthContext`], so everything
+/// downstream (allowlists, session namespacing, span identity) is shared.
+#[derive(Debug)]
+pub enum Authenticator {
+    ApiKeys(KeyRing),
+    Oidc(Box<OidcValidator>),
+}
+
+impl Authenticator {
+    async fn authenticate(&self, raw: &str) -> Option<AuthContext> {
+        match self {
+            Self::ApiKeys(ring) => ring.authenticate(raw),
+            Self::Oidc(validator) => validator.authenticate(raw).await,
+        }
+    }
+
+    /// One-line description for the startup log.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::ApiKeys(ring) => format!(
+                "API-key auth enabled ({} principal(s))",
+                ring.principal_count()
+            ),
+            Self::Oidc(validator) => format!(
+                "OIDC auth enabled (issuer {}, audience {})",
+                validator.cfg.issuer, validator.cfg.audience
+            ),
+        }
+    }
+}
+
+/// The JWKS cache: the last fetched key set, the URL it came from (config or
+/// discovery), and when it was fetched.
+#[derive(Debug, Default)]
+struct JwksCache {
+    set: Option<JwkSet>,
+    resolved_url: Option<String>,
+    fetched_at: Option<Instant>,
+}
+
+/// Validates OIDC bearer JWTs: signature against the issuer's JWKS, plus
+/// issuer, audience, and lifetime claims. JWKS is fetched lazily, cached,
+/// refreshed on the configured interval, and force-refreshed (rate-limited)
+/// when a token presents an unknown `kid` so key rotation is picked up.
+#[derive(Debug)]
+pub struct OidcValidator {
+    cfg: OidcConfig,
+    http: reqwest::Client,
+    cache: tokio::sync::Mutex<JwksCache>,
+}
+
+/// Floor between forced (unknown-`kid`) JWKS refreshes, so a flood of tokens
+/// with random kids cannot turn into a flood of IdP requests.
+const FORCED_REFRESH_FLOOR: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl OidcValidator {
+    pub fn new(cfg: OidcConfig) -> Self {
+        Self {
+            cfg,
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("default client builder"),
+            cache: tokio::sync::Mutex::new(JwksCache::default()),
+        }
+    }
+
+    /// Fetch the JWKS once so a broken issuer/URL fails at startup rather
+    /// than on the first user token.
+    pub async fn warm(&self) -> Result<(), String> {
+        self.fetch_jwks().await.map(|_| ())
+    }
+
+    async fn authenticate(&self, token: &str) -> Option<AuthContext> {
+        let header = jsonwebtoken::decode_header(token).ok()?;
+        let jwks = self.jwks_for_kid(header.kid.as_deref()).await.ok()?;
+        let jwk = select_jwk(&jwks, header.kid.as_deref())?;
+        let algorithm = jwk_algorithm(jwk)?;
+        let key = DecodingKey::from_jwk(jwk).ok()?;
+
+        let mut validation = Validation::new(algorithm);
+        validation.set_issuer(&[&self.cfg.issuer]);
+        validation.set_audience(&[&self.cfg.audience]);
+        validation.leeway = self.cfg.clock_skew_secs;
+
+        let Ok(data) = jsonwebtoken::decode::<serde_json::Map<String, serde_json::Value>>(
+            token,
+            &key,
+            &validation,
+        ) else {
+            return None;
+        };
+        let claims = data.claims;
+
+        if !self.claim_gate_passes(&claims) {
+            warn!(
+                sub = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("?"),
+                "OIDC token rejected by [auth.oidc] claim gate"
+            );
+            return None;
+        }
+
+        let name = claims
+            .get(&self.cfg.principal_claim)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())?;
+        Some(AuthContext {
+            name: name.to_string(),
+            allowed_agents: self.cfg.allowed_agents.clone(),
+        })
+    }
+
+    /// The optional `require_claim` gate: with values configured the claim
+    /// must equal one of them (string claim) or contain one (array claim);
+    /// without values the claim must merely be present and non-empty.
+    fn claim_gate_passes(&self, claims: &serde_json::Map<String, serde_json::Value>) -> bool {
+        let Some(claim) = &self.cfg.require_claim else {
+            return true;
+        };
+        let Some(value) = claims.get(claim) else {
+            return false;
+        };
+        let strings: Vec<&str> = match value {
+            serde_json::Value::String(s) => vec![s.as_str()],
+            serde_json::Value::Array(items) => items.iter().filter_map(|v| v.as_str()).collect(),
+            _ => return false,
+        };
+        if self.cfg.require_claim_values.is_empty() {
+            return !strings.is_empty();
+        }
+        strings
+            .iter()
+            .any(|s| self.cfg.require_claim_values.iter().any(|w| w == s))
+    }
+
+    /// The cached key set, refreshed when absent, stale, or (rate-limited)
+    /// when `kid` is unknown to the current set.
+    async fn jwks_for_kid(&self, kid: Option<&str>) -> Result<JwkSet, String> {
+        let mut cache = self.cache.lock().await;
+        let stale = cache
+            .fetched_at
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(self.cfg.jwks_refresh_secs));
+        let kid_missing = match (kid, &cache.set) {
+            (Some(kid), Some(set)) => set.find(kid).is_none(),
+            _ => false,
+        };
+        let forced_floor =
+            FORCED_REFRESH_FLOOR.min(Duration::from_secs(self.cfg.jwks_refresh_secs));
+        let forced_floor_ok = cache.fetched_at.is_none_or(|t| t.elapsed() >= forced_floor);
+        if cache.set.is_none() || stale || (kid_missing && forced_floor_ok) {
+            let (url, set) = self.fetch_jwks().await?;
+            cache.resolved_url = Some(url);
+            cache.set = Some(set);
+            cache.fetched_at = Some(Instant::now());
+        }
+        cache
+            .set
+            .clone()
+            .ok_or_else(|| "no JWKS available".to_string())
+    }
+
+    /// Resolve the JWKS URL (explicit config, else OIDC discovery) and fetch
+    /// the key set.
+    async fn fetch_jwks(&self) -> Result<(String, JwkSet), String> {
+        let url = match &self.cfg.jwks_url {
+            Some(url) => url.clone(),
+            None => self.discover_jwks_url().await?,
+        };
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("JWKS fetch from {url} failed: {e}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("JWKS fetch from {url} returned {status}"));
+        }
+        let set: JwkSet = response
+            .json()
+            .await
+            .map_err(|e| format!("JWKS from {url} is not a valid key set: {e}"))?;
+        Ok((url, set))
+    }
+
+    async fn discover_jwks_url(&self) -> Result<String, String> {
+        let base = self.cfg.issuer.trim_end_matches('/');
+        let url = format!("{base}/.well-known/openid-configuration");
+        let doc: serde_json::Value = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("OIDC discovery from {url} failed: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("OIDC discovery from {url} failed: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("OIDC discovery document at {url} is not JSON: {e}"))?;
+        doc.get("jwks_uri")
+            .and_then(|v| v.as_str())
+            .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+            .map(str::to_string)
+            .ok_or_else(|| format!("discovery document at {url} has no usable jwks_uri"))
+    }
+}
+
+/// Pick the JWK matching `kid`; without a `kid` header, accept the set only
+/// when it holds exactly one key (no guessing).
+fn select_jwk<'a>(jwks: &'a JwkSet, kid: Option<&str>) -> Option<&'a jsonwebtoken::jwk::Jwk> {
+    match kid {
+        Some(kid) => jwks.find(kid),
+        None if jwks.keys.len() == 1 => jwks.keys.first(),
+        None => None,
+    }
+}
+
+/// The signature algorithm to validate with, taken from the (trusted) JWK
+/// rather than the token header, restricted to asymmetric RS/EC algs —
+/// symmetric `oct` keys must never authenticate bearer JWTs.
+fn jwk_algorithm(jwk: &jsonwebtoken::jwk::Jwk) -> Option<Algorithm> {
+    use jsonwebtoken::jwk::KeyAlgorithm;
+    let declared = jwk.common.key_algorithm.as_ref().and_then(|a| match a {
+        KeyAlgorithm::RS256 => Some(Algorithm::RS256),
+        KeyAlgorithm::RS384 => Some(Algorithm::RS384),
+        KeyAlgorithm::RS512 => Some(Algorithm::RS512),
+        KeyAlgorithm::ES256 => Some(Algorithm::ES256),
+        KeyAlgorithm::ES384 => Some(Algorithm::ES384),
+        _ => None,
+    });
+    let inferred = match &jwk.algorithm {
+        AlgorithmParameters::RSA(_) => Some(Algorithm::RS256),
+        AlgorithmParameters::EllipticCurve(_) => Some(Algorithm::ES256),
+        _ => None,
+    };
+    asymmetric_algorithm(declared.or(inferred)?)
+}
+
+fn asymmetric_algorithm(alg: Algorithm) -> Option<Algorithm> {
+    match alg {
+        Algorithm::RS256
+        | Algorithm::RS384
+        | Algorithm::RS512
+        | Algorithm::ES256
+        | Algorithm::ES384 => Some(alg),
+        _ => None,
+    }
+}
+
 fn key_hashes(key: &aura_config::ApiKeyConfig) -> Vec<[u8; 32]> {
     // Config validation already guarantees both decode; re-decode defensively
     // and skip anything malformed rather than panic at request time.
@@ -212,20 +465,23 @@ fn candidate_key(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Middleware: reject unauthenticated requests when the deployment has an
-/// `[auth]` keyring. Runs inside `shutdown_guard` so draining still answers
-/// 503 before auth challenges.
+/// `[auth]` authenticator. Runs inside `shutdown_guard` so draining still
+/// answers 503 before auth challenges.
 pub async fn require_auth(
     State(state): State<Arc<AppState>>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    let Some(ring) = &state.auth else {
+    let Some(authenticator) = &state.auth else {
         return next.run(request).await;
     };
     if is_open_path(request.uri().path()) {
         return next.run(request).await;
     }
-    let outcome = candidate_key(request.headers()).and_then(|key| ring.authenticate(key));
+    let outcome = match candidate_key(request.headers()) {
+        Some(key) => authenticator.authenticate(key).await,
+        None => None,
+    };
     match outcome {
         Some(ctx) => {
             request.extensions_mut().insert(ctx);
@@ -236,11 +492,15 @@ pub async fn require_auth(
                 path = request.uri().path(),
                 "rejected unauthenticated request"
             );
-            auth_error(
-                StatusCode::UNAUTHORIZED,
-                "Invalid API key provided. Provide your key via the `Authorization: Bearer` header.",
-                "invalid_api_key",
-            )
+            let message = match authenticator.as_ref() {
+                Authenticator::ApiKeys(_) => {
+                    "Invalid API key provided. Provide your key via the `Authorization: Bearer` header."
+                }
+                Authenticator::Oidc(_) => {
+                    "Invalid or expired bearer token. Provide a valid OIDC access token via the `Authorization: Bearer` header."
+                }
+            };
+            auth_error(StatusCode::UNAUTHORIZED, message, "invalid_api_key")
         }
     }
 }
@@ -265,19 +525,53 @@ pub fn forbidden_response(key_name: &str, agent_id: &str) -> Response {
 }
 
 /// Compile the `[auth]` tables of all loaded configs into the deployment
-/// keyring, warning once about mixed-mode setups.
-pub fn build_keyring(configs: &[Config]) -> Result<Option<Arc<KeyRing>>, String> {
+/// authenticator, warning once about mixed-mode setups. Modes are
+/// deployment-wide and mutually exclusive: a server is either api-keys or
+/// oidc, never both.
+pub fn build_authenticator(configs: &[Config]) -> Result<Option<Arc<Authenticator>>, String> {
     let modes: Vec<AuthMode> = configs
         .iter()
         .filter_map(|c| c.auth.as_ref().map(|a| a.mode))
         .collect();
-    if modes.contains(&AuthMode::Off) && modes.contains(&AuthMode::ApiKeys) {
+    let enabled_modes: Vec<AuthMode> = modes
+        .iter()
+        .copied()
+        .filter(|m| *m != AuthMode::Off)
+        .collect();
+    if enabled_modes.contains(&AuthMode::ApiKeys) && enabled_modes.contains(&AuthMode::Oidc) {
+        return Err(
+            "cannot mix [auth] mode = \"api-keys\" and mode = \"oidc\" across loaded configs; \
+             pick one mechanism per server"
+                .to_string(),
+        );
+    }
+    if modes.contains(&AuthMode::Off) && !enabled_modes.is_empty() {
         warn!(
-            "some configs set [auth] mode = \"off\" while others enable api-keys; \
+            "some configs set [auth] mode = \"off\" while others enable auth; \
              auth is enabled for the whole server"
         );
     }
-    KeyRing::from_configs(configs).map(|ring| ring.map(Arc::new))
+    if enabled_modes.first() == Some(&AuthMode::Oidc) {
+        let mut seen = 0usize;
+        for config in configs {
+            let Some(oidc) = config.auth.as_ref().and_then(|a| a.oidc.clone()) else {
+                continue;
+            };
+            seen += 1;
+            if seen == 1 {
+                return Ok(Some(Arc::new(Authenticator::Oidc(Box::new(
+                    OidcValidator::new(oidc),
+                )))));
+            }
+            warn!(
+                "multiple configs define [auth.oidc]; using the first issuer ({}) and \
+                 ignoring the rest",
+                oidc.issuer
+            );
+        }
+        return Err("mode = \"oidc\" but no [auth.oidc] table found".to_string());
+    }
+    KeyRing::from_configs(configs).map(|ring| ring.map(|r| Arc::new(Authenticator::ApiKeys(r))))
 }
 
 #[cfg(test)]
@@ -293,7 +587,11 @@ mod tests {
     const RAW_KEY: &str = "aura-test-key-0001";
 
     fn auth_config(mode: AuthMode, keys: Vec<aura_config::ApiKeyConfig>) -> AuthConfig {
-        AuthConfig { mode, keys }
+        AuthConfig {
+            mode,
+            keys,
+            oidc: None,
+        }
     }
 
     fn key(name: &str, raw: &str, agents: Vec<String>) -> aura_config::ApiKeyConfig {
@@ -312,7 +610,7 @@ mod tests {
         }
     }
 
-    fn test_state(auth: Option<Arc<KeyRing>>) -> Arc<AppState> {
+    pub(super) fn test_state(auth: Option<Arc<Authenticator>>) -> Arc<AppState> {
         Arc::new(AppState {
             configs: Arc::new(vec![]),
             tool_result_mode: ToolResultMode::default(),
@@ -338,7 +636,7 @@ mod tests {
     }
 
     /// Minimal app: middleware + a probe route that echoes the principal.
-    fn app_with_auth(state: Arc<AppState>) -> Router {
+    pub(super) fn app_with_auth(state: Arc<AppState>) -> Router {
         async fn probe(ext: Option<axum::Extension<AuthContext>>) -> String {
             ext.map(|e| e.name.clone())
                 .unwrap_or_else(|| "anonymous".to_string())
@@ -354,7 +652,7 @@ mod tests {
             .with_state(state)
     }
 
-    fn request(path: &str, headers: &[(&str, String)]) -> Request {
+    pub(super) fn request(path: &str, headers: &[(&str, String)]) -> Request {
         let mut builder = axum::http::Request::builder().method("GET").uri(path);
         for (k, v) in headers {
             builder = builder.header(*k, v);
@@ -365,9 +663,9 @@ mod tests {
     #[test]
     fn no_auth_table_disables_the_ring() {
         let configs = vec![config_with_auth(None)];
-        assert!(build_keyring(&configs).unwrap().is_none());
+        assert!(build_authenticator(&configs).unwrap().is_none());
         let configs = vec![config_with_auth(Some(auth_config(AuthMode::Off, vec![])))];
-        assert!(build_keyring(&configs).unwrap().is_none());
+        assert!(build_authenticator(&configs).unwrap().is_none());
     }
 
     #[test]
@@ -414,7 +712,7 @@ mod tests {
                 vec![key("dup", "other-raw", vec!["*".into()])],
             ))),
         ];
-        let err = build_keyring(&configs).unwrap_err();
+        let err = build_authenticator(&configs).unwrap_err();
         assert!(err.contains("duplicate"), "{err}");
     }
 
@@ -430,7 +728,7 @@ mod tests {
 
     #[tokio::test]
     async fn middleware_rejects_missing_and_wrong_keys() {
-        let ring = build_keyring(&[config_with_auth(Some(auth_config(
+        let ring = build_authenticator(&[config_with_auth(Some(auth_config(
             AuthMode::ApiKeys,
             vec![key("ops", RAW_KEY, vec!["*".into()])],
         )))])
@@ -469,7 +767,7 @@ mod tests {
 
     #[tokio::test]
     async fn middleware_accepts_bearer_and_x_api_key() {
-        let ring = build_keyring(&[config_with_auth(Some(auth_config(
+        let ring = build_authenticator(&[config_with_auth(Some(auth_config(
             AuthMode::ApiKeys,
             vec![key("ops", RAW_KEY, vec!["*".into()])],
         )))])
@@ -497,7 +795,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_paths_stay_reachable() {
-        let ring = build_keyring(&[config_with_auth(Some(auth_config(
+        let ring = build_authenticator(&[config_with_auth(Some(auth_config(
             AuthMode::ApiKeys,
             vec![key("ops", RAW_KEY, vec!["*".into()])],
         )))])
@@ -517,7 +815,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_context_reaches_handlers() {
-        let ring = build_keyring(&[config_with_auth(Some(auth_config(
+        let ring = build_authenticator(&[config_with_auth(Some(auth_config(
             AuthMode::ApiKeys,
             vec![key("ops", RAW_KEY, vec!["*".into()])],
         )))])
@@ -545,5 +843,307 @@ mod tests {
         assert!(ct_eq(&a, &b));
         b[31] ^= 1;
         assert!(!ct_eq(&a, &b));
+    }
+}
+
+#[cfg(test)]
+mod oidc_tests {
+    use super::*;
+    use aura_config::{AuthConfig, AuthMode};
+    use base64::Engine;
+    use rsa::RsaPrivateKey;
+    use rsa::pkcs8::EncodePrivateKey;
+    use rsa::traits::PublicKeyParts;
+    use std::sync::OnceLock;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const KID: &str = "test-key-1";
+    const AUDIENCE: &str = "aura";
+
+    fn now_unix() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_secs()
+    }
+
+    /// One RSA keypair for the whole module: key generation dominates the
+    /// runtime otherwise.
+    struct TestIdp {
+        private_pem: String,
+        jwks: serde_json::Value,
+    }
+
+    fn idp() -> &'static TestIdp {
+        static IDP: OnceLock<TestIdp> = OnceLock::new();
+        IDP.get_or_init(|| {
+            let mut rng = rsa::rand_core::OsRng;
+            let key = RsaPrivateKey::new(&mut rng, 2048).expect("keygen");
+            let private_pem = key
+                .to_pkcs8_pem(pkcs8::LineEnding::LF)
+                .expect("pem")
+                .to_string();
+            let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            let jwks = serde_json::json!({
+                "keys": [{
+                    "kty": "RSA",
+                    "use": "sig",
+                    "alg": "RS256",
+                    "kid": KID,
+                    "n": b64.encode(key.n().to_bytes_be()),
+                    "e": b64.encode(key.e().to_bytes_be()),
+                }]
+            });
+            TestIdp { private_pem, jwks }
+        })
+    }
+
+    /// Mint an RS256 JWT; `extra` merges into the claims (e.g. `groups`).
+    fn token(issuer: &str, audience: &str, lifetime_secs: i64, extra: serde_json::Value) -> String {
+        let now = now_unix() as i64;
+        let mut claims = serde_json::json!({
+            "sub": "alice@example.com",
+            "iss": issuer,
+            "aud": audience,
+            "iat": now,
+            "exp": now + lifetime_secs,
+        });
+        if let (Some(map), Some(extra)) = (claims.as_object_mut(), extra.as_object()) {
+            for (k, v) in extra {
+                map.insert(k.clone(), v.clone());
+            }
+        }
+        let header = jsonwebtoken::Header {
+            alg: jsonwebtoken::Algorithm::RS256,
+            kid: Some(KID.to_string()),
+            ..Default::default()
+        };
+        jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_rsa_pem(idp().private_pem.as_bytes())
+                .expect("encoding key"),
+        )
+        .expect("encode")
+    }
+
+    fn oidc_cfg(issuer: String, jwks_url: Option<String>) -> OidcConfig {
+        OidcConfig {
+            issuer,
+            audience: AUDIENCE.to_string(),
+            jwks_url,
+            principal_claim: "sub".to_string(),
+            allowed_agents: vec!["*".to_string()],
+            require_claim: None,
+            require_claim_values: vec![],
+            clock_skew_secs: 0,
+            jwks_refresh_secs: 3600,
+        }
+    }
+
+    async fn mock_idp() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(idp().jwks.clone()))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn valid_token_authenticates_with_sub_as_principal() {
+        let server = mock_idp().await;
+        let issuer = server.uri();
+        let validator = OidcValidator::new(oidc_cfg(
+            issuer.clone(),
+            Some(format!("{issuer}/jwks.json")),
+        ));
+        validator.warm().await.expect("warm");
+        let ctx = validator
+            .authenticate(&token(&issuer, AUDIENCE, 300, serde_json::json!({})))
+            .await
+            .expect("valid token");
+        assert_eq!(ctx.name, "alice@example.com");
+        assert!(ctx.allows("any-agent"));
+    }
+
+    #[tokio::test]
+    async fn resolves_jwks_url_via_discovery() {
+        let server = mock_idp().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": server.uri(),
+                "jwks_uri": format!("{}/jwks.json", server.uri()),
+            })))
+            .mount(&server)
+            .await;
+        let issuer = server.uri();
+        let validator = OidcValidator::new(oidc_cfg(issuer.clone(), None));
+        validator.warm().await.expect("discovery warm");
+        assert!(
+            validator
+                .authenticate(&token(&issuer, AUDIENCE, 300, serde_json::json!({})))
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_expired_wrong_aud_wrong_iss_and_garbage() {
+        let server = mock_idp().await;
+        let issuer = server.uri();
+        let validator = OidcValidator::new(oidc_cfg(
+            issuer.clone(),
+            Some(format!("{issuer}/jwks.json")),
+        ));
+        validator.warm().await.unwrap();
+        // expired (beyond zero skew)
+        assert!(
+            validator
+                .authenticate(&token(&issuer, AUDIENCE, -300, serde_json::json!({})))
+                .await
+                .is_none()
+        );
+        // wrong audience
+        assert!(
+            validator
+                .authenticate(&token(&issuer, "someone-else", 300, serde_json::json!({})))
+                .await
+                .is_none()
+        );
+        // wrong issuer
+        assert!(
+            validator
+                .authenticate(&token(
+                    "http://mallory.invalid",
+                    AUDIENCE,
+                    300,
+                    serde_json::json!({})
+                ))
+                .await
+                .is_none()
+        );
+        // not a JWT at all
+        assert!(validator.authenticate("not-a-jwt").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_gate_matches_string_and_array_claims() {
+        let server = mock_idp().await;
+        let issuer = server.uri();
+        let mut cfg = oidc_cfg(issuer.clone(), Some(format!("{issuer}/jwks.json")));
+        cfg.require_claim = Some("groups".to_string());
+        cfg.require_claim_values = vec!["sre".to_string()];
+        let validator = OidcValidator::new(cfg);
+        validator.warm().await.unwrap();
+
+        let passing = token(
+            &issuer,
+            AUDIENCE,
+            300,
+            serde_json::json!({"groups": ["sre", "other"]}),
+        );
+        assert!(validator.authenticate(&passing).await.is_some());
+
+        let failing = token(
+            &issuer,
+            AUDIENCE,
+            300,
+            serde_json::json!({"groups": ["docs"]}),
+        );
+        assert!(validator.authenticate(&failing).await.is_none());
+
+        let missing = token(&issuer, AUDIENCE, 300, serde_json::json!({}));
+        assert!(validator.authenticate(&missing).await.is_none());
+
+        let string_claim = token(&issuer, AUDIENCE, 300, serde_json::json!({"groups": "sre"}));
+        assert!(validator.authenticate(&string_claim).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn unknown_kid_triggers_refresh_after_floor() {
+        let server = mock_idp().await;
+        let issuer = server.uri();
+        let mut cfg = oidc_cfg(issuer.clone(), Some(format!("{issuer}/jwks.json")));
+        cfg.jwks_refresh_secs = 1;
+        let validator = OidcValidator::new(cfg);
+        validator.warm().await.unwrap();
+
+        // Swap the served key set to one without the token's kid: rejected.
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"keys": []})))
+            .mount(&server)
+            .await;
+        let tok = token(&issuer, AUDIENCE, 300, serde_json::json!({}));
+        assert!(validator.authenticate(&tok).await.is_none());
+
+        // Serve the key again after the refresh floor elapses: the unknown-kid
+        // refresh picks it up without waiting for the full interval.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(idp().jwks.clone()))
+            .mount(&server)
+            .await;
+        assert!(validator.authenticate(&tok).await.is_some());
+    }
+
+    #[test]
+    fn mixed_modes_are_rejected() {
+        let api = aura_config::Config {
+            auth: Some(AuthConfig {
+                mode: AuthMode::ApiKeys,
+                keys: vec![aura_config::ApiKeyConfig {
+                    name: "k".into(),
+                    key_hash: aura_config::hash_api_key("x"),
+                    key_hash_previous: None,
+                    agents: vec!["*".into()],
+                }],
+                oidc: None,
+            }),
+            ..Default::default()
+        };
+        let oidc = aura_config::Config {
+            auth: Some(AuthConfig {
+                mode: AuthMode::Oidc,
+                keys: vec![],
+                oidc: Some(oidc_cfg("https://idp.invalid".into(), None)),
+            }),
+            ..Default::default()
+        };
+        let err = build_authenticator(&[api, oidc]).unwrap_err();
+        assert!(err.contains("cannot mix"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn middleware_accepts_oidc_bearer_token() {
+        let server = mock_idp().await;
+        let issuer = server.uri();
+        let validator = OidcValidator::new(oidc_cfg(
+            issuer.clone(),
+            Some(format!("{issuer}/jwks.json")),
+        ));
+        validator.warm().await.unwrap();
+        let state =
+            super::tests::test_state(Some(Arc::new(Authenticator::Oidc(Box::new(validator)))));
+        let app = super::tests::app_with_auth(state);
+        let jwt = token(&issuer, AUDIENCE, 300, serde_json::json!({}));
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            super::tests::request("/v1/models", &[("authorization", format!("Bearer {jwt}"))]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"alice@example.com");
     }
 }
