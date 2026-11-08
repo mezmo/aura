@@ -1258,12 +1258,15 @@ pub async fn info(
         });
 
     // The default agent's name would otherwise leak a forbidden agent's
-    // existence even though it is absent from the list.
+    // existence even though it is absent from the list. Resolved by the same
+    // effective identifier (alias, else name) `resolve_config` uses — an
+    // agent's bare name can collide with a *different* agent's alias, and
+    // `resolve_config` picks the alias owner.
     let default_agent = state.default_agent.clone().filter(|name| match &auth {
         Some(axum::Extension(ctx)) => state
             .configs
             .iter()
-            .find(|c| &c.agent.name == name || c.agent.alias.as_deref() == Some(name.as_str()))
+            .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == name.as_str())
             .is_none_or(|c| ctx.allows(&c.agent.name, c.agent.alias.as_deref())),
         None => true,
     });
@@ -2441,6 +2444,59 @@ url = "http://127.0.0.1:9"
         let ids: Vec<_> = info.agents.iter().map(|agent| agent.id.as_str()).collect();
         assert_eq!(ids, ["alpha"]);
         assert_eq!(info.default_agent, None);
+    }
+
+    #[tokio::test]
+    async fn test_info_default_agent_resolves_by_effective_identifier() {
+        // `(name="prod", alias="test")` and `(name="worker", alias="prod")`
+        // both pass config validation, and `resolve_config` resolves
+        // `default_agent = "prod"` to the *alias* owner (worker), not the
+        // agent whose bare name is "prod". The allowlist check must resolve
+        // the same way.
+        let state = make_info_state(
+            vec![
+                info_config("prod", r#"alias = "test""#, ""),
+                info_config("worker", r#"alias = "prod""#, ""),
+            ],
+            Some("prod"),
+        );
+        // Allowed only the alias "test" (the first agent): the default
+        // resolves to the forbidden second agent, so it must be hidden.
+        let auth = axum::Extension(crate::auth::AuthContext {
+            name: "restricted".to_string(),
+            allowed_agents: vec!["test".to_string()],
+        });
+        let resp = info(
+            State(state.clone()),
+            Some(auth),
+            HeaderMap::new(),
+            Query(InfoQuery::default()),
+        )
+        .await;
+        let body = parse_info_response(resp).await;
+        assert_eq!(body.default_agent, None);
+        let ids: Vec<_> = body.agents.iter().map(|agent| agent.id.as_str()).collect();
+        assert_eq!(ids, ["test"]);
+
+        // Allowed the alias "prod" (the second agent, the actual default):
+        // the default stays visible. The first agent is also listed because
+        // the allowlist matches names or aliases, and its bare name is
+        // "prod" — documented name-or-alias semantics.
+        let auth = axum::Extension(crate::auth::AuthContext {
+            name: "ops".to_string(),
+            allowed_agents: vec!["prod".to_string()],
+        });
+        let resp = info(
+            State(state),
+            Some(auth),
+            HeaderMap::new(),
+            Query(InfoQuery::default()),
+        )
+        .await;
+        let body = parse_info_response(resp).await;
+        assert_eq!(body.default_agent.as_deref(), Some("prod"));
+        let ids: Vec<_> = body.agents.iter().map(|agent| agent.id.as_str()).collect();
+        assert_eq!(ids, ["test", "prod"]);
     }
 
     #[test]
