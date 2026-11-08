@@ -138,6 +138,8 @@ pub struct AppState {
     pub hitl_webhook_hmac: Option<aura::hitl::WebhookHmac>,
     /// The session-state backend.
     pub session_store: Arc<dyn SessionStore>,
+    /// Compiled `[auth]` keyring; `None` when no loaded config enables auth.
+    pub auth: Option<Arc<crate::auth::KeyRing>>,
 }
 
 impl AppState {

@@ -32,6 +32,11 @@ pub struct Config {
     /// Governance integration for catalog sync and policy endpoints.
     #[serde(default)]
     pub governance: Option<GovernanceConfig>,
+    /// HTTP API authentication for the web server. `None` (no `[auth]` table)
+    /// disables it; presence of the table is the enable bit, same posture as
+    /// `[hitl]`.
+    #[serde(default)]
+    pub auth: Option<crate::auth::AuthConfig>,
 }
 
 /// Reasoning effort level for GPT-5 models
@@ -359,6 +364,10 @@ impl Config {
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
         validate_llm_api_key(&self.agent.llm, "agent.llm")?;
+
+        if let Some(auth) = &self.auth {
+            auth.validate()?;
+        }
 
         if let Some(orch) = &self.orchestration {
             for (name, worker) in &orch.workers {

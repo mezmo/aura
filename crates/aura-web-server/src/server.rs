@@ -491,6 +491,26 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         }
     }
 
+    // HTTP API-key auth ([auth] table, any config): compiled once at startup.
+    // A malformed keyring fails the boot, not the first request.
+    let keyring = match crate::auth::build_keyring(&configs_arc) {
+        Ok(ring) => ring,
+        Err(e) => {
+            error!("Invalid [auth] configuration: {e}");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("auth configuration error: {e}"),
+            ));
+        }
+    };
+    match &keyring {
+        Some(ring) => info!(
+            "API-key auth enabled ({} principal(s))",
+            ring.principal_count()
+        ),
+        None => info!("API-key auth disabled (no [auth] table)"),
+    }
+
     let slack_api = if args.enable_slack {
         let (Some(bot_token), Some(app_token)) =
             (args.slack_bot_token.clone(), args.slack_app_token.clone())
@@ -537,6 +557,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         ),
         hitl_webhook_hmac: ingress_hmac.clone(),
         session_store: session_store.clone(),
+        auth: keyring.clone(),
     });
 
     if let Some(api) = slack_api {
@@ -573,6 +594,10 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
+            crate::auth::require_auth,
+        ))
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
             shutdown_guard,
         ))
         .with_state(app_state.clone());
@@ -607,6 +632,13 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             .layer(tower_http::timeout::TimeoutLayer::with_status_code(
                 axum::http::StatusCode::REQUEST_TIMEOUT,
                 std::time::Duration::from_secs(120),
+            ))
+            // The A2A router is merged after the main router's layers, so it
+            // needs its own auth layer. The agent-card path stays open via
+            // `auth::is_open_path`.
+            .layer(middleware::from_fn_with_state(
+                app_state.clone(),
+                crate::auth::require_auth,
             ));
 
         app.merge(a2a_router)

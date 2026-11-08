@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod config;
 pub mod env;
 pub mod error;
@@ -17,6 +18,7 @@ mod config_test;
 #[cfg(test)]
 mod test_env_lock;
 
+pub use auth::{ApiKeyConfig, AuthConfig, AuthMode, hash_api_key};
 pub use config::*;
 pub use env::resolve_env_vars;
 pub use error::ConfigError;

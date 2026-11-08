@@ -850,6 +850,7 @@ mod tests {
             pending_approvals: aura::hitl::PendingApprovals::new(),
             hitl_webhook_hmac: None,
             session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
+            auth: None,
         });
         AuraAgentExecutor::new(app_state, SharedTaskStore::default())
     }
@@ -863,6 +864,7 @@ mod tests {
             orchestration: None,
             hitl: None,
             governance: None,
+            auth: None,
             agent: aura_config::AgentConfig {
                 name: name.to_owned(),
                 alias: alias.map(str::to_owned),

@@ -28,6 +28,9 @@ regex = { workspace = true }
 # Glob matching for HITL tool-name patterns
 globset = { workspace = true }
 
+# SHA-256 for [auth] API key hashes
+sha2 = { workspace = true }
+
 # Directory perms validation
 tempfile = "3"
 

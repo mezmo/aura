@@ -1,6 +1,7 @@
 //! Aura web server — OpenAI-compatible API for aura agents.
 
 pub mod a2a;
+pub mod auth;
 pub mod handlers;
 pub mod server;
 pub mod session_store;

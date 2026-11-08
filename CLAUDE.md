@@ -70,6 +70,13 @@ aura/
 - Support for multiple LLM providers (OpenAI, Anthropic, Bedrock, Gemini, Ollama, OpenRouter)
 - Dynamic tool registration
 
+### HTTP API Authentication (`[auth]`)
+- Presence of the `[auth]` table in any loaded config enables API-key auth for the whole web server (same enable-by-presence posture as `[hitl]`); keys merge into one deployment-wide keyring and principal names must be unique across configs.
+- Keys are stored as SHA-256 hex hashes (`key_hash`, optionally `key_hash_previous` for zero-downtime rotation); raw key material never lives in the config file and can arrive via `{{ env.* }}`. Clients send the raw key as `Authorization: Bearer` or `x-api-key`; the verifier hashes and constant-time compares.
+- Middleware (`crates/aura-web-server/src/auth.rs::require_auth`) runs inside `shutdown_guard`; open paths are `/health`, `/.well-known/agent-card.json`, and `/v1/approvals/*` (which keeps its own HMAC posture). Failures return OpenAI-shaped 401 (`invalid_api_key`).
+- Per-key `agents` allowlist (default `["*"]`) is enforced in `prepare_request` (403 `permission_error`) and filters `/v1/models`. With auth on, chat sessions are namespaced per principal (`{key_name}:{session_id}`) so callers cannot share or hijack each other's session state, and the principal is stamped on the request span as `enduser.id`.
+- The A2A router is merged after the main router's layers and gets its own copy of the auth layer. The CLI standalone backend never enables auth (`AppState.auth = None`).
+
 ### MCP Integration
 - **HTTP Transport**: Full authentication and tool execution
 - **SSE Transport**: AWS Knowledge Base integration

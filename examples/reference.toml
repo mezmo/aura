@@ -263,3 +263,28 @@ model = "gpt-5.2"
 # model = "anthropic/claude-sonnet-4"
 # base_url = "https://custom-endpoint/v1"  # optional: OpenRouter-compatible proxies only
 
+
+# ---------------------------------------------------------------------------
+# HTTP API authentication (web server only)
+# ---------------------------------------------------------------------------
+# Presence of the [auth] table enables API-key auth for the whole web server.
+# Clients must send `Authorization: Bearer <key>` (or `x-api-key: <key>`);
+# requests without a valid key get an OpenAI-shaped 401.
+#
+# Keys are stored as SHA-256 hashes so raw secrets never live in this file:
+#   printf '%s' "$MY_SECRET_KEY" | sha256sum
+# Hashes can come from the environment via {{ env.* }} templating.
+#
+# [auth]
+# mode = "api-keys"        # default when the table is present; "off" disables
+#
+# [[auth.keys]]
+# name = "sre-team"                     # principal name (logs, session namespace)
+# key_hash = "{{ env.AURA_KEY_SRE_SHA256 }}"
+# # key_hash_previous = "..."           # still accepted; for zero-downtime rotation
+# agents = ["*"]                        # agent names/aliases this key may invoke
+#
+# [[auth.keys]]
+# name = "librechat"
+# key_hash = "{{ env.AURA_KEY_LIBRECHAT_SHA256 }}"
+# agents = ["incident-response"]        # allowlist: also filters /v1/models
