@@ -309,3 +309,10 @@ model = "gpt-5.2"
 # # require_claim_values = ["sre"]      # ...string or array claim must match one
 # # clock_skew_secs = 60
 # # jwks_refresh_secs = 3600            # unknown `kid` forces an earlier refresh
+# # # Per-group allowlists (keep table arrays last in [auth.oidc]): matching
+# # # rules' agents union and replace allowed_agents for that token; no match
+# # # falls back to allowed_agents. A rule match never bypasses the gate.
+# # [[auth.oidc.claim_agents]]
+# # claim = "groups"
+# # value = "sre"
+# # agents = ["incident-response"]

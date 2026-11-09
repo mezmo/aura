@@ -403,7 +403,7 @@ impl OidcValidator {
         };
         AuthOutcome::Authenticated(AuthContext {
             name: name.to_string(),
-            allowed_agents: self.cfg.allowed_agents.clone(),
+            allowed_agents: self.allowed_agents_for(&claims),
         })
     }
 
@@ -414,13 +414,8 @@ impl OidcValidator {
         let Some(claim) = &self.cfg.require_claim else {
             return true;
         };
-        let Some(value) = claims.get(claim) else {
+        let Some(strings) = claim_strings(claims, claim) else {
             return false;
-        };
-        let strings: Vec<&str> = match value {
-            serde_json::Value::String(s) => vec![s.as_str()],
-            serde_json::Value::Array(items) => items.iter().filter_map(|v| v.as_str()).collect(),
-            _ => return false,
         };
         if self.cfg.require_claim_values.is_empty() {
             // "Present and non-empty": an IdP may emit `""` or `[""]` for
@@ -430,6 +425,36 @@ impl OidcValidator {
         strings
             .iter()
             .any(|s| self.cfg.require_claim_values.iter().any(|w| w == s))
+    }
+
+    /// The agents a token may invoke: the union of every matching
+    /// `claim_agents` rule (deduplicated, first-seen order), or the global
+    /// `allowed_agents` when no rule matches. Matching a rule never bypasses
+    /// the claim gate — the gate runs first.
+    fn allowed_agents_for(
+        &self,
+        claims: &serde_json::Map<String, serde_json::Value>,
+    ) -> Vec<String> {
+        let mut union: Vec<String> = Vec::new();
+        let mut matched = false;
+        for rule in &self.cfg.claim_agents {
+            let Some(strings) = claim_strings(claims, &rule.claim) else {
+                continue;
+            };
+            if strings.iter().any(|s| *s == rule.value) {
+                matched = true;
+                for agent in &rule.agents {
+                    if !union.contains(agent) {
+                        union.push(agent.clone());
+                    }
+                }
+            }
+        }
+        if matched {
+            union
+        } else {
+            self.cfg.allowed_agents.clone()
+        }
     }
 
     /// The cached key set, refreshed when absent, stale, or (rate-limited)
@@ -542,6 +567,20 @@ impl OidcValidator {
             .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
             .map(str::to_string)
             .ok_or_else(|| format!("discovery document at {url} has no usable jwks_uri"))
+    }
+}
+
+/// The string values of a claim: a string claim yields one value, an array
+/// claim its string items, and anything else (or absence) yields `None` —
+/// an unusable claim, distinct from an empty array.
+fn claim_strings<'a>(
+    claims: &'a serde_json::Map<String, serde_json::Value>,
+    claim: &str,
+) -> Option<Vec<&'a str>> {
+    match claims.get(claim)? {
+        serde_json::Value::String(s) => Some(vec![s.as_str()]),
+        serde_json::Value::Array(items) => Some(items.iter().filter_map(|v| v.as_str()).collect()),
+        _ => None,
     }
 }
 
@@ -1418,6 +1457,7 @@ mod oidc_tests {
             jwks_url,
             principal_claim: "sub".to_string(),
             allowed_agents: vec!["*".to_string()],
+            claim_agents: vec![],
             require_claim: None,
             require_claim_values: vec![],
             clock_skew_secs: 0,
@@ -2036,5 +2076,116 @@ mod oidc_tests {
                 "missing {claim} must be rejected"
             );
         }
+    }
+
+    fn claim_agents_cfg(issuer: String, jwks_url: String) -> OidcConfig {
+        let mut cfg = oidc_cfg(issuer, Some(jwks_url));
+        cfg.allowed_agents = vec!["assistant".to_string()];
+        cfg.claim_agents = vec![
+            aura_config::ClaimAgentsRule {
+                claim: "groups".into(),
+                value: "sre".into(),
+                agents: vec!["incident-response".into(), "assistant".into()],
+            },
+            aura_config::ClaimAgentsRule {
+                claim: "groups".into(),
+                value: "oncall".into(),
+                agents: vec!["pager".into(), "assistant".into()],
+            },
+            aura_config::ClaimAgentsRule {
+                claim: "team".into(),
+                value: "platform".into(),
+                agents: vec!["platform-tools".into()],
+            },
+        ];
+        cfg
+    }
+
+    #[tokio::test]
+    async fn claim_agents_union_replaces_default_when_matched() {
+        let server = mock_idp().await;
+        let issuer = server.uri();
+        let validator = OidcValidator::new(claim_agents_cfg(
+            issuer.clone(),
+            format!("{issuer}/jwks.json"),
+        ));
+        validator.warm().await.unwrap();
+
+        // Two matching rules: union in first-seen order, deduplicated; the
+        // global default is replaced, not extended.
+        let tok = token(
+            &issuer,
+            AUDIENCE,
+            300,
+            serde_json::json!({"groups": ["sre", "oncall"]}),
+        );
+        let AuthOutcome::Authenticated(ctx) = validator.authenticate(&tok).await else {
+            panic!("expected authenticated");
+        };
+        assert_eq!(
+            ctx.allowed_agents,
+            ["incident-response", "assistant", "pager"]
+        );
+
+        // A string claim matches by equality, not containment.
+        let tok = token(&issuer, AUDIENCE, 300, serde_json::json!({"groups": "sre"}));
+        let AuthOutcome::Authenticated(ctx) = validator.authenticate(&tok).await else {
+            panic!("expected authenticated");
+        };
+        assert_eq!(ctx.allowed_agents, ["incident-response", "assistant"]);
+
+        // No rule matches: the global default applies.
+        let tok = token(
+            &issuer,
+            AUDIENCE,
+            300,
+            serde_json::json!({"groups": ["docs"]}),
+        );
+        let AuthOutcome::Authenticated(ctx) = validator.authenticate(&tok).await else {
+            panic!("expected authenticated");
+        };
+        assert_eq!(ctx.allowed_agents, ["assistant"]);
+
+        // A non-string/array claim value is unusable, not a match.
+        let tok = token(&issuer, AUDIENCE, 300, serde_json::json!({"groups": 42}));
+        let AuthOutcome::Authenticated(ctx) = validator.authenticate(&tok).await else {
+            panic!("expected authenticated");
+        };
+        assert_eq!(ctx.allowed_agents, ["assistant"]);
+    }
+
+    #[tokio::test]
+    async fn claim_agents_match_does_not_bypass_the_claim_gate() {
+        let server = mock_idp().await;
+        let issuer = server.uri();
+        let mut cfg = claim_agents_cfg(issuer.clone(), format!("{issuer}/jwks.json"));
+        cfg.require_claim = Some("approved".into());
+        cfg.require_claim_values = vec!["yes".into()];
+        let validator = OidcValidator::new(cfg);
+        validator.warm().await.unwrap();
+
+        // Matches the sre rule but fails the gate: still 403.
+        let tok = token(
+            &issuer,
+            AUDIENCE,
+            300,
+            serde_json::json!({"groups": ["sre"]}),
+        );
+        assert!(matches!(
+            validator.authenticate(&tok).await,
+            AuthOutcome::Rejected(Rejection::InsufficientScope)
+        ));
+
+        // Passes the gate and matches a rule: rule union applies.
+        let tok = token(
+            &issuer,
+            AUDIENCE,
+            300,
+            serde_json::json!({"groups": ["sre"], "approved": "yes"}),
+        );
+        let AuthOutcome::Authenticated(ctx) = validator.authenticate(&tok).await else {
+            panic!("expected authenticated");
+        };
+        assert_eq!(ctx.allowed_agents, ["incident-response", "assistant"]);
     }
 }

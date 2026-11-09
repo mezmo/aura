@@ -67,9 +67,17 @@ pub struct OidcConfig {
     #[serde(default = "default_principal_claim")]
     pub principal_claim: String,
     /// Agent names/aliases OIDC principals may invoke. `"*"` allows all.
-    /// Defaults to `["*"]`; an explicit empty list allows none.
+    /// Defaults to `["*"]`; an explicit empty list allows none. When
+    /// [`OidcConfig::claim_agents`] rules exist, this is the fallback used
+    /// for tokens whose claims match no rule.
     #[serde(default = "default_agents")]
     pub allowed_agents: Vec<String>,
+    /// Per-claim agent allowlists: each [`ClaimAgentsRule`] whose claim
+    /// matches the token contributes its agents, and the union replaces
+    /// [`OidcConfig::allowed_agents`] for that token. Matching a rule does
+    /// not grant access on its own — the `require_claim` gate still applies.
+    #[serde(default)]
+    pub claim_agents: Vec<ClaimAgentsRule>,
     /// Optional claim used to gate access (e.g. `"groups"` or `"roles"`):
     /// the claim's value must be this string, or a list containing one of
     /// [`OidcConfig::require_claim_values`].
@@ -97,6 +105,20 @@ fn default_clock_skew_secs() -> u64 {
 
 fn default_jwks_refresh_secs() -> u64 {
     3600
+}
+
+/// One `[[auth.oidc.claim_agents]]` entry: when the token's `claim` equals
+/// `value` (string claim) or contains it (array claim), the rule adds
+/// `agents` to the principal's allowlist.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimAgentsRule {
+    /// Token claim to inspect (e.g. `"groups"`, `"roles"`).
+    pub claim: String,
+    /// Value the claim must equal (string claim) or contain (array claim).
+    pub value: String,
+    /// Agents contributed when this rule matches. Names or aliases;
+    /// `"*"` allows all.
+    pub agents: Vec<String>,
 }
 
 /// One `[[auth.keys]]` entry.
@@ -253,6 +275,31 @@ impl OidcConfig {
                 return Err(ConfigError::Validation(
                     "[auth.oidc].allowed_agents must not contain empty entries".to_string(),
                 ));
+            }
+        }
+        for (i, rule) in self.claim_agents.iter().enumerate() {
+            if rule.claim.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "[auth.oidc.claim_agents[{i}]].claim must not be empty"
+                )));
+            }
+            if rule.value.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "[auth.oidc.claim_agents[{i}]].value must not be empty"
+                )));
+            }
+            if rule.agents.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "[auth.oidc.claim_agents[{i}]].agents must not be empty; \
+                     omit the rule to contribute nothing"
+                )));
+            }
+            for agent in &rule.agents {
+                if agent.trim().is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "[auth.oidc.claim_agents[{i}]].agents must not contain empty entries"
+                    )));
+                }
             }
         }
         Ok(())
@@ -483,5 +530,106 @@ require_claim_values = ["sre"]
         ))
         .expect_err("values without a claim name must fail");
         assert!(err.contains("require_claim"), "{err}");
+    }
+
+    #[test]
+    fn claim_agents_parses_and_defaults_empty() {
+        let config = parse_and_validate(&oidc_toml(
+            r#"
+issuer = "https://idp.example.com"
+audience = "aura"
+
+[[auth.oidc.claim_agents]]
+claim = "groups"
+value = "sre"
+agents = ["incident-response", "*"]
+"#,
+        ))
+        .unwrap();
+        let oidc = config.auth.unwrap().oidc.unwrap();
+        assert_eq!(oidc.claim_agents.len(), 1);
+        assert_eq!(oidc.claim_agents[0].claim, "groups");
+        assert_eq!(oidc.claim_agents[0].value, "sre");
+        assert_eq!(
+            oidc.claim_agents[0].agents,
+            vec!["incident-response".to_string(), "*".to_string()]
+        );
+
+        let config = parse_and_validate(&oidc_toml(
+            r#"
+issuer = "https://idp.example.com"
+audience = "aura"
+"#,
+        ))
+        .unwrap();
+        assert!(config.auth.unwrap().oidc.unwrap().claim_agents.is_empty());
+    }
+
+    #[test]
+    fn claim_agents_rejects_unusable_rules() {
+        let err = parse_and_validate(&oidc_toml(
+            r#"
+issuer = "https://idp.example.com"
+audience = "aura"
+
+[[auth.oidc.claim_agents]]
+claim = ""
+value = "sre"
+agents = ["a"]
+"#,
+        ))
+        .expect_err("empty claim must fail");
+        assert!(
+            err.contains("claim_agents[0]].claim must not be empty"),
+            "{err}"
+        );
+
+        let err = parse_and_validate(&oidc_toml(
+            r#"
+issuer = "https://idp.example.com"
+audience = "aura"
+
+[[auth.oidc.claim_agents]]
+claim = "groups"
+value = "  "
+agents = ["a"]
+"#,
+        ))
+        .expect_err("blank value must fail");
+        assert!(
+            err.contains("claim_agents[0]].value must not be empty"),
+            "{err}"
+        );
+
+        let err = parse_and_validate(&oidc_toml(
+            r#"
+issuer = "https://idp.example.com"
+audience = "aura"
+
+[[auth.oidc.claim_agents]]
+claim = "groups"
+value = "sre"
+agents = []
+"#,
+        ))
+        .expect_err("empty agents must fail");
+        assert!(
+            err.contains("claim_agents[0]].agents must not be empty"),
+            "{err}"
+        );
+
+        let err = parse_and_validate(&oidc_toml(
+            r#"
+issuer = "https://idp.example.com"
+audience = "aura"
+
+[[auth.oidc.claim_agents]]
+claim = "groups"
+value = "sre"
+agents = ["ok", ""]
+"#,
+        ))
+        .expect_err("empty agent entry must fail");
+        assert!(err.contains("empty entries"), "{err}");
     }
 }
