@@ -286,8 +286,35 @@ pub(crate) fn config_fingerprint(build_context: &AgentBuildContext) -> String {
             .as_ref()
             .and_then(|o| serde_json::to_value(&o.workers).ok()),
     });
+    let source = sorted_keys(source);
     let canonical = serde_json::to_string(&source).unwrap_or_else(|_| source.to_string());
     hex::encode(Sha256::digest(canonical.as_bytes()))
+}
+
+/// Rebuild `value` with every object's keys in sorted order.
+///
+/// The fingerprint must not depend on map order: `workers` is a `HashMap`,
+/// and serde_json keeps insertion order wherever any crate in the build
+/// enables its `preserve_order` feature. Sorted keys are also what
+/// serde_json's default map produces, so this leaves every existing
+/// fingerprint unchanged.
+fn sorted_keys(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, sorted_keys(value)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sorted_keys).collect())
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -708,6 +735,25 @@ mod tests {
 
     /// The fingerprint is stable for an unchanged config and moves when the
     /// gating or tool surface changes.
+    #[test]
+    fn fingerprint_keys_are_sorted_whatever_the_insertion_order() {
+        let mut forward = serde_json::Map::new();
+        let mut backward = serde_json::Map::new();
+        for key in ["alpha", "beta", "gamma"] {
+            forward.insert(key.to_string(), json!({"z": 1, "a": [{"y": 2, "b": 3}]}));
+        }
+        for key in ["gamma", "beta", "alpha"] {
+            let mut inner = serde_json::Map::new();
+            inner.insert("a".to_string(), json!([{"b": 3, "y": 2}]));
+            inner.insert("z".to_string(), json!(1));
+            backward.insert(key.to_string(), serde_json::Value::Object(inner));
+        }
+        let canonical = |map| serde_json::to_string(&sorted_keys(serde_json::Value::Object(map)));
+        let expected = r#"{"alpha":{"a":[{"b":3,"y":2}],"z":1},"beta":{"a":[{"b":3,"y":2}],"z":1},"gamma":{"a":[{"b":3,"y":2}],"z":1}}"#;
+        assert_eq!(canonical(forward).unwrap(), expected);
+        assert_eq!(canonical(backward).unwrap(), expected);
+    }
+
     #[test]
     fn config_fingerprint_stable_and_sensitive() {
         fn gated_build_context(pattern: &str) -> crate::config::AgentBuildContext {
