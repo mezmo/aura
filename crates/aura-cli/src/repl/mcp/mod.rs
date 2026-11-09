@@ -127,6 +127,17 @@ mod tests {
     }
 
     #[test]
+    fn lists_a_server_on_an_unknown_transport() {
+        let mut agent = crate::test_fixtures::agent("sre", vec![]);
+        agent.mcp_servers = Some(BTreeMap::from([(
+            "future".to_string(),
+            McpServerOverview::Unknown,
+        )]));
+        let text = strip_sgr(&format_server_list(Some(&agent)));
+        assert!(text.contains("future — unknown transport"), "{text}");
+    }
+
+    #[test]
     fn empty_set_nudges_setup() {
         let mut agent = crate::test_fixtures::agent("sre", vec![]);
         agent.mcp_servers = Some(BTreeMap::new());

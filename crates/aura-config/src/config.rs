@@ -952,10 +952,7 @@ pub struct AgentConfig {
     /// Example: `mcp_filter = ["sin", "cos", "degreesToRadians"]`
     #[serde(default)]
     pub mcp_filter: Option<Vec<GlobPattern>>,
-    /// Whether this agent (single-agent or orchestration coordinator) may
-    /// invoke client-side tools advertised on the request. When false
-    /// (default), client tools are not attached even if the request
-    /// supplied them.
+    /// Whether this agent may invoke client-side tools advertised on the request.
     #[serde(default)]
     pub enable_client_tools: bool,
     /// Glob patterns selecting which client-side tools this agent can call.
@@ -1075,8 +1072,8 @@ pub struct AgentSettings {
     /// workers that don't provide an override).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scratchpad: Option<ScratchpadConfig>,
-    /// Whether this agent (single-agent or orchestration coordinator) may
-    /// invoke client-side tools advertised on the request.
+    /// Whether this agent may invoke client-side tools advertised on the
+    /// request.
     #[serde(default)]
     pub enable_client_tools: bool,
     /// Glob patterns selecting which client-side tools this agent can call.

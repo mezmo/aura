@@ -234,11 +234,11 @@ pub async fn prepare_request(
     chat_session_id: &aura::SessionId,
     req_headers_map: &HashMap<String, String>,
 ) -> Result<RequestSetup, PrepareError> {
-    // Client-side tools are gated per-agent by `[agent].enable_client_tools`
-    // (single-agent configs only — orchestrated configs drop client tools with a
-    // warning in `build_streaming_agent`). The handler always honors `req.tools`
-    // if supplied; the agent builder filters and only attaches them to agents
-    // that opted in. `has_client_tools` here is a *transport* flag — it tells
+    // Client-side tools go only to a single agent whose config sets
+    // `[agent].enable_client_tools`: the single-agent branch below checks the
+    // opt-in, and `prepare_agent` applies `client_tool_filter`. An orchestrated
+    // config gets none, since `build_streaming_agent_with_tools` drops them
+    // with a warning. `has_client_tools` here is a *transport* flag — it tells
     // the streaming layer to keep assistant tool_calls in chat history and emit
     // `finish_reason: "tool_calls"` when one fires.
     let has_client_tools = req.tools.is_some();
@@ -313,7 +313,6 @@ pub async fn prepare_request(
     let (streaming_agent, tools_json): (Arc<dyn StreamingAgent>, Vec<String>) =
         if config.orchestration_enabled() {
             // Orchestration path: build via streaming agent builder (returns Orchestrator).
-            // Client tools are filtered per-coordinator/per-worker inside the orchestrator.
             let builder = RigBuilder::new(config.clone(), data.pending_approvals.clone())
                 .with_hitl_hmac(data.hitl_webhook_hmac.clone())
                 .with_skill_recorder(skill_recorder.clone());

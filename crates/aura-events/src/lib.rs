@@ -222,8 +222,8 @@ impl std::fmt::Display for EmptyId {
 impl std::error::Error for EmptyId {}
 
 nonempty_string_newtype! {
-    /// Identifier for a session: an agent's identity over time, and the key
-    /// its [`SessionEvent`](run::SessionEvent) stream is ordered under.
+    /// Identifier for a session: a conversation's identity over time, and the
+    /// key its [`SessionEvent`](run::SessionEvent) stream is ordered under.
     SessionId
 }
 
@@ -726,6 +726,9 @@ pub enum McpServerOverview {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tools: Option<Vec<McpToolOverview>>,
     },
+    /// A value this version of the crate does not know.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// One agent entry in the `GET /aura/info` response.
@@ -779,6 +782,9 @@ pub enum WorkerPhase {
     Executing,
     /// Worker is analyzing results
     Analyzing,
+    /// A value this version of the crate does not know.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// Aura-specific streaming events sent via SSE `event:` field.
@@ -1485,6 +1491,39 @@ mod tests {
         );
     }
 
+    /// A transport added by a newer server keeps the `/aura/info` response
+    /// around it, so an older reader does not lose every agent's overview.
+    #[test]
+    fn an_unknown_mcp_transport_reads_as_unknown_and_keeps_the_server_info() {
+        let info: ServerInfo = serde_json::from_value(serde_json::json!({
+            "agents": [{
+                "id": "ops",
+                "model": "gpt-4o",
+                "mcp_servers": {
+                    "future": {
+                        "transport": "websocket",
+                        "url": "wss://mcp.example.com",
+                        "tools": [{"name": "list_incidents"}]
+                    },
+                    "local": {"transport": "stdio", "command": "fs-server"}
+                }
+            }]
+        }))
+        .expect("an unknown transport should not fail the response");
+
+        let servers = info.agents[0].mcp_servers.as_ref().unwrap();
+        assert_eq!(servers["future"], McpServerOverview::Unknown);
+        assert_eq!(
+            servers["local"],
+            McpServerOverview::Stdio {
+                command: "fs-server".to_string(),
+                description: None,
+                tools: None,
+            }
+        );
+        assert!(serde_json::to_value(&servers["future"]).is_err());
+    }
+
     #[test]
     fn tool_complete_roundtrip() {
         let event = AuraStreamEvent::tool_complete_success(
@@ -1650,6 +1689,62 @@ mod tests {
         }
     }
 
+    /// Each approval event a newer producer extends keeps its identity, so an
+    /// older reader can still show it, and refuses to serialize back.
+    #[test]
+    fn unknown_approval_kinds_read_as_unknown_and_keep_the_event() {
+        let requested: ApprovalRequested = serde_json::from_value(serde_json::json!({
+            "decision_id": "d-1",
+            "tool_name": "deploy",
+            "origin": {"kind": "policy_engine", "rule": "r1"},
+            "scope": {"kind": "subagent", "depth": 2},
+        }))
+        .expect("an unknown origin or scope should not fail approval_requested");
+        assert_eq!(requested.decision_id, "d-1");
+        assert!(matches!(requested.origin, ApprovalOriginWire::Unknown));
+        assert!(matches!(requested.scope, AgentScopeWire::Unknown));
+        assert!(serde_json::to_value(&requested).is_err());
+
+        let pending: ApprovalPending = serde_json::from_value(serde_json::json!({
+            "decision_id": "d-1",
+            "tool_name": "deploy",
+            "arguments": {},
+            "origin": {"kind": "policy_engine"},
+            "scope": {"kind": "subagent"},
+            "expires_at": "2026-11-04T00:00:00Z",
+        }))
+        .expect("an unknown origin or scope should not fail approval_pending");
+        assert!(matches!(pending.origin, ApprovalOriginWire::Unknown));
+        assert!(matches!(pending.scope, AgentScopeWire::Unknown));
+        assert!(serde_json::to_value(&pending).is_err());
+
+        let completed: ApprovalCompleted = serde_json::from_value(serde_json::json!({
+            "decision_id": "d-1",
+            "outcome": {"kind": "deferred", "until": "later"},
+            "duration_ms": 7,
+            "scope": {"kind": "coordinator", "run_id": "r1"},
+        }))
+        .expect("an unknown outcome should not fail approval_completed");
+        assert!(matches!(completed.outcome, ApprovalOutcomeWire::Unknown));
+        assert!(serde_json::to_value(&completed).is_err());
+    }
+
+    #[test]
+    fn an_unknown_cancel_reason_keeps_the_cancelled_outcome() {
+        let outcome: ApprovalOutcomeWire = serde_json::from_value(serde_json::json!({
+            "kind": "cancelled",
+            "reason": "policy_revoked",
+        }))
+        .expect("an unknown cancel reason should not fail the outcome");
+        assert!(matches!(
+            outcome,
+            ApprovalOutcomeWire::Cancelled {
+                reason: CancelReasonWire::Unknown
+            }
+        ));
+        assert!(serde_json::to_value(&outcome).is_err());
+    }
+
     #[test]
     fn approval_completed_error_roundtrip_and_event_name() {
         let event = AuraStreamEvent::ApprovalCompleted(ApprovalCompleted {
@@ -1778,6 +1873,9 @@ pub enum ApprovalOriginWire {
         #[serde(default)]
         agent_name: String,
     },
+    /// A value this version of the crate does not know.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// Which agent surface is asking for approval.
@@ -1799,6 +1897,9 @@ pub enum AgentScopeWire {
     Coordinator {
         run_id: String,
     },
+    /// A value this version of the crate does not know.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// The terminal outcome of an approval.
@@ -1819,6 +1920,9 @@ pub enum ApprovalOutcomeWire {
     Errored {
         message: String,
     },
+    /// A value this version of the crate does not know.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// Why a pending approval was cancelled rather than decided or timed out.
@@ -1828,6 +1932,9 @@ pub enum CancelReasonWire {
     ClientDisconnected,
     Shutdown,
     SenderDropped,
+    /// A value this version of the crate does not know.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// `approval_requested`: an approval was raised (emitted on both routes).

@@ -25,6 +25,9 @@ SNAPSHOT_DATE="${SNAPSHOT_DATE:-}"
 COUNT_PROPERTY="${COUNT_PROPERTY:-download_count}"
 WORK_DIR=""
 
+# hogql_request's status when PostHog could not answer. EX_TEMPFAIL.
+HOGQL_UNAVAILABLE=75
+
 # RFC 4122 version-5 UUID: sha1(namespace bytes || name), with the version and
 # variant nibbles forced. Matches Python's uuid.uuid5 byte for byte.
 uuid5() {
@@ -79,7 +82,9 @@ valid_date() {
 # Plain --retry covers the transient cases (timeouts, 429, 5xx) and leaves
 # 4xx alone: an auth or project error repeated four times is noise, and the
 # status is worth naming because every likely cause is a misconfiguration
-# rather than an outage.
+# rather than an outage. A 5xx or a timeout that outlasts the retries is
+# PostHog failing to answer, not a misconfiguration, so it returns
+# HOGQL_UNAVAILABLE without the configuration hint.
 #
 # The body goes to a file rather than stdout: curl truncates a file before each
 # retry, but on stdout a retried 504's body ("upstream request timeout") stays
@@ -96,12 +101,24 @@ hogql_request() {
             "${POSTHOG_API_HOST%/}/api/projects/${POSTHOG_PROJECT_ID}/query/") || rc=$?
     body=$(cat "${out}")
     rm -f "${out}"
-    if [ "${rc}" -ne 0 ]; then
-        return "${rc}"
-    fi
+    # 28 is a timeout. 7, 35, 52 and 56 are a connection refused, a failed
+    # TLS handshake, an empty reply and a reset, which --retry does not retry.
+    case "${rc}" in
+        0) ;;
+        28)
+            echo "error: PostHog query API timed out for project ${POSTHOG_PROJECT_ID}" >&2
+            return "${HOGQL_UNAVAILABLE}" ;;
+        7 | 35 | 52 | 56)
+            echo "error: PostHog query API could not be reached for project ${POSTHOG_PROJECT_ID} (curl exit ${rc})" >&2
+            return "${HOGQL_UNAVAILABLE}" ;;
+        *) return "${rc}" ;;
+    esac
     if [ "${status}" != 200 ]; then
         echo "error: PostHog query API returned ${status} for project ${POSTHOG_PROJECT_ID}" >&2
         echo "       ${body}" >&2
+        case "${status}" in
+            5??) return "${HOGQL_UNAVAILABLE}" ;;
+        esac
         echo "       POSTHOG_PROJECT_ID must name the project POSTHOG_PROJECT_API_KEY writes to," >&2
         echo "       and POSTHOG_API_READ_KEY must hold query:read on that project" >&2
         return 1
@@ -158,6 +175,151 @@ PY
         || { echo "selftest: a retried query read back '${got}', want the 200's row alone" >&2; exit 1; }
 }
 
+# Self-test for how a failed query is reported and what the read-back does
+# with it. A stub server answers every query with a 504, or with a 403 for the
+# key "forbidden": the 504 must come back as HOGQL_UNAVAILABLE without the
+# configuration hint, and the 403 as a plain failure with it. verify_snapshot
+# must poll through an unavailable read-back and abort on any other failure.
+# Callers run this from their own selftest.
+hogql_unavailable_selftest() {
+    local tmp=$1 pid port="" rc err
+    python3 - "${tmp}/unavailable.port" <<'PY' &
+import http.server, os, sys
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        if self.headers.get("Authorization") == "Bearer forbidden":
+            code, body = 403, b'{"detail": "forbidden"}'
+        else:
+            code, body = 504, b'{"detail": "Query has hit the max execution time"}'
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+with open(sys.argv[1] + ".tmp", "w") as f:
+    f.write(str(server.server_address[1]))
+os.rename(sys.argv[1] + ".tmp", sys.argv[1])
+server.serve_forever()
+PY
+    pid=$!
+    for _ in $(seq 50); do
+        [ -s "${tmp}/unavailable.port" ] && { port=$(cat "${tmp}/unavailable.port"); break; }
+        sleep 0.1
+    done
+    if [ -z "${port}" ]; then
+        kill "${pid}" 2>/dev/null || true
+        wait "${pid}" 2>/dev/null || true
+        echo "selftest: the stub PostHog server did not start" >&2
+        exit 1
+    fi
+
+    rc=0
+    err=$(POSTHOG_API_HOST="http://127.0.0.1:${port}" POSTHOG_API_READ_KEY=selftest \
+          hogql_request "SELECT 1" 2>&1 >/dev/null) || rc=$?
+    if [ "${rc}" -ne "${HOGQL_UNAVAILABLE}" ] || [[ "${err}" == *"must name the project"* ]]; then
+        kill "${pid}" 2>/dev/null || true
+        wait "${pid}" 2>/dev/null || true
+        echo "selftest: a 504 returned ${rc} with '${err}', want ${HOGQL_UNAVAILABLE} without the configuration hint" >&2
+        exit 1
+    fi
+
+    rc=0
+    err=$(POSTHOG_API_HOST="http://127.0.0.1:${port}" POSTHOG_API_READ_KEY=forbidden \
+          hogql_request "SELECT 1" 2>&1 >/dev/null) || rc=$?
+    kill "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+    if [ "${rc}" -ne 1 ] || [[ "${err}" != *"must name the project"* ]]; then
+        echo "selftest: a 403 returned ${rc} with '${err}', want 1 with the configuration hint" >&2
+        exit 1
+    fi
+
+    # The stub server is gone, so its port now refuses the connection.
+    rc=0
+    POSTHOG_API_HOST="http://127.0.0.1:${port}" POSTHOG_API_READ_KEY=selftest \
+        hogql_request "SELECT 1" >/dev/null 2>&1 || rc=$?
+    [ "${rc}" -eq "${HOGQL_UNAVAILABLE}" ] \
+        || { echo "selftest: a refused connection returned ${rc}, want ${HOGQL_UNAVAILABLE}" >&2; exit 1; }
+
+    # The read-back cases run under `set -e`, as the scripts call
+    # verify_snapshot. A subshell on the left of `||` would turn it off.
+    # State goes through files because each query runs in its own command
+    # substitution.
+
+    # count_ingested cannot answer on the first poll; the second finds it all.
+    set +e
+    (
+        set -e
+        WORK_DIR=${tmp}
+        : > "${tmp}/uuids"
+        echo 0 > "${tmp}/polls"
+        sleep() { :; }
+        count_ingested() {
+            local n
+            n=$(( $(cat "${tmp}/polls") + 1 ))
+            echo "${n}" > "${tmp}/polls"
+            [ "${n}" -gt 1 ] || return "${HOGQL_UNAVAILABLE}"
+            printf '1\t5\n'
+        }
+        probes_landed() { echo 1; }
+        VERIFY_TIMEOUT=60 verify_snapshot 2000-01-01 1 5 1 >/dev/null 2>&1
+    )
+    rc=$?
+    set -e
+    [ "${rc}" -eq 0 ] && [ "$(cat "${tmp}/polls")" = 2 ] \
+        || { echo "selftest: verify_snapshot returned ${rc} after $(cat "${tmp}/polls") poll(s), want 0 after polling through an unavailable count" >&2; exit 1; }
+
+    # probes_landed cannot answer on the first poll; the second finds it all.
+    set +e
+    (
+        set -e
+        WORK_DIR=${tmp}
+        : > "${tmp}/uuids"
+        echo 0 > "${tmp}/polls"
+        sleep() { :; }
+        count_ingested() { printf '1\t5\n'; }
+        probes_landed() {
+            local n
+            n=$(( $(cat "${tmp}/polls") + 1 ))
+            echo "${n}" > "${tmp}/polls"
+            [ "${n}" -gt 1 ] || return "${HOGQL_UNAVAILABLE}"
+            echo 1
+        }
+        VERIFY_TIMEOUT=60 verify_snapshot 2000-01-01 1 5 1 >/dev/null 2>&1
+    )
+    rc=$?
+    set -e
+    [ "${rc}" -eq 0 ] && [ "$(cat "${tmp}/polls")" = 2 ] \
+        || { echo "selftest: verify_snapshot returned ${rc} after $(cat "${tmp}/polls") poll(s), want 0 after polling through unavailable probes" >&2; exit 1; }
+
+    # A read-back query that fails outright aborts at its first query. The real
+    # count_ingested runs, so this also covers it passing the failure on.
+    set +e
+    (
+        set -e
+        WORK_DIR=${tmp}
+        echo 00000000-0000-0000-0000-000000000000 > "${tmp}/uuids"
+        rm -f "${tmp}"/uchunk.*
+        echo 0 > "${tmp}/polls"
+        sleep() { :; }
+        hogql_row() {
+            echo $(( $(cat "${tmp}/polls") + 1 )) > "${tmp}/polls"
+            return 1
+        }
+        probes_landed() { echo 1; }
+        VERIFY_TIMEOUT=2 verify_snapshot 2000-01-01 1 5 1 >/dev/null 2>&1
+    )
+    rc=$?
+    set -e
+    [ "${rc}" -eq 1 ] && [ "$(cat "${tmp}/polls")" = 1 ] \
+        || { echo "selftest: verify_snapshot returned ${rc} after $(cat "${tmp}/polls") quer(ies) on a failed read-back, want 1 after one" >&2; exit 1; }
+}
+
 hogql_scalar() {
     hogql_request "$1" | jq -r '.results[0][0]'
 }
@@ -197,11 +359,16 @@ add_probe() {
     mv "${payload}.probed" "${payload}"
 }
 
+# The timestamp bound is what keeps this query cheap: without it PostHog
+# scans every probe event ever sent. A probe is stamped with the time this
+# run sent it, so a day back covers it.
 probes_landed() {
     local list
     list=$(sed "s/^/'/; s/$/'/" "${WORK_DIR}/probes" | paste -sd, -)
     hogql_scalar "SELECT count(DISTINCT uuid) FROM events \
-        WHERE event = '${EVENT_NAME}_probe' AND uuid IN (${list})"
+        WHERE event = '${EVENT_NAME}_probe' \
+          AND timestamp >= now() - INTERVAL 1 DAY \
+          AND uuid IN (${list})"
 }
 
 post_batch() {
@@ -250,7 +417,7 @@ count_ingested() {
             WHERE event = '${EVENT_NAME}' \
               AND timestamp = toDateTime('${date} 23:59:59') \
               AND uuid IN (${list}) \
-            GROUP BY uuid)")
+            GROUP BY uuid)") || return $?
         found=${row%%$'\t'*}
         downloads=${row##*$'\t'}
         # A chunk none of whose events are queryable yet answers with count 0
@@ -273,16 +440,30 @@ count_ingested() {
 }
 
 # Poll until the snapshot is queryable, since ingestion lags the send.
+#
+# A read-back PostHog cannot answer (HOGQL_UNAVAILABLE) says nothing about
+# whether the send landed, so it is polled through like a snapshot not yet
+# ingested. Any other failure aborts.
 verify_snapshot() {
     local date=$1 expected=$2 expected_downloads=$3 probes=$4
-    local deadline row got downloads seen
+    local deadline row got downloads seen rc unavailable=0
     split -l 500 "${WORK_DIR}/uuids" "${WORK_DIR}/uchunk."
     deadline=$(( $(date +%s) + VERIFY_TIMEOUT ))
     while :; do
-        row=$(count_ingested "${date}")
+        rc=0
+        { row=$(count_ingested "${date}") && seen=$(probes_landed); } || rc=$?
+        if [ "${rc}" -eq "${HOGQL_UNAVAILABLE}" ]; then
+            echo "warning: PostHog could not answer the read-back for ${date}; polling again" >&2
+            unavailable=1
+            row=$'0\t0'
+            seen=0
+        elif [ "${rc}" -ne 0 ]; then
+            return "${rc}"
+        else
+            unavailable=0
+        fi
         got=${row%%$'\t'*}
         downloads=${row##*$'\t'}
-        seen=$(probes_landed)
         case "${seen}" in '' | null) seen=0 ;; esac
         if [ "${got}" -ge "${expected}" ] && [ "${downloads}" -ge "${expected_downloads}" ] \
            && [ "${seen}" -ge "${probes}" ]; then
@@ -290,6 +471,10 @@ verify_snapshot() {
             return 0
         fi
         if [ "$(date +%s)" -ge "${deadline}" ]; then
+            if [ "${unavailable}" -eq 1 ]; then
+                echo "error: PostHog could not answer the read-back for ${date} within ${VERIFY_TIMEOUT}s" >&2
+                return 1
+            fi
             echo "error: PostHog holds ${got} of ${expected} event(s), ${downloads} of ${expected_downloads} counted, and ${seen} of ${probes} probe(s) for ${date} after ${VERIFY_TIMEOUT}s" >&2
             return 1
         fi

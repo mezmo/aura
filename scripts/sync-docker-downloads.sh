@@ -192,6 +192,7 @@ selftest() {
     [ "${got}" = "false" ] || { echo "selftest: person profiles not suppressed" >&2; exit 1; }
 
     hogql_retry_selftest "${tmp}"
+    hogql_unavailable_selftest "${tmp}"
 
     echo "selftest: ok"
 }

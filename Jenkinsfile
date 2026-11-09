@@ -345,7 +345,6 @@ pipeline {
               steps {
                 script {
                   withReport('coverage', 'make test-integration-ci') {
-                    junit testResults: 'report/ci/junit.xml', allowEmptyResults: true
                     sh 'make clean-profile'
                     recordCoverage(
                       tools: [[parser: 'COBERTURA', pattern: 'report/ci/cobertura.xml']],
@@ -362,6 +361,11 @@ pipeline {
               }
               post {
                 always {
+                  script {
+                    if (fileExists('report/ci/junit.xml')) {
+                      junit testResults: 'report/ci/junit.xml', allowEmptyResults: true
+                    }
+                  }
                   publishHTML target: [
                     allowMissing: false,
                     alwaysLinkToLastBuild: false,

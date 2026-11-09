@@ -47,8 +47,15 @@ impl AgentEvent {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ToolOutcome {
-    Success { result: String },
-    Failure { error: String },
+    Success {
+        result: String,
+    },
+    Failure {
+        error: String,
+    },
+    /// A value this version of the crate does not know.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// What an agent has to say about its own execution.
@@ -434,5 +441,107 @@ mod tests {
         .unwrap();
         assert!(matches!(event.payload, AgentEventPayload::Unknown));
         assert!(serde_json::to_value(&event).is_err());
+    }
+
+    /// A worker phase added by a newer producer keeps the `WorkerPhase` event
+    /// around it, so an older reader does not lose the event.
+    #[test]
+    fn an_unknown_worker_phase_reads_as_unknown_and_keeps_the_event() {
+        let event: AgentEvent = serde_json::from_value(json!({
+            "agent": serde_json::to_value(EmittingAgent::single_agent()).unwrap(),
+            "payload": {"type": "worker_phase", "phase": "reflecting", "task_id": 2}
+        }))
+        .expect("an unknown phase should not fail the event");
+
+        let AgentEventPayload::WorkerPhase { phase, task_id } = &event.payload else {
+            panic!("expected WorkerPhase, got {:?}", event.payload);
+        };
+        assert!(matches!(phase, WorkerPhase::Unknown));
+        assert_eq!(*task_id, Some(2));
+        assert!(serde_json::to_value(&event).is_err());
+    }
+
+    /// A routing mode added by a newer producer keeps the `PlanCreated` event
+    /// around it, so an older reader does not lose the event.
+    #[test]
+    fn an_unknown_routing_mode_reads_as_unknown_and_keeps_the_event() {
+        let event: AgentEvent = serde_json::from_value(json!({
+            "agent": serde_json::to_value(EmittingAgent::single_agent()).unwrap(),
+            "payload": {
+                "type": "plan_created",
+                "goal": "g",
+                "tasks": ["t"],
+                "routing_mode": "speculative",
+                "routing_rationale": "r",
+                "planning_response": "p"
+            }
+        }))
+        .expect("an unknown routing mode should not fail the event");
+
+        let AgentEventPayload::PlanCreated {
+            goal, routing_mode, ..
+        } = &event.payload
+        else {
+            panic!("expected PlanCreated, got {:?}", event.payload);
+        };
+        assert_eq!(goal, "g");
+        assert!(matches!(routing_mode, RoutingMode::Unknown));
+        assert!(serde_json::to_value(&event).is_err());
+    }
+
+    /// An outcome kind added by a newer producer keeps the `ToolComplete`
+    /// around it, so an older reader does not lose the event.
+    #[test]
+    fn an_unknown_tool_outcome_reads_as_unknown_and_keeps_the_event() {
+        let event: AgentEvent = serde_json::from_value(json!({
+            "agent": serde_json::to_value(EmittingAgent::single_agent()).unwrap(),
+            "payload": {
+                "type": "tool_complete",
+                "tool_call_id": "call_1",
+                "tool_name": "list_files",
+                "duration_ms": 12,
+                "outcome": "timed_out",
+                "after_ms": 30000
+            }
+        }))
+        .expect("an unknown outcome should not fail the event");
+
+        let AgentEventPayload::ToolComplete {
+            tool_call_id,
+            outcome,
+            ..
+        } = &event.payload
+        else {
+            panic!("expected ToolComplete, got {:?}", event.payload);
+        };
+        assert_eq!(tool_call_id, &ToolCallId::new("call_1"));
+        assert!(matches!(outcome, ToolOutcome::Unknown));
+        assert!(serde_json::to_value(&event).is_err());
+    }
+
+    /// An approval outcome added by a newer producer keeps the event around
+    /// it, so an older reader does not lose it or the envelope's `seq`.
+    #[test]
+    fn an_unknown_approval_outcome_keeps_the_event() {
+        let event: AgentEvent = serde_json::from_value(json!({
+            "agent": serde_json::to_value(EmittingAgent::single_agent()).unwrap(),
+            "payload": {
+                "type": "approval_completed",
+                "decision_id": "d-1",
+                "outcome": {"kind": "deferred"},
+                "duration_ms": 7,
+                "scope": {"kind": "subagent"}
+            }
+        }))
+        .expect("an unknown outcome should not fail the event");
+
+        let AgentEventPayload::ApprovalCompleted(completed) = &event.payload else {
+            panic!("expected ApprovalCompleted, got {:?}", event.payload);
+        };
+        assert_eq!(completed.decision_id, "d-1");
+        assert!(matches!(
+            completed.outcome,
+            crate::ApprovalOutcomeWire::Unknown
+        ));
     }
 }

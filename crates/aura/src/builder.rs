@@ -394,7 +394,10 @@ impl PreparedAgent {
                 build_context_owned.instance_id.clone(),
             ));
             hitl_gate = Some(Arc::clone(&wrapper));
-            build_context_owned.add_outer_tool_layer(Arc::new(WrapperLayer(wrapper)));
+            let gate_layer: Arc<dyn crate::tool_middleware::ToolMiddleware> =
+                Arc::new(WrapperLayer(wrapper));
+            build_context_owned.add_outer_tool_layer(Arc::clone(&gate_layer));
+            build_context_owned.hitl_gate_layer = Some(gate_layer);
             let approval_tool = crate::hitl::RequestApprovalTool::new(
                 hitl.route.clone(),
                 scope,
@@ -1094,9 +1097,10 @@ impl PreparedAgent {
                 stack.layers().len()
             );
         }
-        // `(namespace, name)` of each tool registered behind the middleware
-        // stack, the only tools the HITL config gate can stop.
-        let mut wrapped_tools: Vec<(String, String)> = Vec::new();
+        // `(namespace, name)` of each tool registered behind the HITL config
+        // gate: MCP tools behind the middleware stack, and native tools
+        // behind the gate layer alone (no namespace).
+        let mut wrapped_tools: Vec<(Option<String>, String)> = Vec::new();
         let effective_filter = build_context
             .mcp_filter
             .as_ref()
@@ -1198,7 +1202,7 @@ impl PreparedAgent {
 
                     if tool_stack.is_some() {
                         wrapped_tools
-                            .push((mcp_tool.namespace().to_string(), tool_name.to_owned()));
+                            .push((Some(mcp_tool.namespace().to_string()), tool_name.to_owned()));
                     }
 
                     // Wrap with tool_wrapper if configured
@@ -1349,6 +1353,31 @@ impl PreparedAgent {
             builder_state = builder_state.add_tool(submit_tool);
         }
 
+        // Native run tools (the Slack tools) run through the HITL gate layer
+        // alone: a `[hitl]` pattern naming one parks it as it
+        // would an MCP tool, without the MCP-only layers (scratchpad,
+        // persistence) changing what the tool returns. They carry no
+        // namespace, so a namespace-scoped pattern never matches them.
+        let additional_tools: Vec<Box<dyn rig::tool::ToolDyn>> = match &build_context
+            .hitl_gate_layer
+        {
+            Some(gate) if !additional_tools.is_empty() => {
+                let stack = crate::tool_middleware::MiddlewareStack::new(vec![Arc::clone(gate)]);
+                additional_tools
+                    .into_iter()
+                    .map(|tool| {
+                        wrapped_tools.push((None, tool.name()));
+                        Box::new(crate::tool_middleware::MiddlewareToolDyn::new(
+                            tool,
+                            stack.clone(),
+                            build_context.tool_context_factory.clone(),
+                        )) as Box<dyn rig::tool::ToolDyn>
+                    })
+                    .collect()
+            }
+            _ => additional_tools,
+        };
+
         // Attach the agent-callable request_approval tool when HITL pre-built one
         // for this build (orchestration workers set it in `create_worker`; the
         // single-agent path leaves it unset until that surface is wired).
@@ -1356,7 +1385,7 @@ impl PreparedAgent {
             let approval_tool = approval_tool.clone().with_gated_tools(
                 wrapped_tools
                     .iter()
-                    .map(|(namespace, name)| (namespace.as_str(), name.as_str())),
+                    .map(|(namespace, name)| (namespace.as_deref(), name.as_str())),
             );
             builder_state = builder_state.add_tool(approval_tool);
         }
@@ -2018,6 +2047,9 @@ impl StreamingAgent for Agent {
             return crate::streaming::AgentRun::refused(refused);
         }
         let run_id = run.id().to_string();
+        // Set before the run starts, since its tools read attendance from
+        // this context.
+        run.attend(options.attendance());
 
         // The run's token is what its work watches and what dropping the
         // handle cancels. A caller that handed in a token of its own gets the
@@ -2051,16 +2083,19 @@ impl StreamingAgent for Agent {
                 .await
         };
 
-        let started = started.map_stream(move |stream| {
-            Box::pin(crate::run_context::scope_stream(
-                Arc::clone(&run),
-                Box::pin(crate::streaming::tee_content(
-                    run,
-                    aura_events::EmittingAgent::single_agent(),
-                    stream,
-                )),
-            ))
-        });
+        let context = Arc::clone(&run);
+        let started = started
+            .map_stream(move |stream| {
+                Box::pin(crate::run_context::scope_stream(
+                    Arc::clone(&run),
+                    Box::pin(crate::streaming::tee_content(
+                        run,
+                        aura_events::EmittingAgent::single_agent(),
+                        stream,
+                    )),
+                ))
+            })
+            .within(context);
         // One observer per run: the first stream hands the receiver over,
         // a later stream of the same run has no second one to give.
         match self
@@ -2159,12 +2194,7 @@ pub async fn build_streaming_agent_with_tools(
             );
         }
         let attached = if build_context.agent.enable_client_tools {
-            client_tools.map(|tools| {
-                tools
-                    .into_iter()
-                    .filter(|t| build_context.client_tool_matches_filter(&t.name))
-                    .collect::<Vec<_>>()
-            })
+            client_tools.map(|tools| build_context.filter_client_tools(tools))
         } else {
             None
         };
@@ -2350,15 +2380,64 @@ impl AgentBuilder {
     }
 }
 
+/// Prepared agents over a scripted model, for tests anywhere in the crate.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use crate::scratchpad::TiktokenCounter;
 
-    fn budget() -> scratchpad::ContextBudget {
+    /// A prepared agent over `inner`, with `hitl_gate` as its HITL gate, a
+    /// scratchpad budget, and a turn nudge that fires on the second turn, so
+    /// a run has per-run state to own. Tests may change its fields before
+    /// wrapping it in an `Arc`.
+    pub(crate) fn prepared_agent(
+        inner: ProviderAgent,
+        forwarded_headers: ForwardedHeaders,
+        hitl_gate: Option<Arc<crate::hitl::HitlApprovalWrapper>>,
+    ) -> PreparedAgent {
+        PreparedAgent {
+            inner,
+            model: "scripted".to_owned(),
+            max_depth: 1,
+            mcp_manager: None,
+            fallback_tool_parsing: false,
+            fallback_tool_names: Vec::new(),
+            fallback_mcp_filter: None,
+            context_window: None,
+            scratchpad_budget: Some(budget()),
+            client_tool_names: HashSet::new(),
+            turn_nudge: TurnNudgeState::new(true, None, 1),
+            system_prompt: String::new(),
+            invocation_parameters: None,
+            skills: Vec::new(),
+            forwarded_headers,
+            hitl_gate,
+            hitl_approval_tool: None,
+            run: Arc::new(BoundRun::default()),
+            active: Mutex::new(Weak::new()),
+        }
+    }
+
+    /// [`prepared_agent`] in an `Arc`.
+    pub(crate) fn prepared_over(
+        inner: ProviderAgent,
+        forwarded_headers: ForwardedHeaders,
+        hitl_gate: Option<Arc<crate::hitl::HitlApprovalWrapper>>,
+    ) -> Arc<PreparedAgent> {
+        Arc::new(prepared_agent(inner, forwarded_headers, hitl_gate))
+    }
+
+    /// A scratchpad budget of 128k tokens with a fifth of it reserved.
+    pub(crate) fn budget() -> scratchpad::ContextBudget {
         let counter = Arc::new(TiktokenCounter::default_counter());
         scratchpad::ContextBudget::new(128_000, 0.20, 0, counter)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::budget;
+    use super::*;
 
     /// Tool composition is where each MCP adaptor learns which transport it fronts. Both the single-agent path and the orchestration worker path reach it through `add_all_tools`, so what that function tags decides whether a gated call can deliver approver identity or must refuse.
     mod transport_tagging {
@@ -2763,6 +2842,218 @@ mod tests {
             );
         }
 
+        /// A native tool that counts its calls and returns a fixed string,
+        /// boxed as `ToolDyn` the way the Slack run tools arrive.
+        #[derive(Clone)]
+        struct CountingNativeTool {
+            name: &'static str,
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl rig::tool::Tool for CountingNativeTool {
+            const NAME: &'static str = "counting_native_tool";
+            type Error = rig::tool::ToolError;
+            type Args = serde_json::Value;
+            type Output = String;
+
+            fn name(&self) -> String {
+                self.name.to_owned()
+            }
+
+            async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+                rig::completion::ToolDefinition {
+                    name: self.name.to_owned(),
+                    description: "test native tool".to_owned(),
+                    parameters: json!({"type": "object", "properties": {}}),
+                }
+            }
+
+            async fn call(&self, _args: Self::Args) -> Result<String, Self::Error> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok("posted".to_owned())
+            }
+        }
+
+        /// Composes an agent with `tool` as its only (native) tool, behind a
+        /// `[hitl]` gate on `pattern` placed as `prepare` places it.
+        async fn compose_gated_native_agent(
+            pattern: &str,
+            tool: CountingNativeTool,
+            run: Arc<crate::run_context::RunContext>,
+        ) -> rig::agent::Agent<UnpromptedModel> {
+            use crate::tool_middleware::WrapperLayer;
+
+            let gate = HitlApprovalWrapper::new(
+                Arc::from([pattern.into()]),
+                Arc::new(DecisionRoute::Conversational {
+                    registry: PendingApprovals::new(),
+                    timeout: Duration::from_millis(50),
+                }),
+                AgentScope::Single { session_id: None },
+                "test-agent".to_owned(),
+                "test-instance-id".to_owned(),
+            );
+            gate.bind_run(run);
+            let gate_layer: Arc<dyn crate::tool_middleware::ToolMiddleware> =
+                Arc::new(WrapperLayer(Arc::new(gate)));
+            let mut build_context = AgentBuildContext::default();
+            build_context.add_outer_tool_layer(Arc::clone(&gate_layer));
+            build_context.hitl_gate_layer = Some(gate_layer);
+
+            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
+            PreparedAgent::add_all_tools(
+                state,
+                &build_context,
+                &None,
+                &Arc::default(),
+                vec![Box::new(tool) as Box<dyn rig::tool::ToolDyn>],
+            )
+            .await
+            .expect("composition succeeds")
+            .build()
+        }
+
+        /// mezmo/aura#764: a `[hitl]` pattern naming a native tool raises an
+        /// approval for it, and the tool does not run while it is undecided.
+        #[tokio::test]
+        async fn a_pattern_naming_a_native_tool_gates_it() {
+            let (run, mut rx) = crate::run_context::RunContext::channel(
+                crate::run_context::named_run_id("req_native_gating_match"),
+            );
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let tool = CountingNativeTool {
+                name: "slack_post_message",
+                calls: Arc::clone(&calls),
+            };
+            let agent = compose_gated_native_agent("slack_post_message", tool, run).await;
+
+            // The approval expires unanswered; the call's own outcome is not
+            // what this test is about.
+            let _ = agent
+                .tool_server_handle
+                .call_tool("slack_post_message", &json!({}).to_string())
+                .await;
+
+            let event = rx
+                .try_recv()
+                .expect("a native tool matching the pattern must raise an approval");
+            let AgentEventPayload::ApprovalRequested(requested) = event.payload else {
+                panic!("the gate must raise Requested first");
+            };
+            assert_eq!(requested.tool_name, "slack_post_message");
+            assert_eq!(requested.tool_namespace, None);
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the gated native tool must not run without a decision",
+            );
+        }
+
+        /// A native tool the pattern does not name runs ungated, and its
+        /// output reaches the model exactly as it did before the gate layer
+        /// wrapped it.
+        #[tokio::test]
+        async fn a_native_tool_outside_the_pattern_runs_with_its_output_unchanged() {
+            let (run, mut rx) = crate::run_context::RunContext::channel(
+                crate::run_context::named_run_id("req_native_gating_miss"),
+            );
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let tool = CountingNativeTool {
+                name: "slack_search",
+                calls: Arc::clone(&calls),
+            };
+            let ungated_output = rig::tool::ToolDyn::call(&tool, json!({}).to_string())
+                .await
+                .expect("the bare tool runs");
+            calls.store(0, std::sync::atomic::Ordering::SeqCst);
+            let agent = compose_gated_native_agent("slack_post_message", tool, run).await;
+
+            let output = agent
+                .tool_server_handle
+                .call_tool("slack_search", &json!({}).to_string())
+                .await
+                .expect("a native tool outside the pattern runs ungated");
+
+            assert_eq!(output, ungated_output);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let raised = rx.try_recv();
+            assert!(
+                raised.is_err(),
+                "a native tool outside the pattern must not be gated, got: {raised:?}",
+            );
+        }
+
+        /// The gate `prepare` builds for a `[hitl]` policy reaches a native run
+        /// tool. Nothing here sets `hitl_gate_layer`, so this fails if
+        /// `prepare` stops wiring the layer.
+        #[tokio::test]
+        async fn prepare_gates_a_native_run_tool_named_by_hitl() {
+            let config = aura_config::load_config_from_str(
+                r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+
+[hitl]
+require_approval = ["slack_post_message"]
+
+[hitl.route]
+mode = "conversational"
+timeout_secs = 60
+"#,
+            )
+            .expect("config parses");
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let tool = CountingNativeTool {
+                name: "slack_post_message",
+                calls: Arc::clone(&calls),
+            };
+            let prepared = crate::rig_builder::RigBuilder::new(config, PendingApprovals::new())
+                .prepare_agent(None, vec![Box::new(tool)], None, None)
+                .await
+                .expect("agent prepares");
+            let agent = prepared
+                .begin_run(
+                    crate::run_context::named_run_id("req_native_prepare"),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let mut events = agent.events.lock().unwrap().take().unwrap();
+
+            // The call waits on a decision; the approval it raises is what this
+            // test reads, so the call is left pending and aborted.
+            let call = tokio::spawn({
+                let prepared = Arc::clone(&prepared);
+                async move {
+                    let _ = prepared.inner.call_tool("slack_post_message", "{}").await;
+                }
+            });
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("the gate raises an approval in time")
+                .expect("the run's event channel is open");
+            call.abort();
+
+            let AgentEventPayload::ApprovalRequested(requested) = event.payload else {
+                panic!(
+                    "the gate must raise Requested first, got {:?}",
+                    event.payload
+                );
+            };
+            assert_eq!(requested.tool_name, "slack_post_message");
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the gated native tool must not run without a decision",
+            );
+        }
+
         /// `mcp_filter` reaches tool namespaces through the same `is_match`
         /// path the gate uses, and is likewise only unit-tested against a
         /// hand-built `AuraTool`. Registration is where it has to hold.
@@ -3125,6 +3416,7 @@ mod tests {
     /// serve two at once.
     mod prepared_runs {
         use super::*;
+        use crate::builder::test_support::prepared_over;
         use crate::orchestration::{ScriptedCompletionModel, ScriptedTurn};
         use crate::streaming::StreamRefused;
 
@@ -3305,35 +3597,6 @@ mod tests {
                 forwarded_headers,
                 None,
             )
-        }
-
-        /// Like [`prepared`], over `inner` with its HITL gate `hitl_gate`.
-        fn prepared_over(
-            inner: ProviderAgent,
-            forwarded_headers: ForwardedHeaders,
-            hitl_gate: Option<Arc<crate::hitl::HitlApprovalWrapper>>,
-        ) -> Arc<PreparedAgent> {
-            Arc::new(PreparedAgent {
-                inner,
-                model: "scripted".to_owned(),
-                max_depth: 1,
-                mcp_manager: None,
-                fallback_tool_parsing: false,
-                fallback_tool_names: Vec::new(),
-                fallback_mcp_filter: None,
-                context_window: None,
-                scratchpad_budget: Some(budget()),
-                client_tool_names: HashSet::new(),
-                turn_nudge: TurnNudgeState::new(true, None, 1),
-                system_prompt: String::new(),
-                invocation_parameters: None,
-                skills: Vec::new(),
-                forwarded_headers,
-                hitl_gate,
-                hitl_approval_tool: None,
-                run: Arc::new(BoundRun::default()),
-                active: Mutex::new(Weak::new()),
-            })
         }
 
         /// A web request's approvals are released by its request id when the
