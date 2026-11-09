@@ -352,6 +352,13 @@ impl OidcValidator {
         // jsonwebtoken defaults `validate_nbf` to false; the config docs
         // promise `exp`/`nbf` enforcement, so opt in explicitly.
         validation.validate_nbf = true;
+        // Presence is only enforced through `required_spec_claims`, whose
+        // default is `exp` alone: without this, a token omitting `aud` or
+        // `iss` entirely skips those checks and authenticates against any
+        // deployment trusting that issuer (Keycloak clients without an
+        // audience mapper do exactly this). The call replaces the set, so
+        // `exp` must stay listed.
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
 
         let claims = match jsonwebtoken::decode::<serde_json::Map<String, serde_json::Value>>(
             token,
@@ -367,6 +374,7 @@ impl OidcValidator {
                 let reason = match e.kind() {
                     ErrorKind::ExpiredSignature => "token has expired",
                     ErrorKind::ImmatureSignature => "token is not yet valid",
+                    ErrorKind::MissingRequiredClaim(_) => "token is missing a required claim",
                     ErrorKind::InvalidIssuer | ErrorKind::InvalidAudience => {
                         "token failed issuer or audience validation"
                     }
@@ -1377,6 +1385,32 @@ mod oidc_tests {
         .expect("encode")
     }
 
+    /// Mint a token with one standard claim removed entirely (e.g. `aud`).
+    /// A signed token that omits a claim must not skip that claim's check.
+    fn token_without(issuer: &str, drop: &str) -> String {
+        let now = now_unix() as i64;
+        let mut claims = serde_json::json!({
+            "sub": "alice@example.com",
+            "iss": issuer,
+            "aud": AUDIENCE,
+            "iat": now,
+            "exp": now + 300,
+        });
+        claims.as_object_mut().unwrap().remove(drop);
+        let header = jsonwebtoken::Header {
+            alg: jsonwebtoken::Algorithm::RS256,
+            kid: Some(KID.to_string()),
+            ..Default::default()
+        };
+        jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_rsa_pem(idp().private_pem.as_bytes())
+                .expect("encoding key"),
+        )
+        .expect("encode")
+    }
+
     fn oidc_cfg(issuer: String, jwks_url: Option<String>) -> OidcConfig {
         OidcConfig {
             issuer,
@@ -1974,5 +2008,33 @@ mod oidc_tests {
         headers.insert("host", HeaderValue::from_static("aura.example.com"));
         let resp = protected_resource_metadata(axum::extract::State(state), headers).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rejects_token_missing_aud_or_iss() {
+        // jsonwebtoken only enforces claim *presence* through
+        // required_spec_claims (default: exp alone), so a correctly signed
+        // token that omits `aud` or `iss` entirely would otherwise skip
+        // those checks and authenticate against any deployment trusting
+        // the issuer — Keycloak clients without an audience mapper emit
+        // exactly such tokens.
+        let server = mock_idp().await;
+        let issuer = server.uri();
+        let validator = OidcValidator::new(oidc_cfg(
+            issuer.clone(),
+            Some(format!("{issuer}/jwks.json")),
+        ));
+        validator.warm().await.unwrap();
+        for claim in ["aud", "iss"] {
+            assert!(
+                matches!(
+                    validator.authenticate(&token_without(&issuer, claim)).await,
+                    AuthOutcome::Rejected(Rejection::InvalidToken(
+                        "token is missing a required claim"
+                    ))
+                ),
+                "missing {claim} must be rejected"
+            );
+        }
     }
 }
