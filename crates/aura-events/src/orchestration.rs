@@ -15,6 +15,9 @@ pub enum RoutingMode {
     Routed,
     /// Full orchestration — multi-task DAG execution.
     Orchestrated,
+    /// A value this version of the crate does not know.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 impl RoutingMode {

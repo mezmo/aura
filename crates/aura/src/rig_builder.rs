@@ -210,10 +210,7 @@ impl RigBuilder {
     /// - An `Orchestrator` wrapped as `Arc<dyn StreamingAgent>` if `orchestration.enabled = true`
     /// - A standard `Agent` wrapped as `Arc<dyn StreamingAgent>` otherwise
     ///
-    /// `client_tools` is the request-supplied passthrough tool definitions. The orchestrator
-    /// attaches them only to the coordinator / workers whose TOML config sets
-    /// `enable_client_tools = true`, filtered by `client_tool_filter`. In single-agent mode,
-    /// callers should attach client tools via `build_agent` instead.
+    /// See [`crate::builder::build_streaming_agent`] for client-tool support.
     pub async fn build_streaming_agent_with_headers(
         &self,
         req_headers: Option<&HashMap<String, String>>,

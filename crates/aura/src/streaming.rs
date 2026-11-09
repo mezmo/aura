@@ -38,7 +38,7 @@
 //! ```
 
 use crate::provider_agent::{StreamError, StreamItem, StreamedAssistantContent};
-use crate::run_context::RunContext;
+use crate::run_context::{Attendance, RunContext};
 use crate::streaming_request_hook::UsageState;
 use async_trait::async_trait;
 use aura_events::RunId;
@@ -47,11 +47,13 @@ use rig::completion::Message;
 use std::time::Duration;
 use tokio_util::sync::{CancellationToken, DropGuard};
 
-/// How a run is bounded and cancelled.
+/// How a run is bounded and cancelled, and its session's attendance when it
+/// starts.
 #[derive(Default)]
 pub struct RunOptions {
     pub timeout: Option<Duration>,
     cancel: Option<CancellationToken>,
+    attendance: Attendance,
 }
 
 impl RunOptions {
@@ -66,7 +68,20 @@ impl RunOptions {
         Self {
             timeout,
             cancel: None,
+            attendance: Attendance::default(),
         }
+    }
+
+    /// Sets the session's attendance as the run starts. A `StreamingAgent`
+    /// writes it onto the run's context before the run does any work.
+    #[must_use]
+    pub fn attended(mut self, attendance: Attendance) -> Self {
+        self.attendance = attendance;
+        self
+    }
+
+    pub fn attendance(&self) -> Attendance {
+        self.attendance
     }
 
     /// The run stops when `parent` does, and stopping the run leaves `parent`
@@ -84,6 +99,7 @@ impl RunOptions {
         Self {
             timeout,
             cancel: Some(cancel),
+            attendance: Attendance::default(),
         }
     }
 }
@@ -134,6 +150,8 @@ pub struct AgentRun {
     cancel: CancellationToken,
     usage: UsageState,
     guard: DropGuard,
+    /// The run's context.
+    run: Option<std::sync::Arc<RunContext>>,
 }
 
 impl AgentRun {
@@ -151,7 +169,21 @@ impl AgentRun {
             agent_events: None,
             cancel,
             usage,
+            run: None,
         }
+    }
+
+    /// Gives the handle the run's context, which the runtime uses to keep
+    /// the run's attendance current.
+    #[must_use]
+    pub fn within(mut self, run: std::sync::Arc<RunContext>) -> Self {
+        self.run = Some(run);
+        self
+    }
+
+    /// The run's context, if the agent gave one through [`within`](Self::within).
+    pub fn run_context(&self) -> Option<&std::sync::Arc<RunContext>> {
+        self.run.as_ref()
     }
 
     /// A run that does nothing, whose stream yields `refused` and ends.
