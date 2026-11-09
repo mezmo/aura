@@ -18,7 +18,7 @@ mod config_test;
 #[cfg(test)]
 mod test_env_lock;
 
-pub use auth::{ApiKeyConfig, AuthConfig, AuthMode, OidcConfig, hash_api_key};
+pub use auth::{ApiKeyConfig, AuthConfig, AuthMode, ClaimAgentsRule, OidcConfig, hash_api_key};
 pub use config::*;
 pub use env::resolve_env_vars;
 pub use error::ConfigError;
