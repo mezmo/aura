@@ -7,12 +7,14 @@
 //!
 //! # Agent, session, run
 //!
-//! An agent is a config entry. A session is that agent's identity over time,
-//! and the key its stream is ordered under. A run is one unit of work in a
-//! session: a prompt or headless start, through every inference and tool turn,
-//! to one terminal state. One stream per session means an agent's whole
-//! history loads as one stream rather than as a composition of runs, and a run
-//! boundary is a position in it.
+//! An agent is a config entry. A session is a conversation's identity over
+//! time, and the key its stream is ordered under. It runs one agent at a time,
+//! and the agent can change from one run to the next; each run's `Started`
+//! names the agent that ran. A run is one unit of work in a session: a prompt
+//! or headless start, through every inference and tool turn, to one terminal
+//! state. One stream per session means a conversation's whole history loads as
+//! one stream rather than as a composition of runs, and a run boundary is a
+//! position in it.
 //!
 //! # Correlation lives on the envelope
 //!

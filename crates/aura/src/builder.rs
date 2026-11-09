@@ -2047,6 +2047,9 @@ impl StreamingAgent for Agent {
             return crate::streaming::AgentRun::refused(refused);
         }
         let run_id = run.id().to_string();
+        // Set before the run starts, since its tools read attendance from
+        // this context.
+        run.attend(options.attendance());
 
         // The run's token is what its work watches and what dropping the
         // handle cancels. A caller that handed in a token of its own gets the
@@ -2080,16 +2083,19 @@ impl StreamingAgent for Agent {
                 .await
         };
 
-        let started = started.map_stream(move |stream| {
-            Box::pin(crate::run_context::scope_stream(
-                Arc::clone(&run),
-                Box::pin(crate::streaming::tee_content(
-                    run,
-                    aura_events::EmittingAgent::single_agent(),
-                    stream,
-                )),
-            ))
-        });
+        let context = Arc::clone(&run);
+        let started = started
+            .map_stream(move |stream| {
+                Box::pin(crate::run_context::scope_stream(
+                    Arc::clone(&run),
+                    Box::pin(crate::streaming::tee_content(
+                        run,
+                        aura_events::EmittingAgent::single_agent(),
+                        stream,
+                    )),
+                ))
+            })
+            .within(context);
         // One observer per run: the first stream hands the receiver over,
         // a later stream of the same run has no second one to give.
         match self
@@ -2374,15 +2380,64 @@ impl AgentBuilder {
     }
 }
 
+/// Prepared agents over a scripted model, for tests anywhere in the crate.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use crate::scratchpad::TiktokenCounter;
 
-    fn budget() -> scratchpad::ContextBudget {
+    /// A prepared agent over `inner`, with `hitl_gate` as its HITL gate, a
+    /// scratchpad budget, and a turn nudge that fires on the second turn, so
+    /// a run has per-run state to own. Tests may change its fields before
+    /// wrapping it in an `Arc`.
+    pub(crate) fn prepared_agent(
+        inner: ProviderAgent,
+        forwarded_headers: ForwardedHeaders,
+        hitl_gate: Option<Arc<crate::hitl::HitlApprovalWrapper>>,
+    ) -> PreparedAgent {
+        PreparedAgent {
+            inner,
+            model: "scripted".to_owned(),
+            max_depth: 1,
+            mcp_manager: None,
+            fallback_tool_parsing: false,
+            fallback_tool_names: Vec::new(),
+            fallback_mcp_filter: None,
+            context_window: None,
+            scratchpad_budget: Some(budget()),
+            client_tool_names: HashSet::new(),
+            turn_nudge: TurnNudgeState::new(true, None, 1),
+            system_prompt: String::new(),
+            invocation_parameters: None,
+            skills: Vec::new(),
+            forwarded_headers,
+            hitl_gate,
+            hitl_approval_tool: None,
+            run: Arc::new(BoundRun::default()),
+            active: Mutex::new(Weak::new()),
+        }
+    }
+
+    /// [`prepared_agent`] in an `Arc`.
+    pub(crate) fn prepared_over(
+        inner: ProviderAgent,
+        forwarded_headers: ForwardedHeaders,
+        hitl_gate: Option<Arc<crate::hitl::HitlApprovalWrapper>>,
+    ) -> Arc<PreparedAgent> {
+        Arc::new(prepared_agent(inner, forwarded_headers, hitl_gate))
+    }
+
+    /// A scratchpad budget of 128k tokens with a fifth of it reserved.
+    pub(crate) fn budget() -> scratchpad::ContextBudget {
         let counter = Arc::new(TiktokenCounter::default_counter());
         scratchpad::ContextBudget::new(128_000, 0.20, 0, counter)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::budget;
+    use super::*;
 
     /// Tool composition is where each MCP adaptor learns which transport it fronts. Both the single-agent path and the orchestration worker path reach it through `add_all_tools`, so what that function tags decides whether a gated call can deliver approver identity or must refuse.
     mod transport_tagging {
@@ -3361,6 +3416,7 @@ timeout_secs = 60
     /// serve two at once.
     mod prepared_runs {
         use super::*;
+        use crate::builder::test_support::prepared_over;
         use crate::orchestration::{ScriptedCompletionModel, ScriptedTurn};
         use crate::streaming::StreamRefused;
 
@@ -3541,35 +3597,6 @@ timeout_secs = 60
                 forwarded_headers,
                 None,
             )
-        }
-
-        /// Like [`prepared`], over `inner` with its HITL gate `hitl_gate`.
-        fn prepared_over(
-            inner: ProviderAgent,
-            forwarded_headers: ForwardedHeaders,
-            hitl_gate: Option<Arc<crate::hitl::HitlApprovalWrapper>>,
-        ) -> Arc<PreparedAgent> {
-            Arc::new(PreparedAgent {
-                inner,
-                model: "scripted".to_owned(),
-                max_depth: 1,
-                mcp_manager: None,
-                fallback_tool_parsing: false,
-                fallback_tool_names: Vec::new(),
-                fallback_mcp_filter: None,
-                context_window: None,
-                scratchpad_budget: Some(budget()),
-                client_tool_names: HashSet::new(),
-                turn_nudge: TurnNudgeState::new(true, None, 1),
-                system_prompt: String::new(),
-                invocation_parameters: None,
-                skills: Vec::new(),
-                forwarded_headers,
-                hitl_gate,
-                hitl_approval_tool: None,
-                run: Arc::new(BoundRun::default()),
-                active: Mutex::new(Weak::new()),
-            })
         }
 
         /// A web request's approvals are released by its request id when the

@@ -222,8 +222,8 @@ impl std::fmt::Display for EmptyId {
 impl std::error::Error for EmptyId {}
 
 nonempty_string_newtype! {
-    /// Identifier for a session: an agent's identity over time, and the key
-    /// its [`SessionEvent`](run::SessionEvent) stream is ordered under.
+    /// Identifier for a session: a conversation's identity over time, and the
+    /// key its [`SessionEvent`](run::SessionEvent) stream is ordered under.
     SessionId
 }
 
@@ -726,6 +726,9 @@ pub enum McpServerOverview {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tools: Option<Vec<McpToolOverview>>,
     },
+    /// A value this version of the crate does not know.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// One agent entry in the `GET /aura/info` response.
@@ -1486,6 +1489,39 @@ mod tests {
                 tools: None,
             }
         );
+    }
+
+    /// A transport added by a newer server keeps the `/aura/info` response
+    /// around it, so an older reader does not lose every agent's overview.
+    #[test]
+    fn an_unknown_mcp_transport_reads_as_unknown_and_keeps_the_server_info() {
+        let info: ServerInfo = serde_json::from_value(serde_json::json!({
+            "agents": [{
+                "id": "ops",
+                "model": "gpt-4o",
+                "mcp_servers": {
+                    "future": {
+                        "transport": "websocket",
+                        "url": "wss://mcp.example.com",
+                        "tools": [{"name": "list_incidents"}]
+                    },
+                    "local": {"transport": "stdio", "command": "fs-server"}
+                }
+            }]
+        }))
+        .expect("an unknown transport should not fail the response");
+
+        let servers = info.agents[0].mcp_servers.as_ref().unwrap();
+        assert_eq!(servers["future"], McpServerOverview::Unknown);
+        assert_eq!(
+            servers["local"],
+            McpServerOverview::Stdio {
+                command: "fs-server".to_string(),
+                description: None,
+                tools: None,
+            }
+        );
+        assert!(serde_json::to_value(&servers["future"]).is_err());
     }
 
     #[test]
