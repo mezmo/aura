@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet};
@@ -120,11 +120,15 @@ pub struct KeyRing {
 /// Routes that stay reachable without a key when auth is enabled:
 /// - `/health`: container probes must not need credentials.
 /// - `/.well-known/agent-card.json`: A2A discovery convention.
+/// - `/.well-known/oauth-protected-resource`: RFC 9728 discovery, the
+///   target of the 401 challenge's `resource_metadata` parameter — it is
+///   by definition what unauthenticated clients need to find.
 /// - `/v1/approvals/*`: approvers are a different principal than chat
 ///   callers; this route keeps its own HMAC verification in the handler.
 fn is_open_path(path: &str) -> bool {
     path == "/health"
         || path == "/.well-known/agent-card.json"
+        || path == "/.well-known/oauth-protected-resource"
         || path.starts_with("/v1/approvals/")
 }
 
@@ -204,8 +208,23 @@ pub enum Authenticator {
 #[derive(Debug)]
 pub enum AuthOutcome {
     Authenticated(AuthContext),
-    Rejected,
+    Rejected(Rejection),
     Unavailable,
+}
+
+/// Why a presented credential was rejected. The split matters beyond
+/// cosmetics: RFC 6750 clients treat 401 as "discard the cached token and
+/// re-authenticate", so a valid-but-unauthorized token (claim gate) must
+/// answer 403 `insufficient_scope` — answering 401 would loop a compliant
+/// client through login forever.
+#[derive(Debug)]
+pub enum Rejection {
+    /// The credential is malformed, unverifiable, expired, or unknown.
+    /// The payload is a safe-to-echo `error_description` (RFC 6750 §3.1).
+    InvalidToken(&'static str),
+    /// The credential verified, but the `[auth.oidc]` claim gate denied the
+    /// principal: authenticated, not authorized.
+    InsufficientScope,
 }
 
 impl Authenticator {
@@ -213,7 +232,7 @@ impl Authenticator {
         match self {
             Self::ApiKeys(ring) => match ring.authenticate(raw) {
                 Some(ctx) => AuthOutcome::Authenticated(ctx),
-                None => AuthOutcome::Rejected,
+                None => AuthOutcome::Rejected(Rejection::InvalidToken("API key not recognized")),
             },
             Self::Oidc(validator) => validator.authenticate(raw).await,
         }
@@ -302,22 +321,28 @@ impl OidcValidator {
         Ok(())
     }
 
+    /// The configured issuer, for RFC 9728 resource metadata.
+    pub fn issuer(&self) -> &str {
+        &self.cfg.issuer
+    }
+
     async fn authenticate(&self, token: &str) -> AuthOutcome {
+        let reject = |reason: &'static str| AuthOutcome::Rejected(Rejection::InvalidToken(reason));
         let Some(header) = jsonwebtoken::decode_header(token).ok() else {
-            return AuthOutcome::Rejected;
+            return reject("token is not a valid JWT");
         };
         let jwks = match self.jwks_for_kid(header.kid.as_deref()).await {
             Ok(jwks) => jwks,
             Err(JwksError::Unavailable) => return AuthOutcome::Unavailable,
         };
         let Some(jwk) = select_jwk(&jwks, header.kid.as_deref()) else {
-            return AuthOutcome::Rejected;
+            return reject("no signing key matches the token key id");
         };
         let Some(algorithm) = jwk_algorithm(jwk) else {
-            return AuthOutcome::Rejected;
+            return reject("signing key uses an unsupported algorithm");
         };
         let Ok(key) = DecodingKey::from_jwk(jwk) else {
-            return AuthOutcome::Rejected;
+            return reject("signing key could not be parsed");
         };
 
         let mut validation = Validation::new(algorithm);
@@ -328,21 +353,37 @@ impl OidcValidator {
         // promise `exp`/`nbf` enforcement, so opt in explicitly.
         validation.validate_nbf = true;
 
-        let Ok(data) = jsonwebtoken::decode::<serde_json::Map<String, serde_json::Value>>(
+        let claims = match jsonwebtoken::decode::<serde_json::Map<String, serde_json::Value>>(
             token,
             &key,
             &validation,
-        ) else {
-            return AuthOutcome::Rejected;
+        ) {
+            Ok(data) => data.claims,
+            Err(e) => {
+                // Safe-to-echo distinction for the challenge's
+                // error_description: expired tells a compliant client to
+                // refresh its token; anything else means re-login.
+                use jsonwebtoken::errors::ErrorKind;
+                let reason = match e.kind() {
+                    ErrorKind::ExpiredSignature => "token has expired",
+                    ErrorKind::ImmatureSignature => "token is not yet valid",
+                    ErrorKind::InvalidIssuer | ErrorKind::InvalidAudience => {
+                        "token failed issuer or audience validation"
+                    }
+                    _ => "token failed signature or claims validation",
+                };
+                return reject(reason);
+            }
         };
-        let claims = data.claims;
 
         if !self.claim_gate_passes(&claims) {
             warn!(
                 sub = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("?"),
                 "OIDC token rejected by [auth.oidc] claim gate"
             );
-            return AuthOutcome::Rejected;
+            // Authenticated but not authorized: 403, never 401 — a client
+            // that re-authenticates on 401 would loop forever.
+            return AuthOutcome::Rejected(Rejection::InsufficientScope);
         }
 
         let Some(name) = claims
@@ -350,7 +391,7 @@ impl OidcValidator {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
         else {
-            return AuthOutcome::Rejected;
+            return reject("token has no usable principal claim");
         };
         AuthOutcome::Authenticated(AuthContext {
             name: name.to_string(),
@@ -624,9 +665,67 @@ fn candidate_key(headers: &HeaderMap) -> Option<&str> {
         .filter(|v| !v.is_empty())
 }
 
+/// The canonical origin this server believes it is reached at, for RFC 9728
+/// metadata and challenges: forwarded headers win (deployments sit behind
+/// proxies), else localhost is assumed http and everything else https.
+fn canonical_origin(headers: &HeaderMap) -> Option<String> {
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(axum::http::header::HOST))
+        .and_then(|v| v.to_str().ok())?
+        .split(',')
+        .next()?
+        .trim()
+        .to_string();
+    if host.is_empty() {
+        return None;
+    }
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|s| *s == "http" || *s == "https")
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let bare = host.split(':').next().unwrap_or("");
+            if matches!(bare, "localhost" | "127.0.0.1" | "[::1]" | "::1") {
+                "http".to_string()
+            } else {
+                "https".to_string()
+            }
+        });
+    Some(format!("{scheme}://{host}"))
+}
+
+/// RFC 6750 §3 / RFC 9728 §3.1 `WWW-Authenticate` challenge. With OIDC
+/// configured, advertises this server's protected-resource metadata so
+/// OAuth-aware clients (MCP, spec-compliant CLIs) can discover the
+/// authorization server without prior knowledge.
+fn bearer_challenge(origin: Option<&str>) -> String {
+    match origin {
+        Some(origin) => format!(
+            "Bearer realm=\"aura\", resource_metadata=\"{origin}/.well-known/oauth-protected-resource\""
+        ),
+        None => "Bearer realm=\"aura\"".to_string(),
+    }
+}
+
+fn quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// Middleware: reject unauthenticated requests when the deployment has an
 /// `[auth]` authenticator. Runs inside `shutdown_guard` so draining still
 /// answers 503 before auth challenges.
+///
+/// Responses follow RFC 6750 §3.1 alongside the OpenAI-shaped JSON body:
+/// a request with no credential gets a bare challenge; a request whose
+/// credential failed gets `error="invalid_token"` with a safe description;
+/// a verified credential denied by the claim gate gets 403
+/// `insufficient_scope` (re-authenticating cannot fix it); and an
+/// unreachable IdP gets 503 with `Retry-After` and no challenge, since the
+/// caller's credentials are not the problem.
 pub async fn require_auth(
     State(state): State<Arc<AppState>>,
     mut request: Request,
@@ -638,10 +737,14 @@ pub async fn require_auth(
     if is_open_path(request.uri().path()) {
         return next.run(request).await;
     }
+    let presented = candidate_key(request.headers()).is_some();
     let outcome = match candidate_key(request.headers()) {
         Some(key) => authenticator.authenticate(key).await,
-        None => AuthOutcome::Rejected,
+        None => AuthOutcome::Rejected(Rejection::InvalidToken("no credential presented")),
     };
+    let oidc = matches!(authenticator.as_ref(), Authenticator::Oidc(_));
+    let origin = oidc.then(|| canonical_origin(request.headers())).flatten();
+    let challenge = bearer_challenge(origin.as_deref());
     match outcome {
         AuthOutcome::Authenticated(ctx) => {
             // The task-local makes the principal reachable from code paths
@@ -655,18 +758,57 @@ pub async fn require_auth(
                 path = request.uri().path(),
                 "identity provider unreachable; rejecting request"
             );
-            auth_error(
+            // No challenge: the caller's credential is not at fault, and a
+            // client that re-logins on a bearer challenge would loop
+            // against the down IdP.
+            let mut response = auth_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "The identity provider is unreachable; the request could not be authenticated. Retry shortly.",
                 "identity_provider_unreachable",
-            )
+            );
+            if let Ok(value) = HeaderValue::from_str(&FETCH_BACKOFF.as_secs().to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+            response
         }
-        AuthOutcome::Rejected => {
+        AuthOutcome::Rejected(Rejection::InsufficientScope) => {
+            warn!(
+                path = request.uri().path(),
+                "authenticated principal denied by [auth.oidc] claim gate"
+            );
+            let mut response = auth_error(
+                StatusCode::FORBIDDEN,
+                "The token is valid but does not satisfy this deployment's access policy.",
+                "insufficient_scope",
+            );
+            if let Ok(value) =
+                HeaderValue::from_str(&format!("{challenge}, error=\"insufficient_scope\""))
+            {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::WWW_AUTHENTICATE, value);
+            }
+            response
+        }
+        AuthOutcome::Rejected(Rejection::InvalidToken(reason)) => {
             warn!(
                 path = request.uri().path(),
                 "rejected unauthenticated request"
             );
-            match authenticator.as_ref() {
+            // RFC 6750 §3.1: no credential presented gets the bare
+            // challenge; a rejected one names the error and a safe
+            // description.
+            let challenge = if presented {
+                format!(
+                    "{challenge}, error=\"invalid_token\", error_description={}",
+                    quote(reason)
+                )
+            } else {
+                challenge
+            };
+            let mut response = match authenticator.as_ref() {
                 Authenticator::ApiKeys(_) => auth_error(
                     StatusCode::UNAUTHORIZED,
                     "Invalid API key provided. Provide your key via the `Authorization: Bearer` header.",
@@ -677,9 +819,45 @@ pub async fn require_auth(
                     "Invalid or expired bearer token. Provide a valid OIDC access token via the `Authorization: Bearer` header.",
                     "invalid_token",
                 ),
+            };
+            if let Ok(value) = HeaderValue::from_str(&challenge) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::WWW_AUTHENTICATE, value);
             }
+            response
         }
     }
+}
+
+/// RFC 9728 protected resource metadata: lets an OAuth-aware client
+/// discover the authorization server(s) and expected audience from a
+/// 401's `resource_metadata` challenge. Served only in OIDC mode; api-keys
+/// deployments have no authorization server to discover.
+pub async fn protected_resource_metadata(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(Authenticator::Oidc(validator)) = state.auth.as_deref() else {
+        return auth_error(
+            StatusCode::NOT_FOUND,
+            "This server does not use an OIDC authorization server.",
+            "not_found",
+        );
+    };
+    let Some(origin) = canonical_origin(&headers) else {
+        return auth_error(
+            StatusCode::BAD_REQUEST,
+            "Cannot determine the canonical resource URI from request headers.",
+            "invalid_request",
+        );
+    };
+    Json(serde_json::json!({
+        "resource": origin,
+        "authorization_servers": [validator.issuer()],
+        "bearer_methods_supported": ["header"],
+    }))
+    .into_response()
 }
 
 /// The OpenAI-compatible 403 body for a key that is valid but not allowed to
@@ -988,6 +1166,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn challenges_follow_rfc_6750() {
+        let ring = build_authenticator(&[config_with_auth(Some(auth_config(
+            AuthMode::ApiKeys,
+            vec![key("ops", RAW_KEY, vec!["*".into()])],
+        )))])
+        .unwrap()
+        .unwrap();
+        let app = app_with_auth(test_state(Some(ring)));
+
+        // No credential presented: bare challenge, no error parameter
+        // (RFC 6750 section 3.1).
+        let resp = app
+            .clone()
+            .oneshot(request("/v1/models", &[]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers()
+                .get("www-authenticate")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer realm=\"aura\""
+        );
+
+        // Credential presented but rejected: names the error with a safe
+        // description. api-keys mode has no authorization server, so no
+        // resource_metadata parameter.
+        let resp = app
+            .oneshot(request(
+                "/v1/models",
+                &[("authorization", "Bearer nope".to_string())],
+            ))
+            .await
+            .unwrap();
+        let challenge = resp
+            .headers()
+            .get("www-authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(challenge.contains("error=\"invalid_token\""), "{challenge}");
+        assert!(challenge.contains("error_description="), "{challenge}");
+        assert!(!challenge.contains("resource_metadata"), "{challenge}");
+    }
+
+    #[tokio::test]
     async fn middleware_accepts_bearer_and_x_api_key() {
         let ring = build_authenticator(&[config_with_auth(Some(auth_config(
             AuthMode::ApiKeys,
@@ -1230,14 +1457,14 @@ mod oidc_tests {
             validator
                 .authenticate(&token(&issuer, AUDIENCE, -300, serde_json::json!({})))
                 .await,
-            AuthOutcome::Rejected
+            AuthOutcome::Rejected(Rejection::InvalidToken(_))
         ));
         // wrong audience
         assert!(matches!(
             validator
                 .authenticate(&token(&issuer, "someone-else", 300, serde_json::json!({})))
                 .await,
-            AuthOutcome::Rejected
+            AuthOutcome::Rejected(Rejection::InvalidToken(_))
         ));
         // wrong issuer
         assert!(matches!(
@@ -1249,12 +1476,12 @@ mod oidc_tests {
                     serde_json::json!({})
                 ))
                 .await,
-            AuthOutcome::Rejected
+            AuthOutcome::Rejected(Rejection::InvalidToken(_))
         ));
         // not a JWT at all
         assert!(matches!(
             validator.authenticate("not-a-jwt").await,
-            AuthOutcome::Rejected
+            AuthOutcome::Rejected(Rejection::InvalidToken(_))
         ));
     }
 
@@ -1278,7 +1505,7 @@ mod oidc_tests {
                     serde_json::json!({"nbf": future}),
                 ))
                 .await,
-            AuthOutcome::Rejected
+            AuthOutcome::Rejected(Rejection::InvalidToken(_))
         ));
     }
 
@@ -1311,13 +1538,13 @@ mod oidc_tests {
         );
         assert!(matches!(
             validator.authenticate(&failing).await,
-            AuthOutcome::Rejected
+            AuthOutcome::Rejected(Rejection::InsufficientScope)
         ));
 
         let missing = token(&issuer, AUDIENCE, 300, serde_json::json!({}));
         assert!(matches!(
             validator.authenticate(&missing).await,
-            AuthOutcome::Rejected
+            AuthOutcome::Rejected(Rejection::InsufficientScope)
         ));
 
         let string_claim = token(&issuer, AUDIENCE, 300, serde_json::json!({"groups": "sre"}));
@@ -1331,12 +1558,12 @@ mod oidc_tests {
         let empty_string = token(&issuer, AUDIENCE, 300, serde_json::json!({"groups": ""}));
         assert!(matches!(
             validator.authenticate(&empty_string).await,
-            AuthOutcome::Rejected
+            AuthOutcome::Rejected(Rejection::InsufficientScope)
         ));
         let empty_array = token(&issuer, AUDIENCE, 300, serde_json::json!({"groups": [""]}));
         assert!(matches!(
             validator.authenticate(&empty_array).await,
-            AuthOutcome::Rejected
+            AuthOutcome::Rejected(Rejection::InsufficientScope)
         ));
     }
 
@@ -1362,7 +1589,7 @@ mod oidc_tests {
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         assert!(matches!(
             validator.authenticate(&tok).await,
-            AuthOutcome::Rejected
+            AuthOutcome::Rejected(Rejection::InvalidToken(_))
         ));
 
         // Serve the key again: after the next interval the refresh picks the
@@ -1537,6 +1764,13 @@ mod oidc_tests {
         .await
         .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // The caller's credential is not at fault: Retry-After, and no
+        // bearer challenge that would trigger a pointless re-login.
+        assert_eq!(
+            resp.headers().get("retry-after").unwrap().to_str().unwrap(),
+            "30"
+        );
+        assert!(resp.headers().get("www-authenticate").is_none());
     }
 
     #[test]
@@ -1609,5 +1843,136 @@ mod oidc_tests {
         ))
         .expect("valid EC JWK");
         assert_eq!(jwk_algorithm(&jwk), None);
+    }
+
+    #[tokio::test]
+    async fn claim_gate_denial_is_403_insufficient_scope() {
+        // A valid, correctly signed token denied by the claim gate is
+        // authenticated-but-not-authorized: 403, never 401, so a compliant
+        // client does not discard a fine token and re-login forever.
+        let server = mock_idp().await;
+        let issuer = server.uri();
+        let mut cfg = oidc_cfg(issuer.clone(), Some(format!("{issuer}/jwks.json")));
+        cfg.require_claim = Some("groups".to_string());
+        cfg.require_claim_values = vec!["sre".to_string()];
+        let validator = OidcValidator::new(cfg);
+        validator.warm().await.unwrap();
+        let state =
+            super::tests::test_state(Some(Arc::new(Authenticator::Oidc(Box::new(validator)))));
+        let app = super::tests::app_with_auth(state);
+        let jwt = token(
+            &issuer,
+            AUDIENCE,
+            300,
+            serde_json::json!({"groups": ["docs"]}),
+        );
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            super::tests::request("/v1/models", &[("authorization", format!("Bearer {jwt}"))]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let challenge = resp
+            .headers()
+            .get("www-authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            challenge.contains("error=\"insufficient_scope\""),
+            "{challenge}"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_token_challenge_says_expired_and_advertises_metadata() {
+        let server = mock_idp().await;
+        let issuer = server.uri();
+        let validator = OidcValidator::new(oidc_cfg(
+            issuer.clone(),
+            Some(format!("{issuer}/jwks.json")),
+        ));
+        validator.warm().await.unwrap();
+        let state =
+            super::tests::test_state(Some(Arc::new(Authenticator::Oidc(Box::new(validator)))));
+        let app = super::tests::app_with_auth(state);
+        let jwt = token(&issuer, AUDIENCE, -300, serde_json::json!({}));
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            super::tests::request(
+                "/v1/models",
+                &[
+                    ("authorization", format!("Bearer {jwt}")),
+                    ("host", "aura.example.com".to_string()),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let challenge = resp
+            .headers()
+            .get("www-authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            challenge.contains("error_description=\"token has expired\""),
+            "{challenge}"
+        );
+        // OIDC mode advertises the RFC 9728 metadata document.
+        assert!(challenge.contains("resource_metadata=\""), "{challenge}");
+    }
+
+    #[tokio::test]
+    async fn protected_resource_metadata_is_discoverable_unauthenticated() {
+        let server = mock_idp().await;
+        let issuer = server.uri();
+        let validator = OidcValidator::new(oidc_cfg(issuer.clone(), None));
+        let state =
+            super::tests::test_state(Some(Arc::new(Authenticator::Oidc(Box::new(validator)))));
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("aura.example.com"));
+        let resp = protected_resource_metadata(axum::extract::State(state), headers).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["resource"], "https://aura.example.com");
+        assert_eq!(body["authorization_servers"], serde_json::json!([issuer]));
+        assert_eq!(
+            body["bearer_methods_supported"],
+            serde_json::json!(["header"])
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_resource_metadata_absent_in_api_keys_mode() {
+        let ring = build_authenticator(&[aura_config::Config {
+            auth: Some(AuthConfig {
+                mode: AuthMode::ApiKeys,
+                keys: vec![aura_config::ApiKeyConfig {
+                    name: "ops".into(),
+                    key_hash: aura_config::hash_api_key("x"),
+                    key_hash_previous: None,
+                    agents: vec!["*".into()],
+                }],
+                oidc: None,
+            }),
+            ..Default::default()
+        }])
+        .unwrap()
+        .unwrap();
+        let state = super::tests::test_state(Some(ring));
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("aura.example.com"));
+        let resp = protected_resource_metadata(axum::extract::State(state), headers).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

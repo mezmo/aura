@@ -586,6 +586,12 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
 
     let app = Router::new()
         .route("/health", get(handlers::health))
+        // RFC 9728 discovery, advertised from the 401 challenge. Open path;
+        // the handler answers 404 unless OIDC mode is configured.
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(crate::auth::protected_resource_metadata),
+        )
         .route("/aura/info", get(handlers::info))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/chat/completions", post(handlers::chat_completions))
