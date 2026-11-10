@@ -3878,8 +3878,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .await;
             }
 
-            // Taken before any worker future exists: the arms below write
-            // artifacts through it instead of waiting on the shared mutex.
+            // Clone the handle before any worker future exists.
             let wave_persistence = self.persistence.lock().await.clone();
 
             // Execute all ready tasks in parallel using FuturesUnordered
