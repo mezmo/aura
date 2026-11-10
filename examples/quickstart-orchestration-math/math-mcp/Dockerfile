@@ -5,10 +5,7 @@ WORKDIR /app
 # Install mcp-proxy globally
 RUN npm install -g mcp-proxy
 
-# Upstream math-mcp sorts numbers as strings in median (the median of
-# 3, 7, 8, 10, 41 comes back as 41) and answers a zero denominator with a
-# successful Infinity or NaN. The patch sorts numerically and returns a tool
-# error (isError) for division or modulo by zero (mezmo/aura#788).
+# Fixes math-mcp's median and zero division; see the patch (mezmo/aura#788).
 COPY fix-median-and-zero-division.patch /tmp/
 
 # Clone, patch and build math-mcp
