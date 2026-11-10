@@ -216,6 +216,24 @@ impl Default for LlmConfig {
     }
 }
 
+/// The endpoint rig's client uses for each provider when `base_url` is unset.
+const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
+const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+/// Whether two `base_url` settings reach the same endpoint: an unset one is
+/// the provider's default, and a trailing slash does not matter.
+fn same_endpoint(a: &Option<String>, b: &Option<String>, default: &str) -> bool {
+    let effective = |url: &Option<String>| {
+        url.as_deref()
+            .unwrap_or(default)
+            .trim_end_matches('/')
+            .to_owned()
+    };
+    effective(a) == effective(b)
+}
+
 impl LlmConfig {
     /// Check if Ollama text-to-tool fallback is enabled.
     ///
@@ -304,8 +322,8 @@ impl LlmConfig {
                     base_url: other_url,
                     ..
                 },
-            )
-            | (
+            ) => api_key == other_key && same_endpoint(base_url, other_url, OPENAI_BASE_URL),
+            (
                 Self::Anthropic {
                     api_key, base_url, ..
                 },
@@ -314,8 +332,8 @@ impl LlmConfig {
                     base_url: other_url,
                     ..
                 },
-            )
-            | (
+            ) => api_key == other_key && same_endpoint(base_url, other_url, ANTHROPIC_BASE_URL),
+            (
                 Self::Gemini {
                     api_key, base_url, ..
                 },
@@ -324,8 +342,8 @@ impl LlmConfig {
                     base_url: other_url,
                     ..
                 },
-            )
-            | (
+            ) => api_key == other_key && same_endpoint(base_url, other_url, GEMINI_BASE_URL),
+            (
                 Self::OpenRouter {
                     api_key, base_url, ..
                 },
@@ -334,7 +352,7 @@ impl LlmConfig {
                     base_url: other_url,
                     ..
                 },
-            ) => api_key == other_key && base_url == other_url,
+            ) => api_key == other_key && same_endpoint(base_url, other_url, OPENROUTER_BASE_URL),
             (
                 Self::Bedrock {
                     region, profile, ..
@@ -1206,6 +1224,29 @@ mod tests {
     }
 
     #[test]
+    fn an_unset_base_url_is_the_providers_default_endpoint() {
+        for default in [
+            OPENAI_BASE_URL,
+            ANTHROPIC_BASE_URL,
+            GEMINI_BASE_URL,
+            OPENROUTER_BASE_URL,
+        ] {
+            let explicit = Some(default.to_string());
+            assert!(same_endpoint(&None, &explicit, default));
+            assert!(same_endpoint(
+                &explicit,
+                &Some(format!("{default}/")),
+                default
+            ));
+            assert!(!same_endpoint(
+                &None,
+                &Some("https://proxy.example".into()),
+                default
+            ));
+        }
+    }
+
+    #[test]
     fn same_account_compares_provider_and_credentials_not_model() {
         assert!(openai("key", "gpt-5").same_account(&openai("key", "gpt-4o")));
         assert!(!openai("key", "gpt-5").same_account(&openai("other", "gpt-5")));
@@ -1215,6 +1256,13 @@ mod tests {
             *base_url = Some("https://proxy.example".to_string());
         }
         assert!(!openai("key", "gpt-5").same_account(&proxied));
+
+        let mut explicit_default = openai("key", "gpt-5");
+        if let LlmConfig::OpenAI { base_url, .. } = &mut explicit_default {
+            *base_url = Some("https://api.openai.com/v1/".to_string());
+        }
+        assert!(openai("key", "gpt-5").same_account(&explicit_default));
+        assert!(!explicit_default.same_account(&proxied));
 
         assert!(bedrock("us-east-1", Some("a")).same_account(&bedrock("us-east-1", Some("a"))));
         assert!(!bedrock("us-east-1", Some("a")).same_account(&bedrock("us-east-1", Some("b"))));
