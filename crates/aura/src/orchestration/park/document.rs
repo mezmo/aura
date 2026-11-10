@@ -65,6 +65,9 @@ pub(crate) struct ParkedTaskNode {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_category: Option<FailureCategory>,
+    /// Output of an earlier attempt of the failed task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_output: Option<String>,
     /// The worker attempt that blocked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt: Option<usize>,
@@ -173,6 +176,7 @@ pub(crate) fn build_document(
             result: None,
             error: None,
             failure_category: None,
+            kept_output: None,
             attempt: None,
             pending: None,
             history: None,
@@ -195,6 +199,7 @@ pub(crate) fn build_document(
             TaskState::Failed { error, category } => {
                 node.error = Some(error.clone());
                 node.failure_category = Some(*category);
+                node.kept_output = t.kept_output.clone();
             }
             TaskState::Pending | TaskState::Running => {}
         }
@@ -358,6 +363,33 @@ mod tests {
         let untouched = &doc.plan.tasks[2];
         assert_eq!(untouched.status, TaskStatus::Pending);
         assert!(untouched.pending.is_none());
+    }
+
+    /// A parked run keeps what a failed sibling's earlier attempt produced.
+    #[test]
+    fn build_document_keeps_a_failed_tasks_output() {
+        let mut plan = Plan::new("Deploy");
+        plan.add_task(Task::new(0, "Facts", "r"));
+        let task = plan.get_task_mut(0).unwrap();
+        task.fail("context overflow", FailureCategory::ContextOverflow);
+        task.kept_output = Some("found two idle nodes".to_string());
+
+        let doc = build_document(
+            &park_fixture_state("Deploy it", &[]),
+            &plan,
+            &ParkedTaskRecords::new(),
+            &std::collections::HashMap::new(),
+            "2026-09-02T15:00:00+00:00".to_string(),
+            "fingerprint".to_string(),
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&doc).unwrap();
+        let back: ParkedRun = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.plan.tasks[0].kept_output.as_deref(),
+            Some("found two idle nodes")
+        );
     }
 
     #[test]

@@ -1145,6 +1145,9 @@ fn render_task_summary(task: &TaskSummary, out: &mut String) {
                 let category = task.failure_category.unwrap_or_default();
                 out.push_str(&format!("    Error: {}\n", failure_text(error, category)));
             }
+            if let Some(preview) = &task.result_preview {
+                out.push_str(&format!("    Output: \"{}\"\n", preview));
+            }
             if let Some(ctx) = &task.error_context {
                 if let Some(tool) = &ctx.last_tool_call {
                     out.push_str(&format!("    Last tool: {}\n", tool));
@@ -2143,6 +2146,44 @@ mod tests {
         assert!(turn1_pos < turn2_pos);
         assert!(result[turn1_pos..turn2_pos].contains("First query"));
         assert!(result[turn2_pos..].contains("Second query"));
+    }
+
+    /// A later turn's session context shows what a failed task kept.
+    #[test]
+    fn test_build_session_context_failed_task_with_kept_output() {
+        let manifest = RunManifest {
+            run_id: "run-kept".to_string(),
+            session_id: Some("cs_test".to_string()),
+            timestamp: "2026-03-20T01:00:00Z".to_string(),
+            goal: "Failing query".to_string(),
+            status: RunStatus::Failed,
+            iterations: 1,
+            routing_mode: Some(RoutingMode::Orchestrated),
+            outcome: None,
+            response_summary: None,
+            task_summaries: vec![TaskSummary {
+                task_id: 0,
+                description: "Inspect".to_string(),
+                status: TaskStatus::Failed,
+                worker: Some("worker1".to_string()),
+                result_preview: Some("found two idle nodes".to_string()),
+                confidence: None,
+                failure_category: Some(super::super::types::FailureCategory::AgentError),
+                error: Some("Worker failed".to_string()),
+                error_context: None,
+                tool_trace: vec![],
+                artifacts: vec![],
+            }],
+            artifact_paths: vec![],
+            phase_timings: None,
+        };
+
+        let result = build_session_context(&[manifest]);
+
+        assert!(
+            result.contains("Output: \"found two idle nodes\""),
+            "{result}"
+        );
     }
 
     #[test]
