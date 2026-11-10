@@ -4542,19 +4542,28 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 task_id,
                                 attempt
                             );
+                            // A blank retry must not replace the first
+                            // attempt's answer (mezmo/aura#897).
+                            let result = if raw_response.trim().is_empty()
+                                && !last_raw_response.trim().is_empty()
+                            {
+                                last_raw_response
+                            } else {
+                                raw_response
+                            };
                             let duration_ms = start_time.elapsed().as_millis() as u64;
                             self.persist_worker_execution(
                                 task_id,
                                 task_description,
                                 attempt,
                                 duration_ms,
-                                Ok(&raw_response),
+                                Ok(&result),
                                 None,
                                 &prompt,
                             )
                             .await;
                             return Ok(TaskOutcome::Completed(TaskExecutionResult {
-                                result: raw_response,
+                                result,
                                 structured_output: None,
                             }));
                         }
@@ -10212,6 +10221,53 @@ mod tests {
         let summary = orchestrator.build_execution_summary(&plan);
 
         assert!(summary.contains(footer), "{summary}");
+    }
+
+    /// A retry that ends on a blank turn without submit_result must not
+    /// discard the first attempt's answer (mezmo/aura#897).
+    #[tokio::test]
+    async fn a_blank_retry_keeps_the_first_attempts_answer() {
+        let run = run_retry(
+            "found two idle nodes",
+            vec![ScriptedTurn::text("")],
+            OrchestrationConfig::default(),
+        )
+        .await;
+
+        let (error, category) = failed(&run.plan);
+        assert_eq!(category, FailureCategory::SoftFailure, "{error}");
+        assert_eq!(error, "found two idle nodes");
+    }
+
+    /// A retry with text of its own is still the task's failure text.
+    #[tokio::test]
+    async fn a_retry_with_text_keeps_its_own_text() {
+        let run = run_retry(
+            "found two idle nodes",
+            vec![ScriptedTurn::text("the retry's findings")],
+            OrchestrationConfig::default(),
+        )
+        .await;
+
+        let (error, category) = failed(&run.plan);
+        assert_eq!(category, FailureCategory::SoftFailure, "{error}");
+        assert_eq!(error, "the retry's findings");
+    }
+
+    /// Two blank attempts leave nothing to keep, so the task fails with the
+    /// empty-worker message.
+    #[tokio::test]
+    async fn two_blank_attempts_fail_as_empty() {
+        let run = run_retry(
+            "",
+            vec![ScriptedTurn::text("")],
+            OrchestrationConfig::default(),
+        )
+        .await;
+
+        let (error, category) = failed(&run.plan);
+        assert_eq!(category, FailureCategory::SoftFailure, "{error}");
+        assert_eq!(error, EMPTY_WORKER_RESULT);
     }
 
     /// With nothing from the first attempt to keep, the retry's hard error
