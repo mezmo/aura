@@ -3878,6 +3878,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .await;
             }
 
+            // Taken before any worker future exists: the arms below write
+            // artifacts through it instead of waiting on the shared mutex.
+            let wave_persistence = self.persistence.lock().await.clone();
+
             // Execute all ready tasks in parallel using FuturesUnordered
             let mut futures: FuturesUnordered<_> = ready_tasks
                 .into_iter()
@@ -3907,6 +3911,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     Ok(TaskOutcome::Completed(exec_result)) => {
                         let final_result = self
                             .maybe_create_artifact(
+                                &wave_persistence,
                                 task_id,
                                 worker_name.as_deref(),
                                 exec_result.result,
@@ -3950,7 +3955,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     // like a result, but the task fails as a timeout.
                     Ok(TaskOutcome::TimedOut { message }) => {
                         let final_result = self
-                            .maybe_create_artifact(task_id, worker_name.as_deref(), message)
+                            .maybe_create_artifact(
+                                &wave_persistence,
+                                task_id,
+                                worker_name.as_deref(),
+                                message,
+                            )
                             .await;
                         if let Some(t) = plan.get_task_mut(task_id) {
                             t.fail(final_result.clone(), FailureCategory::AgentTimeout);
@@ -3975,7 +3985,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     Ok(TaskOutcome::FailedWithOutput { error, output }) => {
                         let category = Self::categorize_failure_error(&error);
                         let output = self
-                            .maybe_create_artifact(task_id, worker_name.as_deref(), output)
+                            .maybe_create_artifact(
+                                &wave_persistence,
+                                task_id,
+                                worker_name.as_deref(),
+                                output,
+                            )
                             .await;
                         let message = format!("{error}\n{KEPT_OUTPUT_HEADING}\n{output}");
                         if let Some(t) = plan.get_task_mut(task_id) {
@@ -4094,8 +4109,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// If result exceeds artifact threshold, write full result to artifact file
     /// and return a summary. Otherwise, or with persistence disabled, return
     /// the original result unchanged.
+    ///
+    /// Writes through `persistence`, a clone of the shared handle, and never
+    /// takes the shared mutex: the wave loop calls this while worker futures it
+    /// is not polling may hold or be queued for that mutex.
     async fn maybe_create_artifact(
         &self,
+        persistence: &ExecutionPersistence,
         task_id: usize,
         worker_name: Option<&str>,
         result: String,
@@ -4106,7 +4126,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
 
         let summary_len = self.config.result_summary_length();
-        let persistence = self.persistence.lock().await;
         if !persistence.is_enabled() {
             return result;
         }
@@ -4500,8 +4519,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     // The artifact below is named per task, so writing an
                     // earlier attempt's output would replace this attempt's.
                     last_raw_response.clear();
+                    let persistence = self.persistence.lock().await.clone();
                     let processed = self
-                        .maybe_create_artifact(task_id, *worker_name, worker_output)
+                        .maybe_create_artifact(&persistence, task_id, *worker_name, worker_output)
                         .await;
                     Err(format!("Worker blocked by duplicate call loop.\n{processed}").into())
                 }
@@ -11116,8 +11136,9 @@ mod coordinator_artifact_tests {
             .unwrap();
         let result = big_artifact();
 
+        let persistence = orchestrator.persistence.lock().await.clone();
         let kept = orchestrator
-            .maybe_create_artifact(0, Some("files"), result.clone())
+            .maybe_create_artifact(&persistence, 0, Some("files"), result.clone())
             .await;
 
         assert_eq!(kept, result);
@@ -11129,8 +11150,9 @@ mod coordinator_artifact_tests {
         let orchestrator = orchestrator(temp.path(), None, None).await;
         let result = big_artifact();
 
+        let persistence = orchestrator.persistence.lock().await.clone();
         let kept = orchestrator
-            .maybe_create_artifact(0, Some("files"), result.clone())
+            .maybe_create_artifact(&persistence, 0, Some("files"), result.clone())
             .await;
 
         assert!(kept.len() < result.len());
@@ -11139,6 +11161,47 @@ mod coordinator_artifact_tests {
             "{}",
             &kept[kept.len() - 80..]
         );
+    }
+
+    /// The wave loop writes a finished task's artifact while other worker
+    /// futures sit unpolled. One of them pending on a file write with the
+    /// shared mutex held must not stall that write (mezmo/aura#896).
+    #[tokio::test]
+    async fn a_result_artifact_is_written_while_a_worker_holds_the_persistence_lock() {
+        use futures::StreamExt;
+        use futures::stream::FuturesUnordered;
+
+        let temp = tempfile::tempdir().unwrap();
+        let orchestrator = orchestrator(temp.path(), None, None).await;
+        let snapshot = orchestrator.persistence.lock().await.clone();
+
+        type Worker<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = &'static str> + 'a>>;
+        let mut workers: FuturesUnordered<Worker<'_>> = FuturesUnordered::new();
+        workers.push(Box::pin(async {
+            orchestrator
+                .record_worker_execution(0, "task", 1, 1, Ok("output"), None, "prompt")
+                .await;
+            "holder"
+        }));
+        workers.push(Box::pin(async { "finished" }));
+
+        // Polls the holder first, which locks the mutex and pends on its
+        // first file write, then the task that finishes.
+        assert_eq!(workers.next().await, Some("finished"));
+        assert!(
+            orchestrator.persistence.try_lock().is_err(),
+            "the holder must still own the persistence lock"
+        );
+
+        let kept = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            orchestrator.maybe_create_artifact(&snapshot, 1, Some("files"), big_artifact()),
+        )
+        .await
+        .expect("the artifact write waited on the persistence lock");
+        assert!(kept.contains("saved to artifact:"), "{kept}");
+
+        assert_eq!(workers.next().await, Some("holder"));
     }
 
     /// The coordinator's artifact tools with their run bound, as
