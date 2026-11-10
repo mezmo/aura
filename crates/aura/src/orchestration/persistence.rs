@@ -167,8 +167,7 @@ pub struct TaskSummary {
     pub status: TaskStatus,
     /// Assigned worker name (if any).
     pub worker: Option<String>,
-    /// Task result preview for session history. Worker-provided summary from
-    /// `submit_result` when available; falls back to first ~200 chars of result.
+    /// Short preview of the task's outcome, for session history.
     pub result_preview: Option<String>,
     /// Worker-reported confidence from `submit_result` (high/medium/low).
     #[serde(default, skip_serializing_if = "Option::is_none")]
