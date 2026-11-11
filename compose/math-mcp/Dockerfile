@@ -5,15 +5,11 @@ WORKDIR /app
 # Install mcp-proxy globally
 RUN npm install -g mcp-proxy
 
-# Fixes math-mcp's median and zero division; see the patch (mezmo/aura#788).
-COPY fix-median-and-zero-division.patch /tmp/
-
-# Clone, patch and build math-mcp
+# Clone and build math-mcp from a fork that fixes median and zero division (mezmo/aura#788)
 RUN apk add --no-cache git curl \
-    && git clone https://github.com/EthanHenrickson/math-mcp.git \
+    && git clone https://github.com/atishay-kasliwal/math-mcp.git \
     && cd math-mcp \
-    && git checkout 6eed9eb \
-    && git apply /tmp/fix-median-and-zero-division.patch \
+    && git checkout d297753 \
     && npm install \
     && npm run build:stdio \
     && apk del git
