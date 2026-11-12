@@ -5,13 +5,13 @@ WORKDIR /app
 # Install mcp-proxy globally
 RUN npm install -g mcp-proxy
 
-# Clone and build math-mcp
+# Clone and build math-mcp at the upstream merge of its median and zero-division fix (mezmo/aura#788)
 RUN apk add --no-cache git curl \
     && git clone https://github.com/EthanHenrickson/math-mcp.git \
     && cd math-mcp \
-    && git checkout 6eed9eb \
+    && git checkout 1a838f6 \
     && npm install \
-    && npm run build:stdio \
+    && npm run build \
     && apk del git
 
 EXPOSE 8081
