@@ -4,6 +4,7 @@
 use aura_events::run::{RunCancelReason, RunEnding};
 use aura_events::{RunId, SessionId};
 
+use crate::conversation::LaneNumber;
 use crate::logging;
 
 /// How a run is served.
@@ -23,6 +24,8 @@ pub(crate) struct RunSpan {
     pub model: String,
     pub run: RunId,
     pub session: SessionId,
+    /// The conversation's lane the run is on.
+    pub lane: Option<LaneNumber>,
     pub prompt: String,
     pub user: Option<String>,
     /// The request's `metadata`, as one JSON object.
@@ -37,12 +40,13 @@ pub(crate) struct RunSpan {
 
 impl RunSpan {
     /// Records the input side on `span`: the provider and model, the prompt,
-    /// the system prompt, the run and session ids, the `aura.version`
-    /// attribute, the mode, the user and metadata if set, the invocation
-    /// parameters, a single agent's tool schemas, and the message count (the
-    /// history plus the prompt). The version comes from the crate's version
-    /// constant. The attributes go on in the same order as on the
-    /// request-bound path, so the two paths' spans compare equal.
+    /// the system prompt, the run and session ids, the lane's number as
+    /// `session.lane` for a run on a lane, the `aura.version` attribute, the
+    /// mode, the user and metadata if set, the invocation parameters, a
+    /// single agent's tool schemas, and the message count (the history plus
+    /// the prompt). The version comes from the crate's version constant. The
+    /// attributes go on in the same order as on the request-bound path, so
+    /// the two paths' spans compare equal.
     pub(crate) fn record_input(&self, span: &tracing::Span) {
         logging::set_llm_identifiers(span, &self.provider, &self.model);
         logging::set_input_attributes(span, &self.prompt);
@@ -51,6 +55,9 @@ impl RunSpan {
         }
         logging::set_span_attribute(span, "http.request_id", self.run.to_string());
         logging::set_span_attribute(span, "session.id", self.session.to_string());
+        if let Some(lane) = self.lane {
+            logging::set_span_attribute(span, "session.lane", i64::from(lane.get()));
+        }
         logging::set_span_attribute(span, logging::ATTR_AURA_VERSION, logging::AURA_VERSION);
         let (mode, tools_json): (&'static str, &[String]) = match &self.mode {
             RunMode::SingleAgent { tools_json } => ("single-agent", tools_json),

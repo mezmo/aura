@@ -33,11 +33,12 @@ use crate::provider_agent::{
     ProviderAgent, StreamError, StreamItem, StreamedUserContent, ToolResult, ToolResultKind,
 };
 use crate::run_context::{Attendance, RunContext};
-use crate::session_store::JournalEntry;
+use crate::session_store::{JournalEntry, SkillLogKey};
 use crate::streaming::{AgentRun, RunOptions, StreamingAgent};
 use crate::streaming_request_hook::UsageState;
 use aura_events::McpServerStatus;
 
+mod lanes;
 mod observe;
 
 // ---------------------------------------------------------------------------
@@ -261,6 +262,8 @@ struct TestPreparer {
     gate: Option<Arc<Notify>>,
     /// The agent ids prepared, in order.
     prepared: Mutex<Vec<String>>,
+    /// The session and skill log each `prepare` was handed, in order.
+    requests: Mutex<Vec<(SessionId, Option<SkillLogKey>)>>,
     /// What every fake agent's `cancel_and_close_mcp` was called with.
     closed: Arc<Mutex<Vec<(String, String)>>>,
     /// The attendance every fake agent's `stream` saw.
@@ -274,6 +277,7 @@ impl TestPreparer {
             queued: Mutex::new(queued.into()),
             gate: None,
             prepared: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
             closed: Arc::default(),
             attended: Arc::default(),
         }
@@ -345,6 +349,13 @@ impl AgentPreparer for TestPreparer {
             .lock()
             .unwrap()
             .push(config.agent_id().to_owned());
+        self.requests.lock().unwrap().push((
+            request.session.clone(),
+            request
+                .skill_recorder
+                .as_ref()
+                .map(|recorder| recorder.log().clone()),
+        ));
         let queued = self
             .queued
             .lock()
@@ -615,7 +626,7 @@ fn harness_stalling_on(
 
 fn on_session(session: &str, prompt: &str) -> StartRun {
     StartRun {
-        session: Some(SessionId::new(session).unwrap()),
+        target: RunTarget::Session(SessionId::new(session).unwrap()),
         ..StartRun::new(prompt)
     }
 }
@@ -1968,7 +1979,7 @@ async fn a_panicking_run_fails_and_frees_its_session() {
 fn preparing(run_id: RunId) -> RunFacts {
     RunFacts {
         run_id,
-        session_id: SessionId::new("s1").unwrap(),
+        landing: Landing::Session(SessionId::new("s1").unwrap()),
         agent: "a".to_owned(),
         status: RunStatus::Preparing,
         liveness: Liveness::default(),
@@ -2374,7 +2385,7 @@ async fn stored(h: &Harness, run: RunId) -> RunFacts {
 #[tokio::test]
 async fn a_run_opens_with_session_info_then_rehydrated_skills_then_mcp_status() {
     use crate::session_store::{
-        SKILL_INVOCATION_RECORD_VERSION, SkillInvocation, SkillInvocationRecord, SkillLogKey,
+        SKILL_INVOCATION_RECORD_VERSION, SkillInvocation, SkillInvocationRecord,
     };
 
     let skills = tempfile::TempDir::new().unwrap();
@@ -2809,6 +2820,11 @@ mod spans {
         assert_eq!(attribute("run.id"), run_id);
         assert_eq!(attribute("http.request_id"), run_id);
         assert_eq!(attribute("session.id").as_deref(), Some("s1"));
+        assert_eq!(
+            attribute("session.lane"),
+            None,
+            "a session start has no lane"
+        );
         for key in ["llm.system", "llm.provider", "llm.model_name"] {
             assert_eq!(attribute(key).as_deref(), Some("scripted"), "{key}");
         }
@@ -2851,6 +2867,45 @@ mod spans {
         for key in ["run.id", "http.request_id", "session.id", "aura.mode"] {
             assert_eq!(captured.attribute("chat_completions", key), None, "{key}");
         }
+    }
+
+    /// A run on a conversation's lane records the chat id as `session.id`,
+    /// not the lane's session id, and the lane's number as `session.lane`.
+    #[tokio::test]
+    async fn a_run_on_a_lane_records_the_chat_id_and_the_lane_number() {
+        let captured = CapturedSpans::default();
+        let _capturing = captured.install();
+        let gate = Arc::new(Notify::new());
+        let h = harness(TestPreparer::new(
+            &["a"],
+            vec![
+                Prepared::Fake(vec![Step::Wait(Arc::clone(&gate))]),
+                Prepared::Scripted(vec![ScriptedTurn::text("hello")]),
+            ],
+        ));
+        let on_chat = |span| StartRun {
+            target: RunTarget::Conversation {
+                chat: SessionId::new("c1").unwrap(),
+            },
+            span,
+            ..StartRun::new("q")
+        };
+
+        let held = h
+            .runtime
+            .start(on_chat(tracing::Span::none()))
+            .await
+            .unwrap();
+        let run = h.runtime.start(on_chat(agent_stream())).await.unwrap();
+        assert_eq!(h.ended(run).await.status, RunStatus::Finished);
+        exported(&captured, "agent.stream").await;
+
+        let attribute = |key| captured.attribute("agent.stream", key);
+        assert_eq!(attribute("run.id"), Some(run.to_string()));
+        assert_eq!(attribute("session.id").as_deref(), Some("c1"));
+        assert_eq!(attribute("session.lane").as_deref(), Some("1"));
+        gate.notify_one();
+        h.ended(held).await;
     }
 
     /// A run given `Span::none()` is untraced. The runtime opens no span of
