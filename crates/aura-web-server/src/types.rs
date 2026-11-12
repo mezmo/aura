@@ -138,6 +138,8 @@ pub struct AppState {
     pub hitl_webhook_hmac: Option<aura::hitl::WebhookHmac>,
     /// The session-state backend.
     pub session_store: Arc<dyn SessionStore>,
+    /// The deployment authenticator compiled from the `[auth]` tables.
+    pub auth: Option<Arc<crate::auth::Authenticator>>,
 }
 
 impl AppState {

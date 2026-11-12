@@ -820,6 +820,7 @@ mod tests {
             orchestration: None,
             hitl: None,
             governance: None,
+            auth: None,
             agent: aura_config::AgentConfig {
                 name: "slack-bot".to_owned(),
                 system_prompt: "Be brief.".to_owned(),

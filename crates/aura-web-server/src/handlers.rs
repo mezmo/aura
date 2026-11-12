@@ -70,6 +70,11 @@ impl Drop for RequestResourceGuard {
 pub enum PrepareError {
     BadRequest(String),
     NotFound(String),
+    /// Valid API key, but not allowed to invoke the resolved agent.
+    Forbidden {
+        key_name: String,
+        agent_id: String,
+    },
     Internal(String),
 }
 
@@ -79,6 +84,9 @@ impl PrepareError {
         match self {
             PrepareError::BadRequest(msg) => msg,
             PrepareError::NotFound(msg) => msg,
+            PrepareError::Forbidden { .. } => {
+                "access to this agent is not permitted for this API key"
+            }
             PrepareError::Internal(msg) => msg,
         }
     }
@@ -94,6 +102,9 @@ impl PrepareError {
                 Json(ChatCompletionErrorResponse::ModelNotFound(model_name)),
             )
                 .into_response(),
+            PrepareError::Forbidden { key_name, agent_id } => {
+                crate::auth::forbidden_response(&key_name, &agent_id)
+            }
             PrepareError::Internal(msg) => {
                 error_response(StatusCode::INTERNAL_SERVER_ERROR, msg, "internal_error")
             }
@@ -233,6 +244,7 @@ pub async fn prepare_request(
     req: &mut ChatCompletionRequest,
     chat_session_id: &aura::SessionId,
     req_headers_map: &HashMap<String, String>,
+    auth: Option<&crate::auth::AuthContext>,
 ) -> Result<RequestSetup, PrepareError> {
     // Client-side tools go only to a single agent whose config sets
     // `[agent].enable_client_tools`: the single-agent branch below checks the
@@ -268,6 +280,16 @@ pub async fn prepare_request(
             "you must provide a model parameter".to_string(),
         ));
     };
+    // Per-key agent allowlist: the key authenticated at the middleware layer,
+    // but may not be permitted to invoke this agent.
+    if let Some(auth) = auth
+        && !auth.allows(&config.agent.name, config.agent.alias.as_deref())
+    {
+        return Err(PrepareError::Forbidden {
+            key_name: auth.name.clone(),
+            agent_id: config.agent_id().to_string(),
+        });
+    }
     let serves_skills = !config.agent.skills.local.is_empty();
 
     // Single pass: pull the user query out of `messages` and convert the rest
@@ -428,9 +450,10 @@ fn validate_hitl_delivery_mode(
 }
 
 /// Handle chat completions endpoint
-#[tracing::instrument(name = "chat_completions", skip(state, req, headers), fields(otel.kind = "server"))]
+#[tracing::instrument(name = "chat_completions", skip(state, req, headers, auth), fields(otel.kind = "server", enduser.id = tracing::field::Empty))]
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    auth: Option<axum::Extension<crate::auth::AuthContext>>,
     headers: HeaderMap,
     Json(mut req): Json<ChatCompletionRequest>,
 ) -> Response {
@@ -443,7 +466,24 @@ pub async fn chat_completions(
         );
     }
 
+    if let Some(axum::Extension(ctx)) = &auth {
+        tracing::Span::current().record("enduser.id", ctx.name.as_str());
+    }
+
     let chat_session_id = chat_session_id(req.metadata.as_ref(), &headers);
+    // With auth enabled, namespace sessions per principal: two callers that
+    // happen to use the same client-side session id (or guess one) must not
+    // share conversation state, skill logs, or orchestration history.
+    // Idempotent, so a client that adopts the echoed `X-Chat-Session-Id`
+    // keeps the same session across turns.
+    let chat_session_id = match &auth {
+        Some(axum::Extension(ctx)) => aura::SessionId::new(crate::auth::namespace_session(
+            &ctx.name,
+            chat_session_id.as_str(),
+        ))
+        .expect("namespaced session id is non-blank"),
+        None => chat_session_id,
+    };
 
     // Convert HeaderMap to HashMap for framework-agnostic passing
     let req_headers_map: HashMap<String, String> = headers
@@ -451,7 +491,15 @@ pub async fn chat_completions(
         .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
         .collect();
 
-    let setup = match prepare_request(&state, &mut req, &chat_session_id, &req_headers_map).await {
+    let setup = match prepare_request(
+        &state,
+        &mut req,
+        &chat_session_id,
+        &req_headers_map,
+        auth.as_ref().map(|axum::Extension(c)| c),
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => return e.into_http_response(),
     };
@@ -1177,8 +1225,13 @@ async fn native_tool_overviews(factory: aura::RunToolFactory) -> Vec<NativeToolO
 /// the result reflects that caller's authorization. Agents are swept
 /// concurrently, but the response still costs a full round of MCP connections —
 /// callers that only need the config view should omit the parameter.
+///
+/// With auth enabled, "visible" also honors the caller's agent allowlist (the
+/// same filter as `/v1/models`): forbidden agents are neither described nor
+/// connected to for tool discovery.
 pub async fn info(
     State(state): State<Arc<AppState>>,
+    auth: Option<axum::Extension<crate::auth::AuthContext>>,
     headers: HeaderMap,
     Query(query): Query<InfoQuery>,
 ) -> Response {
@@ -1189,7 +1242,34 @@ pub async fn info(
         }
     };
 
-    let visible = state.configs.iter().filter(|config| !config.agent.hidden);
+    let visible = state
+        .configs
+        .iter()
+        .filter(|config| !config.agent.hidden)
+        .filter(|config| match &auth {
+            // With auth on, agents the principal may not invoke must not be
+            // discoverable here — including via `detail=tools`, which would
+            // otherwise connect to their MCP servers with configured
+            // credentials and enumerate their tools.
+            Some(axum::Extension(ctx)) => {
+                ctx.allows(&config.agent.name, config.agent.alias.as_deref())
+            }
+            None => true,
+        });
+
+    // The default agent's name would otherwise leak a forbidden agent's
+    // existence even though it is absent from the list. Resolved by the same
+    // effective identifier (alias, else name) `resolve_config` uses — an
+    // agent's bare name can collide with a *different* agent's alias, and
+    // `resolve_config` picks the alias owner.
+    let default_agent = state.default_agent.clone().filter(|name| match &auth {
+        Some(axum::Extension(ctx)) => state
+            .configs
+            .iter()
+            .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == name.as_str())
+            .is_none_or(|c| ctx.allows(&c.agent.name, c.agent.alias.as_deref())),
+        None => true,
+    });
 
     let agents: Vec<AgentInfo> = if detail == ToolDetail::None {
         visible.map(aura::agent_info).collect()
@@ -1222,7 +1302,7 @@ pub async fn info(
     };
 
     Json(ServerInfo {
-        default_agent: state.default_agent.clone(),
+        default_agent,
         agents,
     })
     .into_response()
@@ -1233,11 +1313,21 @@ pub async fn info(
 /// Filters out `hidden` agents. `description` is an additive extension of
 /// the OpenAI model object, absent unless `[agent].description` is set, so
 /// strict OpenAI clients can ignore it.
-pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
+pub async fn list_models(
+    State(state): State<Arc<AppState>>,
+    auth: Option<axum::Extension<crate::auth::AuthContext>>,
+) -> Response {
     let models: Vec<serde_json::Value> = state
         .configs
         .iter()
         .filter(|config| !config.agent.hidden)
+        .filter(|config| match &auth {
+            // With auth on, only list agents the key may invoke.
+            Some(axum::Extension(ctx)) => {
+                ctx.allows(&config.agent.name, config.agent.alias.as_deref())
+            }
+            None => true,
+        })
         .map(|config| {
             let id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
             let created = config.agent.created_at / 1000;
@@ -1583,6 +1673,7 @@ mod tests {
             orchestration: None,
             hitl: None,
             governance: None,
+            auth: None,
             agent: aura_config::AgentConfig {
                 name: "test-agent".to_string(),
                 ..aura_config::AgentConfig::default()
@@ -2012,6 +2103,7 @@ mod tests {
             pending_approvals: aura::hitl::PendingApprovals::new(),
             hitl_webhook_hmac: None,
             session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
+            auth: None,
         })
     }
 
@@ -2049,7 +2141,7 @@ model = "gpt-4o"
         );
 
         let state = make_state(vec![hidden, visible]);
-        let resp = list_models(State(state)).await;
+        let resp = list_models(State(state), None).await;
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -2080,7 +2172,7 @@ model = "gpt-4o"
         );
 
         let state = make_state(vec![described]);
-        let resp = list_models(State(state)).await;
+        let resp = list_models(State(state), None).await;
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -2129,6 +2221,7 @@ model = "gpt-4o"
             pending_approvals: aura::hitl::PendingApprovals::new(),
             hitl_webhook_hmac: None,
             session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
+            auth: None,
         })
     }
 
@@ -2188,7 +2281,13 @@ model = "gpt-4o-mini"
     #[tokio::test]
     async fn test_info_returns_agents_with_workers() {
         let state = make_info_state(vec![orch_info_config()], None);
-        let resp = info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await;
+        let resp = info(
+            State(state),
+            None::<axum::Extension<crate::auth::AuthContext>>,
+            HeaderMap::new(),
+            Query(InfoQuery::default()),
+        )
+        .await;
         let info = parse_info_response(resp).await;
 
         assert_eq!(info.agents.len(), 1);
@@ -2215,7 +2314,13 @@ model = "gpt-4o-mini"
             None,
         );
         let info = parse_info_response(
-            info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await,
+            info(
+                State(state),
+                None::<axum::Extension<crate::auth::AuthContext>>,
+                HeaderMap::new(),
+                Query(InfoQuery::default()),
+            )
+            .await,
         )
         .await;
 
@@ -2251,7 +2356,13 @@ url = "http://127.0.0.1:9"
             None,
         );
         let info = parse_info_response(
-            info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await,
+            info(
+                State(state),
+                None::<axum::Extension<crate::auth::AuthContext>>,
+                HeaderMap::new(),
+                Query(InfoQuery::default()),
+            )
+            .await,
         )
         .await;
         let servers_of = |id: &str| {
@@ -2295,12 +2406,97 @@ url = "http://127.0.0.1:9"
             ],
             Some("visible-agent"),
         );
-        let resp = info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await;
+        let resp = info(
+            State(state),
+            None::<axum::Extension<crate::auth::AuthContext>>,
+            HeaderMap::new(),
+            Query(InfoQuery::default()),
+        )
+        .await;
         let info = parse_info_response(resp).await;
 
         let ids: Vec<_> = info.agents.iter().map(|agent| agent.id.as_str()).collect();
         assert_eq!(ids, ["visible-agent"]);
         assert_eq!(info.default_agent.as_deref(), Some("visible-agent"));
+    }
+
+    #[tokio::test]
+    async fn test_info_filters_agents_by_principal_allowlist() {
+        let state = make_info_state(
+            vec![solo_info_config("alpha"), solo_info_config("beta")],
+            Some("beta"),
+        );
+        let auth = axum::Extension(crate::auth::AuthContext {
+            name: "restricted".to_string(),
+            allowed_agents: vec!["alpha".to_string()],
+        });
+        let resp = info(
+            State(state),
+            Some(auth),
+            HeaderMap::new(),
+            Query(InfoQuery::default()),
+        )
+        .await;
+        let info = parse_info_response(resp).await;
+
+        // Forbidden agents are not discoverable, and the default-agent field
+        // does not leak the forbidden name either.
+        let ids: Vec<_> = info.agents.iter().map(|agent| agent.id.as_str()).collect();
+        assert_eq!(ids, ["alpha"]);
+        assert_eq!(info.default_agent, None);
+    }
+
+    #[tokio::test]
+    async fn test_info_default_agent_resolves_by_effective_identifier() {
+        // `(name="prod", alias="test")` and `(name="worker", alias="prod")`
+        // both pass config validation, and `resolve_config` resolves
+        // `default_agent = "prod"` to the *alias* owner (worker), not the
+        // agent whose bare name is "prod". The allowlist check must resolve
+        // the same way.
+        let state = make_info_state(
+            vec![
+                info_config("prod", r#"alias = "test""#, ""),
+                info_config("worker", r#"alias = "prod""#, ""),
+            ],
+            Some("prod"),
+        );
+        // Allowed only the alias "test" (the first agent): the default
+        // resolves to the forbidden second agent, so it must be hidden.
+        let auth = axum::Extension(crate::auth::AuthContext {
+            name: "restricted".to_string(),
+            allowed_agents: vec!["test".to_string()],
+        });
+        let resp = info(
+            State(state.clone()),
+            Some(auth),
+            HeaderMap::new(),
+            Query(InfoQuery::default()),
+        )
+        .await;
+        let body = parse_info_response(resp).await;
+        assert_eq!(body.default_agent, None);
+        let ids: Vec<_> = body.agents.iter().map(|agent| agent.id.as_str()).collect();
+        assert_eq!(ids, ["test"]);
+
+        // Allowed the alias "prod" (the second agent, the actual default):
+        // the default stays visible. The first agent is also listed because
+        // the allowlist matches names or aliases, and its bare name is
+        // "prod" — documented name-or-alias semantics.
+        let auth = axum::Extension(crate::auth::AuthContext {
+            name: "ops".to_string(),
+            allowed_agents: vec!["prod".to_string()],
+        });
+        let resp = info(
+            State(state),
+            Some(auth),
+            HeaderMap::new(),
+            Query(InfoQuery::default()),
+        )
+        .await;
+        let body = parse_info_response(resp).await;
+        assert_eq!(body.default_agent.as_deref(), Some("prod"));
+        let ids: Vec<_> = body.agents.iter().map(|agent| agent.id.as_str()).collect();
+        assert_eq!(ids, ["test", "prod"]);
     }
 
     #[test]
@@ -2331,6 +2527,7 @@ url = "http://127.0.0.1:9"
         let state = make_info_state(vec![solo_info_config("solo")], None);
         let resp = info(
             State(state),
+            None::<axum::Extension<crate::auth::AuthContext>>,
             HeaderMap::new(),
             Query(InfoQuery {
                 detail: Some("bogus".to_string()),
@@ -2363,7 +2560,13 @@ url = "http://127.0.0.1:9"
             )],
             None,
         );
-        let resp = info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await;
+        let resp = info(
+            State(state),
+            None::<axum::Extension<crate::auth::AuthContext>>,
+            HeaderMap::new(),
+            Query(InfoQuery::default()),
+        )
+        .await;
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -2398,8 +2601,16 @@ url = "http://127.0.0.1:9"
         };
 
         let state = info_state(configs(), None, Some(api.clone()));
-        let parsed =
-            parse_info_response(info(State(state), HeaderMap::new(), tools_query()).await).await;
+        let parsed = parse_info_response(
+            info(
+                State(state),
+                None::<axum::Extension<crate::auth::AuthContext>>,
+                HeaderMap::new(),
+                tools_query(),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(names(&parsed.agents[0]), [crate::slack::POST_TOOL_NAME]);
         assert!(
             parsed.agents[0].tools[0]
@@ -2411,7 +2622,13 @@ url = "http://127.0.0.1:9"
         assert!(names(&parsed.agents[1]).is_empty());
 
         let state = info_state(configs(), None, Some(api));
-        let resp = info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await;
+        let resp = info(
+            State(state),
+            None::<axum::Extension<crate::auth::AuthContext>>,
+            HeaderMap::new(),
+            Query(InfoQuery::default()),
+        )
+        .await;
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -2419,8 +2636,16 @@ url = "http://127.0.0.1:9"
         assert!(body["agents"][0].get("tools").is_none(), "{body}");
 
         let state = info_state(configs(), None, None);
-        let parsed =
-            parse_info_response(info(State(state), HeaderMap::new(), tools_query()).await).await;
+        let parsed = parse_info_response(
+            info(
+                State(state),
+                None::<axum::Extension<crate::auth::AuthContext>>,
+                HeaderMap::new(),
+                tools_query(),
+            )
+            .await,
+        )
+        .await;
         assert!(parsed.agents.iter().all(|agent| agent.tools.is_empty()));
     }
 
@@ -2443,6 +2668,7 @@ url = "http://127.0.0.1:9"
             );
             let resp = info(
                 State(state),
+                None::<axum::Extension<crate::auth::AuthContext>>,
                 HeaderMap::new(),
                 Query(InfoQuery {
                     detail: Some(detail.to_string()),
@@ -2652,6 +2878,7 @@ url = "http://127.0.0.1:9"
                 pending_approvals: aura::hitl::PendingApprovals::new(),
                 hitl_webhook_hmac: None,
                 session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
+                auth: None,
             })
         }
 
@@ -3113,6 +3340,7 @@ source = '{}'
                 hitl_webhook_hmac: None,
                 slack_api: None,
                 session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
+                auth: None,
             }
         }
 
@@ -3163,10 +3391,15 @@ source = '{}'
 
             // The client keeps the session id and switches to agent B, which
             // configures a skill of the same name it never loaded.
-            let setup =
-                prepare_request(&state, &mut follow_up("agent-b"), &session, &HashMap::new())
-                    .await
-                    .unwrap();
+            let setup = prepare_request(
+                &state,
+                &mut follow_up("agent-b"),
+                &session,
+                &HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
             assert!(
                 setup.rehydrated_skills.is_empty(),
                 "agent B must not replay agent A's invocations, got {:?}",
@@ -3175,10 +3408,15 @@ source = '{}'
             assert_eq!(setup.chat_history.len(), 2);
 
             // Agent A, back on the same session, still gets its own.
-            let setup =
-                prepare_request(&state, &mut follow_up("agent-a"), &session, &HashMap::new())
-                    .await
-                    .unwrap();
+            let setup = prepare_request(
+                &state,
+                &mut follow_up("agent-a"),
+                &session,
+                &HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
             assert_eq!(setup.rehydrated_skills, ["shared"]);
             assert_eq!(setup.chat_history.len(), 4);
         }

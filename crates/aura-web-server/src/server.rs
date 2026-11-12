@@ -491,6 +491,31 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         }
     }
 
+    // HTTP API-key auth ([auth] table, any config): compiled once at startup.
+    // A malformed keyring fails the boot, not the first request.
+    let keyring = match crate::auth::build_authenticator(&configs_arc) {
+        Ok(ring) => ring,
+        Err(e) => {
+            error!("Invalid [auth] configuration: {e}");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("auth configuration error: {e}"),
+            ));
+        }
+    };
+    // With OIDC, fetch the JWKS now so a broken issuer/URL fails startup
+    // rather than the first user token.
+    if let Some(crate::auth::Authenticator::Oidc(validator)) = keyring.as_deref()
+        && let Err(e) = validator.warm().await
+    {
+        error!("OIDC warm-up failed: {e}");
+        return Err(std::io::Error::other(format!("OIDC warm-up failed: {e}")));
+    }
+    match &keyring {
+        Some(authenticator) => info!("{}", authenticator.describe()),
+        None => info!("API-key auth disabled (no [auth] table)"),
+    }
+
     let slack_api = if args.enable_slack {
         let (Some(bot_token), Some(app_token)) =
             (args.slack_bot_token.clone(), args.slack_app_token.clone())
@@ -537,6 +562,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         ),
         hitl_webhook_hmac: ingress_hmac.clone(),
         session_store: session_store.clone(),
+        auth: keyring.clone(),
     });
 
     if let Some(api) = slack_api {
@@ -560,6 +586,12 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
 
     let app = Router::new()
         .route("/health", get(handlers::health))
+        // RFC 9728 discovery, advertised from the 401 challenge. Open path;
+        // the handler answers 404 unless OIDC mode is configured.
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(crate::auth::protected_resource_metadata),
+        )
         .route("/aura/info", get(handlers::info))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/chat/completions", post(handlers::chat_completions))
@@ -570,6 +602,13 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         .layer(axum::extract::Extension(handlers::IngressHmac(
             ingress_hmac,
         )))
+        // require_auth inside TraceLayer so auth rejections (401/403/503)
+        // still produce HTTP spans, but outside nothing else: shutdown_guard
+        // stays outermost so draining answers 503 before auth challenges.
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            crate::auth::require_auth,
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
@@ -607,6 +646,13 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             .layer(tower_http::timeout::TimeoutLayer::with_status_code(
                 axum::http::StatusCode::REQUEST_TIMEOUT,
                 std::time::Duration::from_secs(120),
+            ))
+            // The A2A router is merged after the main router's layers, so it
+            // needs its own auth layer. The agent-card path stays open via
+            // `auth::is_open_path`.
+            .layer(middleware::from_fn_with_state(
+                app_state.clone(),
+                crate::auth::require_auth,
             ));
 
         app.merge(a2a_router)

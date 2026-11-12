@@ -138,6 +138,7 @@ impl DirectBackend {
             pending_approvals: aura::hitl::PendingApprovals::new(),
             hitl_webhook_hmac,
             session_store: Arc::new(InMemorySessionStore::new()),
+            auth: None,
         });
 
         let headers_map = extra_headers.into_iter().collect();
@@ -300,6 +301,7 @@ impl DirectBackend {
             pending_approvals: old.pending_approvals.clone(),
             hitl_webhook_hmac: old.hitl_webhook_hmac.clone(),
             session_store: old.session_store.clone(),
+            auth: None,
         });
     }
 
@@ -340,10 +342,15 @@ impl DirectBackend {
         let selected = get_selected_model();
         let mut req = Self::build_chat_request(messages, tools, selected);
 
-        let setup =
-            handlers::prepare_request(&self.app_state, &mut req, session_id, &self.extra_headers)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let setup = handlers::prepare_request(
+            &self.app_state,
+            &mut req,
+            session_id,
+            &self.extra_headers,
+            None,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let config = handlers::build_completion_config(&self.app_state, &setup, None, true, true);
 
@@ -406,10 +413,15 @@ impl DirectBackend {
             tools: None,
         };
 
-        let setup =
-            handlers::prepare_request(&self.app_state, &mut req, session_id, &self.extra_headers)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let setup = handlers::prepare_request(
+            &self.app_state,
+            &mut req,
+            session_id,
+            &self.extra_headers,
+            None,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let config = handlers::build_completion_config(&self.app_state, &setup, None, false, false);
 
@@ -538,6 +550,7 @@ mod tests {
             pending_approvals: aura::hitl::PendingApprovals::new(),
             hitl_webhook_hmac: None,
             session_store: Arc::new(InMemorySessionStore::new()),
+            auth: None,
         });
         // Synthetic: these configs were built in memory, not loaded from
         // disk, so point at paths that cannot exist.

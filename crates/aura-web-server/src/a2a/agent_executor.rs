@@ -221,6 +221,10 @@ impl AgentExecutor for AuraAgentExecutor {
             .get("x-aura-model")
             .and_then(|v| v.first())
             .cloned();
+        // The principal rides in via service_params, injected (and forged
+        // values stripped) by AuraRequestHandler in the request task. A
+        // task-local cannot reach here: the framework spawns execution.
+        let auth = super::request_handler::principal_from_service_params(&ctx.service_params);
         let config = match self
             .app_state
             .resolve_config(model_requested_model.as_deref())
@@ -236,6 +240,18 @@ impl AgentExecutor for AuraAgentExecutor {
                 }));
             }
         };
+        if let Some(auth) = &auth
+            && !auth.allows(&config.agent.name, config.agent.alias.as_deref())
+        {
+            let msg = format!(
+                "the authenticated principal `{}` does not have access to agent '{}'",
+                auth.name,
+                config.agent_id()
+            );
+            return Box::pin(futures_util::stream::once(async move {
+                Err::<StreamResponse, A2AError>(A2AError::invalid_params(msg))
+            }));
+        }
         let stream_shutdown_token = self.app_state.stream_shutdown_token.clone();
         let task_cancel_state = self.task_cancel_state.clone();
         let active_request_tracker = self.app_state.active_requests.clone();
@@ -308,7 +324,24 @@ impl AgentExecutor for AuraAgentExecutor {
 
             // Run a blank contextId without a session. Using it as-is would put
             // every client that sends a blank contextId in the same session.
-            let session_id = aura::SessionId::non_empty(context_id.clone());
+            //
+            // Namespace the agent-facing session per principal so shared or
+            // guessed `context_id`s cannot cross conversation state. The
+            // protocol-visible `context_id` in events stays as the client
+            // sent it. NOTE: the A2A task store itself is still shared
+            // across principals (tasks are keyed by unguessable task ids);
+            // history listed by `context_id` below therefore remains
+            // context-scoped, not principal-scoped. See CLAUDE.md.
+            let session_id = aura::SessionId::non_empty(context_id.clone()).map(|sid| {
+                match &auth {
+                    Some(auth) => aura::SessionId::new(crate::auth::namespace_session(
+                        &auth.name,
+                        sid.as_str(),
+                    ))
+                    .expect("namespaced session id is non-blank"),
+                    None => sid,
+                }
+            });
             let builder = RigBuilder::new(config, pending_approvals).with_hitl_hmac(hitl_hmac);
             let agent = match builder
                 .build_streaming_agent_with_tools(
@@ -850,6 +883,7 @@ mod tests {
             pending_approvals: aura::hitl::PendingApprovals::new(),
             hitl_webhook_hmac: None,
             session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
+            auth: None,
         });
         AuraAgentExecutor::new(app_state, SharedTaskStore::default())
     }
@@ -863,6 +897,7 @@ mod tests {
             orchestration: None,
             hitl: None,
             governance: None,
+            auth: None,
             agent: aura_config::AgentConfig {
                 name: name.to_owned(),
                 alias: alias.map(str::to_owned),
