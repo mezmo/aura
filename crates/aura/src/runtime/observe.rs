@@ -135,6 +135,10 @@ impl ObserverSet {
         self.collecting.remove(id).map(|observer| (observer, false))
     }
 
+    pub(super) fn claimant(&self) -> Option<&ObserverId> {
+        self.claimant.as_ref().map(|holder| &holder.id)
+    }
+
     pub(super) fn attendance(&self) -> Attendance {
         Attendance {
             present: self.all().any(|observer| observer.presence),

@@ -607,6 +607,7 @@ mod tests {
 
     use super::*;
     use crate::config::SessionId;
+    use crate::conversation::Landing;
     use crate::hitl::{
         AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, PROTOCOL_VERSION,
     };
@@ -1334,7 +1335,7 @@ mod tests {
     fn facts(n: u128, session: &str, status: RunStatus) -> RunFacts {
         RunFacts {
             run_id: run_id(n),
-            session_id: SessionId::new(session).unwrap(),
+            landing: Landing::Session(SessionId::new(session).unwrap()),
             agent: "agent".to_owned(),
             status,
             liveness: aura_events::run::Liveness::default(),
@@ -1430,6 +1431,48 @@ mod tests {
             ..in_a
         };
         assert_eq!(listed(&store, finished_in_a).await, vec![3]);
+    }
+
+    /// Listing by conversation returns the runs on any of its lanes. It
+    /// leaves out runs of another agent or another chat, and a run on the
+    /// chat id used as a plain session.
+    #[tokio::test]
+    async fn run_store_lists_a_conversations_runs_across_its_lanes() {
+        use crate::conversation::{Conversation, Lane, LaneNumber};
+        use RunStatus::*;
+
+        let math = Conversation::new(SessionId::new("chat-1").unwrap(), "math");
+        let on = |n, conversation: &Conversation, lane| RunFacts {
+            landing: Landing::Lane(Lane::new(
+                conversation.clone(),
+                LaneNumber::new(lane).unwrap(),
+            )),
+            ..facts(n, "unused", Finished)
+        };
+        let store = InMemoryRunStore::new();
+        for run in [
+            on(4, &math, 1),
+            on(1, &math, 0),
+            facts(2, "chat-1", Finished),
+            on(
+                3,
+                &Conversation::new(SessionId::new("chat-1").unwrap(), "weather"),
+                0,
+            ),
+            on(
+                5,
+                &Conversation::new(SessionId::new("chat-2").unwrap(), "math"),
+                0,
+            ),
+        ] {
+            store.put(&run).await.unwrap();
+        }
+
+        let by_math = RunFilter {
+            conversation: Some(math),
+            ..RunFilter::default()
+        };
+        assert_eq!(listed(&store, by_math).await, vec![1, 4]);
     }
 
     #[tokio::test]

@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use aura::hitl::PendingApprovals;
 use aura::runtime::{
-    AgentForRun, AgentRuntime, Attach, Caller, RuntimeStores, StartRun, Subscription,
+    AgentForRun, AgentRuntime, Attach, Caller, RunTarget, RuntimeStores, StartRun, Subscription,
 };
 use aura::stream_events::{CorrelationContext, EmittingAgent, McpServerStatus};
 use aura::test_span_capture::CapturedSpans;
@@ -1444,7 +1444,7 @@ async fn attach_and_start(runtime: &AgentRuntime) -> (Subscription, RunId) {
     let span = tracing::info_span!(parent: None, "agent.stream", run.id = tracing::field::Empty);
     let run = runtime
         .start(StartRun {
-            session: Some(session),
+            target: RunTarget::Session(session),
             caller: Some(Caller {
                 user: Some(USER.to_owned()),
                 metadata: Some(metadata()),

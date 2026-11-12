@@ -215,17 +215,24 @@ async fn execute(
         ..
     } = start;
     let agent_id = config.agent_id().to_owned();
+    // The agent, the skill log and the span see the chat id, not the lane's
+    // session id, so all lanes of a conversation share them. The journal,
+    // the run store and the claim stay on the lane's session.
+    let landing = record.facts().landing;
+    let chat = landing.lane().map_or_else(
+        || session.id.clone(),
+        |lane| lane.conversation().chat().clone(),
+    );
 
     let ready: Result<_, Outcome> = async {
         // Write the run as `Preparing` before preparing the agent, so the
         // store lists it from the start.
         put_facts(shared, record).await;
 
-        // Skill invocations are logged under this session and agent, so a
-        // later run of the same agent on the session can rehydrate them.
-        // Each one is anchored at this turn's position: after the history
-        // and the prompt.
-        let skill_log = SkillLogKey::new(session.id.clone(), agent_id.clone());
+        // A later run of the same agent rehydrates the skill invocations
+        // logged here. Each one is anchored at this turn's position: after
+        // the history and the prompt.
+        let skill_log = SkillLogKey::new(chat.clone(), agent_id.clone());
         let skill_recorder = (!config.agent.skills.local.is_empty()).then(|| {
             Arc::new(SkillInvocationRecorder::new(
                 Arc::clone(&shared.skill_store),
@@ -242,7 +249,7 @@ async fn execute(
             prepared = shared.preparer.prepare(
                 config,
                 PrepareRequest {
-                    session: &session.id,
+                    session: &chat,
                     run_id: record.id,
                     req_headers: req_headers.as_ref(),
                     client_tools,
@@ -322,7 +329,8 @@ async fn execute(
         provider: provider.to_owned(),
         model: model.to_owned(),
         run: record.id,
-        session: session.id.clone(),
+        session: chat,
+        lane: landing.lane().map(|lane| lane.number()),
         prompt: prompt.clone(),
         user: user.filter(|user| !user.is_empty()),
         metadata_json: metadata
@@ -342,8 +350,13 @@ async fn execute(
     *traced = Some(attributes);
 
     async {
-        // Stopped after the agent was prepared but before it streams: end
-        // without a `Started` event.
+        // An observer attach or detach still being written goes on the
+        // stream first, so `Started` follows it.
+        session.observer_writes_done().await;
+        // Stopped after the agent was prepared, or while it waited for that
+        // write: end without a `Started` event and without opening the
+        // stream. `Registered`'s `Drop` relies on this when a claimed start's
+        // attach fails.
         if record.cancel.is_cancelled() {
             return Outcome {
                 agent: Some(agent),
@@ -395,9 +408,6 @@ async fn execute(
             _ => items,
         };
 
-        // An observer attach or detach still being written goes on the
-        // stream first, so `Started` follows it.
-        session.observer_writes_done().await;
         let journal = &session.journal;
         let started = LifecycleEvent::Started {
             agent: agent_id,
