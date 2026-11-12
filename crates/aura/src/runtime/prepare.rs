@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use aura_config::Config;
-use aura_events::{RunId, SessionId};
+use aura_events::{EmittingAgent, RunId, SessionId};
 
 use crate::builder::{ClientTool, PreparedAgent, RunToolFactory};
 use crate::error::BuilderError;
@@ -21,8 +21,32 @@ pub(crate) enum PreparedForRun {
     /// A single agent's reusable half.
     Prepared(Arc<PreparedAgent>),
     /// An agent built for this run only, such as an orchestrator, which has
-    /// no reusable half.
-    Built(Arc<dyn StreamingAgent>),
+    /// no reusable half. `attribution` is the agent its events are
+    /// attributed to.
+    Built {
+        agent: Arc<dyn StreamingAgent>,
+        attribution: EmittingAgent,
+    },
+}
+
+/// Picks the config in `configs` for the agent named `agent`. If only one
+/// config is loaded, it serves any name, just as a one-agent server answers
+/// any `model`. Otherwise `agent`, or `default_agent` if `agent` is `None`,
+/// must match a config's `agent_id`.
+pub(super) fn resolve_config(
+    configs: &[Config],
+    default_agent: Option<&str>,
+    agent: Option<&str>,
+) -> Result<Config, StartError> {
+    if let [only] = configs {
+        return Ok(only.clone());
+    }
+    let name = agent.or(default_agent).ok_or(StartError::AgentRequired)?;
+    configs
+        .iter()
+        .find(|config| config.agent_id() == name)
+        .cloned()
+        .ok_or_else(|| StartError::NoSuchAgent(name.to_owned()))
 }
 
 /// What the preparer needs from a start to prepare its agent.
@@ -90,22 +114,9 @@ impl RigBuilderPreparer {
 
 #[async_trait]
 impl AgentPreparer for RigBuilderPreparer {
-    /// With one config loaded, that config serves any name, just as a
-    /// one-agent server answers any `model`. Otherwise the name the start
-    /// gives, or the default agent when it gives none, must match a config's
-    /// `agent_id`.
+    /// See [`resolve_config`].
     fn config(&self, agent: Option<&str>) -> Result<Config, StartError> {
-        if let [only] = self.configs.as_slice() {
-            return Ok(only.clone());
-        }
-        let name = agent
-            .or(self.default_agent.as_deref())
-            .ok_or(StartError::AgentRequired)?;
-        self.configs
-            .iter()
-            .find(|config| config.agent_id() == name)
-            .cloned()
-            .ok_or_else(|| StartError::NoSuchAgent(name.to_owned()))
+        resolve_config(&self.configs, self.default_agent.as_deref(), agent)
     }
 
     /// An orchestrated config is built fresh for the run, and every worker
@@ -133,7 +144,10 @@ impl AgentPreparer for RigBuilderPreparer {
                     request.run_tools,
                 )
                 .await
-                .map(PreparedForRun::Built);
+                .map(|agent| PreparedForRun::Built {
+                    agent,
+                    attribution: EmittingAgent::coordinator(),
+                });
         }
 
         let client_tools = request
@@ -148,5 +162,61 @@ impl AgentPreparer for RigBuilderPreparer {
             )
             .await
             .map(PreparedForRun::Prepared)
+    }
+}
+
+/// An agent a test supplies in place of a configured one, with the agent its
+/// events are attributed to.
+#[cfg(feature = "test-support")]
+pub struct AgentForRun {
+    pub agent: Arc<dyn StreamingAgent>,
+    pub attribution: EmittingAgent,
+}
+
+/// A test's replacement for building agents from config. It is given the
+/// resolved config and the run's id, and returns the agent for the run, or
+/// the error that preparing the agent would have failed with.
+#[cfg(feature = "test-support")]
+pub(super) type AgentFactory =
+    Box<dyn Fn(&Config, RunId) -> Result<AgentForRun, BuilderError> + Send + Sync>;
+
+/// Serves each run the agent its factory returns, resolving agent names as
+/// [`RigBuilderPreparer`] does.
+#[cfg(feature = "test-support")]
+pub(super) struct AgentFactoryPreparer {
+    configs: Arc<Vec<Config>>,
+    default_agent: Option<String>,
+    agents: AgentFactory,
+}
+
+#[cfg(feature = "test-support")]
+impl AgentFactoryPreparer {
+    pub(super) fn new(
+        configs: Arc<Vec<Config>>,
+        default_agent: Option<String>,
+        agents: AgentFactory,
+    ) -> Self {
+        Self {
+            configs,
+            default_agent,
+            agents,
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[async_trait]
+impl AgentPreparer for AgentFactoryPreparer {
+    fn config(&self, agent: Option<&str>) -> Result<Config, StartError> {
+        resolve_config(&self.configs, self.default_agent.as_deref(), agent)
+    }
+
+    async fn prepare(
+        &self,
+        config: &Config,
+        request: PrepareRequest<'_>,
+    ) -> Result<PreparedForRun, BuilderError> {
+        let AgentForRun { agent, attribution } = (self.agents)(config, request.run_id)?;
+        Ok(PreparedForRun::Built { agent, attribution })
     }
 }

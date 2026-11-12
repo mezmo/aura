@@ -2,9 +2,11 @@
 //!
 //! Instead of reimplementing agent building and stream consumption, this backend
 //! constructs an `AppState`, calls `prepare_request` / `execute_completion` from
-//! `aura_web_server::handlers`, and parses the resulting SSE chunks through the
-//! same `process_sse_events` parser used by the HTTP backend. This guarantees
-//! identical behavior whether the CLI connects via HTTP or runs standalone.
+//! `aura_web_server::handlers` (or `stream_chat` / `complete_chat` when
+//! `AURA_RUNTIME_CHAT_COMPLETIONS` selects the runtime path), and parses the
+//! resulting SSE chunks through the same `process_sse_events` parser used by
+//! the HTTP backend. This guarantees identical behavior whether the CLI
+//! connects via HTTP or runs standalone.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use aura_web_server::handlers::{self, CollectedResult, DeliveryMode};
-use aura_web_server::session_store::InMemorySessionStore;
+use aura_web_server::session_store::{InMemorySessionStore, SessionStore};
 use aura_web_server::streaming::ToolResultMode;
 use aura_web_server::types::{
     ActiveRequestTracker, AppState, ChatCompletionRequest, ChatMessage, ChatMessageFunctionCall,
@@ -45,6 +47,32 @@ use crate::ui::prompt::get_selected_model;
 /// wired into the CLI binary.
 fn additional_tools_factory() -> Arc<dyn Fn() -> Vec<Box<dyn aura::ToolDyn>> + Send + Sync> {
     Arc::new(Vec::new)
+}
+
+/// The variable that selects the runtime path for chat completions.
+const RUNTIME_CHAT_COMPLETIONS_VAR: &str = "AURA_RUNTIME_CHAT_COMPLETIONS";
+
+/// Reads `AURA_RUNTIME_CHAT_COMPLETIONS` to decide whether chat completions
+/// in standalone mode use the runtime path. The value is parsed with
+/// `aura::env_flags::parse_bool`, the same way the server parses it. An
+/// unset, empty or unrecognised value means off. The CLI has no command-line
+/// flag for this setting.
+///
+/// An unrecognised value is also printed as a warning on stderr, because the
+/// CLI's tracing output is dropped unless a log file is set.
+fn runtime_chat_completions_from_env() -> bool {
+    let value = std::env::var(RUNTIME_CHAT_COMPLETIONS_VAR).unwrap_or_default();
+    if value.is_empty() {
+        return false;
+    }
+    aura::env_flags::parse_bool(&value).unwrap_or_else(|| {
+        let warning = format!(
+            "{RUNTIME_CHAT_COMPLETIONS_VAR}={value:?} is not a boolean (expected 1/0, true/false, yes/no, on/off, t/f, y/n); chat completions use the request-bound path"
+        );
+        tracing::warn!("{warning}");
+        eprintln!("warning: {warning}");
+        false
+    })
 }
 
 /// Direct backend — holds AppState with loaded configs and CLI tool factory.
@@ -118,11 +146,22 @@ impl DirectBackend {
             }
         }
 
+        let configs = Arc::new(configs);
+        let pending_approvals = aura::hitl::PendingApprovals::new();
+        let session_store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
         let app_state = Arc::new(AppState {
-            configs: Arc::new(configs),
+            runtime: aura_web_server::types::build_runtime(
+                &configs,
+                None,
+                &pending_approvals,
+                hitl_webhook_hmac.clone(),
+                &session_store,
+            ),
+            configs,
             tool_result_mode: ToolResultMode::Aura,
             tool_result_max_length: 0,
             streaming_buffer_size: 400,
+            runtime_chat_completions: runtime_chat_completions_from_env(),
             aura_custom_events: true,
             aura_emit_reasoning: true,
             debug_provider_errors: true,
@@ -135,9 +174,9 @@ impl DirectBackend {
             default_agent: None,
             additional_tools: additional_tools_factory(),
             slack_api: None,
-            pending_approvals: aura::hitl::PendingApprovals::new(),
+            pending_approvals,
             hitl_webhook_hmac,
-            session_store: Arc::new(InMemorySessionStore::new()),
+            session_store,
         });
 
         let headers_map = extra_headers.into_iter().collect();
@@ -280,11 +319,20 @@ impl DirectBackend {
         }
 
         let old = &self.app_state;
+        let configs = Arc::new(configs);
         self.app_state = Arc::new(AppState {
-            configs: Arc::new(configs),
+            runtime: aura_web_server::types::build_runtime(
+                &configs,
+                old.default_agent.clone(),
+                &old.pending_approvals,
+                old.hitl_webhook_hmac.clone(),
+                &old.session_store,
+            ),
+            configs,
             tool_result_mode: old.tool_result_mode,
             tool_result_max_length: old.tool_result_max_length,
             streaming_buffer_size: old.streaming_buffer_size,
+            runtime_chat_completions: old.runtime_chat_completions,
             aura_custom_events: old.aura_custom_events,
             aura_emit_reasoning: old.aura_emit_reasoning,
             debug_provider_errors: old.debug_provider_errors,
@@ -339,6 +387,21 @@ impl DirectBackend {
     ) -> Result<StreamResult> {
         let selected = get_selected_model();
         let mut req = Self::build_chat_request(messages, tools, selected);
+
+        if self.app_state.runtime_chat_completions {
+            let span = || tracing::info_span!(parent: None, "agent.stream", run.id = tracing::field::Empty);
+            let stream = handlers::stream_chat(
+                &self.app_state,
+                req,
+                session_id.clone(),
+                self.extra_headers.clone(),
+                span,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let sse_stream = stream.into_bytes().eventsource();
+            return process_sse_events(sse_stream, cancel, handler).await;
+        }
 
         let setup =
             handlers::prepare_request(&self.app_state, &mut req, session_id, &self.extra_headers)
@@ -405,6 +468,35 @@ impl DirectBackend {
             user: None,
             tools: None,
         };
+
+        if self.app_state.runtime_chat_completions {
+            let span = || {
+                tracing::info_span!(
+                    parent: None,
+                    "agent.stream.summarize",
+                    run.id = tracing::field::Empty
+                )
+            };
+            let response = handlers::complete_chat(
+                &self.app_state,
+                req,
+                session_id.clone(),
+                self.extra_headers.clone(),
+                span,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let usage = response
+                .usage
+                .map(|u| (u.prompt_tokens, u.completion_tokens));
+            let content = response
+                .choices
+                .into_iter()
+                .next()
+                .and_then(|choice| choice.message.content)
+                .unwrap_or_default();
+            return Ok((content.trim().to_string(), usage));
+        }
 
         let setup =
             handlers::prepare_request(&self.app_state, &mut req, session_id, &self.extra_headers)
@@ -518,11 +610,22 @@ mod tests {
 
     /// Construct a DirectBackend with test configs (no real TOML loading).
     fn make_backend(configs: Vec<aura_config::Config>) -> DirectBackend {
+        let configs = Arc::new(configs);
+        let pending_approvals = aura::hitl::PendingApprovals::new();
+        let session_store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
         let app_state = Arc::new(AppState {
-            configs: Arc::new(configs),
+            runtime: aura_web_server::types::build_runtime(
+                &configs,
+                None,
+                &pending_approvals,
+                None,
+                &session_store,
+            ),
+            configs,
             tool_result_mode: ToolResultMode::Aura,
             tool_result_max_length: 0,
             streaming_buffer_size: 400,
+            runtime_chat_completions: false,
             aura_custom_events: true,
             aura_emit_reasoning: true,
             debug_provider_errors: true,
@@ -535,9 +638,9 @@ mod tests {
             default_agent: None,
             additional_tools: additional_tools_factory(),
             slack_api: None,
-            pending_approvals: aura::hitl::PendingApprovals::new(),
+            pending_approvals,
             hitl_webhook_hmac: None,
-            session_store: Arc::new(InMemorySessionStore::new()),
+            session_store,
         });
         // Synthetic: these configs were built in memory, not loaded from
         // disk, so point at paths that cannot exist.
