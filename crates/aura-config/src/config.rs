@@ -410,6 +410,8 @@ impl Config {
         // Scratchpad validation
         self.validate_scratchpad()?;
 
+        self.validate_header_tables()?;
+
         if let (Some(hitl), Some(orch)) = (
             &self.hitl,
             self.orchestration.as_ref().filter(|o| o.enabled),
@@ -521,6 +523,63 @@ impl Config {
 
         Ok(())
     }
+
+    /// Check every `headers` and `headers_from_request` table with
+    /// [`validate_header_names_unique`].
+    fn validate_header_tables(&self) -> Result<(), crate::ConfigError> {
+        if let Some(mcp) = &self.mcp {
+            let mut servers: Vec<_> = mcp.servers.iter().collect();
+            servers.sort_unstable_by_key(|(name, _)| name.as_str());
+            for (name, server) in servers {
+                match server {
+                    McpServerConfig::HttpStreamable {
+                        headers,
+                        headers_from_request,
+                        ..
+                    }
+                    | McpServerConfig::Sse {
+                        headers,
+                        headers_from_request,
+                        ..
+                    } => {
+                        validate_header_names_unique(
+                            headers,
+                            &format!("mcp.servers.{name}.headers"),
+                        )?;
+                        validate_header_names_unique(
+                            headers_from_request,
+                            &format!("mcp.servers.{name}.headers_from_request"),
+                        )?;
+                    }
+                    McpServerConfig::Stdio { .. } => {}
+                }
+            }
+        }
+
+        if let Some(HitlConfig {
+            route:
+                DecisionRouteConfig::Webhook {
+                    headers,
+                    headers_from_request,
+                    ..
+                },
+            ..
+        }) = &self.hitl
+        {
+            validate_header_names_unique(headers, "hitl.route.headers")?;
+            validate_header_names_unique(headers_from_request, "hitl.route.headers_from_request")?;
+        }
+
+        if let Some(catalog) = self.governance.as_ref().and_then(|g| g.catalog.as_ref()) {
+            validate_header_names_unique(&catalog.headers, "governance.catalog.headers")?;
+            validate_header_names_unique(
+                &catalog.headers_from_request,
+                "governance.catalog.headers_from_request",
+            )?;
+        }
+
+        Ok(())
+    }
 }
 
 /// Warn when both orchestration timeouts are disabled, leaving only the
@@ -574,6 +633,34 @@ fn hitl_timeout_conflict_warning(hitl: &HitlConfig, per_call_timeout_secs: u64) 
     } else {
         None
     }
+}
+
+/// Reject a header table with an invalid header name, or with two names equal
+/// ignoring case.
+///
+/// An invalid name would be dropped at connect time with only a warning. Header
+/// names are lowercased before use, so a case-only pair collapses into one
+/// entry and the value that survives depends on `HashMap` iteration order.
+fn validate_header_names_unique(
+    headers: &HashMap<String, String>,
+    location: &str,
+) -> Result<(), crate::ConfigError> {
+    let mut names: Vec<&str> = headers.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    let mut seen: HashMap<http::header::HeaderName, &str> = HashMap::with_capacity(names.len());
+    for name in names {
+        let parsed = http::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            crate::ConfigError::Validation(format!(
+                "'{name}' in [{location}] is not a valid header name"
+            ))
+        })?;
+        if let Some(first) = seen.insert(parsed, name) {
+            return Err(crate::ConfigError::Validation(format!(
+                "Header names '{first}' and '{name}' in [{location}] differ only by case; keep one"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_llm_api_key(llm: &LlmConfig, location: &str) -> Result<(), crate::ConfigError> {
