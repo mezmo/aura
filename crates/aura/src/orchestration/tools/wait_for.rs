@@ -1,5 +1,6 @@
 //! Bounded polling via the `wait_for` tool.
 
+use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,8 +10,13 @@ use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
-use crate::mcp::McpManager;
+use crate::config::AgentBuildContext;
 use crate::mcp::execute_mcp_tool;
+use crate::mcp::{McpClient, McpManager};
+use crate::tool_middleware::{MiddlewareStack, MiddlewareToolDyn, WrapperLayer};
+use crate::tool_wrapper::{
+    PreCallOutcome, ToolCallContext, ToolWrapper, TransformArgsResult, extracted_field, non_blank,
+};
 
 /// Hard ceiling on any single wait.
 pub const MAX_WAIT_HARD_CEILING_SECS: u64 = 300;
@@ -37,11 +43,7 @@ pub struct WaitForArgs {
     pub poll_sec: Option<u64>,
     #[serde(default)]
     pub max_wait_sec: Option<u64>,
-    /// The persistence wrapper teaches worker models to attach
-    /// `_aura_reasoning` to every call, so it arrives here too even though
-    /// this tool sits outside the wrapper. Accepted and ignored — same
-    /// contract as `request_approval` — so the strict parse rejects only
-    /// genuinely unknown fields.
+    /// Optional model-authored intent.
     #[serde(default, rename = "_aura_reasoning")]
     pub aura_reasoning: Option<String>,
 }
@@ -315,6 +317,13 @@ impl WaitForCall {
     pub fn budget(&self) -> WaitBudget {
         self.budget
     }
+
+    fn polling_scope(&self) -> crate::hitl::PollingScope {
+        crate::hitl::PollingScope {
+            every_secs: self.budget.poll().as_duration().as_secs(),
+            for_up_to_secs: self.budget.bound().as_secs(),
+        }
+    }
 }
 
 // ============================================================================
@@ -459,6 +468,8 @@ pub enum ProbeSampleError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WaitForError {
+    #[error("polling cancelled")]
+    Cancelled,
     #[error(transparent)]
     Call(#[from] WaitForCallError),
     #[error("probe tool '{tool}' is not exposed by any connected MCP server")]
@@ -495,38 +506,104 @@ pub trait ProbeDispatcher: Send + Sync {
 }
 
 struct McpProbeDispatcher {
-    mcp: Arc<McpManager>,
-}
-
-impl McpProbeDispatcher {
-    /// Find the client of the server exposing `tool`.
-    fn resolve(&self, tool: &str) -> Option<&crate::mcp::McpClient> {
-        let manager = &self.mcp;
-        [
-            (&manager.streamable_tools, &manager.streamable_clients),
-            (&manager.sse_tools, &manager.sse_clients),
-            (&manager.stdio_tools, &manager.stdio_clients),
-        ]
-        .into_iter()
-        .find_map(|(tools, clients)| {
-            tools
-                .iter()
-                .find(|(_, server_tools)| server_tools.iter().any(|t| t.name().as_str() == tool))
-                .and_then(|(server_name, _)| clients.get(server_name))
-        })
-    }
+    tool_servers: Arc<BTreeMap<String, (String, McpClient)>>,
+    stdio_servers: std::collections::BTreeSet<String>,
 }
 
 #[async_trait::async_trait]
 impl ProbeDispatcher for McpProbeDispatcher {
     async fn sample(&self, probe: &ProbeRequest) -> Result<String, ProbeSampleError> {
         let tool_name = probe.tool().as_str();
-        let client = self
-            .resolve(tool_name)
+        let (server_id, client) = self
+            .tool_servers
+            .get(tool_name)
             .ok_or(ProbeSampleError::UnknownTool)?;
         let args = serde_json::Value::Object(probe.args().clone());
-        // Probes are liveness checks and never carry approver identity.
-        Ok(execute_mcp_tool(client, tool_name, args, None).await?)
+        let overrides = crate::approver_headers::current_approver_overrides();
+        if overrides.is_some() && self.stdio_servers.contains(server_id) {
+            crate::approver_headers::ensure_transport_delivers_overrides(
+                crate::approver_headers::McpTransportKind::Stdio,
+            )
+            .map_err(|error| rig::tool::ToolError::ToolCallError(Box::new(error)))?;
+        }
+        Ok(execute_mcp_tool(client, tool_name, args, overrides).await?)
+    }
+}
+
+struct PollingApproval {
+    tool_servers: Arc<BTreeMap<String, (String, McpClient)>>,
+    gate: Option<Arc<crate::hitl::HitlApprovalWrapper>>,
+    hitl_configured: bool,
+}
+
+#[async_trait::async_trait]
+impl ToolWrapper for PollingApproval {
+    fn wrap_schema(&self, mut schema: serde_json::Value) -> serde_json::Value {
+        crate::orchestration::persistence_wrapper::add_reasoning_to_schema(&mut schema);
+        schema
+    }
+
+    fn transform_args(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolCallContext,
+    ) -> TransformArgsResult {
+        let (reasoning, args) = crate::orchestration::persistence_wrapper::extract_reasoning(args);
+        TransformArgsResult {
+            args,
+            extracted: reasoning.map(|reasoning| serde_json::json!({"reasoning": reasoning})),
+        }
+    }
+
+    fn write_context(&self, extracted: Option<&serde_json::Value>, ctx: &mut ToolCallContext) {
+        if let Some(intent) = extracted_field(extracted, "reasoning")
+            .and_then(serde_json::Value::as_str)
+            .and_then(non_blank)
+        {
+            ctx.tool_call_intent = Some(intent.to_owned());
+        }
+    }
+
+    async fn pre_call(
+        &self,
+        args: &serde_json::Value,
+        ctx: &ToolCallContext,
+    ) -> Result<PreCallOutcome, rig::tool::ToolError> {
+        let call = serde_json::from_value(args.clone())
+            .map_err(|error| rig::tool::ToolError::ToolCallError(Box::new(error)))
+            .and_then(|args| {
+                WaitForCall::parse(args)
+                    .map_err(|error| rig::tool::ToolError::ToolCallError(Box::new(error)))
+            })?;
+        let tool_name = call.probe().tool().as_str();
+        let (server_id, client) = self.tool_servers.get(tool_name).ok_or_else(|| {
+            rig::tool::ToolError::ToolCallError(
+                format!("probe tool '{tool_name}' is unavailable").into(),
+            )
+        })?;
+        let Some(gate) = &self.gate else {
+            return if self.hitl_configured {
+                Err(rig::tool::ToolError::ToolCallError(
+                    "polling approval gate is missing".into(),
+                ))
+            } else {
+                Ok(PreCallOutcome::Proceed { overrides: None })
+            };
+        };
+        let target = crate::hitl::PollingTarget {
+            server_id: server_id.clone(),
+            namespace: client.namespace().to_string(),
+            tool_name: tool_name.to_owned(),
+            invocation_arguments: args.clone(),
+        };
+        let item = crate::hitl::ApprovalItem {
+            tool_name: target.tool_name.clone(),
+            tool_namespace: Some(target.namespace.clone()),
+            arguments: serde_json::Value::Object(call.probe().args().clone()),
+            tool_call_intent: ctx.tool_call_intent.clone(),
+            polling: Some(call.polling_scope()),
+        };
+        gate.pre_call_polling(args, ctx, &target, item).await
     }
 }
 
@@ -552,18 +629,59 @@ impl Sleeper for TokioSleeper {
 pub struct WaitForTool {
     dispatcher: Arc<dyn ProbeDispatcher>,
     sleeper: Arc<dyn Sleeper>,
+    cancel: crate::request_cancellation::RequestCancelToken,
 }
 
 impl WaitForTool {
-    pub fn new(mcp: Arc<McpManager>) -> Self {
-        Self::with_sleeper(mcp, Arc::new(TokioSleeper))
+    pub(crate) fn approval_matches(
+        target: &crate::hitl::PollingTarget,
+        item: &crate::hitl::ApprovalItem,
+    ) -> bool {
+        let Ok(args) = serde_json::from_value::<WaitForArgs>(target.invocation_arguments.clone())
+        else {
+            return false;
+        };
+        let Ok(call) = WaitForCall::parse(args) else {
+            return false;
+        };
+        item.tool_name == target.tool_name
+            && item.tool_namespace.as_deref() == Some(target.namespace.as_str())
+            && call.probe().tool().as_str() == target.tool_name
+            && serde_json::Value::Object(call.probe().args().clone()) == item.arguments
+            && item.polling.as_ref() == Some(&call.polling_scope())
     }
 
-    pub fn with_sleeper(mcp: Arc<McpManager>, sleeper: Arc<dyn Sleeper>) -> Self {
-        Self {
-            dispatcher: Arc::new(McpProbeDispatcher { mcp }),
+    pub fn scoped(mcp: Arc<McpManager>, context: &AgentBuildContext) -> MiddlewareToolDyn {
+        Self::with_sleeper(mcp, context, Arc::new(TokioSleeper))
+    }
+
+    pub fn with_sleeper(
+        mcp: Arc<McpManager>,
+        context: &AgentBuildContext,
+        sleeper: Arc<dyn Sleeper>,
+    ) -> MiddlewareToolDyn {
+        let tool_servers =
+            Arc::new(mcp.resolve_winning_tools(|tool| context.tool_matches_filter(tool)));
+        let guard = PollingApproval {
+            tool_servers: Arc::clone(&tool_servers),
+            gate: context.hitl_gate.clone(),
+            hitl_configured: context.hitl.is_some(),
+        };
+        let tool = Self {
+            dispatcher: Arc::new(McpProbeDispatcher {
+                tool_servers,
+                stdio_servers: mcp.stdio_clients.keys().cloned().collect(),
+            }),
             sleeper,
-        }
+            cancel: crate::run_context::current_run()
+                .map(|run| run.cancel_token().clone().into())
+                .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound),
+        };
+        MiddlewareToolDyn::new(
+            Box::new(tool),
+            MiddlewareStack::new(vec![Arc::new(WrapperLayer(Arc::new(guard)))]),
+            context.tool_context_factory.clone(),
+        )
     }
 
     #[cfg(test)]
@@ -571,6 +689,7 @@ impl WaitForTool {
         Self {
             dispatcher,
             sleeper,
+            cancel: crate::request_cancellation::RequestCancelToken::unbound(),
         }
     }
 
@@ -601,7 +720,11 @@ impl WaitForTool {
         let verdict = loop {
             let remaining = bound.saturating_sub(start.elapsed());
             let sampled = tokio::time::timeout(remaining, self.dispatcher.sample(call.probe()));
-            let observation = match sampled.await {
+            let observation = match tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Err(WaitForError::Cancelled),
+                sampled = sampled => sampled,
+            } {
                 Ok(Ok(observation)) => observation,
                 Ok(Err(error)) => {
                     samples += 1;
@@ -646,7 +769,11 @@ impl WaitForTool {
                 None if elapsed >= bound => break Ok((StopReason::Timeout, observation, samples)),
                 None => {
                     last = Some(observation);
-                    self.sleeper.sleep(poll.min(bound - elapsed)).await;
+                    tokio::select! {
+                        biased;
+                        _ = self.cancel.cancelled() => return Err(WaitForError::Cancelled),
+                        _ = self.sleeper.sleep(poll.min(bound - elapsed)) => {},
+                    }
                 }
             }
         };
@@ -676,7 +803,9 @@ impl WaitForTool {
                 matching, or a quiet period after which unchanged output counts as settled), \
                 and optional poll/bound seconds. Returns the stop reason, the last probe \
                 output, elapsed seconds, and the sample count. A timeout is a normal result \
-                carrying the last observation, not an error."
+                carrying the last observation, not an error. Inner tools obey worker filtering. \
+                If approval is required, one approval authorizes repeated calls with fixed \
+                arguments for this invocation. The polling clock starts after approval."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -784,6 +913,544 @@ impl Tool for WaitForTool {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    async fn polling_fixture() -> (
+        crate::mcp::client::tests::RecordingMcpServer,
+        Arc<McpManager>,
+    ) {
+        use std::collections::HashMap;
+        let (server, client) = crate::mcp::client::tests::client_and_server(&HashMap::from([(
+            "authorization".to_owned(),
+            "Bearer requester".to_owned(),
+        )]))
+        .await;
+        let tool = rmcp::model::Tool::new(
+            "probe_tool".to_owned(),
+            "Probe".to_owned(),
+            Arc::new(serde_json::Map::new()),
+        );
+        let manager = McpManager {
+            streamable_clients: HashMap::from([("server-id".to_owned(), client)]),
+            streamable_tools: HashMap::from([(
+                "server-id".to_owned(),
+                vec![crate::mcp::AuraTool::new(tool, "test")],
+            )]),
+            ..McpManager::with_sanitization(false)
+        };
+        (server, Arc::new(manager))
+    }
+
+    fn polling_args() -> serde_json::Value {
+        serde_json::json!({
+            "probe": {"tool": "probe_tool", "args": {"query": "fixed"}},
+            "until": {"quiet_for_sec": 1}, "poll_sec": 1, "max_wait_sec": 3
+        })
+    }
+
+    fn polling_context(route: Arc<crate::hitl::DecisionRoute>, pattern: &str) -> AgentBuildContext {
+        let patterns: Arc<[aura_config::GlobPattern]> = Arc::from([pattern.into()]);
+        AgentBuildContext {
+            hitl: Some(crate::hitl::HitlPolicy {
+                patterns: Arc::clone(&patterns),
+                route: Arc::clone(&route),
+                park_enabled: false,
+            }),
+            hitl_gate: Some(Arc::new(crate::hitl::HitlApprovalWrapper::new(
+                patterns,
+                route,
+                crate::hitl::AgentScope::Single { session_id: None },
+                "worker".to_owned(),
+                "instance".to_owned(),
+            ))),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn polling_filters_before_resolution_and_does_not_promote_an_ungated_loser() {
+        use std::collections::HashMap;
+        let (server, manager) = polling_fixture().await;
+        let mut manager = Arc::try_unwrap(manager).ok().unwrap();
+        let other = crate::mcp::client::tests::RecordingMcpServer::start().await;
+        let client = McpClient::new(other.url.clone(), "other".into(), &HashMap::new(), "test/0")
+            .await
+            .unwrap();
+        manager
+            .streamable_clients
+            .insert("zzz".to_owned(), client.clone());
+        let tool = || {
+            crate::mcp::AuraTool::new(
+                rmcp::model::Tool::new(
+                    "probe_tool".to_owned(),
+                    "Probe".to_owned(),
+                    Arc::new(serde_json::Map::new()),
+                ),
+                "other",
+            )
+        };
+        manager
+            .streamable_tools
+            .insert("zzz".to_owned(), vec![tool()]);
+        let route = Arc::new(crate::hitl::DecisionRoute::Webhook {
+            client: crate::hitl::WebhookClient::new(
+                reqwest::Client::new(),
+                aura_config::WebhookUrl::new("http://127.0.0.1:9").unwrap(),
+            ),
+            timeout: Duration::from_secs(1),
+        });
+        let manager = Arc::new(manager);
+        let tool_guard =
+            WaitForTool::scoped(Arc::clone(&manager), &polling_context(route, "test:*"));
+        assert!(
+            rig::tool::ToolDyn::call(&tool_guard, polling_args().to_string())
+                .await
+                .is_err()
+        );
+        assert!(server.tool_calls().is_empty());
+        assert!(
+            other.tool_calls().is_empty(),
+            "shadowed ungated server is not promoted"
+        );
+        drop(tool_guard);
+        let mut manager = Arc::try_unwrap(manager).ok().unwrap();
+        manager.streamable_clients.insert("aaa".to_owned(), client);
+        manager
+            .streamable_tools
+            .insert("aaa".to_owned(), vec![tool()]);
+        let context = AgentBuildContext {
+            mcp_filter: Some(vec!["test:*".into()]),
+            ..Default::default()
+        };
+        let tool_guard = WaitForTool::scoped(Arc::new(manager), &context);
+        let mut args = polling_args();
+        args["until"] = serde_json::json!({"matches": "ok"});
+        rig::tool::ToolDyn::call(&tool_guard, args.to_string())
+            .await
+            .unwrap();
+        assert_eq!(server.tool_calls().len(), 1);
+        assert!(
+            other.tool_calls().is_empty(),
+            "excluded earlier server cannot claim the name"
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_gates_on_the_outer_wait_for_name() {
+        let (server, manager) = polling_fixture().await;
+        let route = Arc::new(crate::hitl::DecisionRoute::Webhook {
+            client: crate::hitl::WebhookClient::new(
+                reqwest::Client::new(),
+                aura_config::WebhookUrl::new("http://127.0.0.1:9").unwrap(),
+            ),
+            timeout: Duration::from_secs(1),
+        });
+        let tool = WaitForTool::scoped(manager, &polling_context(route, "wait_for"));
+        let mut args = polling_args();
+        args["until"] = serde_json::json!({"matches": "ok"});
+        assert!(
+            rig::tool::ToolDyn::call(&tool, args.to_string())
+                .await
+                .is_err()
+        );
+        assert!(server.tool_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn polling_stdio_refuses_identity_overrides_before_dispatch() {
+        let (server, manager) = polling_fixture().await;
+        let dispatcher = McpProbeDispatcher {
+            tool_servers: Arc::new(manager.resolve_winning_tools(|_| true)),
+            stdio_servers: std::collections::BTreeSet::from(["server-id".to_owned()]),
+        };
+        let call = WaitForCall::parse(serde_json::from_value(polling_args()).unwrap()).unwrap();
+        let overrides =
+            crate::approver_headers::tests::captured_overrides("authorization", "Bearer approver");
+        let error = crate::approver_headers::APPROVER_OVERRIDES
+            .scope(Some(overrides), dispatcher.sample(call.probe()))
+            .await
+            .unwrap_err();
+        let ProbeSampleError::Call(rig::tool::ToolError::ToolCallError(source)) = error else {
+            panic!("expected a transport error");
+        };
+        assert!(matches!(
+            source.downcast_ref::<crate::approver_headers::OverrideApplicationError>(),
+            Some(
+                crate::approver_headers::OverrideApplicationError::TransportUnsupported {
+                    kind: crate::approver_headers::McpTransportKind::Stdio,
+                }
+            )
+        ));
+        assert!(server.tool_calls().is_empty());
+        dispatcher.sample(call.probe()).await.unwrap();
+        assert_eq!(server.tool_calls().len(), 1);
+    }
+
+    #[test]
+    fn polling_scope_uses_effective_defaults_and_clamped_duration() {
+        for (bound, expected) in [
+            (None, MAX_WAIT_DEFAULT_SECS),
+            (Some(400), MAX_WAIT_HARD_CEILING_SECS),
+        ] {
+            let mut args = serde_json::json!({
+                "probe": {"tool": "probe_tool", "args": {}},
+                "until": {"matches": "ok"}
+            });
+            if let Some(bound) = bound {
+                args["max_wait_sec"] = bound.into();
+            }
+            let call = WaitForCall::parse(serde_json::from_value(args).unwrap()).unwrap();
+            assert_eq!(
+                call.polling_scope(),
+                crate::hitl::PollingScope {
+                    every_secs: POLL_DEFAULT_SECS,
+                    for_up_to_secs: expected,
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn polling_approval_covers_repeated_samples_but_not_the_next_invocation() {
+        let (server, manager) = polling_fixture().await;
+        let registry = crate::hitl::PendingApprovals::new();
+        let route = Arc::new(crate::hitl::DecisionRoute::Conversational {
+            registry: registry.clone(),
+            timeout: Duration::from_secs(10),
+        });
+        let (run, mut events) = crate::run_context::RunContext::channel(aura_events::RunId::mint());
+        let calls = crate::run_context::with_run(run, async {
+            let tool = WaitForTool::scoped(manager, &polling_context(route, "test:*"));
+            let args = polling_args().to_string();
+            for _ in 0..2 {
+                let output = rig::tool::ToolDyn::call(&tool, args.clone()).await.unwrap();
+                let output: serde_json::Value = serde_json::from_str(&output).unwrap();
+                assert!(output["samples"].as_u64().unwrap() >= 2, "{output}");
+            }
+        });
+        let approvals = async {
+            let mut ids = Vec::new();
+            for invocation in 0..2 {
+                let pending = loop {
+                    let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if let aura_events::agent::AgentEventPayload::ApprovalPending(pending) =
+                        event.payload
+                    {
+                        break pending;
+                    }
+                };
+                assert_eq!(pending.tool_name, "probe_tool");
+                assert_eq!(pending.arguments, polling_args()["probe"]["args"]);
+                assert_eq!(
+                    pending.polling,
+                    Some(aura_events::ApprovalPolling {
+                        every_secs: 1,
+                        for_up_to_secs: 3,
+                    })
+                );
+                let before = server.tool_calls().len();
+                if invocation == 0 {
+                    assert_eq!(before, 0);
+                } else {
+                    assert!(before >= 2);
+                }
+                tokio::task::yield_now().await;
+                assert_eq!(server.tool_calls().len(), before, "no call before consent");
+                let id = crate::hitl::DecisionId::parse(&pending.decision_id).unwrap();
+                assert!(!ids.contains(&id));
+                registry
+                    .resolve(&id, crate::hitl::ApprovalDecision::Approved)
+                    .await
+                    .unwrap();
+                ids.push(id);
+            }
+        };
+        tokio::join!(calls, approvals);
+        assert!(server.tool_calls().len() >= 4);
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(
+                    event.payload,
+                    aura_events::agent::AgentEventPayload::ApprovalRequested(_)
+                ),
+                "no per-sample approval"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn polling_inner_outer_and_both_policies_raise_one_approval() {
+        for pattern in ["test:*", "wait_for", "*", "unrelated"] {
+            let (server, manager) = polling_fixture().await;
+            let registry = crate::hitl::PendingApprovals::new();
+            let route = Arc::new(crate::hitl::DecisionRoute::Conversational {
+                registry: registry.clone(),
+                timeout: Duration::from_secs(5),
+            });
+            let (run, mut events) =
+                crate::run_context::RunContext::channel(aura_events::RunId::mint());
+            let call = crate::run_context::with_run(run, async {
+                let tool = WaitForTool::scoped(manager, &polling_context(route, pattern));
+                let mut args = polling_args();
+                args["until"] = serde_json::json!({"matches": "ok"});
+                rig::tool::ToolDyn::call(&tool, args.to_string())
+                    .await
+                    .unwrap();
+            });
+            let approve = async {
+                if pattern == "unrelated" {
+                    return;
+                }
+                loop {
+                    let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if let aura_events::agent::AgentEventPayload::ApprovalPending(pending) =
+                        event.payload
+                    {
+                        assert!(server.tool_calls().is_empty());
+                        let id = crate::hitl::DecisionId::parse(&pending.decision_id).unwrap();
+                        registry
+                            .resolve(&id, crate::hitl::ApprovalDecision::Approved)
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                }
+            };
+            tokio::join!(call, approve);
+            assert_eq!(server.tool_calls().len(), 1);
+            while let Ok(event) = events.try_recv() {
+                assert!(
+                    !matches!(
+                        event.payload,
+                        aura_events::agent::AgentEventPayload::ApprovalPending(_)
+                            | aura_events::agent::AgentEventPayload::ApprovalRequested(_)
+                    ),
+                    "unexpected extra approval for {pattern}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn polling_replay_binds_disclosed_scope_to_the_effective_invocation() {
+        let args = polling_args();
+        let target = crate::hitl::PollingTarget {
+            server_id: "server-id".to_owned(),
+            namespace: "test".to_owned(),
+            tool_name: "probe_tool".to_owned(),
+            invocation_arguments: args.clone(),
+        };
+        let mut item = crate::hitl::ApprovalItem {
+            tool_name: "probe_tool".to_owned(),
+            tool_namespace: Some("test".to_owned()),
+            arguments: args["probe"]["args"].clone(),
+            tool_call_intent: None,
+            polling: Some(crate::hitl::PollingScope {
+                every_secs: 1,
+                for_up_to_secs: 3,
+            }),
+        };
+        assert!(WaitForTool::approval_matches(&target, &item));
+        item.polling.as_mut().unwrap().every_secs = 2;
+        assert!(!WaitForTool::approval_matches(&target, &item));
+        item.polling = Some(crate::hitl::PollingScope {
+            every_secs: 1,
+            for_up_to_secs: 4,
+        });
+        assert!(!WaitForTool::approval_matches(&target, &item));
+        item.polling = None;
+        assert!(!WaitForTool::approval_matches(&target, &item));
+    }
+
+    #[tokio::test]
+    async fn polling_denial_is_not_an_observation() {
+        let (server, manager) = polling_fixture().await;
+        let registry = crate::hitl::PendingApprovals::new();
+        let route = Arc::new(crate::hitl::DecisionRoute::Conversational {
+            registry: registry.clone(),
+            timeout: Duration::from_secs(10),
+        });
+        let (run, mut events) = crate::run_context::RunContext::channel(aura_events::RunId::mint());
+        let call = crate::run_context::with_run(run, async {
+            let tool = WaitForTool::scoped(manager, &polling_context(route, "test:*"));
+            let mut args = polling_args();
+            args["until"] = serde_json::json!({"not_matches": "ok"});
+            rig::tool::ToolDyn::call(&tool, args.to_string())
+                .await
+                .unwrap()
+        });
+        let deny = async {
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if let aura_events::agent::AgentEventPayload::ApprovalPending(pending) =
+                    event.payload
+                {
+                    registry
+                        .resolve(
+                            &crate::hitl::DecisionId::parse(&pending.decision_id).unwrap(),
+                            crate::hitl::ApprovalDecision::Denied {
+                                reason: Some("no".to_owned()),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    break;
+                }
+            }
+        };
+        let (output, _) = tokio::join!(call, deny);
+        assert!(output.contains(crate::hitl::DENIAL_PREFIX));
+        assert!(server.tool_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn polling_webhook_identity_reaches_every_sample_and_does_not_leak() {
+        use std::collections::HashMap;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let webhook = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(socket);
+            let mut length = None;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut body = vec![0; length.unwrap()];
+            reader.read_exact(&mut body).await.unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let body = r#"{"approved":true}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Approver: Bearer approver\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            reader
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
+            request
+        });
+        let (server, manager) = polling_fixture().await;
+        let config = aura_config::HitlConfig {
+            require_approval: vec!["test:*".into()],
+            park: Default::default(),
+            route: aura_config::DecisionRouteConfig::Webhook {
+                url: aura_config::WebhookUrl::new(format!("http://{address}")).unwrap(),
+                timeout_secs: 5,
+                headers: HashMap::new(),
+                headers_from_request: HashMap::new(),
+                tool_headers_from_response: aura_config::ToolHeaderMappings::try_from(
+                    HashMap::from([("authorization".to_owned(), "x-approver".to_owned())]),
+                )
+                .unwrap(),
+            },
+        };
+        let policy = crate::hitl::HitlPolicy::from_config(
+            &config,
+            &crate::hitl::PendingApprovals::new(),
+            None,
+            None,
+        );
+        let (run, _events) = crate::run_context::RunContext::channel(aura_events::RunId::mint());
+        let reasoning = "Verify the rollout recovered.\nKeep the original rationale — verbatim.";
+        crate::run_context::with_run(run, async {
+            let gated = WaitForTool::scoped(
+                Arc::clone(&manager),
+                &polling_context(policy.route, "test:*"),
+            );
+            let definition = rig::tool::ToolDyn::definition(&gated, String::new()).await;
+            assert!(definition.parameters["properties"]["_aura_reasoning"].is_object());
+            let mut args = polling_args();
+            args["_aura_reasoning"] = reasoning.into();
+            rig::tool::ToolDyn::call(&gated, args.to_string())
+                .await
+                .unwrap();
+            let gated_calls = server.tool_calls();
+            assert!(gated_calls.len() >= 2);
+            for call in &gated_calls {
+                assert_eq!(call.header_values("authorization"), vec!["Bearer approver"]);
+            }
+            let ungated = WaitForTool::scoped(manager, &AgentBuildContext::default());
+            let mut args = polling_args();
+            args["until"] = serde_json::json!({"matches": "ok"});
+            rig::tool::ToolDyn::call(&ungated, args.to_string())
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(
+            server
+                .tool_calls()
+                .last()
+                .unwrap()
+                .header_values("authorization"),
+            vec!["Bearer requester"]
+        );
+        let request = webhook.await.unwrap();
+        let item = &request["items"][0];
+        assert_eq!(item["tool_name"], "probe_tool");
+        assert_eq!(item["tool_namespace"], "test");
+        assert_eq!(item["arguments"], polling_args()["probe"]["args"]);
+        assert_eq!(item["tool_call_intent"], reasoning);
+        assert_eq!(
+            item["polling"],
+            serde_json::json!({
+                "every_secs": 1, "for_up_to_secs": 3,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_cancellation_during_sleep_prevents_the_next_sample() {
+        struct ParkSleep(Arc<tokio::sync::Notify>);
+        #[async_trait::async_trait]
+        impl Sleeper for ParkSleep {
+            async fn sleep(&self, _duration: Duration) {
+                self.0.notify_one();
+                std::future::pending::<()>().await;
+            }
+        }
+        let (server, manager) = polling_fixture().await;
+        let sleeping = Arc::new(tokio::sync::Notify::new());
+        let (run, _events) = crate::run_context::RunContext::channel(aura_events::RunId::mint());
+        let call = crate::run_context::with_run(Arc::clone(&run), async {
+            let tool = WaitForTool::with_sleeper(
+                manager,
+                &AgentBuildContext::default(),
+                Arc::new(ParkSleep(Arc::clone(&sleeping))),
+            );
+            rig::tool::ToolDyn::call(&tool, polling_args().to_string()).await
+        });
+        let cancel = async {
+            tokio::time::timeout(Duration::from_secs(5), sleeping.notified())
+                .await
+                .unwrap();
+            assert_eq!(server.tool_calls().len(), 1);
+            run.cancel_token().cancel();
+        };
+        let (result, _) = tokio::join!(call, cancel);
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert_eq!(server.tool_calls().len(), 1);
+    }
 
     /// Yields the queued outputs in order, then repeats the last forever.
     struct ScriptedProbe {

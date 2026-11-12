@@ -806,6 +806,7 @@ mod tests {
                 tool_namespace: None,
                 arguments: json!({ "cmd": "ls -la" }),
                 tool_call_intent: None,
+                polling: None,
             }],
         };
 
@@ -844,6 +845,7 @@ mod tests {
             tool_namespace,
             arguments: json!({}),
             tool_call_intent: None,
+            polling: None,
         };
         let with_namespace =
             serde_json::to_value(item(Some("github".to_string()))).expect("serializable");
@@ -912,6 +914,7 @@ mod tests {
                 tool_namespace: None,
                 arguments: json!({ "namespace": "prod" }),
                 tool_call_intent: Some("rollout restart to pick up the new config map".to_string()),
+                polling: None,
             }],
         };
 
@@ -944,6 +947,7 @@ mod tests {
                     "risk_rationale": "touches prod"
                 }),
                 tool_call_intent: None,
+                polling: None,
             }],
         };
 
@@ -975,6 +979,7 @@ mod tests {
                 tool_call_intent: Some(
                     "namespace cleanup is the fastest path to unblock".to_string(),
                 ),
+                polling: None,
             }],
         };
 
@@ -2273,6 +2278,7 @@ mod tests {
                 tool_namespace: None,
                 arguments: serde_json::json!({}),
                 tool_call_intent: None,
+                polling: None,
             }],
         };
 
@@ -2623,6 +2629,7 @@ mod tests {
                 tool_namespace: None,
                 arguments: serde_json::json!({}),
                 tool_call_intent: None,
+                polling: None,
             }],
         }
     }

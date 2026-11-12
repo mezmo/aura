@@ -910,22 +910,9 @@ impl Orchestrator {
         })
     }
 
-    /// The tools a worker executes itself beside its MCP tools: `wait_for`
-    /// when an MCP manager exists, plus fresh instances of the run's own
-    /// tools. Called once per worker built.
+    /// Fresh instances of the run's action tools for each worker.
     fn worker_own_tools(&self) -> Vec<Box<dyn rig::tool::ToolDyn>> {
-        let mut tools: Vec<Box<dyn rig::tool::ToolDyn>> = self
-            .mcp_manager
-            .as_ref()
-            .map(|mcp| {
-                vec![
-                    Box::new(super::tools::wait_for::WaitForTool::new(Arc::clone(mcp)))
-                        as Box<dyn rig::tool::ToolDyn>,
-                ]
-            })
-            .unwrap_or_default();
-        tools.extend((self.run_tools)());
-        tools
+        (self.run_tools)()
     }
 
     /// The names of the run's own tools, as the planner lists them under
@@ -1258,7 +1245,9 @@ impl Orchestrator {
             if let Some(recorded) = recorded {
                 gate = gate.with_recorded_decisions(Arc::clone(recorded));
             }
-            let gate_layer: Arc<dyn ToolMiddleware> = Arc::new(WrapperLayer(Arc::new(gate)));
+            let gate = Arc::new(gate);
+            worker_build_context.hitl_gate = Some(Arc::clone(&gate));
+            let gate_layer: Arc<dyn ToolMiddleware> = Arc::new(WrapperLayer(gate));
             layers.insert(0, Arc::clone(&gate_layer));
             worker_build_context.hitl_gate_layer = Some(gate_layer);
             worker_build_context.hitl_request_approval_tool = Some(
@@ -3477,7 +3466,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let shared_mcp: Option<Arc<McpManager>> = self.mcp_manager.clone();
 
         // Box<dyn ToolDyn> is not Clone, so each provider arm constructs its own instance.
-        let wait_for_tools = || self.worker_own_tools();
+        let run_tools = || self.worker_own_tools();
 
         // Test-only model injection (park/reify rig): a queued override builds
         // this worker from a scripted model. The override's extra tools go
@@ -3523,7 +3512,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 worker_build_context,
                 &shared_mcp,
                 run,
-                wait_for_tools(),
+                run_tools(),
             )
             .await?;
             return Ok((
@@ -3582,7 +3571,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     worker_build_context,
                     &shared_mcp,
                     run,
-                    wait_for_tools(),
+                    run_tools(),
                 )
                 .await?;
                 Ok((ProviderAgent::OpenAI(state.build()), model.clone()))
@@ -3626,7 +3615,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     worker_build_context,
                     &shared_mcp,
                     run,
-                    wait_for_tools(),
+                    run_tools(),
                 )
                 .await?;
                 Ok((ProviderAgent::Anthropic(state.build()), model.clone()))
@@ -3678,7 +3667,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     worker_build_context,
                     &shared_mcp,
                     run,
-                    wait_for_tools(),
+                    run_tools(),
                 )
                 .await?;
                 Ok((ProviderAgent::Bedrock(state.build()), model.clone()))
@@ -3715,7 +3704,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     worker_build_context,
                     &shared_mcp,
                     run,
-                    wait_for_tools(),
+                    run_tools(),
                 )
                 .await?;
                 Ok((ProviderAgent::Gemini(state.build()), model.clone()))
@@ -3751,7 +3740,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     worker_build_context,
                     &shared_mcp,
                     run,
-                    wait_for_tools(),
+                    run_tools(),
                 )
                 .await?;
                 Ok((ProviderAgent::Ollama(state.build()), model.clone()))
@@ -3791,7 +3780,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     worker_build_context,
                     &shared_mcp,
                     run,
-                    wait_for_tools(),
+                    run_tools(),
                 )
                 .await?;
                 Ok((ProviderAgent::OpenRouter(state.build()), model.clone()))
@@ -8745,6 +8734,7 @@ mod tests {
             let decision_id = TestDecisionId::generate();
             registry
                 .register_durable(ParkedApproval {
+                    polling_target: None,
                     request: ApprovalRequest {
                         version: PROTOCOL_VERSION,
                         instance_id: "test-instance".to_string(),
@@ -8875,6 +8865,7 @@ mod tests {
             let decision_id = TestDecisionId::generate();
             registry
                 .register_durable(ParkedApproval {
+                    polling_target: None,
                     request: crate::hitl::ApprovalRequest {
                         version: crate::hitl::PROTOCOL_VERSION,
                         instance_id: "test-instance".to_string(),
@@ -8890,6 +8881,7 @@ mod tests {
                             tool_namespace: None,
                             arguments: serde_json::json!({ "namespace": "prod" }),
                             tool_call_intent: None,
+                            polling: None,
                         }],
                     },
                     registered_at: now,
@@ -9375,6 +9367,301 @@ mod tests {
     /// process-global, and two parallel installs could cross-consume each
     /// other's scripted workers. Async-aware so the guard may cross awaits.
     static WORKER_OVERRIDE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn run_wait_for_worker(
+        filter: Option<Vec<aura_config::GlobPattern>>,
+        require_approval: bool,
+    ) -> usize {
+        use std::collections::HashMap;
+
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut orchestrator, _store, _registry, request_id) =
+            override_park_orchestrator(dir.path(), 4).await;
+        orchestrator
+            .config
+            .workers
+            .get_mut("operations")
+            .unwrap()
+            .mcp_filter = filter;
+        orchestrator.park_guard = None;
+        orchestrator.agent_build_context.hitl = require_approval.then(|| crate::hitl::HitlPolicy {
+            patterns: Arc::from(["test:*".into()]),
+            route: Arc::new(crate::hitl::DecisionRoute::Webhook {
+                client: crate::hitl::WebhookClient::new(
+                    reqwest::Client::new(),
+                    aura_config::WebhookUrl::new("http://127.0.0.1:9").unwrap(),
+                ),
+                timeout: Duration::from_secs(1),
+            }),
+            park_enabled: false,
+        });
+        let (server, client) = crate::mcp::client::tests::client_and_server(&HashMap::new()).await;
+        let tool = rmcp::model::Tool::new(
+            "probe_tool".to_owned(),
+            "Probe".to_owned(),
+            Arc::new(serde_json::Map::new()),
+        );
+        // The server id differs from the client's namespace ("test").
+        let manager = crate::mcp::McpManager {
+            streamable_clients: HashMap::from([("server-id".to_owned(), client)]),
+            streamable_tools: HashMap::from([(
+                "server-id".to_owned(),
+                vec![crate::mcp::AuraTool::new(tool, "test")],
+            )]),
+            ..crate::mcp::McpManager::with_sanitization(false)
+        };
+        orchestrator.mcp_manager = Some(Arc::new(manager));
+        let model = test_rig::ScriptedCompletionModel::new(vec![
+            ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                "poll-1",
+                "wait_for",
+                serde_json::json!({
+                    "probe": {"tool": "probe_tool", "args": {}},
+                    "until": {"matches": "ok"},
+                    "poll_sec": 1,
+                    "max_wait_sec": 2
+                }),
+            )]),
+            ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                "result-1",
+                "submit_result",
+                serde_json::json!({
+                    "summary": "finished",
+                    "result": "probe checked",
+                    "confidence": "high"
+                }),
+            )]),
+        ]);
+        test_rig::install_worker_overrides(vec![WorkerOverride {
+            model: model.clone(),
+            extra_tools: vec![],
+        }]);
+        let (run, _events) = crate::run_context::RunContext::channel(request_id.parse().unwrap());
+        let params = TaskExecutionParams {
+            task_description: "Poll the probe",
+            task_context: &None,
+            worker_name: Some("operations"),
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(128);
+        crate::run_context::with_run(
+            run,
+            orchestrator.execute_task(0, &params, Some(&event_tx), None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(model.requests().lock().unwrap().len(), 2);
+        server.tool_calls().len()
+    }
+
+    #[tokio::test]
+    async fn wait_for_worker_cannot_execute_a_filtered_probe() {
+        assert_eq!(run_wait_for_worker(Some(vec![]), false).await, 0);
+    }
+
+    #[tokio::test]
+    async fn wait_for_worker_cannot_execute_without_inner_approval() {
+        assert_eq!(run_wait_for_worker(None, true).await, 0);
+    }
+
+    #[tokio::test]
+    async fn wait_for_worker_can_execute_an_ungated_visible_probe() {
+        assert_eq!(run_wait_for_worker(None, false).await, 1);
+    }
+
+    async fn park_poll_then_resume(change_server: bool) {
+        use std::collections::HashMap;
+
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _store) = file_store_registry(&dir.path().join("approvals"));
+        let (server, client) = crate::mcp::client::tests::client_and_server(&HashMap::new()).await;
+        let manager_for = |server_id: &str| {
+            Arc::new(crate::mcp::McpManager {
+                streamable_clients: HashMap::from([(server_id.to_owned(), client.clone())]),
+                streamable_tools: HashMap::from([(
+                    server_id.to_owned(),
+                    vec![crate::mcp::AuraTool::new(
+                        rmcp::model::Tool::new(
+                            "probe_tool".to_owned(),
+                            "Probe".to_owned(),
+                            Arc::new(serde_json::Map::new()),
+                        ),
+                        "test",
+                    )],
+                )]),
+                ..crate::mcp::McpManager::with_sanitization(false)
+            })
+        };
+        let (mut orchestrator, run_id) =
+            file_backed_park_orchestrator(&registry, dir.path(), "poll-resume").await;
+        orchestrator
+            .config
+            .workers
+            .get_mut("operations")
+            .unwrap()
+            .mcp_filter = None;
+        orchestrator
+            .agent_build_context
+            .hitl
+            .as_mut()
+            .unwrap()
+            .patterns = Arc::from(["*".into()]);
+        orchestrator.mcp_manager = Some(manager_for("server-a"));
+        // Approval scope includes effective defaults; replay keeps the original arguments.
+        let args = serde_json::json!({"probe": {"tool": "probe_tool", "args": {"query": "fixed"}}, "until": {"matches": "ok"}});
+        let reasoning = "Wait for the rollout to recover before continuing.";
+        let mut model_args = args.clone();
+        model_args["_aura_reasoning"] = reasoning.into();
+        let model = test_rig::ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+            ScriptedToolCall::new("poll-1", "wait_for", model_args).with_call_id("poll-call-id"),
+        ])]);
+        test_rig::install_worker_overrides(vec![WorkerOverride {
+            model: model.clone(),
+            extra_tools: vec![],
+        }]);
+        let mut plan = Plan::new("Poll");
+        plan.add_task(Task::new(0, "Poll the probe", "r").with_worker("operations"));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(128);
+        let (_, records) = orchestrator.execute(&mut plan, &event_tx).await.unwrap();
+        let TaskState::AwaitingApproval { pending } = &plan.tasks[0].state else {
+            panic!("must park");
+        };
+        assert_eq!(
+            pending.len(),
+            1,
+            "one inner-operation approval, no redundant outer gate"
+        );
+        assert_eq!(pending[0].tool_name, "wait_for");
+        assert_eq!(pending[0].arguments, args);
+        assert_eq!(pending[0].call_id, "poll-1");
+        let id = pending[0].decision_id;
+        assert!(server.tool_calls().is_empty());
+        assert_eq!(model.requests().lock().unwrap().len(), 1);
+        let stored = registry.try_parked(&id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.polling_target.as_ref().unwrap().server_id,
+            "server-a"
+        );
+        assert_eq!(
+            stored.request.items[0].tool_namespace.as_deref(),
+            Some("test")
+        );
+        let item = &stored.request.items[0];
+        assert_eq!(item.tool_name, "probe_tool");
+        assert_eq!(item.arguments, args["probe"]["args"]);
+        assert_eq!(item.tool_call_intent.as_deref(), Some(reasoning));
+        assert_eq!(
+            item.polling,
+            Some(crate::hitl::PollingScope {
+                every_secs: 2,
+                for_up_to_secs: 120,
+            })
+        );
+        assert_eq!(
+            stored.polling_target.as_ref().unwrap().invocation_arguments,
+            args
+        );
+        orchestrator
+            .park_run(
+                "poll",
+                &[],
+                &[],
+                None,
+                1,
+                0,
+                &[],
+                &plan,
+                &records,
+                &event_tx,
+            )
+            .await
+            .unwrap();
+        drop(orchestrator);
+        registry
+            .resolve(&id, ApprovalDecision::Approved)
+            .await
+            .unwrap();
+        let path = dir
+            .path()
+            .join("poll-resume")
+            .join("parked")
+            .join(format!("{run_id}.json"));
+        let document = crate::orchestration::park::load_parked_run(&path)
+            .await
+            .unwrap();
+        let (recorded, ids) =
+            crate::orchestration::park::load_recorded_decisions(&registry, &document)
+                .await
+                .unwrap();
+        assert_eq!(ids, vec![id]);
+        let node = &document.plan.tasks[0];
+        let continuation = TaskContinuation {
+            attempt: node.attempt.unwrap(),
+            history: node.history.clone().unwrap(),
+            current_prompt: node.current_prompt.clone().unwrap(),
+            pending: node.pending.clone().unwrap(),
+        };
+        let resume = ResumeContext {
+            recorded,
+            document: Arc::new(open_resuming_document(&path).await),
+        };
+        let (mut resumed, _) =
+            file_backed_park_orchestrator(&registry, dir.path(), "poll-resume").await;
+        resumed
+            .config
+            .workers
+            .get_mut("operations")
+            .unwrap()
+            .mcp_filter = None;
+        resumed.agent_build_context.hitl.as_mut().unwrap().patterns = Arc::from(["*".into()]);
+        resumed.mcp_manager = Some(manager_for(if change_server {
+            "server-b"
+        } else {
+            "server-a"
+        }));
+        test_rig::install_worker_overrides(vec![WorkerOverride {
+            model: test_rig::ScriptedCompletionModel::new(vec![ScriptedTurn::tool_calls(vec![
+                ScriptedToolCall::new(
+                    "result-1",
+                    "submit_result",
+                    serde_json::json!({"summary": "finished", "result": "polled", "confidence": "high"}),
+                ),
+            ])]),
+            extra_tools: vec![],
+        }]);
+        let params = TaskExecutionParams {
+            task_description: "Poll the probe",
+            task_context: &None,
+            worker_name: Some("operations"),
+        };
+        let result = resumed
+            .execute_task(
+                0,
+                &params,
+                Some(&event_tx),
+                Some(&continuation),
+                Some(&resume),
+            )
+            .await;
+        if change_server {
+            assert!(result.is_err(), "changed target must fail resume");
+            assert!(server.tool_calls().is_empty());
+        } else {
+            assert!(matches!(result.unwrap(), TaskOutcome::Completed(_)));
+            assert_eq!(server.tool_calls().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_park_resume_replays_the_polling_invocation() {
+        park_poll_then_resume(false).await;
+    }
+
+    #[tokio::test]
+    async fn wait_for_park_resume_rejects_a_changed_winning_server() {
+        park_poll_then_resume(true).await;
+    }
 
     /// A park-mode orchestrator whose `operations` worker is built through
     /// the override seam: the gate glob matches the stub tool, and the

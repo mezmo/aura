@@ -26,6 +26,36 @@ of `POST /v1/approvals/{id}`.
 - The Rust signatures and diagrams below describe intended design, not code that
   exists yet.
 
+## Polling probes
+
+This section records the polling contract as of 2026-11-06.
+
+The built-in orchestration `wait_for` checks its inner MCP probe's approval
+policy first, then falls back to the outer `wait_for` policy. Either match
+requires one approval. Worker `mcp_filter` rules apply before target resolution.
+The approval item uses the probe's tool name, namespace, and arguments, just
+as a direct call does. Its optional `polling` object carries `every_secs` and
+`for_up_to_secs`, using the effective poll interval and wait bound. The
+conversational pending event carries the same values, and the CLI displays
+them before asking for consent. `tool_call_intent` retains the model's
+original rationale. `_aura_reasoning` stays out of executable arguments.
+
+One approval covers repeated samples with fixed arguments for that polling
+invocation. A new invocation needs a new approval. The polling clock starts
+after approval; denial or approval failure executes no samples. Approver
+headers apply to every approved sample without leaking into later calls.
+Stdio probes with approver identity overrides fail before dispatch because
+stdio cannot deliver per-request headers.
+
+The durable approval contains the inner operation and a separate copy of the
+outer `wait_for` invocation for continuation. Resume requires an exact match
+with the stored target and disclosed polling scope.
+
+Deploy the updated CLI alongside the server: older clients ignore the polling
+fields and cannot disclose repeated execution. Drain pending polling approvals
+before upgrading or rolling back; approvals without the structured polling
+scope cannot resume. Ordinary single-call records remain readable without it.
+
 ## The two routes in detail
 
 ### Route A: webhook (unattended)
@@ -524,8 +554,9 @@ only the transports that read it back before serializing can deliver it:
 
 The override rides the one request value the gate released, inserted into that
 request's `Extensions` map and read back by the transport before the outbound
-POST. There is no keyed map and nothing to clean up: every tool execution
-re-enters `pre_call` and the gate mints a fresh `DecisionId` per call.
+POST. There is no keyed map and nothing to clean up: every direct tool execution
+re-enters `pre_call` and the gate mints a fresh `DecisionId` per call. For the
+scope of a polling invocation, see [Polling probes](#polling-probes).
 
 ### Application-time audit
 

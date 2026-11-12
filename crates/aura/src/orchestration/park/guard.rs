@@ -109,6 +109,7 @@ mod tests {
         scope: &AgentScope,
     ) -> ParkedApproval {
         ParkedApproval {
+            polling_target: None,
             request: ApprovalRequest {
                 version: PROTOCOL_VERSION,
                 instance_id: "test-instance".to_string(),
@@ -124,6 +125,7 @@ mod tests {
                     tool_namespace: None,
                     arguments: serde_json::json!({ "namespace": "prod" }),
                     tool_call_intent: None,
+                    polling: None,
                 }],
             },
             registered_at: chrono::Utc::now(),
