@@ -688,7 +688,12 @@ pub fn current_orch_scrollback() -> u32 {
 
 /// Increment the orchestrator scrollback counter.
 pub fn increment_orch_scrollback() {
-    ORCH_SCROLLBACK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    increment_orch_scrollback_by(1);
+}
+
+/// Advance the orchestrator scrollback counter by `rows` already printed.
+pub fn increment_orch_scrollback_by(rows: usize) {
+    ORCH_SCROLLBACK_COUNTER.fetch_add(rows as u32, Ordering::Relaxed);
 }
 
 /// Increment the orchestrator scrollback counter by the number of *visual*

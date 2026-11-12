@@ -1,8 +1,8 @@
 //! The request headers a prepared agent forwards.
 //!
 //! `headers_from_request` mappings copy inbound request headers onto the MCP
-//! servers and the HITL webhook route when an agent is prepared, and the MCP
-//! connections are opened with them. A prepared agent is therefore bound to
+//! servers, the A2A remotes, and the HITL webhook route when an agent is
+//! prepared, and the MCP connections and A2A clients are built with them. A prepared agent is therefore bound to
 //! the request that prepared it as far as those headers go, and can only serve
 //! another request that forwards the same values.
 
@@ -20,8 +20,8 @@ pub struct ForwardedHeaders {
 
 impl ForwardedHeaders {
     /// The headers `req_headers` forwards under `config`: every inbound name a
-    /// `headers_from_request` mapping reads, on an MCP server or the HITL
-    /// webhook route, looked up case-insensitively.
+    /// `headers_from_request` mapping reads, on an MCP server, an A2A remote,
+    /// or the HITL webhook route, looked up case-insensitively.
     pub fn resolve(config: &Config, req_headers: Option<&HashMap<String, String>>) -> Self {
         let mut names = BTreeSet::new();
         if let Some(mcp) = &config.mcp {
@@ -37,6 +37,16 @@ impl ForwardedHeaders {
                     } => names.extend(headers_from_request.values().map(|n| n.to_lowercase())),
                     McpServerConfig::Stdio { .. } => {}
                 }
+            }
+        }
+        if let Some(a2a) = &config.a2a {
+            for remote in a2a.remote.values() {
+                names.extend(
+                    remote
+                        .headers_from_request
+                        .values()
+                        .map(|n| n.to_lowercase()),
+                );
             }
         }
         if let Some(DecisionRouteConfig::Webhook {
@@ -180,6 +190,31 @@ api_key = "k"
             format!("{forwarded:?}"),
             r#"{"x-actor": "<absent>", "x-user-token": "<present>"}"#,
             "debug output names the headers and never their values",
+        );
+    }
+
+    #[test]
+    fn an_a2a_remote_mapping_is_forwarded() {
+        let mut config = config(&[], &[]);
+        config.a2a = Some(
+            toml::from_str(
+                r#"
+                [remote.k8s_ops]
+                url = "http://k8s:8080"
+                [remote.k8s_ops.headers_from_request]
+                authorization = "X-Spoke-Token"
+                "#,
+            )
+            .expect("a2a parses"),
+        );
+        let forwarded =
+            ForwardedHeaders::resolve(&config, Some(&headers(&[("x-spoke-token", "t1")])));
+
+        assert_eq!(forwarded.as_request(), headers(&[("x-spoke-token", "t1")]));
+        assert_eq!(
+            forwarded.first_difference(Some(&headers(&[("x-spoke-token", "t2")]))),
+            Some("x-spoke-token"),
+            "the remote's client was built with t1, so a request forwarding t2 differs",
         );
     }
 
