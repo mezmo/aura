@@ -13,9 +13,10 @@ The runtime path runs these steps:
 - build an `AgentRuntime::over_agents` that serves the mock (behind
   `aura`'s `test-support` feature, which this crate's dev-dependency turns
   on);
-- attach an observer that claims the session with presence;
-- call `start`, handing it the run's `agent.stream` span;
-- read the session's stream up to the run's `Started`;
+- call `start_attached` on a lane of the parity chat's conversation, as
+  the streaming handler does, claiming the lane with presence and handing
+  it the run's `agent.stream` span;
+- read the lane's stream up to the run's `Started`;
 - render the rest with `sse_body`, using an `SseProjector` built from the
   same `StreamConfig` and `TurnContext` as the oracle, and
   `Timeouts::default()`, which sets no window and no heartbeat.
@@ -127,7 +128,7 @@ The span, root `agent.stream` only (the mock opens no child spans):
 
 | Surface | Covered by |
 |---|---|
-| `llm.system`, `llm.provider`, `llm.model_name`, `input.mime_type`, `input.length`, `http.request_id`, `session.id`, `aura.version`, `aura.mode` (both modes), `user.id`, `metadata`, `llm.invocation_parameters`, `message_count`, `output.mime_type`, `output.length`, in the order recorded | every script |
+| `llm.system`, `llm.provider`, `llm.model_name`, `input.mime_type`, `input.length`, `http.request_id`, `session.id` (the chat id on both paths), `aura.version`, `aura.mode` (both modes), `user.id`, `metadata`, `llm.invocation_parameters`, `message_count`, `output.mime_type`, `output.length`, in the order recorded | every script |
 | status ok | every finishing script, `passthrough_tool` |
 | status error with the stream's error text, and its `exception` event | `provider_error`, `context_overflow` |
 | a park: `stream.termination = parked`, no status | `orchestration_parks` (rewritten on the oracle's side, see below) |
@@ -167,6 +168,7 @@ there.
 | `duration_ms` becomes `<elapsed>` | `aura.tool_complete` frames only. The orchestration frames' durations come from the script, so they are compared as they are. | Exactly one `"duration_ms":` per such frame, followed by digits | Both paths measure it on the wall clock (`std::time::Instant`), which paused tokio time does not control. |
 | `code.*`, `thread.id`, `thread.name`, `busy_ns`, `idle_ns` dropped | Every span | Exactly one of each (`thread.name` at most one) | Each path creates its span at its own call site, on its own schedule. |
 | `run.id`, `http.request_id` become `<run>` | The `agent.stream` root | Exactly one of each, equal to that path's run id | Each path's run has its own id. |
+| `session.lane` dropped | The `agent.stream` root | Exactly one on the runtime's side, equal to 0, and none on the oracle's | Only the runtime path runs on a lane. The parity chat's only run takes the conversation's first lane. |
 | Span events kept only from `aura::logging` | Every span | No span dropped an event | The rest are each path's log lines. |
 | The oracle's park ending becomes the runtime's | The root, `orchestration_parks` only | The oracle's status is ok, with no `stream.termination` | The runtime's termination table (`termination` in `crates/aura/src/runtime/otel.rs`) records a park as `stream.termination = parked` with no status. The request-bound path has no park ending and records the stream as complete. |
 
@@ -197,14 +199,16 @@ on the other is a difference.
 
 ## Differences between the paths
 
-One these scripts reach: the park ending in `orchestration_parks`. The
-request-bound span ends with status ok and no `stream.termination`, and
-the runtime's ends with status unset and `stream.termination = parked`.
-The oracle's side is rewritten before the compare (see "Rewrites before
-comparing"). Apart from that, every `both_paths` test agrees on every
-variant. The other known differences are time-driven, so no script
-reaches them. They are listed under "Not covered", in the rows for the
-windows and the run's deadline.
+Two these scripts reach. Every runtime root carries `session.lane`,
+the lane its run is on, which the request-bound path has no counterpart
+for; it is checked and dropped. And the park ending in
+`orchestration_parks`: the request-bound span ends with status ok and no
+`stream.termination`, and the runtime's ends with status unset and
+`stream.termination = parked`. The oracle's side is rewritten before the
+compare. Both are in "Rewrites before comparing". Apart from those two,
+every `both_paths` test agrees on every variant. The other known
+differences are time-driven, so no script reaches them. They are listed
+under "Not covered", in the rows for the windows and the run's deadline.
 
 ## Residual risks
 
