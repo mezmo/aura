@@ -267,8 +267,8 @@ async fn execute(
     let events = run.take_agent_events();
     let items = run.into_events();
 
-    // An observer attach or detach still being written goes on the stream
-    // first, so `Started` follows it.
+    // An observer attach or detach already counted goes on the stream first,
+    // so `Started` follows it.
     session.observer_writes_done().await;
     let journal = &session.journal;
     let started = LifecycleEvent::Started {
@@ -679,7 +679,7 @@ async fn journal_ending(
         LifecycleEvent::Parked { checkpoint, .. } => Some(checkpoint.clone()),
         _ => None,
     };
-    // An observer detach still being written goes on the stream first, so a
+    // An observer detach already counted goes on the stream first, so a
     // claim that went while the run was live shows before the run's ending.
     session.observer_writes_done().await;
     let stamped = session
