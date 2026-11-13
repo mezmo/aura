@@ -4542,6 +4542,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 task_id,
                                 attempt
                             );
+                            let duration_ms = start_time.elapsed().as_millis() as u64;
+                            self.persist_worker_execution(
+                                task_id,
+                                task_description,
+                                attempt,
+                                duration_ms,
+                                Ok(&raw_response),
+                                None,
+                                &prompt,
+                            )
+                            .await;
                             // A blank retry must not replace the first
                             // attempt's answer (mezmo/aura#897).
                             let result = if raw_response.trim().is_empty()
@@ -4551,17 +4562,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             } else {
                                 raw_response
                             };
-                            let duration_ms = start_time.elapsed().as_millis() as u64;
-                            self.persist_worker_execution(
-                                task_id,
-                                task_description,
-                                attempt,
-                                duration_ms,
-                                Ok(&result),
-                                None,
-                                &prompt,
-                            )
-                            .await;
                             return Ok(TaskOutcome::Completed(TaskExecutionResult {
                                 result,
                                 structured_output: None,
@@ -9892,6 +9892,9 @@ mod tests {
         responses: Vec<String>,
         /// Every `task-0-*-result.txt` artifact under the memory dir.
         artifacts: Vec<String>,
+        /// Every `task-0.attempt-2.response.txt` and
+        /// `task-0.attempt-2.result.json` under the memory dir.
+        retry_records: Vec<String>,
     }
 
     /// Runs one task through its first attempt, which answers `first` without
@@ -9938,6 +9941,11 @@ mod tests {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if name == "task-0.attempt-1.response.txt" {
                     run.responses.push(std::fs::read_to_string(&path).unwrap());
+                } else if name == "task-0.attempt-2.response.txt"
+                    || name == "task-0.attempt-2.result.json"
+                {
+                    run.retry_records
+                        .push(std::fs::read_to_string(&path).unwrap());
                 } else if name.starts_with("task-0-") && name.ends_with("-result.txt") {
                     run.artifacts.push(std::fs::read_to_string(&path).unwrap());
                 }
@@ -9947,6 +9955,7 @@ mod tests {
             plan,
             responses: Vec::new(),
             artifacts: Vec::new(),
+            retry_records: Vec::new(),
         };
         find(dir.path(), &mut run);
         run
@@ -10237,6 +10246,16 @@ mod tests {
         let (error, category) = failed(&run.plan);
         assert_eq!(category, FailureCategory::SoftFailure, "{error}");
         assert_eq!(error, "found two idle nodes");
+        // The run directory records the retry as it came back: blank.
+        assert_eq!(run.retry_records.len(), 2, "{:?}", run.retry_records);
+        for record in &run.retry_records {
+            assert!(!record.contains("found two idle nodes"), "{record}");
+        }
+        assert!(
+            run.retry_records.iter().any(String::is_empty),
+            "{:?}",
+            run.retry_records
+        );
     }
 
     /// A retry with text of its own is still the task's failure text.
