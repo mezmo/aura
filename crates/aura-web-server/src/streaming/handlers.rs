@@ -1355,12 +1355,15 @@ fn handle_orchestrator_event(
             );
             // A quota failure carries the provider's raw body and request id,
             // which reach the client as they do on the stream-error path: only
-            // with `debug_provider_errors`.
+            // with `debug_provider_errors`. Only the error is the provider's,
+            // so an earlier attempt's kept output follows the message whole.
             let result = if *quota_exhausted {
-                std::borrow::Cow::Owned(build_quota_exhausted_message(
-                    result,
-                    config.debug_provider_errors,
-                ))
+                let (error, kept) = aura::orchestration::split_kept_output(result);
+                let message = build_quota_exhausted_message(error, config.debug_provider_errors);
+                std::borrow::Cow::Owned(match kept {
+                    Some(kept) => format!("{message}\n{kept}"),
+                    None => message,
+                })
             } else {
                 std::borrow::Cow::Borrowed(result)
             };
@@ -2007,6 +2010,56 @@ mod tests {
             !frame.contains(aura::provider_error::QUOTA_EXHAUSTED_MESSAGE),
             "{frame}"
         );
+    }
+
+    /// A quota failure that kept an earlier attempt's output reaches the
+    /// client with that output whole, debugging or not: only the error before
+    /// the kept-output heading becomes the quota message. The output is longer
+    /// than the provider detail's cut, so it cannot survive inside the detail.
+    #[test]
+    fn a_quota_task_failure_keeps_an_earlier_attempts_output() {
+        use aura_events::agent::{AgentEvent, AgentEventPayload, ToolOutcome};
+
+        let ctx = test_turn_ctx();
+        let quota = r#"Worker failed task 0 after 2 attempts: ProviderError: Invalid status code 400 Bad Request with message: {"error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."},"request_id":"req_011secret"}"#;
+        let output = "found two idle nodes in pool-a; ".repeat(30);
+        let text = aura::orchestration::with_kept_output(quota, &output);
+        let heading = aura::orchestration::split_kept_output(&text)
+            .1
+            .and_then(|kept| kept.lines().next())
+            .expect("the text keeps the output under its heading");
+        let event = AgentEvent::new(
+            aura_events::EmittingAgent::worker("log-analyst", None, "coordinator"),
+            AgentEventPayload::TaskCompleted {
+                task_id: 0,
+                duration_ms: 42,
+                orchestrator_id: "coordinator".into(),
+                outcome: ToolOutcome::Failure {
+                    error: text.clone(),
+                },
+                quota_exhausted: true,
+            },
+        );
+        let render = |config: &StreamConfig| {
+            handle_orchestrator_event(config, &ctx, &event)
+                .iter()
+                .filter_map(|b| std::str::from_utf8(b).ok().map(str::to_owned))
+                .collect::<String>()
+        };
+
+        let config = StreamConfig::new(true, false, ToolResultMode::None, 10_000);
+        let debug = StreamConfig::new(true, false, ToolResultMode::None, 10_000)
+            .with_debug_provider_errors(true);
+        for (config, shows_body) in [(&config, false), (&debug, true)] {
+            let frame = render(config);
+            assert!(
+                frame.contains(aura::provider_error::QUOTA_EXHAUSTED_MESSAGE),
+                "{frame}"
+            );
+            assert_eq!(frame.contains("req_011secret"), shows_body, "{frame}");
+            assert!(frame.contains(heading), "{frame}");
+            assert!(frame.contains(&output), "{frame}");
+        }
     }
 
     /// The `arguments` of the result delta OpenWebUI mode sends for `result`.

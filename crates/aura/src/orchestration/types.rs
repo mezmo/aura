@@ -1287,6 +1287,23 @@ fn extract_artifact_footer(result: &str) -> Option<&str> {
 pub(super) const KEPT_OUTPUT_HEADING: &str =
     "Output from an earlier attempt, which did not call submit_result:";
 
+/// A failed task's `TaskCompleted` text: its `error`, then `output` under
+/// [`KEPT_OUTPUT_HEADING`].
+pub fn with_kept_output(error: &str, output: &str) -> String {
+    format!("{error}\n{KEPT_OUTPUT_HEADING}\n{output}")
+}
+
+/// A `TaskCompleted` text split into its error and, if it carries one, the
+/// kept output with its heading. The split is at the first heading, so the
+/// worker's output can quote the heading without moving it.
+pub fn split_kept_output(text: &str) -> (&str, Option<&str>) {
+    let marker = format!("\n{KEPT_OUTPUT_HEADING}\n");
+    match text.find(&marker) {
+        Some(at) => (&text[..at], Some(&text[at + 1..])),
+        None => (text, None),
+    }
+}
+
 /// `output` cut to `max_length`, with its artifact footer kept so the filename
 /// survives the cut.
 pub(super) fn truncate_kept_output(output: &str, max_length: usize) -> String {

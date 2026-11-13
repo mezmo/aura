@@ -75,6 +75,7 @@ use super::types::{
     BlockedCell, CellOutcome, FailedTaskRecord, FailureCategory, FailureSummary, IterationContext,
     IterationOutcome, IterationTimings, KEPT_OUTPUT_HEADING, ParkSnapshot, PendingCall, Plan,
     PlanningResponse, Task, TaskState, TaskStatus, failure_text, truncate_kept_output,
+    with_kept_output,
 };
 
 // ============================================================================
@@ -4055,7 +4056,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         let output = self
                             .maybe_create_artifact(task_id, worker_name.as_deref(), output)
                             .await;
-                        let message = format!("{error}\n{KEPT_OUTPUT_HEADING}\n{output}");
+                        let message = with_kept_output(&error, &output);
                         if let Some(t) = plan.get_task_mut(task_id) {
                             t.fail(error.clone(), category);
                             t.kept_output = Some(output);
@@ -10920,6 +10921,8 @@ mod tests {
         responses: Vec<String>,
         /// Every `task-0-*-result.txt` artifact under the memory dir.
         artifacts: Vec<String>,
+        /// Each `TaskCompleted` frame's quota flag and text.
+        completed: Vec<(bool, String)>,
     }
 
     /// Runs one task through its first attempt, which answers `first` without
@@ -10949,11 +10952,28 @@ mod tests {
 
         let mut plan = Plan::new("Inspect");
         plan.add_task(Task::new(0, "Inspect the pool", "r").with_worker("operations"));
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(256);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
         orchestrator
             .execute(&mut plan, &[], &event_tx)
             .await
             .unwrap();
+        let mut completed = Vec::new();
+        while let Ok(item) = event_rx.try_recv() {
+            if let Ok(StreamItem::AgentEvent(event)) = item
+                && let AgentEventPayload::TaskCompleted {
+                    outcome,
+                    quota_exhausted,
+                    ..
+                } = event.payload
+            {
+                let text = match outcome {
+                    aura_events::agent::ToolOutcome::Success { result } => result,
+                    aura_events::agent::ToolOutcome::Failure { error } => error,
+                    aura_events::agent::ToolOutcome::Unknown => String::new(),
+                };
+                completed.push((quota_exhausted, text));
+            }
+        }
 
         // Skips symlinks: the run directory is also reachable as `latest`.
         fn find(dir: &std::path::Path, run: &mut RetryRun) {
@@ -10978,6 +10998,7 @@ mod tests {
             plan,
             responses: Vec::new(),
             artifacts: Vec::new(),
+            completed,
         };
         find(dir.path(), &mut run);
         run
@@ -11054,6 +11075,30 @@ mod tests {
             &Orchestrator::collect_iteration_failures(&run.plan, 1),
             run.plan.completed_count(),
         ));
+    }
+
+    /// A quota refusal on the retry flags the task's frame as a quota failure,
+    /// and the frame still carries the first attempt's answer after the error,
+    /// where the web server's quota rewrite leaves it alone.
+    #[tokio::test]
+    async fn a_quota_error_on_the_retry_flags_the_frame_that_keeps_the_output() {
+        let run = run_retry(
+            "found two idle nodes",
+            vec![ScriptedTurn::provider_error(QUOTA_ERROR)],
+            OrchestrationConfig::default(),
+        )
+        .await;
+
+        let [(quota_exhausted, text)] = run.completed.as_slice() else {
+            panic!("one TaskCompleted frame, got {:?}", run.completed);
+        };
+        assert!(quota_exhausted, "{text}");
+        let (error, kept) = crate::orchestration::split_kept_output(text);
+        assert!(crate::provider_error::is_quota_exhausted(error), "{error}");
+        assert!(
+            kept.is_some_and(|kept| kept.contains("found two idle nodes")),
+            "{text}"
+        );
     }
 
     /// The first attempt's text can quote a provider error without changing
