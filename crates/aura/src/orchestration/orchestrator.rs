@@ -4572,8 +4572,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 &prompt,
                             )
                             .await;
+                            // A blank retry must not replace the first
+                            // attempt's answer (mezmo/aura#897).
+                            let result = if raw_response.trim().is_empty()
+                                && !last_raw_response.trim().is_empty()
+                            {
+                                last_raw_response
+                            } else {
+                                raw_response
+                            };
                             return Ok(TaskOutcome::Completed(TaskExecutionResult {
-                                result: raw_response,
+                                result,
                                 structured_output: None,
                             }));
                         }
@@ -9902,6 +9911,9 @@ mod tests {
         responses: Vec<String>,
         /// Every `task-0-*-result.txt` artifact under the memory dir.
         artifacts: Vec<String>,
+        /// Every `task-0.attempt-2.response.txt` and
+        /// `task-0.attempt-2.result.json` under the memory dir.
+        retry_records: Vec<String>,
     }
 
     /// Runs one task through its first attempt, which answers `first` without
@@ -9948,6 +9960,11 @@ mod tests {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if name == "task-0.attempt-1.response.txt" {
                     run.responses.push(std::fs::read_to_string(&path).unwrap());
+                } else if name == "task-0.attempt-2.response.txt"
+                    || name == "task-0.attempt-2.result.json"
+                {
+                    run.retry_records
+                        .push(std::fs::read_to_string(&path).unwrap());
                 } else if name.starts_with("task-0-") && name.ends_with("-result.txt") {
                     run.artifacts.push(std::fs::read_to_string(&path).unwrap());
                 }
@@ -9957,6 +9974,7 @@ mod tests {
             plan,
             responses: Vec::new(),
             artifacts: Vec::new(),
+            retry_records: Vec::new(),
         };
         find(dir.path(), &mut run);
         run
@@ -10231,6 +10249,63 @@ mod tests {
         let summary = orchestrator.build_execution_summary(&plan);
 
         assert!(summary.contains(footer), "{summary}");
+    }
+
+    /// A retry that ends on a blank turn without submit_result must not
+    /// discard the first attempt's answer (mezmo/aura#897).
+    #[tokio::test]
+    async fn a_blank_retry_keeps_the_first_attempts_answer() {
+        let run = run_retry(
+            "found two idle nodes",
+            vec![ScriptedTurn::text("")],
+            OrchestrationConfig::default(),
+        )
+        .await;
+
+        let (error, category) = failed(&run.plan);
+        assert_eq!(category, FailureCategory::SoftFailure, "{error}");
+        assert_eq!(error, "found two idle nodes");
+        // The run directory records the retry as it came back: blank.
+        assert_eq!(run.retry_records.len(), 2, "{:?}", run.retry_records);
+        for record in &run.retry_records {
+            assert!(!record.contains("found two idle nodes"), "{record}");
+        }
+        assert!(
+            run.retry_records.iter().any(String::is_empty),
+            "{:?}",
+            run.retry_records
+        );
+    }
+
+    /// A retry with text of its own is still the task's failure text.
+    #[tokio::test]
+    async fn a_retry_with_text_keeps_its_own_text() {
+        let run = run_retry(
+            "found two idle nodes",
+            vec![ScriptedTurn::text("the retry's findings")],
+            OrchestrationConfig::default(),
+        )
+        .await;
+
+        let (error, category) = failed(&run.plan);
+        assert_eq!(category, FailureCategory::SoftFailure, "{error}");
+        assert_eq!(error, "the retry's findings");
+    }
+
+    /// Two blank attempts leave nothing to keep, so the task fails with the
+    /// empty-worker message.
+    #[tokio::test]
+    async fn two_blank_attempts_fail_as_empty() {
+        let run = run_retry(
+            "",
+            vec![ScriptedTurn::text("")],
+            OrchestrationConfig::default(),
+        )
+        .await;
+
+        let (error, category) = failed(&run.plan);
+        assert_eq!(category, FailureCategory::SoftFailure, "{error}");
+        assert_eq!(error, EMPTY_WORKER_RESULT);
     }
 
     /// With nothing from the first attempt to keep, the retry's hard error
