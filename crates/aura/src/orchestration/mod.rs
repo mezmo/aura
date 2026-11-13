@@ -97,4 +97,5 @@ pub(crate) use test_rig::{ScriptedAgent, ScriptedCompletionModel, ScriptedTurn};
 pub use types::{
     BlockedCell, CellOutcome, ParkSnapshot, PendingCall, PersistenceRunId, Plan, PlanningResponse,
     StepInput, StructuredTaskOutput, Task, TaskIdentity, TaskJson, TaskState, TaskStatus,
+    split_kept_output, with_kept_output,
 };

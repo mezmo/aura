@@ -203,6 +203,9 @@ pub enum AgentEventPayload {
         orchestrator_id: String,
         #[serde(flatten)]
         outcome: ToolOutcome,
+        /// The task failed on a provider account out of credit or quota.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        quota_exhausted: bool,
     },
 
     /// A worker's gated call is waiting on an approval the run will not block
@@ -250,6 +253,29 @@ pub enum AgentEventPayload {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn task_completed_omits_a_false_quota_flag_and_reads_it_as_false_when_absent() {
+        let payload = AgentEventPayload::TaskCompleted {
+            task_id: 0,
+            duration_ms: 1,
+            orchestrator_id: "coordinator".into(),
+            outcome: ToolOutcome::Failure {
+                error: "boom".into(),
+            },
+            quota_exhausted: false,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(!json.contains("quota_exhausted"), "{json}");
+        let read: AgentEventPayload = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            read,
+            AgentEventPayload::TaskCompleted {
+                quota_exhausted: false,
+                ..
+            }
+        ));
+    }
 
     fn roundtrip(payload: AgentEventPayload) -> AgentEventPayload {
         let json = serde_json::to_string(&payload).expect("payload should serialize");
