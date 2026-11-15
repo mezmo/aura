@@ -157,7 +157,7 @@ budget_tokens = 8000
             } => {
                 assert_eq!(url, "https://mcp.mezmo.com/mcp");
                 assert_eq!(
-                    headers.get("Authorization"),
+                    headers.get("authorization"),
                     Some(&"Bearer test_mezmo_key".to_string())
                 );
                 assert_eq!(
@@ -165,21 +165,21 @@ budget_tokens = 8000
                     "Mezmo MCP server for log analysis and monitoring"
                 );
                 assert_eq!(
-                    headers_from_request.get("Authorization"),
+                    headers_from_request.get("authorization"),
                     Some(&"x-test-mezmo-token".to_string())
                 );
                 assert_eq!(
-                    headers_from_request.get("X-Test-Account-ID"),
+                    headers_from_request.get("x-test-account-id"),
                     Some(&"x-test-account-id".to_string())
                 );
-                // Verify original casing is preserved (lowercase keys should not match)
+                // Names are stored in lowercase, so the TOML spelling does not match
                 assert!(
-                    headers_from_request.get("authorization").is_none(),
-                    "headers_from_request keys should preserve original TOML casing"
+                    headers_from_request.get("Authorization").is_none(),
+                    "headers_from_request keys should be lowercase"
                 );
                 assert!(
-                    headers_from_request.get("x-test-account-id").is_none(),
-                    "headers_from_request keys should preserve original TOML casing"
+                    headers_from_request.get("X-Test-Account-ID").is_none(),
+                    "headers_from_request keys should be lowercase"
                 );
             }
             _ => panic!("Mezmo server should be HttpStreamable"),
@@ -558,7 +558,7 @@ model = "gpt-4"
         match test_server {
             McpServerConfig::HttpStreamable { headers, .. } => {
                 assert_eq!(
-                    headers.get("Authorization"),
+                    headers.get("authorization"),
                     Some(&"Bearer mock_test_key".to_string())
                 );
             }
@@ -2371,33 +2371,33 @@ api_key = "test"
 model = "gpt-4"
 "#;
 
-    /// See `validate_header_names_unique`.
+    /// See [`crate::HeaderMap`].
     #[test]
     fn header_names_differing_only_by_case_are_rejected() {
         for (table, location) in [
             (
                 "[mcp.servers.example]\ntransport = \"http_streamable\"\nurl = \"http://localhost:9999/mcp\"\nheaders = { Authorization = \"Bearer A\", authorization = \"Bearer B\" }\n",
-                "mcp.servers.example.headers",
+                "[mcp.servers.example]",
             ),
             (
                 "[mcp.servers.example]\ntransport = \"sse\"\nurl = \"http://localhost:9999/sse\"\nheaders_from_request = { X-Tenant = \"x-a\", x-tenant = \"x-b\" }\n",
-                "mcp.servers.example.headers_from_request",
+                "[mcp.servers.example]",
             ),
             (
                 "[hitl]\nrequire_approval = []\n\n[hitl.route]\nmode = \"webhook\"\nurl = \"https://approvals.example.com/decide\"\nheaders = { X-Tenant = \"a\", x-tenant = \"b\" }\n",
-                "hitl.route.headers",
+                "[hitl.route]",
             ),
             (
                 "[governance.catalog]\nurl = \"https://catalog.example.com/sync\"\nheaders_from_request = { Authorization = \"authorization\", AUTHORIZATION = \"x-token\" }\n",
-                "governance.catalog.headers_from_request",
+                "[governance.catalog.headers_from_request]",
             ),
             (
                 "[hitl]\nrequire_approval = []\n\n[hitl.route]\nmode = \"webhook\"\nurl = \"https://approvals.example.com/decide\"\nheaders_from_request = { Authorization = \"authorization\", authorization = \"x-token\" }\n",
-                "hitl.route.headers_from_request",
+                "[hitl.route]",
             ),
             (
                 "[governance.catalog]\nurl = \"https://catalog.example.com/sync\"\nheaders = { X-Tenant = \"a\", x-tenant = \"b\" }\n",
-                "governance.catalog.headers",
+                "[governance.catalog.headers]",
             ),
         ] {
             let toml = format!("{HEADER_CASE_BASE}\n{table}");
@@ -2405,7 +2405,7 @@ model = "gpt-4"
                 .expect_err(&format!("{location} should be rejected"))
                 .to_string();
             assert!(
-                err.contains("differ only by case") && err.contains(&format!("[{location}]")),
+                err.contains("differ only by case; keep one") && err.contains(location),
                 "unexpected error for {location}: {err}"
             );
         }

@@ -211,6 +211,7 @@ fn ensure_table<'a>(
 mod tests {
     use super::*;
     use crate::config::{McpServerConfig, McpUserAgent};
+    use crate::header_map::HeaderMap;
     use crate::load_config_from_str;
     use std::collections::HashMap;
 
@@ -236,12 +237,12 @@ model = "claude-3-sonnet-20240229"
         }
     }
 
-    fn http_server(headers: HashMap<String, String>) -> McpServerConfig {
+    fn http_server(headers: HeaderMap) -> McpServerConfig {
         McpServerConfig::HttpStreamable {
             url: "https://mcp.example.com/mcp".to_owned(),
             headers,
             description: Some("Example server".to_owned()),
-            headers_from_request: HashMap::new(),
+            headers_from_request: HeaderMap::new(),
             scratchpad: crate::ScratchpadRules::default(),
             user_agent: None,
         }
@@ -265,14 +266,14 @@ model = "claude-3-sonnet-20240229"
     fn round_trips_through_loader_for_all_transports() {
         let servers: [(&str, McpServerConfig); 3] = [
             ("stdio_srv", stdio_server()),
-            ("http_srv", http_server(HashMap::new())),
+            ("http_srv", http_server(HeaderMap::new())),
             (
                 "sse_srv",
                 McpServerConfig::Sse {
                     url: "https://sse.example.com/mcp".to_owned(),
-                    headers: HashMap::new(),
+                    headers: HeaderMap::new(),
                     description: None,
-                    headers_from_request: HashMap::new(),
+                    headers_from_request: HeaderMap::new(),
                     scratchpad: crate::ScratchpadRules::default(),
                     user_agent: None,
                 },
@@ -322,7 +323,7 @@ url = "https://old.example.com/mcp"
 "#,
         );
         let updated =
-            upsert_mcp_server_in_str(&content, "target", &http_server(HashMap::new())).unwrap();
+            upsert_mcp_server_in_str(&content, "target", &http_server(HeaderMap::new())).unwrap();
         assert!(
             updated.contains("# Keep me: sibling server comment"),
             "{updated}"
@@ -337,10 +338,11 @@ url = "https://old.example.com/mcp"
 
     #[test]
     fn preserves_env_placeholders_verbatim() {
-        let headers = HashMap::from([(
+        let headers = HeaderMap::try_from(HashMap::from([(
             "Authorization".to_owned(),
             "Bearer {{ env.MEZMO_API_KEY }}".to_owned(),
-        )]);
+        )]))
+        .unwrap();
         let updated =
             upsert_mcp_server_in_str(BASE_CONFIG, "mezmo", &http_server(headers)).unwrap();
         assert!(
@@ -363,11 +365,12 @@ url = "https://old.example.com/mcp"
 
     #[test]
     fn map_output_is_key_sorted_and_deterministic() {
-        let headers = HashMap::from([
+        let headers = HeaderMap::try_from(HashMap::from([
             ("b-header".to_owned(), "2".to_owned()),
             ("a-header".to_owned(), "1".to_owned()),
             ("c-header".to_owned(), "3".to_owned()),
-        ]);
+        ]))
+        .unwrap();
         let first =
             upsert_mcp_server_in_str(BASE_CONFIG, "srv", &http_server(headers.clone())).unwrap();
         let second = upsert_mcp_server_in_str(BASE_CONFIG, "srv", &http_server(headers)).unwrap();
@@ -384,7 +387,7 @@ url = "https://old.example.com/mcp"
             "{BASE_CONFIG}\n# IMPORTANT: do not remove\n[mcp.servers.target]\ntransport = \"stdio\"\ncmd = [\"old\"]\n"
         );
         let updated =
-            upsert_mcp_server_in_str(&content, "target", &http_server(HashMap::new())).unwrap();
+            upsert_mcp_server_in_str(&content, "target", &http_server(HeaderMap::new())).unwrap();
         assert!(
             updated.contains("# IMPORTANT: do not remove"),
             "comment above the replaced header must survive:\n{updated}"
@@ -398,7 +401,7 @@ url = "https://old.example.com/mcp"
             "{BASE_CONFIG}\n[mcp]\nservers = {{ target = {{ transport = \"stdio\", cmd = [\"old\"] }} }}\n"
         );
         let updated =
-            upsert_mcp_server_in_str(&content, "target", &http_server(HashMap::new())).unwrap();
+            upsert_mcp_server_in_str(&content, "target", &http_server(HeaderMap::new())).unwrap();
         let config = load_config_from_str(&updated).expect("restyled config must parse");
         let parsed = config.mcp.expect("mcp table present").servers;
         match &parsed["target"] {
@@ -415,7 +418,7 @@ url = "https://old.example.com/mcp"
             "{BASE_CONFIG}\n[mcp]\nservers.dotted.transport = \"stdio\"\nservers.dotted.cmd = [\"dotted-mcp\"]\n"
         );
         let updated =
-            upsert_mcp_server_in_str(&content, "added", &http_server(HashMap::new())).unwrap();
+            upsert_mcp_server_in_str(&content, "added", &http_server(HeaderMap::new())).unwrap();
         let config = load_config_from_str(&updated).expect("config must parse");
         let parsed = config.mcp.expect("mcp table present").servers;
         assert_eq!(parsed.len(), 2);
@@ -451,12 +454,14 @@ url = "https://old.example.com/mcp"
     fn round_trips_nonempty_maps_through_loader() {
         let server = McpServerConfig::HttpStreamable {
             url: "https://mcp.example.com/mcp".to_owned(),
-            headers: HashMap::from([("X-Static".to_owned(), "s".to_owned())]),
+            headers: HeaderMap::try_from(HashMap::from([("X-Static".to_owned(), "s".to_owned())]))
+                .unwrap(),
             description: None,
-            headers_from_request: HashMap::from([(
+            headers_from_request: HeaderMap::try_from(HashMap::from([(
                 "Authorization".to_owned(),
                 "authorization".to_owned(),
-            )]),
+            )]))
+            .unwrap(),
             scratchpad: crate::ScratchpadRules::default(),
             user_agent: None,
         };
@@ -468,10 +473,10 @@ url = "https://old.example.com/mcp"
                 headers_from_request,
                 ..
             } => {
-                assert_eq!(headers.get("X-Static").map(String::as_str), Some("s"));
+                assert_eq!(headers.get("x-static").map(String::as_str), Some("s"));
                 assert_eq!(
                     headers_from_request
-                        .get("Authorization")
+                        .get("authorization")
                         .map(String::as_str),
                     Some("authorization")
                 );
