@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -15,6 +16,7 @@ use super::events::{DisconnectReason, EventCallback, Frame, parse_frame};
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+const STABLE_CONNECTION: Duration = Duration::from_secs(60);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Slack pings a healthy connection every 20 seconds or so.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -60,6 +62,7 @@ async fn run_with_idle_timeout(
 ) {
     let mut backoff = INITIAL_BACKOFF;
     loop {
+        let started = Instant::now();
         let attempt = async {
             let url = api.connections_open().await?;
             serve_connection(&url, &events, &shutdown, idle_timeout).await
@@ -69,6 +72,9 @@ async fn run_with_idle_timeout(
             () = shutdown.cancelled() => return,
             outcome = attempt => outcome,
         };
+        if started.elapsed() >= STABLE_CONNECTION {
+            backoff = INITIAL_BACKOFF;
+        }
         let pause = match outcome {
             Ok(Disconnected::Shutdown) | Err(SocketModeError::ConsumerGone) => return,
             Ok(Disconnected::Slack(
@@ -430,6 +436,76 @@ mod tests {
         .await
         .expect("run must return once shutdown is cancelled");
         assert_eq!(hellos.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn stable_connection_resets_a_failure_streak() {
+        let shutdown = CancellationToken::new();
+        let stopper = shutdown.clone();
+        let (connected_tx, mut connected_rx) = mpsc::channel(5);
+        let url = fake_slack(5, move |ordinal, mut ws| {
+            let stopper = stopper.clone();
+            let connected_tx = connected_tx.clone();
+            async move {
+                if ordinal == 3 {
+                    // Advance only the stable connection's age; reconnect waits
+                    // and all network I/O run with the clock resumed.
+                    tokio::time::pause();
+                    tokio::time::advance(Duration::from_secs(60)).await;
+                    tokio::time::resume();
+                }
+                connected_tx
+                    .send(tokio::time::Instant::now())
+                    .await
+                    .unwrap();
+                if ordinal == 5 {
+                    stopper.cancel();
+                    let _ = ws.next().await;
+                } else {
+                    ws.send(Message::Close(None)).await.unwrap();
+                }
+            }
+        })
+        .await;
+
+        let slack = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/apps.connections.open"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "url": url})),
+            )
+            .expect(5)
+            .mount(&slack)
+            .await;
+        let api = SlackApi::new(
+            BotToken::new("xoxb-b".to_owned()).unwrap(),
+            AppToken::new("xapp-a".to_owned()).unwrap(),
+        )
+        .with_base_url(slack.uri());
+        let (tx, _rx) = mpsc::channel(1);
+        tokio::time::timeout(Duration::from_secs(80), run(api, tx, shutdown))
+            .await
+            .expect("run must stop after the fifth connection");
+
+        let mut times = Vec::new();
+        while let Ok(time) = connected_rx.try_recv() {
+            times.push(time);
+        }
+        assert_eq!(times.len(), 5);
+        // Two short connections grow the delay. A stable connection resets it,
+        // and the next short connection starts growing it again.
+        for (index, expected) in [(1, 1), (3, 1), (4, 2)] {
+            let elapsed = times[index] - times[index - 1];
+            assert!(elapsed >= Duration::from_secs(expected), "{elapsed:?}");
+            assert!(
+                elapsed < Duration::from_secs(expected + 1),
+                "reconnect {index}: expected about {expected}s, got {elapsed:?}"
+            );
+        }
+        let before_stable = times[2] - times[1] - Duration::from_secs(60);
+        assert!(before_stable >= Duration::from_secs(2), "{before_stable:?}");
+        assert!(before_stable < Duration::from_secs(3), "{before_stable:?}");
     }
 
     #[tokio::test]
