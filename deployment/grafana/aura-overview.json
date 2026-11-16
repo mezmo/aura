@@ -545,7 +545,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -670,7 +670,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -781,7 +781,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -892,7 +892,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -1432,7 +1432,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -1491,7 +1491,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -1572,7 +1572,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -1633,7 +1633,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -1744,7 +1744,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -1803,7 +1803,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -1912,7 +1912,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -1970,7 +1970,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -3081,7 +3081,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -3140,7 +3140,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -3199,7 +3199,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -3258,7 +3258,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -3317,7 +3317,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -3376,7 +3376,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -3435,7 +3435,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -3493,7 +3493,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -3551,7 +3551,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -3626,7 +3626,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -3684,7 +3684,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -3864,7 +3864,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -3974,7 +3974,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },
@@ -4084,7 +4084,7 @@
             {
               "title": "${__field.labels.gen_ai_agent_name} in AURA agents",
               "targetBlank": false,
-              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
+              "url": "/d/aura-agents/aura-agents?${__url_time_range}&${datasource:queryparam}&${instance:queryparam}&${config:queryparam}&var-agent=${__field.labels.gen_ai_agent_name}"
             }
           ]
         },

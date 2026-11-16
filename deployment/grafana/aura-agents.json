@@ -1040,7 +1040,8 @@
           "mode": "multi",
           "sort": "desc"
         }
-      }
+      },
+      "description": "Empty for a main agent: tasks are recorded under the coordinator with this agent as aura.worker."
     }
   ]
 }
