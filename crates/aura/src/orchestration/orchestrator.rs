@@ -2165,7 +2165,8 @@ impl Orchestrator {
         );
     }
 
-    /// One routing decision, in the metrics.
+    /// One routing decision, in the metrics. A post-execute call that fails
+    /// before it routes records its own decision where it is handled.
     fn record_routing_metric(&self, response: &PlanningResponse) {
         let decision = match response {
             PlanningResponse::Direct { .. } => "direct_answer",
@@ -5937,18 +5938,29 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .record("orchestration.post_execute_decision", "coordinator_error");
                 let err_str = e.to_string();
                 let category = Self::categorize_failure_error(&err_str);
-                let note = match category {
-                    FailureCategory::AgentTimeout => {
-                        format!("Post-execute coordinator call timed out: {}", err_str)
-                    }
-                    FailureCategory::DepthExhausted => {
+                let (decision, note) = match category {
+                    FailureCategory::AgentTimeout => (
+                        "coordinator_timeout",
+                        format!("Post-execute coordinator call timed out: {}", err_str),
+                    ),
+                    FailureCategory::DepthExhausted => (
+                        "coordinator_turn_budget_exhausted",
                         format!(
                             "Post-execute coordinator exhausted its turn budget without routing: {}",
                             err_str
-                        )
-                    }
-                    _ => format!("Post-execute coordinator call failed: {}", err_str),
+                        ),
+                    ),
+                    _ => (
+                        "coordinator_error",
+                        format!("Post-execute coordinator call failed: {}", err_str),
+                    ),
                 };
+                // The run ends `ok` with the raw task results, so this routing
+                // decision is what the metrics keep of the failed call.
+                crate::metrics::record_routing_decision(
+                    &self.agent_build_context.agent.name,
+                    decision,
+                );
                 tracing::warn!("{}", note);
                 let raw = Self::build_raw_task_results(&plan, &note);
                 Self::emit_event(
