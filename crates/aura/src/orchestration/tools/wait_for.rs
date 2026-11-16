@@ -495,6 +495,8 @@ pub trait ProbeDispatcher: Send + Sync {
 }
 
 struct McpProbeDispatcher {
+    /// The agent whose `wait_for` call the probes serve.
+    agent: Arc<str>,
     mcp: Arc<McpManager>,
 }
 
@@ -526,7 +528,7 @@ impl ProbeDispatcher for McpProbeDispatcher {
             .ok_or(ProbeSampleError::UnknownTool)?;
         let args = serde_json::Value::Object(probe.args().clone());
         // Probes are liveness checks and never carry approver identity.
-        Ok(execute_mcp_tool(client, tool_name, args, None).await?)
+        Ok(execute_mcp_tool(client, &self.agent, tool_name, args, None).await?)
     }
 }
 
@@ -555,13 +557,18 @@ pub struct WaitForTool {
 }
 
 impl WaitForTool {
-    pub fn new(mcp: Arc<McpManager>) -> Self {
-        Self::with_sleeper(mcp, Arc::new(TokioSleeper))
+    /// `agent` is the name the probes' MCP metrics carry: the worker that
+    /// holds this tool.
+    pub fn new(agent: &str, mcp: Arc<McpManager>) -> Self {
+        Self::with_sleeper(agent, mcp, Arc::new(TokioSleeper))
     }
 
-    pub fn with_sleeper(mcp: Arc<McpManager>, sleeper: Arc<dyn Sleeper>) -> Self {
+    pub fn with_sleeper(agent: &str, mcp: Arc<McpManager>, sleeper: Arc<dyn Sleeper>) -> Self {
         Self {
-            dispatcher: Arc::new(McpProbeDispatcher { mcp }),
+            dispatcher: Arc::new(McpProbeDispatcher {
+                agent: agent.into(),
+                mcp,
+            }),
             sleeper,
         }
     }

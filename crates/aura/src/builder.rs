@@ -670,7 +670,7 @@ impl PreparedAgent {
                 }
 
                 // Add tools using the BuilderState helper
-                let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = BuilderState::new(&build_context.agent.name, agent_builder);
                 let builder_state = if let Some(ref tools) = client_tools {
                     Self::add_passthrough_tools(builder_state, tools)
                 } else {
@@ -736,7 +736,7 @@ impl PreparedAgent {
                     agent_builder = agent_builder.additional_params(params.clone());
                 }
 
-                let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = BuilderState::new(&build_context.agent.name, agent_builder);
                 let builder_state = if let Some(ref tools) = client_tools {
                     Self::add_passthrough_tools(builder_state, tools)
                 } else {
@@ -818,7 +818,7 @@ impl PreparedAgent {
                     agent_builder = agent_builder.additional_params(params.clone());
                 }
 
-                let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = BuilderState::new(&build_context.agent.name, agent_builder);
                 let builder_state = if let Some(ref tools) = client_tools {
                     Self::add_passthrough_tools(builder_state, tools)
                 } else {
@@ -874,7 +874,7 @@ impl PreparedAgent {
                     agent_builder = agent_builder.additional_params(params.clone());
                 }
 
-                let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = BuilderState::new(&build_context.agent.name, agent_builder);
                 let builder_state = if let Some(ref tools) = client_tools {
                     Self::add_passthrough_tools(builder_state, tools)
                 } else {
@@ -929,7 +929,7 @@ impl PreparedAgent {
                     agent_builder = agent_builder.additional_params(params.clone());
                 }
 
-                let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = BuilderState::new(&build_context.agent.name, agent_builder);
                 let builder_state = if let Some(ref tools) = client_tools {
                     Self::add_passthrough_tools(builder_state, tools)
                 } else {
@@ -989,7 +989,7 @@ impl PreparedAgent {
                     agent_builder = agent_builder.additional_params(params.clone());
                 }
 
-                let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = BuilderState::new(&build_context.agent.name, agent_builder);
                 let builder_state = if let Some(ref tools) = client_tools {
                     Self::add_passthrough_tools(builder_state, tools)
                 } else {
@@ -1305,6 +1305,7 @@ impl PreparedAgent {
                     tracing::info!("  Adding dynamic {} tool: {}", label, tool_name);
 
                     let tool_adaptor = crate::mcp::McpToolAdaptor::new(
+                        &build_context.agent.name,
                         mcp_tool.clone(),
                         Arc::clone(&client_arc),
                         transport_kind,
@@ -2674,7 +2675,7 @@ mod tests {
                 ..Default::default()
             };
             let manager = Some(Arc::new(manager_serving_all_transports(server).await));
-            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
+            let state = BuilderState::new("test", rig::agent::AgentBuilder::new(UnpromptedModel));
             PreparedAgent::add_all_tools(
                 state,
                 &build_context,
@@ -2822,7 +2823,7 @@ mod tests {
         ) -> rig::agent::Agent<UnpromptedModel> {
             let config = gated_build_context(pattern, run);
             let manager = Some(Arc::new(manager_serving(server, namespace, tool).await));
-            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
+            let state = BuilderState::new("test", rig::agent::AgentBuilder::new(UnpromptedModel));
             PreparedAgent::add_all_tools(state, &config, &manager, &Arc::default(), Vec::new())
                 .await
                 .expect("composition succeeds")
@@ -2872,7 +2873,7 @@ mod tests {
             let manager = Some(Arc::new(
                 manager_serving(&server, "github", "list_repos").await,
             ));
-            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
+            let state = BuilderState::new("test", rig::agent::AgentBuilder::new(UnpromptedModel));
             let agent = PreparedAgent::add_all_tools(
                 state,
                 &build_context,
@@ -3189,7 +3190,7 @@ timeout_secs = 60
                 mcp_filter: Some(vec!["github:*".into()]),
                 ..Default::default()
             };
-            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
+            let state = BuilderState::new("test", rig::agent::AgentBuilder::new(UnpromptedModel));
             let agent = PreparedAgent::add_all_tools(
                 state,
                 &build_context,
@@ -3247,7 +3248,7 @@ timeout_secs = 60
         /// identifies the winner.
         async fn compose_over(manager: McpManager) -> rig::agent::Agent<UnpromptedModel> {
             let build_context = AgentBuildContext::default();
-            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
+            let state = BuilderState::new("test", rig::agent::AgentBuilder::new(UnpromptedModel));
             PreparedAgent::add_all_tools(
                 state,
                 &build_context,
@@ -3862,9 +3863,10 @@ timeout_secs = 60
             let manager = Some(Arc::new(
                 super::namespace_gating::manager_serving(&server, "github", "list_repos").await,
             ));
-            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(
-                ScriptedCompletionModel::new(Vec::new()),
-            ));
+            let state = BuilderState::new(
+                "test",
+                rig::agent::AgentBuilder::new(ScriptedCompletionModel::new(Vec::new())),
+            );
             let inner = PreparedAgent::add_all_tools(
                 state,
                 &build_context,

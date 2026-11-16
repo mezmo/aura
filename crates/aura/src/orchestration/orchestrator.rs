@@ -913,16 +913,16 @@ impl Orchestrator {
 
     /// The tools a worker executes itself beside its MCP tools: `wait_for`
     /// when an MCP manager exists, plus fresh instances of the run's own
-    /// tools. Called once per worker built.
-    fn worker_own_tools(&self) -> Vec<Box<dyn rig::tool::ToolDyn>> {
+    /// tools. Called once per worker built, with that worker's name.
+    fn worker_own_tools(&self, worker: &str) -> Vec<Box<dyn rig::tool::ToolDyn>> {
         let mut tools: Vec<Box<dyn rig::tool::ToolDyn>> = self
             .mcp_manager
             .as_ref()
             .map(|mcp| {
-                vec![
-                    Box::new(super::tools::wait_for::WaitForTool::new(Arc::clone(mcp)))
-                        as Box<dyn rig::tool::ToolDyn>,
-                ]
+                vec![Box::new(super::tools::wait_for::WaitForTool::new(
+                    worker,
+                    Arc::clone(mcp),
+                )) as Box<dyn rig::tool::ToolDyn>]
             })
             .unwrap_or_default();
         tools.extend((self.run_tools)());
@@ -2909,6 +2909,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Shared helper that eliminates per-provider duplication in `create_coordinator`.
     #[allow(clippy::too_many_arguments)]
     fn build_agent_with_tools<M: rig::completion::CompletionModel + Send + Sync>(
+        agent_name: &str,
         completion_model: M,
         preamble: &str,
         temperature: Option<f64>,
@@ -2931,7 +2932,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         if let Some(max) = max_tokens {
             builder = builder.max_tokens(max);
         }
-        let mut state = BuilderState::Initial(builder);
+        let mut state = BuilderState::new(agent_name, builder);
         if let Some(list_tools) = tools.list_tools {
             state = state.add_tool(list_tools);
         }
@@ -3331,6 +3332,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     });
                 }
                 Ok(ProviderAgent::OpenAI(Self::build_agent_with_tools(
+                    &self.agent_build_context.agent.name,
                     cm,
                     preamble,
                     temperature,
@@ -3361,6 +3363,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     cm = cm.with_prompt_caching();
                 }
                 Ok(ProviderAgent::Anthropic(Self::build_agent_with_tools(
+                    &self.agent_build_context.agent.name,
                     cm,
                     preamble,
                     temperature,
@@ -3399,6 +3402,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     cm = cm.with_prompt_caching();
                 }
                 Ok(ProviderAgent::Bedrock(Self::build_agent_with_tools(
+                    &self.agent_build_context.agent.name,
                     cm,
                     preamble,
                     temperature,
@@ -3425,6 +3429,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .map_err(|e| format!("Failed to build Gemini coordinator: {}", e))?
                     .completion_model(model);
                 Ok(ProviderAgent::Gemini(Self::build_agent_with_tools(
+                    &self.agent_build_context.agent.name,
                     cm,
                     preamble,
                     temperature,
@@ -3446,6 +3451,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .map_err(|e| format!("Failed to build Ollama coordinator: {}", e))?
                     .completion_model(model);
                 Ok(ProviderAgent::Ollama(Self::build_agent_with_tools(
+                    &self.agent_build_context.agent.name,
                     cm,
                     preamble,
                     temperature,
@@ -3472,6 +3478,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .map_err(|e| format!("Failed to build OpenRouter coordinator: {}", e))?
                     .completion_model(model);
                 Ok(ProviderAgent::OpenRouter(Self::build_agent_with_tools(
+                    &self.agent_build_context.agent.name,
                     cm,
                     preamble,
                     temperature,
@@ -3502,7 +3509,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let shared_mcp: Option<Arc<McpManager>> = self.mcp_manager.clone();
 
         // Box<dyn ToolDyn> is not Clone, so each provider arm constructs its own instance.
-        let wait_for_tools = || self.worker_own_tools();
+        let wait_for_tools = || self.worker_own_tools(&worker_build_context.agent.name);
 
         // Test-only model injection (park/reify rig): a queued override builds
         // this worker from a scripted model. The override's extra tools go
@@ -3522,7 +3529,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             builder = builder.name(&worker_build_context.agent.name);
             builder = builder.provider_name(llm_provider).model_name(llm_model);
             builder = builder.preamble(preamble);
-            let mut state = BuilderState::Initial(builder);
+            let mut state = BuilderState::new(&worker_build_context.agent.name, builder);
             for tool in worker_override.extra_tools {
                 let shim = DynToolAsTool::new(tool);
                 match (
@@ -3601,7 +3608,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(max) = worker_build_context.llm.max_tokens() {
                     builder = builder.max_tokens(max);
                 }
-                let state = BuilderState::Initial(builder);
+                let state = BuilderState::new(&worker_build_context.agent.name, builder);
                 let state = PreparedAgent::add_all_tools(
                     state,
                     worker_build_context,
@@ -3645,7 +3652,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(params) = additional_params {
                     builder = builder.additional_params(params.clone());
                 }
-                let state = BuilderState::Initial(builder);
+                let state = BuilderState::new(&worker_build_context.agent.name, builder);
                 let state = PreparedAgent::add_all_tools(
                     state,
                     worker_build_context,
@@ -3697,7 +3704,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(params) = additional_params {
                     builder = builder.additional_params(params.clone());
                 }
-                let state = BuilderState::Initial(builder);
+                let state = BuilderState::new(&worker_build_context.agent.name, builder);
                 let state = PreparedAgent::add_all_tools(
                     state,
                     worker_build_context,
@@ -3734,7 +3741,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(params) = additional_params {
                     builder = builder.additional_params(params.clone());
                 }
-                let state = BuilderState::Initial(builder);
+                let state = BuilderState::new(&worker_build_context.agent.name, builder);
                 let state = PreparedAgent::add_all_tools(
                     state,
                     worker_build_context,
@@ -3770,7 +3777,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
 
-                let state = BuilderState::Initial(builder);
+                let state = BuilderState::new(&worker_build_context.agent.name, builder);
                 let state = PreparedAgent::add_all_tools(
                     state,
                     worker_build_context,
@@ -3810,7 +3817,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(params) = additional_params {
                     builder = builder.additional_params(params.clone());
                 }
-                let state = BuilderState::Initial(builder);
+                let state = BuilderState::new(&worker_build_context.agent.name, builder);
                 let state = PreparedAgent::add_all_tools(
                     state,
                     worker_build_context,
@@ -8675,7 +8682,7 @@ mod tests {
         let mut orchestrator = Orchestrator::new(AgentBuildContext::default())
             .await
             .unwrap();
-        assert!(orchestrator.worker_own_tools().is_empty());
+        assert!(orchestrator.worker_own_tools("worker").is_empty());
 
         let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = Arc::clone(&built);
@@ -8683,8 +8690,8 @@ mod tests {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             vec![Box::new(Marker) as Box<dyn rig::tool::ToolDyn>]
         });
-        let first = orchestrator.worker_own_tools();
-        let second = orchestrator.worker_own_tools();
+        let first = orchestrator.worker_own_tools("worker");
+        let second = orchestrator.worker_own_tools("worker");
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].name(), Marker::NAME);
         assert_eq!(second[0].name(), Marker::NAME);

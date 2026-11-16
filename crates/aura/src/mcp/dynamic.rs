@@ -15,6 +15,8 @@ use crate::mcp::types::AuraTool;
 /// Dynamic MCP Tool Adaptor for MCP clients (transport-agnostic)
 #[derive(Clone)]
 pub struct McpToolAdaptor {
+    /// The agent this tool belongs to.
+    agent: Arc<str>,
     tool: AuraTool,
     client: Arc<McpClient>,
     /// Which transport this adaptor fronts, tagged at construction.
@@ -22,13 +24,20 @@ pub struct McpToolAdaptor {
 }
 
 impl McpToolAdaptor {
-    /// `transport_kind` must name the transport `client` actually fronts;
-    /// the type cannot enforce it because one `McpClient` serves all three
-    /// transports. Construction sites are the three `add_all_tools`
-    /// branches in `builder.rs`; a mistag bypasses the stdio fail-closed
-    /// check.
-    pub fn new(tool: AuraTool, client: Arc<McpClient>, transport_kind: McpTransportKind) -> Self {
+    /// `agent` is the name the tool's MCP metrics carry, the same one the
+    /// agent's inference metrics use. `transport_kind` must name the
+    /// transport `client` actually fronts; the type cannot enforce it
+    /// because one `McpClient` serves all three transports. Construction
+    /// sites are the three `add_all_tools` branches in `builder.rs`; a
+    /// mistag bypasses the stdio fail-closed check.
+    pub fn new(
+        agent: &str,
+        tool: AuraTool,
+        client: Arc<McpClient>,
+        transport_kind: McpTransportKind,
+    ) -> Self {
         Self {
+            agent: agent.into(),
             tool,
             client,
             transport_kind,
@@ -76,6 +85,7 @@ impl RigTool for McpToolAdaptor {
         // The wire call always dispatches by the tool's sanitized bare name,
         // never the namespaced name.
         let tool_name = self.tool.name().as_str();
+        let agent = Arc::clone(&self.agent);
         let client = self.client.clone();
         let transport_kind = self.transport_kind;
 
@@ -92,7 +102,7 @@ impl RigTool for McpToolAdaptor {
             }
 
             // Use shared execution function for consistent logging and error handling
-            execute_mcp_tool(&client, tool_name, args, approver_overrides).await
+            execute_mcp_tool(&client, &agent, tool_name, args, approver_overrides).await
         })
     }
 }
@@ -116,7 +126,7 @@ mod tests {
             std::sync::Arc::new(serde_json::Map::new()),
         );
         let tool = AuraTool::new(tool, "test-server");
-        McpToolAdaptor::new(tool, Arc::new(client), kind)
+        McpToolAdaptor::new("test-agent", tool, Arc::new(client), kind)
     }
 
     #[tokio::test]

@@ -104,10 +104,11 @@ fn record_tool_call_result(span: &tracing::Span, result: &Result<String, anyhow:
 ///
 /// The client's namespace — the MCP server config key it fronts — is recorded
 /// as a separate `tool.namespace` span attribute, never folded into
-/// `tool_name`, which is always the bare name sent to the model.
+/// `tool_name`, which is always the bare name sent to the model. `agent` is
+/// the agent the call is made for, as the MCP metric labels it.
 #[tracing::instrument(
     name = "mcp.tool_call",
-    skip(client, args, approver_overrides),
+    skip(client, agent, args, approver_overrides),
     fields(
         tool.name = %tool_name,
         tool.namespace = %client.namespace(),
@@ -116,6 +117,7 @@ fn record_tool_call_result(span: &tracing::Span, result: &Result<String, anyhow:
 )]
 pub async fn execute_mcp_tool(
     client: &McpClient,
+    agent: &str,
     tool_name: &str,
     args: Value,
     approver_overrides: Option<crate::approver_headers::ApproverHeaders>,
@@ -154,6 +156,7 @@ pub async fn execute_mcp_tool(
         .call_tool(tool_name, args_map, approver_overrides)
         .await;
     crate::metrics::record_mcp_operation(
+        agent,
         client.namespace().as_ref(),
         tool_name,
         mcp_error_type(&result),
@@ -409,7 +412,7 @@ mod tests {
                     .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test"))),
             );
 
-            execute_mcp_tool(client, "gated", json!({}), overrides)
+            execute_mcp_tool(client, "test-agent", "gated", json!({}), overrides)
                 .await
                 .expect("the call succeeds");
 

@@ -812,11 +812,15 @@ pub(crate) fn read_tool_result(
     (text, kind)
 }
 
-/// Builder state enum for handling AgentBuilder type transitions.
-///
-/// After the first `.tool()` call, `AgentBuilder<M>` transitions to
-/// `AgentBuilderSimple<M>`. This enum handles both states uniformly.
-pub(crate) enum BuilderState<M: CompletionModel> {
+/// A rig agent builder together with the name of the agent it builds.
+pub(crate) struct BuilderState<M: CompletionModel> {
+    agent: std::sync::Arc<str>,
+    inner: Inner<M>,
+}
+
+/// The rig builder's state: after the first `.tool()` call, `AgentBuilder<M>`
+/// transitions to `AgentBuilderSimple<M>`, and this handles both uniformly.
+enum Inner<M: CompletionModel> {
     Initial(AgentBuilder<M>),
     WithTools(AgentBuilderSimple<M>),
 }
@@ -825,6 +829,16 @@ impl<M> BuilderState<M>
 where
     M: CompletionModel + Send + Sync,
 {
+    /// `agent` is the name the agent's tool metrics carry, the same one its
+    /// inference metrics use: the config name for a single agent or the
+    /// coordinator, the worker name for a worker.
+    pub fn new(agent: &str, builder: AgentBuilder<M>) -> Self {
+        Self {
+            agent: agent.into(),
+            inner: Inner::Initial(builder),
+        }
+    }
+
     /// Add a tool to the agent builder.
     pub fn add_tool<T>(self, tool: T) -> BuilderState<M>
     where
@@ -837,27 +851,34 @@ where
     ///
     /// This accepts pre-boxed `ToolDyn` objects, which is useful for adding
     /// tools from external crates that implement `rig::tool::Tool`. Each
-    /// tool is registered behind a [`MeteredTool`], so every call it gets
-    /// lands in the tool-execution metric.
+    /// tool is registered behind a [`MeteredTool`] under this agent's name,
+    /// so every call it gets lands in the tool-execution metric.
     pub fn add_tools_dyn(self, tools: Vec<Box<dyn rig::tool::ToolDyn>>) -> BuilderState<M> {
         if tools.is_empty() {
             return self;
         }
         let tools = tools
             .into_iter()
-            .map(|tool| Box::new(MeteredTool::new(tool)) as Box<dyn rig::tool::ToolDyn>)
+            .map(|tool| {
+                Box::new(MeteredTool::new(std::sync::Arc::clone(&self.agent), tool))
+                    as Box<dyn rig::tool::ToolDyn>
+            })
             .collect();
-        match self {
-            BuilderState::Initial(builder) => BuilderState::WithTools(builder.tools(tools)),
-            BuilderState::WithTools(builder) => BuilderState::WithTools(builder.tools(tools)),
+        let inner = match self.inner {
+            Inner::Initial(builder) => Inner::WithTools(builder.tools(tools)),
+            Inner::WithTools(builder) => Inner::WithTools(builder.tools(tools)),
+        };
+        Self {
+            agent: self.agent,
+            inner,
         }
     }
 
     /// Build the final agent.
     pub fn build(self) -> rig::agent::Agent<M> {
-        match self {
-            BuilderState::Initial(builder) => builder.build(),
-            BuilderState::WithTools(builder) => builder.build(),
+        match self.inner {
+            Inner::Initial(builder) => builder.build(),
+            Inner::WithTools(builder) => builder.build(),
         }
     }
 }
