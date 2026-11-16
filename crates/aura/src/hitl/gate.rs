@@ -62,6 +62,8 @@ pub struct HitlApprovalWrapper {
     /// consumed before the park arm; a miss while the task is strict is a
     /// resume fault, and a miss otherwise re-parks.
     recorded_decisions: Option<Arc<RecordedDecisions>>,
+    /// How the gate's metrics name the agent it guards.
+    labels: crate::metrics::AgentLabels,
 }
 
 impl HitlApprovalWrapper {
@@ -80,11 +82,20 @@ impl HitlApprovalWrapper {
             // A worker's gate is built inside its run; a single agent's is
             // built before one exists and is bound by `begin_run`.
             run: crate::run_context::BoundRun::captured(),
+            labels: crate::metrics::AgentLabels::main(&agent_name),
             agent_name,
             instance_id,
             park: None,
             recorded_decisions: None,
         }
+    }
+
+    /// Name the agent in the gate's metrics as `labels` do, which a worker
+    /// needs so its config is named beside it.
+    #[must_use]
+    pub fn metered_as(mut self, labels: crate::metrics::AgentLabels) -> Self {
+        self.labels = labels;
+        self
     }
 
     /// Names the run this gate's approvals belong to.
@@ -341,7 +352,7 @@ impl ToolWrapper for HitlApprovalWrapper {
             .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
         // `DecisionRoute` emits the lifecycle itself; the scope is how those
         // events find the run, since rig calls this off it.
-        let pending = crate::metrics::hitl_pending(&self.agent_name);
+        let pending = crate::metrics::hitl_pending(&self.labels);
         let asked = std::time::Instant::now();
         let decision = match run {
             Some(run) => {
@@ -352,7 +363,7 @@ impl ToolWrapper for HitlApprovalWrapper {
         };
         drop(pending);
         crate::metrics::record_hitl_decision(
-            &self.agent_name,
+            &self.labels,
             decision_metric_label(&decision),
             asked.elapsed(),
         );

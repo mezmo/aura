@@ -134,8 +134,9 @@ pub(crate) fn scratchpad_usage_event(
 pub struct PreparedAgent {
     pub(crate) inner: ProviderAgent,
     pub(crate) model: String,
-    /// `[agent].name`, or the worker's name under orchestration.
-    pub(crate) agent_name: String,
+    /// How the agent's metrics name it: `[agent].name`, or the worker's name
+    /// under orchestration, beside the config's.
+    pub(crate) agent_labels: crate::metrics::AgentLabels,
     pub(crate) max_depth: usize,
     pub(crate) mcp_manager: Option<Arc<crate::mcp::McpManager>>,
     /// Whether Ollama text-to-tool parsing is on.
@@ -473,13 +474,16 @@ impl PreparedAgent {
             let scope = crate::hitl::AgentScope::Single {
                 session_id: build_context_owned.session_id.clone(),
             };
-            let wrapper = Arc::new(crate::hitl::HitlApprovalWrapper::new(
-                hitl.patterns.clone(),
-                hitl.route.clone(),
-                scope.clone(),
-                build_context_owned.agent.name.clone(),
-                build_context_owned.instance_id.clone(),
-            ));
+            let wrapper = Arc::new(
+                crate::hitl::HitlApprovalWrapper::new(
+                    hitl.patterns.clone(),
+                    hitl.route.clone(),
+                    scope.clone(),
+                    build_context_owned.agent.name.clone(),
+                    build_context_owned.instance_id.clone(),
+                )
+                .metered_as(build_context_owned.agent_labels()),
+            );
             hitl_gate = Some(Arc::clone(&wrapper));
             let gate_layer: Arc<dyn crate::tool_middleware::ToolMiddleware> =
                 Arc::new(WrapperLayer(wrapper));
@@ -670,7 +674,7 @@ impl PreparedAgent {
                 }
 
                 // Add tools using the BuilderState helper
-                let builder_state = BuilderState::new(&build_context.agent.name, agent_builder);
+                let builder_state = BuilderState::new(&build_context.agent_labels(), agent_builder);
                 let builder_state = if let Some(ref tools) = client_tools {
                     Self::add_passthrough_tools(builder_state, tools)
                 } else {
@@ -736,7 +740,7 @@ impl PreparedAgent {
                     agent_builder = agent_builder.additional_params(params.clone());
                 }
 
-                let builder_state = BuilderState::new(&build_context.agent.name, agent_builder);
+                let builder_state = BuilderState::new(&build_context.agent_labels(), agent_builder);
                 let builder_state = if let Some(ref tools) = client_tools {
                     Self::add_passthrough_tools(builder_state, tools)
                 } else {
@@ -818,7 +822,7 @@ impl PreparedAgent {
                     agent_builder = agent_builder.additional_params(params.clone());
                 }
 
-                let builder_state = BuilderState::new(&build_context.agent.name, agent_builder);
+                let builder_state = BuilderState::new(&build_context.agent_labels(), agent_builder);
                 let builder_state = if let Some(ref tools) = client_tools {
                     Self::add_passthrough_tools(builder_state, tools)
                 } else {
@@ -874,7 +878,7 @@ impl PreparedAgent {
                     agent_builder = agent_builder.additional_params(params.clone());
                 }
 
-                let builder_state = BuilderState::new(&build_context.agent.name, agent_builder);
+                let builder_state = BuilderState::new(&build_context.agent_labels(), agent_builder);
                 let builder_state = if let Some(ref tools) = client_tools {
                     Self::add_passthrough_tools(builder_state, tools)
                 } else {
@@ -929,7 +933,7 @@ impl PreparedAgent {
                     agent_builder = agent_builder.additional_params(params.clone());
                 }
 
-                let builder_state = BuilderState::new(&build_context.agent.name, agent_builder);
+                let builder_state = BuilderState::new(&build_context.agent_labels(), agent_builder);
                 let builder_state = if let Some(ref tools) = client_tools {
                     Self::add_passthrough_tools(builder_state, tools)
                 } else {
@@ -989,7 +993,7 @@ impl PreparedAgent {
                     agent_builder = agent_builder.additional_params(params.clone());
                 }
 
-                let builder_state = BuilderState::new(&build_context.agent.name, agent_builder);
+                let builder_state = BuilderState::new(&build_context.agent_labels(), agent_builder);
                 let builder_state = if let Some(ref tools) = client_tools {
                     Self::add_passthrough_tools(builder_state, tools)
                 } else {
@@ -1017,7 +1021,7 @@ impl PreparedAgent {
         Ok(PreparedAgent {
             inner: provider_agent,
             model: model_name,
-            agent_name: build_context.agent.name.clone(),
+            agent_labels: build_context.agent_labels(),
             max_depth,
             mcp_manager,
             fallback_tool_parsing,
@@ -1046,7 +1050,7 @@ impl PreparedAgent {
     /// How this agent's LLM turns are labelled in the inference metrics.
     pub fn inference_labels(&self) -> crate::metrics::InferenceLabels {
         crate::metrics::InferenceLabels::new(
-            &self.agent_name,
+            &self.agent_labels,
             self.inner.provider_name(),
             &self.model,
         )
@@ -1305,7 +1309,7 @@ impl PreparedAgent {
                     tracing::info!("  Adding dynamic {} tool: {}", label, tool_name);
 
                     let tool_adaptor = crate::mcp::McpToolAdaptor::new(
-                        &build_context.agent.name,
+                        &build_context.agent_labels(),
                         mcp_tool.clone(),
                         Arc::clone(&client_arc),
                         transport_kind,
@@ -2518,7 +2522,7 @@ pub(crate) mod test_support {
         PreparedAgent {
             inner,
             model: "scripted".to_owned(),
-            agent_name: "scripted".to_owned(),
+            agent_labels: crate::metrics::AgentLabels::main("scripted"),
             max_depth: 1,
             mcp_manager: None,
             fallback_tool_parsing: false,
@@ -2675,7 +2679,10 @@ mod tests {
                 ..Default::default()
             };
             let manager = Some(Arc::new(manager_serving_all_transports(server).await));
-            let state = BuilderState::new("test", rig::agent::AgentBuilder::new(UnpromptedModel));
+            let state = BuilderState::new(
+                &crate::metrics::AgentLabels::main("test"),
+                rig::agent::AgentBuilder::new(UnpromptedModel),
+            );
             PreparedAgent::add_all_tools(
                 state,
                 &build_context,
@@ -2823,7 +2830,10 @@ mod tests {
         ) -> rig::agent::Agent<UnpromptedModel> {
             let config = gated_build_context(pattern, run);
             let manager = Some(Arc::new(manager_serving(server, namespace, tool).await));
-            let state = BuilderState::new("test", rig::agent::AgentBuilder::new(UnpromptedModel));
+            let state = BuilderState::new(
+                &crate::metrics::AgentLabels::main("test"),
+                rig::agent::AgentBuilder::new(UnpromptedModel),
+            );
             PreparedAgent::add_all_tools(state, &config, &manager, &Arc::default(), Vec::new())
                 .await
                 .expect("composition succeeds")
@@ -2873,7 +2883,10 @@ mod tests {
             let manager = Some(Arc::new(
                 manager_serving(&server, "github", "list_repos").await,
             ));
-            let state = BuilderState::new("test", rig::agent::AgentBuilder::new(UnpromptedModel));
+            let state = BuilderState::new(
+                &crate::metrics::AgentLabels::main("test"),
+                rig::agent::AgentBuilder::new(UnpromptedModel),
+            );
             let agent = PreparedAgent::add_all_tools(
                 state,
                 &build_context,
@@ -3021,7 +3034,10 @@ mod tests {
             build_context.add_outer_tool_layer(Arc::clone(&gate_layer));
             build_context.hitl_gate_layer = Some(gate_layer);
 
-            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
+            let state = BuilderState::new(
+                &build_context.agent_labels(),
+                rig::agent::AgentBuilder::new(UnpromptedModel),
+            );
             PreparedAgent::add_all_tools(
                 state,
                 &build_context,
@@ -3190,7 +3206,10 @@ timeout_secs = 60
                 mcp_filter: Some(vec!["github:*".into()]),
                 ..Default::default()
             };
-            let state = BuilderState::new("test", rig::agent::AgentBuilder::new(UnpromptedModel));
+            let state = BuilderState::new(
+                &crate::metrics::AgentLabels::main("test"),
+                rig::agent::AgentBuilder::new(UnpromptedModel),
+            );
             let agent = PreparedAgent::add_all_tools(
                 state,
                 &build_context,
@@ -3248,7 +3267,10 @@ timeout_secs = 60
         /// identifies the winner.
         async fn compose_over(manager: McpManager) -> rig::agent::Agent<UnpromptedModel> {
             let build_context = AgentBuildContext::default();
-            let state = BuilderState::new("test", rig::agent::AgentBuilder::new(UnpromptedModel));
+            let state = BuilderState::new(
+                &crate::metrics::AgentLabels::main("test"),
+                rig::agent::AgentBuilder::new(UnpromptedModel),
+            );
             PreparedAgent::add_all_tools(
                 state,
                 &build_context,
@@ -3677,7 +3699,7 @@ timeout_secs = 60
             assert_eq!((usage.llm_turns(), usage.tool_calls()), (1, 0));
 
             let text = crate::metrics::render_prometheus().unwrap();
-            let labels = r#"gen_ai_agent_name="scripted",gen_ai_operation_name="chat",gen_ai_provider_name="scripted",gen_ai_request_model="scripted""#;
+            let labels = r#"aura_agent="scripted",gen_ai_agent_name="scripted",gen_ai_operation_name="chat",gen_ai_provider_name="scripted",gen_ai_request_model="scripted""#;
             assert!(
                 text.contains(&format!(
                     "gen_ai_client_inference_duration_seconds_count{{{labels}}}"
@@ -3737,29 +3759,35 @@ timeout_secs = 60
                 sleep(delay).await;
                 item
             });
-            let labels = crate::metrics::InferenceLabels::new("timed", "scripted", "scripted");
+            let labels = crate::metrics::InferenceLabels::new(
+                &crate::metrics::AgentLabels::main("timed"),
+                "scripted",
+                "scripted",
+            );
             let items: Vec<_> = meter_turns(labels, Box::pin(stream), None).collect().await;
             assert_eq!(items.len(), 6);
 
             let text = crate::metrics::render_prometheus().unwrap();
+            // Labels in exposition order: aura_agent sorts before error_type.
+            let config = r#"aura_agent="timed","#;
             let labels = r#"gen_ai_agent_name="timed",gen_ai_operation_name="chat",gen_ai_provider_name="scripted",gen_ai_request_model="scripted""#;
             // 0.5 + 30 + 0.25 less the 30 s tool run, then 2 s of text.
             assert!(
                 text.contains(&format!(
-                    "gen_ai_client_inference_duration_seconds_sum{{{labels}}} 2.75"
+                    "gen_ai_client_inference_duration_seconds_sum{{{config}{labels}}} 2.75"
                 )),
                 "{text}"
             );
             assert!(
                 text.contains(&format!(
-                    "gen_ai_client_inference_duration_seconds_count{{{labels}}} 2"
+                    "gen_ai_client_inference_duration_seconds_count{{{config}{labels}}} 2"
                 )),
                 "{text}"
             );
             // 0.1 s before the tool call; the 10 s the tool ran do not count.
             assert!(
                 text.contains(&format!(
-                    "gen_ai_client_inference_duration_seconds_sum{{error_type=\"stream_error\",{labels}}} 0.1"
+                    "gen_ai_client_inference_duration_seconds_sum{{{config}error_type=\"stream_error\",{labels}}} 0.1"
                 )),
                 "{text}"
             );
@@ -3864,7 +3892,7 @@ timeout_secs = 60
                 super::namespace_gating::manager_serving(&server, "github", "list_repos").await,
             ));
             let state = BuilderState::new(
-                "test",
+                &crate::metrics::AgentLabels::main("test"),
                 rig::agent::AgentBuilder::new(ScriptedCompletionModel::new(Vec::new())),
             );
             let inner = PreparedAgent::add_all_tools(

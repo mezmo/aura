@@ -496,7 +496,7 @@ pub trait ProbeDispatcher: Send + Sync {
 
 struct McpProbeDispatcher {
     /// The agent whose `wait_for` call the probes serve.
-    agent: Arc<str>,
+    agent: crate::metrics::AgentLabels,
     mcp: Arc<McpManager>,
 }
 
@@ -557,16 +557,20 @@ pub struct WaitForTool {
 }
 
 impl WaitForTool {
-    /// `agent` is the name the probes' MCP metrics carry: the worker that
-    /// holds this tool.
-    pub fn new(agent: &str, mcp: Arc<McpManager>) -> Self {
+    /// `agent` is how the probes' MCP metrics name the worker that holds
+    /// this tool.
+    pub fn new(agent: &crate::metrics::AgentLabels, mcp: Arc<McpManager>) -> Self {
         Self::with_sleeper(agent, mcp, Arc::new(TokioSleeper))
     }
 
-    pub fn with_sleeper(agent: &str, mcp: Arc<McpManager>, sleeper: Arc<dyn Sleeper>) -> Self {
+    pub fn with_sleeper(
+        agent: &crate::metrics::AgentLabels,
+        mcp: Arc<McpManager>,
+        sleeper: Arc<dyn Sleeper>,
+    ) -> Self {
         Self {
             dispatcher: Arc::new(McpProbeDispatcher {
-                agent: agent.into(),
+                agent: agent.clone(),
                 mcp,
             }),
             sleeper,

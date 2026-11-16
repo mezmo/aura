@@ -600,7 +600,7 @@ fn worker_rig_inner(turns: Vec<ScriptedTurn>, stalled: bool) -> WorkerRig {
     // The tool goes in the way every agent's tools do, so the rig keeps
     // whatever `BuilderState` puts around them.
     let agent = crate::provider_agent::BuilderState::new(
-        "rig-worker",
+        &crate::metrics::AgentLabels::main("rig-worker"),
         rig::agent::AgentBuilder::new(model.clone())
             .name("rig-worker")
             .preamble("test worker preamble"),
@@ -881,7 +881,7 @@ async fn smoke_scripted_worker_ungated_tool_round_trip() {
     {
         let text = crate::metrics::render_prometheus().expect("render");
         let needle = format!(
-            "gen_ai_execute_tool_duration_seconds_count{{gen_ai_agent_name=\"rig-worker\",gen_ai_tool_name=\"{ECHO_TOOL_NAME}\"}}"
+            "gen_ai_execute_tool_duration_seconds_count{{aura_agent=\"rig-worker\",gen_ai_agent_name=\"rig-worker\",gen_ai_tool_name=\"{ECHO_TOOL_NAME}\"}}"
         );
         assert!(text.contains(&needle), "missing {needle} in:\n{text}");
     }

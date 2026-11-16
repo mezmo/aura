@@ -117,7 +117,7 @@ fn record_tool_call_result(span: &tracing::Span, result: &Result<String, anyhow:
 )]
 pub async fn execute_mcp_tool(
     client: &McpClient,
-    agent: &str,
+    agent: &crate::metrics::AgentLabels,
     tool_name: &str,
     args: Value,
     approver_overrides: Option<crate::approver_headers::ApproverHeaders>,
@@ -412,9 +412,15 @@ mod tests {
                     .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test"))),
             );
 
-            execute_mcp_tool(client, "test-agent", "gated", json!({}), overrides)
-                .await
-                .expect("the call succeeds");
+            execute_mcp_tool(
+                client,
+                &crate::metrics::AgentLabels::main("test-agent"),
+                "gated",
+                json!({}),
+                overrides,
+            )
+            .await
+            .expect("the call succeeds");
 
             assert!(
                 captured.contains("mcp.tool_call"),

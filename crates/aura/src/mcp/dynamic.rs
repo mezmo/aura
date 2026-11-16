@@ -11,12 +11,13 @@ use crate::approver_headers::{
 use crate::mcp::client::McpClient;
 use crate::mcp::execution::execute_mcp_tool;
 use crate::mcp::types::AuraTool;
+use crate::metrics::AgentLabels;
 
 /// Dynamic MCP Tool Adaptor for MCP clients (transport-agnostic)
 #[derive(Clone)]
 pub struct McpToolAdaptor {
     /// The agent this tool belongs to.
-    agent: Arc<str>,
+    agent: AgentLabels,
     tool: AuraTool,
     client: Arc<McpClient>,
     /// Which transport this adaptor fronts, tagged at construction.
@@ -24,20 +25,20 @@ pub struct McpToolAdaptor {
 }
 
 impl McpToolAdaptor {
-    /// `agent` is the name the tool's MCP metrics carry, the same one the
-    /// agent's inference metrics use. `transport_kind` must name the
+    /// `agent` is how the tool's MCP metrics name its agent, the same labels
+    /// the agent's inference metrics use. `transport_kind` must name the
     /// transport `client` actually fronts; the type cannot enforce it
     /// because one `McpClient` serves all three transports. Construction
     /// sites are the three `add_all_tools` branches in `builder.rs`; a
     /// mistag bypasses the stdio fail-closed check.
     pub fn new(
-        agent: &str,
+        agent: &AgentLabels,
         tool: AuraTool,
         client: Arc<McpClient>,
         transport_kind: McpTransportKind,
     ) -> Self {
         Self {
-            agent: agent.into(),
+            agent: agent.clone(),
             tool,
             client,
             transport_kind,
@@ -85,7 +86,7 @@ impl RigTool for McpToolAdaptor {
         // The wire call always dispatches by the tool's sanitized bare name,
         // never the namespaced name.
         let tool_name = self.tool.name().as_str();
-        let agent = Arc::clone(&self.agent);
+        let agent = self.agent.clone();
         let client = self.client.clone();
         let transport_kind = self.transport_kind;
 
@@ -126,7 +127,12 @@ mod tests {
             std::sync::Arc::new(serde_json::Map::new()),
         );
         let tool = AuraTool::new(tool, "test-server");
-        McpToolAdaptor::new("test-agent", tool, Arc::new(client), kind)
+        McpToolAdaptor::new(
+            &AgentLabels::main("test-agent"),
+            tool,
+            Arc::new(client),
+            kind,
+        )
     }
 
     #[tokio::test]

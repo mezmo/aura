@@ -6,24 +6,23 @@
 //! `gen_ai.execute_tool.duration` independent of which stream the agent runs
 //! on and of whether a middleware stack sits in front of the tool.
 
-use std::sync::Arc;
-
 use rig::completion::ToolDefinition;
 use rig::tool::{ToolDyn, ToolError};
 use rig::wasm_compat::WasmBoxedFuture;
 
+use crate::metrics::AgentLabels;
 use crate::streaming_request_hook::StreamingRequestHook;
 use crate::tool_error_detection::is_reported_error;
 
 /// A tool whose every call is timed into `gen_ai.execute_tool.duration`
 /// under the name of the agent that holds it.
 pub(crate) struct MeteredTool {
-    agent: Arc<str>,
+    agent: AgentLabels,
     tool: Box<dyn ToolDyn>,
 }
 
 impl MeteredTool {
-    pub(crate) fn new(agent: Arc<str>, tool: Box<dyn ToolDyn>) -> Self {
+    pub(crate) fn new(agent: AgentLabels, tool: Box<dyn ToolDyn>) -> Self {
         Self { agent, tool }
     }
 }
@@ -153,7 +152,10 @@ mod tests {
         #[tokio::test]
         async fn metered_tool_records_each_call_with_its_outcome() {
             crate::metrics::init(false).expect("metrics init");
-            let tool = MeteredTool::new("probe-agent".into(), Box::new(Named("metered_probe")));
+            let tool = MeteredTool::new(
+                AgentLabels::main("probe-agent"),
+                Box::new(Named("metered_probe")),
+            );
 
             tool.call(r#"{"fail": false}"#.to_string())
                 .await
@@ -167,9 +169,9 @@ mod tests {
 
             let text = crate::metrics::render_prometheus().expect("render");
             for needle in [
-                r#"gen_ai_execute_tool_duration_seconds_count{gen_ai_agent_name="probe-agent",gen_ai_tool_name="metered_probe"} 1"#,
-                r#"gen_ai_execute_tool_duration_seconds_count{error_type="tool_call_error",gen_ai_agent_name="probe-agent",gen_ai_tool_name="metered_probe"} 1"#,
-                r#"gen_ai_execute_tool_duration_seconds_count{error_type="json_error",gen_ai_agent_name="probe-agent",gen_ai_tool_name="metered_probe"} 1"#,
+                r#"gen_ai_execute_tool_duration_seconds_count{aura_agent="probe-agent",gen_ai_agent_name="probe-agent",gen_ai_tool_name="metered_probe"} 1"#,
+                r#"gen_ai_execute_tool_duration_seconds_count{aura_agent="probe-agent",error_type="tool_call_error",gen_ai_agent_name="probe-agent",gen_ai_tool_name="metered_probe"} 1"#,
+                r#"gen_ai_execute_tool_duration_seconds_count{aura_agent="probe-agent",error_type="json_error",gen_ai_agent_name="probe-agent",gen_ai_tool_name="metered_probe"} 1"#,
             ] {
                 assert!(text.contains(needle), "missing {needle} in:\n{text}");
             }
@@ -187,7 +189,7 @@ mod tests {
                 .name;
             assert!(crate::scratchpad::is_scratchpad_tool(&name));
             let name: &'static str = Box::leak(name.into_boxed_str());
-            let tool = MeteredTool::new("probe-agent".into(), Box::new(Named(name)));
+            let tool = MeteredTool::new(AgentLabels::main("probe-agent"), Box::new(Named(name)));
 
             tool.call(r#"{"fail": false}"#.to_string())
                 .await
@@ -195,7 +197,7 @@ mod tests {
 
             let text = crate::metrics::render_prometheus().expect("render");
             let series = format!(
-                "gen_ai_execute_tool_duration_seconds_count{{gen_ai_agent_name=\"probe-agent\",gen_ai_tool_name=\"{name}\"}}"
+                "gen_ai_execute_tool_duration_seconds_count{{aura_agent=\"probe-agent\",gen_ai_agent_name=\"probe-agent\",gen_ai_tool_name=\"{name}\"}}"
             );
             assert!(
                 !text.contains(&series),

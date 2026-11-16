@@ -814,7 +814,7 @@ pub(crate) fn read_tool_result(
 
 /// A rig agent builder together with the name of the agent it builds.
 pub(crate) struct BuilderState<M: CompletionModel> {
-    agent: std::sync::Arc<str>,
+    agent: crate::metrics::AgentLabels,
     inner: Inner<M>,
 }
 
@@ -829,12 +829,11 @@ impl<M> BuilderState<M>
 where
     M: CompletionModel + Send + Sync,
 {
-    /// `agent` is the name the agent's tool metrics carry, the same one its
-    /// inference metrics use: the config name for a single agent or the
-    /// coordinator, the worker name for a worker.
-    pub fn new(agent: &str, builder: AgentBuilder<M>) -> Self {
+    /// `agent` is how the agent's tool metrics name it, the same labels its
+    /// inference metrics use.
+    pub fn new(agent: &crate::metrics::AgentLabels, builder: AgentBuilder<M>) -> Self {
         Self {
-            agent: agent.into(),
+            agent: agent.clone(),
             inner: Inner::Initial(builder),
         }
     }
@@ -860,8 +859,7 @@ where
         let tools = tools
             .into_iter()
             .map(|tool| {
-                Box::new(MeteredTool::new(std::sync::Arc::clone(&self.agent), tool))
-                    as Box<dyn rig::tool::ToolDyn>
+                Box::new(MeteredTool::new(self.agent.clone(), tool)) as Box<dyn rig::tool::ToolDyn>
             })
             .collect();
         let inner = match self.inner {

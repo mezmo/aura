@@ -66,12 +66,35 @@ pub struct RunMeasure<'a> {
     pub tool_calls: Option<u64>,
 }
 
+/// An agent as its metrics name it: the loaded config's `[agent].name` and
+/// the agent's own name, which under orchestration is a worker's.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "otel"), allow(dead_code))]
+pub struct AgentLabels {
+    config: Arc<str>,
+    agent: Arc<str>,
+}
+
+impl AgentLabels {
+    pub fn new(config: &str, agent: &str) -> Self {
+        Self {
+            config: config.into(),
+            agent: agent.into(),
+        }
+    }
+
+    /// A main agent: the config's own name on both labels.
+    pub fn main(name: &str) -> Self {
+        Self::new(name, name)
+    }
+}
+
 /// The agent and model behind a run's LLM turns, as the inference metrics
 /// label them.
 #[derive(Debug, Clone)]
 #[cfg_attr(not(feature = "otel"), allow(dead_code))]
 pub struct InferenceLabels {
-    agent: Arc<str>,
+    agent: AgentLabels,
     provider: Arc<str>,
     model: Arc<str>,
 }
@@ -79,9 +102,9 @@ pub struct InferenceLabels {
 impl InferenceLabels {
     /// `provider` is aura's provider identifier; the semconv spelling is
     /// applied when the labels are recorded.
-    pub fn new(agent: &str, provider: &str, model: &str) -> Self {
+    pub fn new(agent: &AgentLabels, provider: &str, model: &str) -> Self {
         Self {
-            agent: agent.into(),
+            agent: agent.clone(),
             provider: provider.into(),
             model: model.into(),
         }
@@ -146,9 +169,10 @@ mod imp {
     use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
     use prometheus::Encoder;
 
-    use std::sync::Arc;
-
-    use super::{InferenceLabels, Ingress, MetricsError, RunMeasure, TokenMeasure, provider_name};
+    use super::{
+        AgentLabels, InferenceLabels, Ingress, MetricsError, RunMeasure, TokenMeasure,
+        provider_name,
+    };
 
     const METER_NAME: &str = "aura";
 
@@ -157,6 +181,7 @@ mod imp {
     const GEN_AI_PROVIDER_NAME: &str = "gen_ai.provider.name";
     const GEN_AI_REQUEST_MODEL: &str = "gen_ai.request.model";
     const GEN_AI_AGENT_NAME: &str = "gen_ai.agent.name";
+    const AURA_AGENT: &str = "aura.agent";
     const GEN_AI_TOKEN_MODALITY: &str = "gen_ai.token.modality";
     const GEN_AI_TOOL_NAME: &str = "gen_ai.tool.name";
     const ERROR_TYPE: &str = "error.type";
@@ -545,19 +570,17 @@ mod imp {
         } else {
             "single"
         };
-        let mut attrs = vec![
-            kv(GEN_AI_AGENT_NAME, run.agent),
+        let mut attrs = main_agent_attrs(run.agent).to_vec();
+        attrs.extend([
             kv(AURA_INGRESS, run.ingress.as_str()),
             kv(AURA_ROLE, run.role.as_str()),
             kv(AURA_MODE, mode),
-        ];
+        ]);
         push_error(&mut attrs, run.error_type);
         i.invoke_agent_duration
             .record(run.duration.as_secs_f64(), &attrs);
-        let count_attrs = [
-            kv(GEN_AI_AGENT_NAME, run.agent),
-            kv(AURA_ROLE, run.role.as_str()),
-        ];
+        let mut count_attrs = main_agent_attrs(run.agent).to_vec();
+        count_attrs.push(kv(AURA_ROLE, run.role.as_str()));
         if let Some(n) = run.inference_calls {
             i.invoke_agent_inference_calls.record(n, &count_attrs);
         }
@@ -566,13 +589,29 @@ mod imp {
         }
     }
 
+    impl AgentLabels {
+        /// `gen_ai.agent.name` and `aura.agent` for this agent.
+        fn attrs(&self) -> [KeyValue; 2] {
+            [
+                kv(GEN_AI_AGENT_NAME, &self.agent),
+                kv(AURA_AGENT, &self.config),
+            ]
+        }
+    }
+
+    /// Both agent labels of a main agent, whose config is itself.
+    fn main_agent_attrs(agent: &str) -> [KeyValue; 2] {
+        [kv(GEN_AI_AGENT_NAME, agent), kv(AURA_AGENT, agent)]
+    }
+
     fn inference_attrs(labels: &InferenceLabels) -> Vec<KeyValue> {
-        vec![
+        let mut attrs = vec![
             kv(GEN_AI_OPERATION_NAME, "chat"),
             kv(GEN_AI_PROVIDER_NAME, provider_name(&labels.provider)),
             kv(GEN_AI_REQUEST_MODEL, &labels.model),
-            kv(GEN_AI_AGENT_NAME, &labels.agent),
-        ]
+        ];
+        attrs.extend(labels.agent.attrs());
+        attrs
     }
 
     pub fn record_inference(
@@ -610,7 +649,7 @@ mod imp {
     }
 
     pub fn record_mcp_operation(
-        agent: &str,
+        agent: &AgentLabels,
         server: &str,
         tool: &str,
         error_type: Option<&str>,
@@ -621,21 +660,22 @@ mod imp {
             kv(MCP_METHOD_NAME, "tools/call"),
             kv(AURA_MCP_SERVER, server),
             kv(GEN_AI_TOOL_NAME, tool),
-            kv(GEN_AI_AGENT_NAME, agent),
         ];
+        attrs.extend(agent.attrs());
         push_error(&mut attrs, error_type);
         i.mcp_operation_duration
             .record(duration.as_secs_f64(), &attrs);
     }
 
     pub fn record_tool_execution(
-        agent: &str,
+        agent: &AgentLabels,
         tool: &str,
         error_type: Option<&str>,
         duration: Duration,
     ) {
         let Some(i) = instruments() else { return };
-        let mut attrs = vec![kv(GEN_AI_TOOL_NAME, tool), kv(GEN_AI_AGENT_NAME, agent)];
+        let mut attrs = vec![kv(GEN_AI_TOOL_NAME, tool)];
+        attrs.extend(agent.attrs());
         push_error(&mut attrs, error_type);
         i.execute_tool_duration
             .record(duration.as_secs_f64(), &attrs);
@@ -655,41 +695,35 @@ mod imp {
 
     pub fn set_mcp_server_status(agent: &str, server: &str, connected: bool, tool_count: u64) {
         let Some(i) = instruments() else { return };
-        let attrs = [kv(GEN_AI_AGENT_NAME, agent), kv(AURA_MCP_SERVER, server)];
+        let mut attrs = main_agent_attrs(agent).to_vec();
+        attrs.push(kv(AURA_MCP_SERVER, server));
         i.mcp_server_connected.record(u64::from(connected), &attrs);
         i.mcp_server_tools.record(tool_count, &attrs);
     }
 
     pub fn record_routing_decision(agent: &str, decision: &str) {
         let Some(i) = instruments() else { return };
-        i.routing.add(
-            1,
-            &[kv(GEN_AI_AGENT_NAME, agent), kv(AURA_DECISION, decision)],
-        );
+        let mut attrs = main_agent_attrs(agent).to_vec();
+        attrs.push(kv(AURA_DECISION, decision));
+        i.routing.add(1, &attrs);
     }
 
     pub fn record_planning_cycles(agent: &str, cycles: u64) {
         let Some(i) = instruments() else { return };
-        i.planning_cycles
-            .record(cycles, &[kv(GEN_AI_AGENT_NAME, agent)]);
+        i.planning_cycles.record(cycles, &main_agent_attrs(agent));
     }
 
     pub fn record_task(agent: &str, worker: &str, outcome: &str, duration: Duration) {
         let Some(i) = instruments() else { return };
-        i.task_duration.record(
-            duration.as_secs_f64(),
-            &[
-                kv(GEN_AI_AGENT_NAME, agent),
-                kv(AURA_WORKER, worker),
-                kv(AURA_OUTCOME, outcome),
-            ],
-        );
+        let mut attrs = main_agent_attrs(agent).to_vec();
+        attrs.extend([kv(AURA_WORKER, worker), kv(AURA_OUTCOME, outcome)]);
+        i.task_duration.record(duration.as_secs_f64(), &attrs);
     }
 
     /// One approval awaiting a decision, counted in `aura.hitl.pending`
     /// until dropped.
     pub struct HitlPending {
-        agent: Arc<str>,
+        agent: AgentLabels,
     }
 
     impl Drop for HitlPending {
@@ -700,24 +734,24 @@ mod imp {
 
     /// Count an approval as pending until the returned guard drops, which a
     /// decision, a cancellation and a dropped future all do.
-    pub fn hitl_pending(agent: &str) -> HitlPending {
+    pub fn hitl_pending(agent: &AgentLabels) -> HitlPending {
         hitl_pending_add(agent, 1);
         HitlPending {
-            agent: Arc::from(agent),
+            agent: agent.clone(),
         }
     }
 
-    fn hitl_pending_add(agent: &str, delta: i64) {
+    fn hitl_pending_add(agent: &AgentLabels, delta: i64) {
         let Some(i) = instruments() else { return };
-        i.hitl_pending.add(delta, &[kv(GEN_AI_AGENT_NAME, agent)]);
+        i.hitl_pending.add(delta, &agent.attrs());
     }
 
-    pub fn record_hitl_decision(agent: &str, decision: &str, duration: Duration) {
+    pub fn record_hitl_decision(agent: &AgentLabels, decision: &str, duration: Duration) {
         let Some(i) = instruments() else { return };
-        i.hitl_decision_duration.record(
-            duration.as_secs_f64(),
-            &[kv(GEN_AI_AGENT_NAME, agent), kv(AURA_DECISION, decision)],
-        );
+        let mut attrs = agent.attrs().to_vec();
+        attrs.push(kv(AURA_DECISION, decision));
+        i.hitl_decision_duration
+            .record(duration.as_secs_f64(), &attrs);
     }
 }
 
@@ -729,7 +763,7 @@ pub use stub::*;
 mod stub {
     use std::time::Duration;
 
-    use super::{InferenceLabels, Ingress, MetricsError, RunMeasure, TokenMeasure};
+    use super::{AgentLabels, InferenceLabels, Ingress, MetricsError, RunMeasure, TokenMeasure};
 
     pub fn init(_: bool) -> Result<(), MetricsError> {
         Err(MetricsError::Disabled)
@@ -743,8 +777,8 @@ mod stub {
     pub fn record_run(_: RunMeasure<'_>) {}
     pub fn record_inference(_: &InferenceLabels, _: Option<&str>, _: Duration) {}
     pub fn record_token_usage(_: &InferenceLabels, _: TokenMeasure) {}
-    pub fn record_mcp_operation(_: &str, _: &str, _: &str, _: Option<&str>, _: Duration) {}
-    pub fn record_tool_execution(_: &str, _: &str, _: Option<&str>, _: Duration) {}
+    pub fn record_mcp_operation(_: &AgentLabels, _: &str, _: &str, _: Option<&str>, _: Duration) {}
+    pub fn record_tool_execution(_: &AgentLabels, _: &str, _: Option<&str>, _: Duration) {}
     pub fn record_scratchpad_intercept(_: &str, _: u64) {}
     pub fn record_scratchpad_extract(_: &str, _: u64) {}
     pub fn set_mcp_server_status(_: &str, _: &str, _: bool, _: u64) {}
@@ -755,10 +789,10 @@ mod stub {
     impl Drop for HitlPending {
         fn drop(&mut self) {}
     }
-    pub fn hitl_pending(_: &str) -> HitlPending {
+    pub fn hitl_pending(_: &AgentLabels) -> HitlPending {
         HitlPending
     }
-    pub fn record_hitl_decision(_: &str, _: &str, _: Duration) {}
+    pub fn record_hitl_decision(_: &AgentLabels, _: &str, _: Duration) {}
 }
 
 #[cfg(all(test, feature = "otel"))]
@@ -797,7 +831,7 @@ mod tests {
             inference_calls: Some(2),
             tool_calls: Some(1),
         });
-        let labels = InferenceLabels::new("demo", "bedrock", "claude");
+        let labels = InferenceLabels::new(&AgentLabels::main("demo"), "bedrock", "claude");
         record_inference(&labels, None, Duration::from_millis(800));
         record_token_usage(
             &labels,
@@ -809,44 +843,53 @@ mod tests {
             },
         );
         record_mcp_operation(
-            "demo",
+            &AgentLabels::main("demo"),
             "mezmo",
             "search_logs",
             Some("tool_error"),
             Duration::from_secs(1),
         );
-        record_tool_execution("demo", "search_logs", None, Duration::from_secs(1));
+        record_tool_execution(
+            &AgentLabels::main("demo"),
+            "search_logs",
+            None,
+            Duration::from_secs(1),
+        );
         record_scratchpad_intercept("search_logs", 9000);
         record_scratchpad_extract("head", 300);
         set_mcp_server_status("demo", "mezmo", true, 17);
         record_routing_decision("demo", "orchestrated");
         record_planning_cycles("demo", 2);
         record_task("demo", "logs", "completed", Duration::from_secs(4));
-        let pending = hitl_pending("demo");
-        record_hitl_decision("demo", "approved", Duration::from_secs(30));
+        let pending = hitl_pending(&AgentLabels::main("demo"));
+        record_hitl_decision(
+            &AgentLabels::main("demo"),
+            "approved",
+            Duration::from_secs(30),
+        );
 
         let text = render_prometheus().expect("render");
 
         for needle in [
             r#"http_server_request_duration_seconds_count{http_request_method="POST",http_response_status_code="200",http_route="/v1/chat/completions"} 1"#,
             r#"aura_runs_active{aura_ingress="http"} 1"#,
-            r#"gen_ai_invoke_agent_duration_seconds_count{aura_ingress="http",aura_mode="single",aura_role="main",error_type="timeout",gen_ai_agent_name="demo"} 1"#,
-            r#"gen_ai_invoke_agent_inference_calls_count{aura_role="main",gen_ai_agent_name="demo"} 1"#,
-            r#"gen_ai_client_inference_duration_seconds_count{gen_ai_agent_name="demo",gen_ai_operation_name="chat",gen_ai_provider_name="aws.bedrock",gen_ai_request_model="claude"} 1"#,
-            r#"gen_ai_client_inference_usage_input_tokens_total{gen_ai_agent_name="demo",gen_ai_operation_name="chat",gen_ai_provider_name="aws.bedrock",gen_ai_request_model="claude",gen_ai_token_modality="text"} 100"#,
-            r#"gen_ai_client_inference_usage_cache_read_input_tokens_total{gen_ai_agent_name="demo",gen_ai_operation_name="chat",gen_ai_provider_name="aws.bedrock",gen_ai_request_model="claude",gen_ai_token_modality="text"} 40"#,
-            r#"gen_ai_client_inference_operation_input_tokens_sum{gen_ai_agent_name="demo",gen_ai_operation_name="chat",gen_ai_provider_name="aws.bedrock",gen_ai_request_model="claude"} 100"#,
-            r#"mcp_client_operation_duration_seconds_count{aura_mcp_server="mezmo",error_type="tool_error",gen_ai_agent_name="demo",gen_ai_tool_name="search_logs",mcp_method_name="tools/call"} 1"#,
-            r#"gen_ai_execute_tool_duration_seconds_count{gen_ai_agent_name="demo",gen_ai_tool_name="search_logs"} 1"#,
+            r#"gen_ai_invoke_agent_duration_seconds_count{aura_agent="demo",aura_ingress="http",aura_mode="single",aura_role="main",error_type="timeout",gen_ai_agent_name="demo"} 1"#,
+            r#"gen_ai_invoke_agent_inference_calls_count{aura_agent="demo",aura_role="main",gen_ai_agent_name="demo"} 1"#,
+            r#"gen_ai_client_inference_duration_seconds_count{aura_agent="demo",gen_ai_agent_name="demo",gen_ai_operation_name="chat",gen_ai_provider_name="aws.bedrock",gen_ai_request_model="claude"} 1"#,
+            r#"gen_ai_client_inference_usage_input_tokens_total{aura_agent="demo",gen_ai_agent_name="demo",gen_ai_operation_name="chat",gen_ai_provider_name="aws.bedrock",gen_ai_request_model="claude",gen_ai_token_modality="text"} 100"#,
+            r#"gen_ai_client_inference_usage_cache_read_input_tokens_total{aura_agent="demo",gen_ai_agent_name="demo",gen_ai_operation_name="chat",gen_ai_provider_name="aws.bedrock",gen_ai_request_model="claude",gen_ai_token_modality="text"} 40"#,
+            r#"gen_ai_client_inference_operation_input_tokens_sum{aura_agent="demo",gen_ai_agent_name="demo",gen_ai_operation_name="chat",gen_ai_provider_name="aws.bedrock",gen_ai_request_model="claude"} 100"#,
+            r#"mcp_client_operation_duration_seconds_count{aura_agent="demo",aura_mcp_server="mezmo",error_type="tool_error",gen_ai_agent_name="demo",gen_ai_tool_name="search_logs",mcp_method_name="tools/call"} 1"#,
+            r#"gen_ai_execute_tool_duration_seconds_count{aura_agent="demo",gen_ai_agent_name="demo",gen_ai_tool_name="search_logs"} 1"#,
             r#"aura_scratchpad_intercepted_tokens_sum{gen_ai_tool_name="search_logs"} 9000"#,
             r#"aura_scratchpad_extracted_tokens_count{gen_ai_tool_name="head"} 1"#,
-            r#"aura_mcp_server_connected{aura_mcp_server="mezmo",gen_ai_agent_name="demo"} 1"#,
-            r#"aura_mcp_server_tools{aura_mcp_server="mezmo",gen_ai_agent_name="demo"} 17"#,
-            r#"aura_orchestration_routing_total{aura_decision="orchestrated",gen_ai_agent_name="demo"} 1"#,
-            r#"aura_orchestration_planning_cycles_sum{gen_ai_agent_name="demo"} 2"#,
-            r#"aura_orchestration_task_duration_seconds_count{aura_outcome="completed",aura_worker="logs",gen_ai_agent_name="demo"} 1"#,
-            r#"aura_hitl_pending{gen_ai_agent_name="demo"} 1"#,
-            r#"aura_hitl_decision_duration_seconds_count{aura_decision="approved",gen_ai_agent_name="demo"} 1"#,
+            r#"aura_mcp_server_connected{aura_agent="demo",aura_mcp_server="mezmo",gen_ai_agent_name="demo"} 1"#,
+            r#"aura_mcp_server_tools{aura_agent="demo",aura_mcp_server="mezmo",gen_ai_agent_name="demo"} 17"#,
+            r#"aura_orchestration_routing_total{aura_agent="demo",aura_decision="orchestrated",gen_ai_agent_name="demo"} 1"#,
+            r#"aura_orchestration_planning_cycles_sum{aura_agent="demo",gen_ai_agent_name="demo"} 2"#,
+            r#"aura_orchestration_task_duration_seconds_count{aura_agent="demo",aura_outcome="completed",aura_worker="logs",gen_ai_agent_name="demo"} 1"#,
+            r#"aura_hitl_pending{aura_agent="demo",gen_ai_agent_name="demo"} 1"#,
+            r#"aura_hitl_decision_duration_seconds_count{aura_agent="demo",aura_decision="approved",gen_ai_agent_name="demo"} 1"#,
             r#"target_info{service_name="aura""#,
         ] {
             assert!(text.contains(needle), "missing `{needle}` in:\n{text}");
@@ -859,7 +902,7 @@ mod tests {
         drop(pending);
         let text = render_prometheus().expect("render");
         assert!(
-            text.contains(r#"aura_hitl_pending{gen_ai_agent_name="demo"} 0"#),
+            text.contains(r#"aura_hitl_pending{aura_agent="demo",gen_ai_agent_name="demo"} 0"#),
             "pending gauge must return to zero in:\n{text}"
         );
     }
@@ -869,7 +912,7 @@ mod tests {
     #[test]
     fn empty_usage_adds_no_distribution_sample() {
         init(false).expect("metrics init");
-        let labels = InferenceLabels::new("silent", "openai", "gpt");
+        let labels = InferenceLabels::new(&AgentLabels::main("silent"), "openai", "gpt");
         record_token_usage(
             &labels,
             TokenMeasure {
@@ -882,7 +925,7 @@ mod tests {
         let text = render_prometheus().expect("render");
         assert!(
             !text.contains(
-                r#"gen_ai_client_inference_operation_input_tokens_count{gen_ai_agent_name="silent""#
+                r#"gen_ai_client_inference_operation_input_tokens_count{aura_agent="silent",gen_ai_agent_name="silent""#
             ),
             "no distribution sample for an empty turn in:\n{text}"
         );
@@ -901,7 +944,7 @@ mod tests {
         let text = render_prometheus().expect("render");
         assert!(
             text.contains(
-                r#"aura_orchestration_routing_total{aura_decision="direct_answer",gen_ai_agent_name="init-race"} 1"#
+                r#"aura_orchestration_routing_total{aura_agent="init-race",aura_decision="direct_answer",gen_ai_agent_name="init-race"} 1"#
             ),
             "a record after concurrent init must reach the served registry in:\n{text}"
         );
