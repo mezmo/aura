@@ -2168,10 +2168,11 @@ impl Orchestrator {
     /// One routing decision, in the metrics. A post-execute call that fails
     /// before it routes records its own decision where it is handled.
     fn record_routing_metric(&self, response: &PlanningResponse) {
+        use crate::metrics::decision;
         let decision = match response {
-            PlanningResponse::Direct { .. } => "direct_answer",
-            PlanningResponse::Clarification { .. } => "clarification",
-            PlanningResponse::StepsPlan { .. } => "orchestrated",
+            PlanningResponse::Direct { .. } => decision::DIRECT_ANSWER,
+            PlanningResponse::Clarification { .. } => decision::CLARIFICATION,
+            PlanningResponse::StepsPlan { .. } => decision::ORCHESTRATED,
         };
         crate::metrics::record_routing_decision(&self.agent_build_context.agent.name, decision);
     }
@@ -5940,18 +5941,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 let category = Self::categorize_failure_error(&err_str);
                 let (decision, note) = match category {
                     FailureCategory::AgentTimeout => (
-                        "coordinator_timeout",
+                        crate::metrics::decision::COORDINATOR_TIMEOUT,
                         format!("Post-execute coordinator call timed out: {}", err_str),
                     ),
                     FailureCategory::DepthExhausted => (
-                        "coordinator_turn_budget_exhausted",
+                        crate::metrics::decision::COORDINATOR_TURN_BUDGET_EXHAUSTED,
                         format!(
                             "Post-execute coordinator exhausted its turn budget without routing: {}",
                             err_str
                         ),
                     ),
                     _ => (
-                        "coordinator_error",
+                        crate::metrics::decision::COORDINATOR_ERROR,
                         format!("Post-execute coordinator call failed: {}", err_str),
                     ),
                 };

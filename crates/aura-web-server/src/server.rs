@@ -420,6 +420,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             id, provider, model, iid
         );
         warn_timeout_relationships(id, config, &args);
+        aura::metrics::declare_config(config);
     }
 
     // Tool-name collisions are a config fault the request path can only warn

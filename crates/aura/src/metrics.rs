@@ -143,6 +143,24 @@ pub const fn is_available() -> bool {
     cfg!(feature = "otel")
 }
 
+/// The `aura.decision` values of `aura.orchestration.routing`.
+pub mod decision {
+    pub const DIRECT_ANSWER: &str = "direct_answer";
+    pub const CLARIFICATION: &str = "clarification";
+    pub const ORCHESTRATED: &str = "orchestrated";
+    pub const COORDINATOR_TIMEOUT: &str = "coordinator_timeout";
+    pub const COORDINATOR_TURN_BUDGET_EXHAUSTED: &str = "coordinator_turn_budget_exhausted";
+    pub const COORDINATOR_ERROR: &str = "coordinator_error";
+    pub const ALL: [&str; 6] = [
+        DIRECT_ANSWER,
+        CLARIFICATION,
+        ORCHESTRATED,
+        COORDINATOR_TIMEOUT,
+        COORDINATOR_TURN_BUDGET_EXHAUSTED,
+        COORDINATOR_ERROR,
+    ];
+}
+
 /// `gen_ai.provider.name` for one of aura's provider identifiers
 /// (`ProviderAgent::provider_name`), using the semconv spelling where the
 /// conventions define one.
@@ -648,6 +666,40 @@ mod imp {
         }
     }
 
+    /// Create the counter series a loaded config's agents will increment, at
+    /// zero, so their first increment is a change `rate()` can see rather
+    /// than the birth of a series. Token usage for the agent and for each
+    /// worker under its own `llm`, and the routing decisions of an
+    /// orchestrating agent; histograms have no zero to record and start at
+    /// their first sample.
+    pub fn declare_config(config: &aura_config::Config) {
+        let Some(i) = instruments() else { return };
+        let main = AgentLabels::main(&config.agent.name);
+        let (provider, model) = config.agent.llm.model_info();
+        declare_inference(i, &InferenceLabels::new(&main, provider, model));
+        let Some(orchestration) = config.orchestration.as_ref().filter(|o| o.enabled) else {
+            return;
+        };
+        for (name, worker) in &orchestration.workers {
+            let llm = worker.llm.as_ref().unwrap_or(&config.agent.llm);
+            let (provider, model) = llm.model_info();
+            let labels = AgentLabels::new(&config.agent.name, name);
+            declare_inference(i, &InferenceLabels::new(&labels, provider, model));
+        }
+        for decision in super::decision::ALL {
+            let mut attrs = main_agent_attrs(&config.agent.name).to_vec();
+            attrs.push(kv(AURA_DECISION, decision));
+            i.routing.add(0, &attrs);
+        }
+    }
+
+    fn declare_inference(i: &Instruments, labels: &InferenceLabels) {
+        let mut attrs = inference_attrs(labels);
+        attrs.push(kv(GEN_AI_TOKEN_MODALITY, "text"));
+        i.usage_input_tokens.add(0, &attrs);
+        i.usage_output_tokens.add(0, &attrs);
+    }
+
     pub fn record_mcp_operation(
         agent: &AgentLabels,
         server: &str,
@@ -779,6 +831,7 @@ mod stub {
     pub fn record_run(_: RunMeasure<'_>) {}
     pub fn record_inference(_: &InferenceLabels, _: Option<&str>, _: Duration) {}
     pub fn record_token_usage(_: &InferenceLabels, _: TokenMeasure) {}
+    pub fn declare_config(_: &aura_config::Config) {}
     pub fn record_mcp_operation(_: &AgentLabels, _: &str, _: &str, _: Option<&str>, _: Duration) {}
     pub fn record_tool_execution(_: &AgentLabels, _: &str, _: Option<&str>, _: Duration) {}
     pub fn record_scratchpad_intercept(_: &AgentLabels, _: &str, _: u64) {}
@@ -936,6 +989,57 @@ mod tests {
     /// First calls from several threads must end on one registry: the
     /// instruments every later record uses have to feed the registry the
     /// endpoint renders, whichever caller built them.
+    #[test]
+    fn declared_config_starts_its_counters_at_zero() {
+        init(false).expect("metrics init");
+        let config: aura_config::Config = toml::from_str(
+            r#"
+[agent]
+name = "declared"
+system_prompt = "declare"
+
+[agent.llm]
+provider = "bedrock"
+model = "main-model"
+region = "us-east-1"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.scout]
+description = "looks"
+preamble = "look"
+
+[orchestration.worker.scribe]
+description = "writes"
+preamble = "write"
+
+[orchestration.worker.scribe.llm]
+provider = "bedrock"
+model = "small-model"
+region = "us-east-1"
+"#,
+        )
+        .expect("config");
+        declare_config(&config);
+        let text = render_prometheus().expect("render");
+        for needle in [
+            r#"gen_ai_client_inference_usage_input_tokens_total{aura_agent="declared",gen_ai_agent_name="declared",gen_ai_operation_name="chat",gen_ai_provider_name="aws.bedrock",gen_ai_request_model="main-model",gen_ai_token_modality="text"} 0"#,
+            r#"gen_ai_client_inference_usage_output_tokens_total{aura_agent="declared",gen_ai_agent_name="scout",gen_ai_operation_name="chat",gen_ai_provider_name="aws.bedrock",gen_ai_request_model="main-model",gen_ai_token_modality="text"} 0"#,
+            r#"gen_ai_client_inference_usage_input_tokens_total{aura_agent="declared",gen_ai_agent_name="scribe",gen_ai_operation_name="chat",gen_ai_provider_name="aws.bedrock",gen_ai_request_model="small-model",gen_ai_token_modality="text"} 0"#,
+            r#"aura_orchestration_routing_total{aura_agent="declared",aura_decision="coordinator_error",gen_ai_agent_name="declared"} 0"#,
+            r#"aura_orchestration_routing_total{aura_agent="declared",aura_decision="direct_answer",gen_ai_agent_name="declared"} 0"#,
+        ] {
+            assert!(text.contains(needle), "missing `{needle}` in:\n{text}");
+        }
+        assert!(
+            !text.contains(
+                r#"gen_ai_client_inference_usage_cache_read_tokens_total{aura_agent="declared""#
+            ),
+            "cache counters wait for a provider that reports them"
+        );
+    }
+
     #[test]
     fn concurrent_first_calls_serve_one_registry() {
         let callers: Vec<_> = (0..8).map(|_| std::thread::spawn(|| init(false))).collect();
