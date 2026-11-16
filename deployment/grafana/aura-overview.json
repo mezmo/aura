@@ -1,7 +1,7 @@
 {
   "uid": "aura-overview",
   "title": "AURA overview",
-  "description": "Runs, LLM calls and tokens, scratchpad, MCP tools, orchestration and HITL for aura webserver, from its /metrics endpoint (OpenTelemetry GenAI and MCP semantic conventions).",
+  "description": "Runs, LLM calls and tokens, scratchpad, MCP tools, orchestration and HITL for aura webserver, from its /metrics endpoint (OpenTelemetry GenAI and MCP semantic conventions). Token and routing counters start at zero when a config loads, so their first increment shows; run, LLM call, tool, task and scratchpad counts come from histograms and miss a fresh series' first event.",
   "tags": [
     "aura",
     "genai"

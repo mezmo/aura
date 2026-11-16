@@ -1,7 +1,7 @@
 {
   "uid": "aura-agents",
   "title": "AURA agents",
-  "description": "One section per agent name (main agents and workers alike), repeated from the Agent variable and narrowed by Config; the same instruments as AURA overview, read per agent instead of per agent-and-tool line. Opened from an agent series on the overview.",
+  "description": "One section per agent name (main agents and workers alike), repeated from the Agent variable and narrowed by Config; the same instruments as AURA overview, read per agent instead of per agent-and-tool line. Opened from an agent series on the overview. Token and routing counters start at zero when a config loads, so their first increment shows; run, LLM call, tool, task and scratchpad counts come from histograms and miss a fresh series' first event.",
   "tags": [
     "aura",
     "genai"
