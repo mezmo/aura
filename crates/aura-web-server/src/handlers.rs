@@ -17,7 +17,7 @@ use tracing::{Instrument, error};
 use uuid::Uuid;
 
 use aura::journal::JournalItem;
-use aura::runtime::{Attach, AttachError, Caller, RunTarget, StartError, StartRun, Subscription};
+use aura::runtime::{Admitted, Attach, Caller, RunTarget, StartError, StartRun, Subscription};
 use aura_events::run::{
     LifecycleEvent, Liveness, LivenessPolicy, RunCancelReason, RunEnding, SessionEventPayload,
 };
@@ -39,7 +39,8 @@ use crate::types::*;
 /// to start and what its response is built from.
 pub(crate) struct ChatRequest {
     pub(crate) config: aura_config::Config,
-    pub(crate) session: aura::SessionId,
+    /// The request's chat id.
+    pub(crate) chat: aura::SessionId,
     /// The headers of the request.
     pub(crate) headers: HashMap<String, String>,
     /// The turn the response renders: completion id, model, timestamp,
@@ -61,13 +62,15 @@ impl ChatRequest {
 }
 
 /// A run started for a chat request. It holds the request's subscription to
-/// its session, and what the response still needs from the request.
+/// the lane its run landed on, and what the response still needs from the
+/// request.
 pub(crate) struct StartedRun {
     pub(crate) run_id: aura::RunId,
     pub(crate) subscription: Subscription,
     /// The turn the response renders.
     pub(crate) turn: TurnContext,
-    pub(crate) session: aura::SessionId,
+    /// The request's chat id.
+    pub(crate) chat: aura::SessionId,
 }
 
 /// A streaming completion served from the runtime: the SSE body, and the
@@ -87,9 +90,6 @@ impl ChatStream {
 /// Why a run could not be started for a chat request.
 #[derive(Debug, thiserror::Error)]
 pub enum StartChatError {
-    /// The runtime refused the attach.
-    #[error(transparent)]
-    Attach(#[from] AttachError),
     /// The runtime refused the start.
     #[error(transparent)]
     Start(#[from] StartError),
@@ -113,17 +113,23 @@ pub enum StartChatError {
 impl StartChatError {
     /// The HTTP response for the refusal, in the OpenAI error envelope:
     ///
-    /// - 409 `session_busy` when the session already has a live run, or
-    ///   another client holds its claim. Each case has its own message.
-    /// - 503 when the attach or the start is refused because the runtime is
-    ///   shutting down, or the run is cancelled for a shutdown before
-    ///   `Started`.
+    /// - 409 `session_busy` when every lane of the request's chat is busy,
+    ///   with why each lane is. A start on one named session gets 409 too
+    ///   when the session has a live run or another client holds its claim.
+    ///   Each case has its own message.
+    /// - 503 when the start is refused because the runtime is shutting down,
+    ///   or the run is cancelled for a shutdown before `Started`.
     /// - 500 `internal_error` for everything else, with a message naming the
     ///   refusal: a store failure, a failure or any other cancel before
     ///   `Started`, a stream that ended before `Started`, and any refusal
     ///   this crate does not know.
     pub fn into_http_response(self) -> Response {
         match &self {
+            Self::Start(busy @ StartError::ConversationBusy { .. }) => error_response(
+                StatusCode::CONFLICT,
+                format!("{busy}; wait for a lane to finish or use another chat_session_id"),
+                "session_busy",
+            ),
             Self::Start(StartError::RunInProgress(run)) => error_response(
                 StatusCode::CONFLICT,
                 format!(
@@ -131,21 +137,19 @@ impl StartChatError {
                 ),
                 "session_busy",
             ),
-            Self::Attach(AttachError::AlreadyClaimed { by }) => error_response(
+            Self::Start(StartError::AlreadyClaimed { by }) => error_response(
                 StatusCode::CONFLICT,
                 format!(
                     "another client holds this session (observer {by}); wait for it or use another chat_session_id"
                 ),
                 "session_busy",
             ),
-            Self::Attach(AttachError::ShuttingDown)
-            | Self::Start(StartError::ShuttingDown)
+            Self::Start(StartError::ShuttingDown)
             | Self::CancelledBeforeStart {
                 reason: RunCancelReason::Shutdown,
                 ..
             } => shutting_down_response(),
-            Self::Attach(_)
-            | Self::Start(_)
+            Self::Start(_)
             | Self::FailedBeforeStart { .. }
             | Self::CancelledBeforeStart { .. }
             | Self::EndedBeforeStart => error_response(
@@ -206,7 +210,7 @@ impl std::error::Error for ChatError {}
 pub(crate) fn parse_request(
     state: &AppState,
     req: ChatCompletionRequest,
-    session: aura::SessionId,
+    chat: aura::SessionId,
     headers: HashMap<String, String>,
 ) -> Result<ChatRequest, PrepareError> {
     let config = state.resolve_config(req.model.as_deref()).ok_or_else(|| {
@@ -226,7 +230,7 @@ pub(crate) fn parse_request(
         format!("{provider}/{model}"),
         Utc::now().timestamp() as u64,
         req.max_tokens,
-        session.as_str(),
+        chat.as_str(),
     );
     let turn = if config.orchestration_enabled() {
         turn.with_orchestration()
@@ -239,7 +243,7 @@ pub(crate) fn parse_request(
 
     Ok(ChatRequest {
         config,
-        session,
+        chat,
         headers,
         turn,
         prompt,
@@ -250,21 +254,28 @@ pub(crate) fn parse_request(
     })
 }
 
-/// Attaches to the request's session as `attach` says, starts the run with
-/// the request's prompt, history and tools under `liveness`, and waits for
-/// the run's `Started` event before returning. A run that fails before it starts comes
-/// back as an error, not as a stream.
+/// Starts the run with the request's prompt, history and tools under
+/// `liveness` on a lane of the conversation between the request's chat id
+/// and its agent, attaches to that lane's session as `attach` says, and
+/// waits for the run's `Started` event before returning. A run that fails
+/// before it starts comes back as an error, not as a stream.
 ///
 /// `run_span` creates the run's `agent.stream` span, which declares
-/// `run.id`. It is called only after the session is attached, so a request
-/// refused before that opens no span. The span is handed to the runtime,
-/// which records the run on it once the agent is prepared. If the start is
-/// refused, or the run ends before `Started`, the span may still be empty.
-/// In that case this function records the refusal on it (see
-/// [`record_refusal`]), plus the run's id when the start made one. A refused
-/// start made none, so the span gets no `run.id`: the run a `RunInProgress`
-/// names is another request's, and its text already says which. The run's
-/// id also goes on the current (request) span as `http.request_id`.
+/// `run.id`. The span is handed to the runtime, which records the run on it
+/// once the agent is prepared. If the start is refused, or the run ends
+/// before `Started`, this function records the refusal on the span (see
+/// [`record_refusal`]). For a run that ended before `Started`, it records
+/// the run's id too.
+///
+/// A start refused before the runtime made a run leaves the span with no
+/// `run.id`. The runs a busy chat's refusal names belong to other requests,
+/// and its text already says which. A start that
+/// [`start_attached`](aura::runtime::AgentRuntime::start_attached) refuses
+/// after it made a run leaves on the span whatever the runtime recorded for
+/// that run, beside the refusal.
+///
+/// The run's id also goes on the current (request) span as
+/// `http.request_id`.
 pub(crate) async fn start_run(
     state: &AppState,
     request: ChatRequest,
@@ -274,7 +285,7 @@ pub(crate) async fn start_run(
 ) -> Result<StartedRun, StartChatError> {
     let ChatRequest {
         config,
-        session,
+        chat,
         headers,
         turn,
         prompt,
@@ -283,29 +294,33 @@ pub(crate) async fn start_run(
         user,
         metadata,
     } = request;
-    let mut subscription = state.runtime.attach(&session, attach).await?;
     let span = run_span();
-    // If the start is refused, returning drops the subscription, which
-    // detaches it.
-    let started = state
+    let admitted = state
         .runtime
-        .start(StartRun {
-            agent: Some(config.agent_id().to_owned()),
-            req_headers: Some(headers),
-            client_tools,
-            run_tools: state.run_tools(&config),
-            target: RunTarget::Session(session.clone()),
-            continues: None,
-            prompt,
-            history,
-            timeout: optional_secs(state.streaming_timeout_secs),
-            liveness,
-            caller: Some(Caller { user, metadata }),
-            span: span.clone(),
-        })
+        .start_attached(
+            StartRun {
+                agent: Some(config.agent_id().to_owned()),
+                req_headers: Some(headers),
+                client_tools,
+                run_tools: state.run_tools(&config),
+                target: RunTarget::Conversation { chat: chat.clone() },
+                continues: None,
+                prompt,
+                history,
+                timeout: optional_secs(state.streaming_timeout_secs),
+                liveness,
+                caller: Some(Caller { user, metadata }),
+                span: span.clone(),
+            },
+            attach,
+        )
         .await;
-    let run = match started {
-        Ok(run) => run,
+    let Admitted {
+        run,
+        mut subscription,
+        ..
+    } = match admitted {
+        Ok(admitted) => admitted,
         Err(refused) => {
             let refused = StartChatError::from(refused);
             record_refusal(&span, &refused);
@@ -323,7 +338,7 @@ pub(crate) async fn start_run(
             run_id: run,
             subscription,
             turn,
-            session,
+            chat,
         }),
         Err(refused) => {
             error!(run_id = %run, "{refused}");
@@ -337,19 +352,27 @@ pub(crate) async fn start_run(
 /// Records on the run's `agent.stream` span why the run never started. A
 /// run cancelled before `Started` gets the ending its cancel stands for, as
 /// the runtime records an ending, so a shutdown or a client that left is
-/// not an error; the runtime may already have recorded the same ending.
-/// Any other refusal is an error with the refusal's text.
+/// not an error; the runtime may already have recorded the same ending. A
+/// start refused because the runtime is shutting down gets a shutdown's
+/// ending as well. Any other refusal is an error with the refusal's text.
 fn record_refusal(span: &tracing::Span, refused: &StartChatError) {
-    match refused {
-        StartChatError::CancelledBeforeStart { reason, message } => {
-            let ending = RunEnding::Cancelled {
-                reason: *reason,
-                message: message.clone(),
-            };
-            aura::runtime::record_ending(span, &ending);
+    let ending = match refused {
+        StartChatError::CancelledBeforeStart { reason, message } => RunEnding::Cancelled {
+            reason: *reason,
+            message: message.clone(),
+        },
+        StartChatError::Start(StartError::ShuttingDown) => RunEnding::Cancelled {
+            reason: RunCancelReason::Shutdown,
+            message: None,
+        },
+        StartChatError::Start(_)
+        | StartChatError::FailedBeforeStart { .. }
+        | StartChatError::EndedBeforeStart => {
+            aura::logging::set_span_error(span, refused.to_string());
+            return;
         }
-        _ => aura::logging::set_span_error(span, refused.to_string()),
-    }
+    };
+    aura::runtime::record_ending(span, &ending);
 }
 
 /// Reads `subscription` until it sees `run`'s `Started` event. The start
@@ -416,10 +439,10 @@ fn runtime_stream_config(
 }
 
 /// Serves a streaming completion from the runtime. Returns the SSE body and
-/// the session id for its headers. The request claims its session, with
-/// presence, until the body has read the run's ending or the client stops
-/// reading. `run_span` creates the run's `agent.stream` span, as described
-/// on `start_run`.
+/// the chat id for its headers. The request claims the lane its run lands
+/// on, with presence, until the body has read the run's ending or the client
+/// stops reading. `run_span` creates the run's `agent.stream` span, as
+/// described on `start_run`.
 pub async fn stream_chat(
     state: &AppState,
     req: ChatCompletionRequest,
@@ -438,7 +461,7 @@ pub async fn stream_chat(
         run_id,
         subscription,
         turn,
-        session,
+        chat,
     } = start_run(
         state,
         request,
@@ -461,15 +484,15 @@ pub async fn stream_chat(
         timeouts,
     );
     Ok(ChatStream {
-        session_id: session,
+        session_id: chat,
         bytes,
     })
 }
 
 /// Serves a non-streaming completion from the runtime. The request claims
-/// its session, without presence, until the run ends. A client that leaves
-/// before then lets go of the claim, and the run goes on to its ending.
-/// `run_span` creates the run's `agent.stream` span, as described on
+/// the lane its run lands on, without presence, until the run ends. A client
+/// that leaves before then lets go of the claim, and the run goes on to its
+/// ending. `run_span` creates the run's `agent.stream` span, as described on
 /// `start_run`.
 pub async fn complete_chat(
     state: &AppState,
@@ -484,7 +507,7 @@ pub async fn complete_chat(
         run_id,
         subscription,
         turn,
-        session,
+        chat,
     } = start_run(
         state,
         request,
@@ -503,7 +526,7 @@ pub async fn complete_chat(
         completion_id: turn.completion_id.clone(),
         model_str: turn.model_str.clone(),
         created_timestamp: turn.created_timestamp,
-        chat_session_id: session,
+        chat_session_id: chat,
     };
     let max_tokens = turn.max_tokens;
     let outcome = collect_body(subscription, SseProjector::new(config, turn, run_id)).await;
@@ -3723,6 +3746,8 @@ source = '{}'
         use aura::runtime::{
             AgentForRun, AgentRuntime, Attach, RunTarget, RuntimeStores, StartRun,
         };
+        use aura::session_store::{RunFacts, RunFilter, RunStatus};
+        use aura::{Conversation, LANES_PER_CONVERSATION, Landing, Lane, LaneNumber};
         use aura_events::{EmittingAgent, RunId, SessionId};
         use aura_test_utils::mock_agent::{MockAgent, Step, items};
         use axum::Router;
@@ -3748,6 +3773,101 @@ source = '{}'
 
         fn session() -> SessionId {
             SessionId::new(SESSION).expect("a session id")
+        }
+
+        /// Lane `n` of the conversation between the test's chat id and
+        /// `agent`.
+        fn lane(agent: &str, n: usize) -> Lane {
+            let n = u8::try_from(n).expect("a lane number fits a u8");
+            Lane::new(
+                Conversation::new(session(), agent),
+                LaneNumber::new(n).expect("a lane number below the cap"),
+            )
+        }
+
+        /// The runs on the lanes of the conversation between the test's chat
+        /// id and `agent`, in start order.
+        async fn runs_of(state: &AppState, agent: &str) -> Vec<RunFacts> {
+            state
+                .runtime
+                .list(&RunFilter {
+                    conversation: Some(Conversation::new(session(), agent)),
+                    ..RunFilter::default()
+                })
+                .await
+                .expect("the run store lists runs")
+        }
+
+        /// Waits until `count` runs of `agent`'s conversation are running.
+        async fn running(state: &AppState, agent: &str, count: usize) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let runs = runs_of(state, agent).await;
+                    if runs
+                        .iter()
+                        .filter(|run| run.status == RunStatus::Running)
+                        .count()
+                        == count
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the runs are running");
+        }
+
+        /// An agent for `run` that waits for a permit from `gate`, then
+        /// answers `answer`.
+        fn gated(
+            gate: &Arc<tokio::sync::Semaphore>,
+            run: RunId,
+            answer: &str,
+        ) -> Result<AgentForRun, aura::BuilderError> {
+            let gate = Arc::clone(gate);
+            let agent = MockAgent::scripted(vec![
+                Step::effect(move |_| {
+                    let gate = Arc::clone(&gate);
+                    async move { gate.acquire().await.expect("the gate stays open").forget() }
+                }),
+                Step::item(items::text(answer)),
+            ])
+            .for_run(run)
+            .with_run_context();
+            Ok(AgentForRun {
+                agent: Arc::new(agent),
+                attribution: EmittingAgent::single_agent(),
+            })
+        }
+
+        /// The session id in the body's `aura.session_info` frame.
+        fn session_info_session_id(body: &str) -> String {
+            let data = body
+                .split("event: aura.session_info\n")
+                .nth(1)
+                .and_then(|rest| rest.lines().next())
+                .and_then(|line| line.strip_prefix("data: "))
+                .unwrap_or_else(|| panic!("no aura.session_info frame: {body}"));
+            let json: Value = serde_json::from_str(data).expect("the frame is JSON");
+            json["session_id"]
+                .as_str()
+                .expect("the frame has a session id")
+                .to_owned()
+        }
+
+        /// The 409 text for a conversation whose lanes are busy as `lanes`
+        /// says, one entry per lane from the home lane up.
+        fn every_lane_busy(agent: &str, lanes: &[String]) -> String {
+            let lanes = lanes
+                .iter()
+                .enumerate()
+                .map(|(n, busy)| format!("lane {n} {busy}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!(
+                "every lane of chat `{SESSION}` with agent `{agent}` is busy: {lanes}; wait for a lane to finish or use another chat_session_id"
+            )
         }
 
         /// A state over `configs` with the runtime path on. Each run gets
@@ -3872,48 +3992,239 @@ source = '{}'
         }
 
         #[tokio::test]
-        async fn a_session_with_a_live_run_refuses_another_with_409() {
+        async fn a_chat_whose_every_lane_is_running_refuses_with_409() {
             let state = state_over(vec![config("solo")], |_, run| pending(run));
-            let live = state
-                .runtime
-                .start(StartRun {
-                    target: RunTarget::Session(session()),
-                    ..StartRun::new("first")
-                })
-                .await
-                .expect("the first run starts");
+            let mut lanes = Vec::new();
+            for _ in 0..LANES_PER_CONVERSATION {
+                let run = state
+                    .runtime
+                    .start(StartRun {
+                        target: RunTarget::Conversation { chat: session() },
+                        ..StartRun::new("first")
+                    })
+                    .await
+                    .expect("a lane is free");
+                lanes.push(format!("running `{run}`"));
+            }
 
-            let (status, message, kind) = refusal(send(&state, chat(None, true)).await).await;
-            assert_eq!(status, StatusCode::CONFLICT);
-            assert_eq!(
-                message,
-                format!(
-                    "the session is already running {live}; wait for it or use another chat_session_id"
-                )
-            );
+            let response = send(&state, chat(None, true)).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let (_, message, kind) = refusal(response).await;
+            assert_eq!(message, every_lane_busy("solo", &lanes));
             assert_eq!(kind, "session_busy");
             state.runtime.drain(Duration::from_secs(1)).await;
         }
 
         #[tokio::test]
-        async fn a_session_another_client_claims_refuses_with_409() {
+        async fn a_chat_whose_every_lane_another_client_claims_refuses_with_409() {
             let state = state_over(vec![config("solo")], |_, run| pending(run));
-            let holder = state
-                .runtime
-                .attach(&session(), Attach::claiming())
-                .await
-                .expect("the holder claims the session");
+            let mut holders = Vec::new();
+            for n in 0..LANES_PER_CONVERSATION {
+                let holder = state
+                    .runtime
+                    .attach(&lane("solo", n).session_id(), Attach::claiming())
+                    .await
+                    .expect("the holder claims the lane");
+                holders.push(holder);
+            }
+            let lanes = holders
+                .iter()
+                .map(|holder| format!("claimed by observer `{}`", holder.observer().id))
+                .collect::<Vec<_>>();
 
-            let (status, message, kind) = refusal(send(&state, chat(None, true)).await).await;
-            assert_eq!(status, StatusCode::CONFLICT);
-            assert_eq!(
-                message,
-                format!(
-                    "another client holds this session (observer {}); wait for it or use another chat_session_id",
-                    holder.observer().id
-                )
-            );
+            let response = send(&state, chat(None, true)).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let (_, message, kind) = refusal(response).await;
+            assert_eq!(message, every_lane_busy("solo", &lanes));
             assert_eq!(kind, "session_busy");
+        }
+
+        /// While a request on a chat id is still running, a second streaming
+        /// request on it runs beside it and streams a whole body. Both
+        /// responses name the chat id, not a lane, in their header and in
+        /// `aura.session_info`.
+        #[tokio::test]
+        async fn a_second_request_on_a_busy_chat_streams_a_full_body() {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let held = Arc::clone(&gate);
+            let runs = AtomicUsize::new(0);
+            let mut state = runtime_state(vec![config("solo")], move |_, run| {
+                match runs.fetch_add(1, Ordering::SeqCst) {
+                    0 => gated(&held, run, "answer 1"),
+                    _ => gated(&Arc::new(tokio::sync::Semaphore::new(1)), run, "answer 2"),
+                }
+            });
+            state.aura_custom_events = true;
+            let state = Arc::new(state);
+
+            let first = send(&state, chat(None, true)).await;
+            assert_eq!(first.status(), StatusCode::OK);
+            let second = send(&state, chat(None, true)).await;
+            assert_eq!(second.status(), StatusCode::OK);
+            for response in [&first, &second] {
+                assert_eq!(response.headers()["x-chat-session-id"], SESSION);
+            }
+
+            let second = body_text(second).await;
+            assert!(second.contains("answer 2"), "{second}");
+            assert_eq!(second.matches("data: [DONE]").count(), 1, "{second}");
+            gate.add_permits(1);
+            let first = body_text(first).await;
+            assert!(first.contains("answer 1"), "{first}");
+            for body in [&first, &second] {
+                assert_eq!(session_info_session_id(body), SESSION);
+            }
+            let lanes = runs_of(&state, "solo")
+                .await
+                .iter()
+                .map(|run| run.lane().map(|lane| lane.number().get()))
+                .collect::<Vec<_>>();
+            assert_eq!(lanes, [Some(0), Some(1)]);
+        }
+
+        /// A client that drops its stream and sends again at once is served
+        /// at once, while the dropped run is still being stopped.
+        #[tokio::test]
+        async fn a_resend_after_dropping_the_first_body_streams_at_once() {
+            let state = state_over(vec![config("solo")], |_, run| pending(run));
+            let first = send(&state, chat(None, true)).await;
+            assert_eq!(first.status(), StatusCode::OK);
+            drop(first);
+
+            let resent =
+                tokio::time::timeout(Duration::from_secs(2), send(&state, chat(None, true)))
+                    .await
+                    .expect("the resend does not wait for the dropped run to end");
+            assert_eq!(resent.status(), StatusCode::OK);
+            state.runtime.drain(Duration::ZERO).await;
+        }
+
+        /// One request more than the chat has lanes is refused with why
+        /// each lane is busy: each runs a request's run and holds its claim.
+        #[tokio::test]
+        async fn a_request_past_every_lane_is_409_naming_each_lane() {
+            let state = state_over(vec![config("solo")], |_, run| pending(run));
+            let mut streams = Vec::new();
+            for _ in 0..LANES_PER_CONVERSATION {
+                let response = send(&state, chat(None, true)).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                streams.push(response);
+            }
+
+            let response = send(&state, chat(None, true)).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let (_, message, kind) = refusal(response).await;
+            assert_eq!(kind, "session_busy");
+            assert!(
+                message.starts_with(&format!(
+                    "every lane of chat `{SESSION}` with agent `solo` is busy: lane 0 running `"
+                )),
+                "{message}"
+            );
+            assert_eq!(
+                message.matches(", claimed by observer `").count(),
+                LANES_PER_CONVERSATION,
+                "{message}"
+            );
+            assert!(
+                message.ends_with("; wait for a lane to finish or use another chat_session_id"),
+                "{message}"
+            );
+            drop(streams);
+            state.runtime.drain(Duration::ZERO).await;
+        }
+
+        /// Two agents under one chat id are two conversations, so a request
+        /// to each runs at once, each on its own home lane.
+        #[tokio::test]
+        async fn requests_to_two_agents_under_one_chat_id_both_run() {
+            let state = state_over(vec![config("a"), config("b")], |_, run| pending(run));
+            let a = send(&state, chat(Some("a"), true)).await;
+            let b = send(&state, chat(Some("b"), true)).await;
+            assert_eq!(a.status(), StatusCode::OK);
+            assert_eq!(b.status(), StatusCode::OK);
+            for agent in ["a", "b"] {
+                let [run] = runs_of(&state, agent)
+                    .await
+                    .try_into()
+                    .expect("one run for each agent");
+                assert_eq!(run.landing, Landing::Lane(lane(agent, 0)));
+            }
+            drop((a, b));
+            state.runtime.drain(Duration::ZERO).await;
+        }
+
+        /// The client's chat id names a conversation. The run lands on one of
+        /// its lanes, and no run is started on a session named by the chat id
+        /// itself.
+        #[tokio::test]
+        async fn a_request_runs_on_a_lane_and_never_on_its_chat_id() {
+            let state = answering();
+            let response = send(&state, chat(None, true)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            body_text(response).await;
+
+            let on_chat_id = state
+                .runtime
+                .list(&RunFilter {
+                    session: Some(session()),
+                    ..RunFilter::default()
+                })
+                .await
+                .expect("the run store lists runs");
+            assert!(on_chat_id.is_empty(), "{on_chat_id:?}");
+            let [run] = runs_of(&state, "solo")
+                .await
+                .try_into()
+                .expect("one run on the conversation");
+            assert_eq!(run.landing, Landing::Lane(lane("solo", 0)));
+        }
+
+        /// A refusal at the cap is recorded on the run's span, which the
+        /// handler opens before it starts the run.
+        #[cfg(feature = "otel")]
+        #[tokio::test]
+        async fn a_busy_chat_records_the_refusal_on_the_runs_span() {
+            let captured = aura::test_span_capture::CapturedSpans::default();
+            let _subscriber = captured.install();
+            // See `a_run_that_never_starts_ends_its_span_with_an_error`.
+            let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let state = state_over(vec![config("solo")], |_, run| pending(run));
+            for _ in 0..LANES_PER_CONVERSATION {
+                state
+                    .runtime
+                    .start(StartRun {
+                        target: RunTarget::Conversation { chat: session() },
+                        ..StartRun::new("first")
+                    })
+                    .await
+                    .expect("a lane is free");
+            }
+
+            let response = send(&state, chat(None, true)).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+
+            let records_the_refusal = || {
+                captured.spans().iter().any(|span| {
+                    span.name == "agent.stream"
+                        && matches!(
+                            &span.status,
+                            opentelemetry::trace::Status::Error { description }
+                                if description.starts_with("every lane of chat")
+                        )
+                })
+            };
+            for _ in 0..10_000 {
+                if records_the_refusal() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                records_the_refusal(),
+                "no agent.stream span records the refusal"
+            );
+            state.runtime.drain(Duration::ZERO).await;
         }
 
         #[tokio::test]
@@ -3996,12 +4307,15 @@ source = '{}'
         }
 
         /// A run cancelled before `Started` records the ending its cancel
-        /// stands for, so a shutdown is not an error on the span, as it is
-        /// not on the request-bound path. Any other refusal is an error.
+        /// stands for, and a start refused because the runtime is shutting
+        /// down records a shutdown's ending. So a shutdown is not an error on
+        /// the span, as it is not on the request-bound path. Any other
+        /// refusal is an error.
         #[cfg(feature = "otel")]
         #[test]
         fn a_refusal_records_what_its_cancel_means_on_the_span() {
             use super::super::StartChatError;
+            use aura::runtime::StartError;
             use aura_events::run::RunCancelReason;
             use opentelemetry::trace::Status;
 
@@ -4033,6 +4347,14 @@ source = '{}'
             assert_eq!(status, Status::Unset, "a shutdown is not an error");
             assert_eq!(termination.as_deref(), Some("shutdown"));
 
+            let (status, termination) = recorded(StartChatError::Start(StartError::ShuttingDown));
+            assert_eq!(
+                status,
+                Status::Unset,
+                "a shutdown's refusal is not an error"
+            );
+            assert_eq!(termination.as_deref(), Some("shutdown"));
+
             let (status, termination) = recorded(StartChatError::FailedBeforeStart {
                 error: "no provider".to_owned(),
             });
@@ -4043,9 +4365,9 @@ source = '{}'
             assert_eq!(termination, None);
         }
 
-        /// Each turn's stream carries only its own run. The second turn does
-        /// not replay the first, and the first turn's claim is released in
-        /// time for the second.
+        /// Each turn's stream carries only its own run, and the second turn
+        /// does not replay the first. Once the first turn's run has ended,
+        /// its claim is gone too, so the second turn takes the same lane.
         #[tokio::test]
         async fn a_second_turn_on_a_session_streams_only_its_own_run() {
             let state = answering();
@@ -4055,6 +4377,7 @@ source = '{}'
             assert_eq!(first.headers()["x-chat-session-id"], SESSION);
             assert_eq!(first.headers()["content-type"], "text/event-stream");
             let first = body_text(first).await;
+            running(&state, "solo", 0).await;
 
             let second = send(&state, chat(None, true)).await;
             assert_eq!(second.status(), StatusCode::OK);
@@ -4071,6 +4394,48 @@ source = '{}'
             for body in [&first, &second] {
                 assert_eq!(body.matches("data: [DONE]").count(), 1, "{body}");
             }
+            let lanes = runs_of(&state, "solo")
+                .await
+                .iter()
+                .map(|run| run.lane().map(|lane| lane.number().get()))
+                .collect::<Vec<_>>();
+            assert_eq!(lanes, [Some(0), Some(0)]);
+        }
+
+        /// A start on one named session is 409 when the session has a live
+        /// run or another client holds its claim, each with its own message.
+        /// A chat request starts on a conversation and never gets either,
+        /// so the mapping is checked directly.
+        #[tokio::test]
+        async fn a_busy_named_session_is_409() {
+            use super::super::StartChatError;
+            use aura::runtime::StartError;
+            use aura_events::run::ObserverId;
+
+            let run = RunId::mint();
+            let (status, message, kind) =
+                refusal(StartChatError::Start(StartError::RunInProgress(run)).into_http_response())
+                    .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(
+                message,
+                format!(
+                    "the session is already running {run}; wait for it or use another chat_session_id"
+                )
+            );
+            assert_eq!(kind, "session_busy");
+
+            let by = ObserverId::new("obs_1").expect("an observer id");
+            let (status, message, kind) = refusal(
+                StartChatError::Start(StartError::AlreadyClaimed { by }).into_http_response(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(
+                message,
+                "another client holds this session (observer obs_1); wait for it or use another chat_session_id"
+            );
+            assert_eq!(kind, "session_busy");
         }
 
         /// A cancel before `Started` is 503 for a shutdown and 500 otherwise.
@@ -4159,74 +4524,47 @@ source = '{}'
 
         /// A non-streaming client sees nothing until the run ends, so a
         /// proxy's idle timeout can drop it partway through. The run goes
-        /// on without it, and the session stays busy until the run ends.
+        /// on without it, and the client's resend runs beside it on the
+        /// chat's next lane.
         #[tokio::test]
         async fn a_non_streaming_client_that_leaves_does_not_stop_the_run() {
-            use aura::runtime::AgentState;
-            use aura::session_store::{RunFilter, RunStatus};
-            use tokio::sync::Notify;
-
-            let release = Arc::new(Notify::new());
-            let gate = Arc::clone(&release);
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let held = Arc::clone(&gate);
             let state = state_over(vec![config("solo")], move |_, run| {
-                let gate = Arc::clone(&gate);
-                let agent = MockAgent::scripted(vec![
-                    Step::effect(move |_| {
-                        let gate = Arc::clone(&gate);
-                        async move { gate.notified().await }
-                    }),
-                    Step::item(items::text("late answer")),
-                ])
-                .for_run(run)
-                .with_run_context();
-                Ok(AgentForRun {
-                    agent: Arc::new(agent),
-                    attribution: EmittingAgent::single_agent(),
-                })
+                gated(&held, run, "late answer")
             });
-            let runs = || async {
-                state
-                    .runtime
-                    .list(&RunFilter {
-                        session: Some(session()),
-                        ..RunFilter::default()
-                    })
-                    .await
-                    .expect("the run store lists runs")
-            };
 
             let mut request = Box::pin(send(&state, chat(None, false)));
-            let running = async {
-                while state.runtime.session_state(&session()) != Some(AgentState::Running) {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            };
             tokio::select! {
                 _ = &mut request => panic!("the request answered before the run was released"),
-                () = running => {}
+                () = running(&state, "solo", 1) => {}
             }
             // The client leaves.
             drop(request);
 
-            let [listed] = runs().await.try_into().expect("one run on the session");
-            let run = listed.run_id;
-            let (status, message, _) = refusal(send(&state, chat(None, false)).await).await;
-            assert_eq!(status, StatusCode::CONFLICT, "{message}");
-            assert!(message.contains(&run.to_string()), "{message}");
+            let mut resent = Box::pin(send(&state, chat(None, false)));
+            tokio::select! {
+                _ = &mut resent => panic!("the resend answered before its run was released"),
+                () = running(&state, "solo", 2) => {}
+            }
+            gate.add_permits(2);
+            let resent = resent.await;
+            assert_eq!(resent.status(), StatusCode::OK);
+            let body: Value = serde_json::from_str(&body_text(resent).await).expect("JSON");
+            assert_eq!(body["choices"][0]["message"]["content"], "late answer");
 
-            release.notify_one();
             let ended = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    let status = runs().await[0].status;
-                    if status.is_terminal() {
-                        return status;
+                    let runs = runs_of(&state, "solo").await;
+                    if runs.iter().all(|run| run.status.is_terminal()) {
+                        return runs.iter().map(|run| run.status).collect::<Vec<_>>();
                     }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             })
             .await
-            .expect("the run ends");
-            assert_eq!(ended, RunStatus::Finished);
+            .expect("both runs end");
+            assert_eq!(ended, [RunStatus::Finished, RunStatus::Finished]);
         }
     }
 }
