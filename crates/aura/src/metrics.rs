@@ -986,9 +986,6 @@ mod tests {
         );
     }
 
-    /// First calls from several threads must end on one registry: the
-    /// instruments every later record uses have to feed the registry the
-    /// endpoint renders, whichever caller built them.
     #[test]
     fn declared_config_starts_its_counters_at_zero() {
         init(false).expect("metrics init");
@@ -1040,6 +1037,9 @@ region = "us-east-1"
         );
     }
 
+    /// First calls from several threads must end on one registry: the
+    /// instruments every later record uses have to feed the registry the
+    /// endpoint renders, whichever caller built them.
     #[test]
     fn concurrent_first_calls_serve_one_registry() {
         let callers: Vec<_> = (0..8).map(|_| std::thread::spawn(|| init(false))).collect();
