@@ -3643,7 +3643,7 @@
           "sort": "desc"
         }
       },
-      "description": "aura.orchestration.routing: direct_answer, orchestrated or clarification, counted at every planning call including continuations."
+      "description": "aura.orchestration.routing: direct_answer, orchestrated or clarification, counted at every planning call including continuations. A post-execute coordinator call that fails before it routes counts as coordinator_timeout, coordinator_turn_budget_exhausted or coordinator_error; the run itself still ends ok."
     },
     {
       "type": "timeseries",
