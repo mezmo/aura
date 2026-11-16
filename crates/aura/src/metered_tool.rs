@@ -15,7 +15,7 @@ use crate::streaming_request_hook::StreamingRequestHook;
 use crate::tool_error_detection::is_reported_error;
 
 /// A tool whose every call is timed into `gen_ai.execute_tool.duration`
-/// under the name of the agent that holds it.
+/// under the labels of the agent that holds it.
 pub(crate) struct MeteredTool {
     agent: AgentLabels,
     tool: Box<dyn ToolDyn>,

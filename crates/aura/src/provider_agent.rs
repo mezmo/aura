@@ -812,7 +812,7 @@ pub(crate) fn read_tool_result(
     (text, kind)
 }
 
-/// A rig agent builder together with the name of the agent it builds.
+/// A rig agent builder together with the labels of the agent it builds.
 pub(crate) struct BuilderState<M: CompletionModel> {
     agent: crate::metrics::AgentLabels,
     inner: Inner<M>,
