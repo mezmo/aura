@@ -35,6 +35,7 @@
   },
   "devDependencies": {
     "@mezmoinc/commitlint-config": "^1.1.0",
-    "@mezmoinc/release-config-docker": "^1.0.2"
+    "@mezmoinc/release-config-docker": "^1.0.2",
+    "semantic-release": "^25.0.9"
   }
 }
