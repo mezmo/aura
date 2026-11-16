@@ -27,7 +27,8 @@ use std::time::Duration;
 
 use aura::hitl::PendingApprovals;
 use aura::runtime::{
-    AgentForRun, AgentRuntime, Attach, Caller, RunTarget, RuntimeStores, StartRun, Subscription,
+    Admitted, AgentForRun, AgentRuntime, Attach, Caller, RunTarget, RuntimeStores, StartRun,
+    Subscription,
 };
 use aura::stream_events::{CorrelationContext, EmittingAgent, McpServerStatus};
 use aura::test_span_capture::CapturedSpans;
@@ -1382,7 +1383,7 @@ async fn runtime_backed(runtime: Arc<AgentRuntime>, script: Script, variant: Var
     let captured = CapturedSpans::default();
     let _subscriber = captured.install();
 
-    let (subscription, run) = attach_and_start(&runtime).await;
+    let (subscription, run) = start_claimed(&runtime).await;
     let projector = SseProjector::new(script.stream_config(variant), script.turn(), run);
     let body = tokio::time::timeout(
         BODY_DEADLINE,
@@ -1413,7 +1414,7 @@ async fn runtime_span(runtime: Arc<AgentRuntime>, script: Script) -> String {
     let captured = CapturedSpans::default();
     let _subscriber = captured.install();
 
-    let (mut subscription, run) = attach_and_start(&runtime).await;
+    let (mut subscription, run) = start_claimed(&runtime).await;
     loop {
         let item = tokio::time::timeout(BODY_DEADLINE, subscription.next())
             .await
@@ -1431,27 +1432,30 @@ async fn runtime_span(runtime: Arc<AgentRuntime>, script: Script) -> String {
     render_spans(&captured, run, script.ending, Side::Runtime)
 }
 
-/// Attaches an observer that claims the session with presence, then starts
-/// the run with an `agent.stream` span for the runtime to record `run.id`
-/// on. Reads the session's stream up to the run's `Started` event, and
-/// panics if the run ends, or the stream ends or skips ahead, before that.
-async fn attach_and_start(runtime: &AgentRuntime) -> (Subscription, RunId) {
-    let session = session();
-    let mut subscription = runtime
-        .attach(&session, Attach::claiming().present())
-        .await
-        .expect("the attach is admitted");
+/// Starts the run as the streaming handler does: one `start_attached` on a
+/// lane of the parity chat's conversation, claiming the lane with presence,
+/// with an `agent.stream` span for the runtime to record `run.id` on. Reads
+/// the lane's stream up to the run's `Started` event, and panics if the run
+/// ends, or the stream ends or skips ahead, before that.
+async fn start_claimed(runtime: &AgentRuntime) -> (Subscription, RunId) {
     let span = tracing::info_span!(parent: None, "agent.stream", run.id = tracing::field::Empty);
-    let run = runtime
-        .start(StartRun {
-            target: RunTarget::Session(session),
-            caller: Some(Caller {
-                user: Some(USER.to_owned()),
-                metadata: Some(metadata()),
-            }),
-            span,
-            ..StartRun::new(PROMPT)
-        })
+    let Admitted {
+        run,
+        mut subscription,
+        ..
+    } = runtime
+        .start_attached(
+            StartRun {
+                target: RunTarget::Conversation { chat: session() },
+                caller: Some(Caller {
+                    user: Some(USER.to_owned()),
+                    metadata: Some(metadata()),
+                }),
+                span,
+                ..StartRun::new(PROMPT)
+            },
+            Attach::claiming().present(),
+        )
         .await
         .expect("the start is admitted");
     loop {
@@ -1595,6 +1599,9 @@ fn typed(value: &Value) -> String {
 /// - On the root, exactly one `run.id` and one `http.request_id`, both equal
 ///   to the run's id. Both become `<run>`, because each path's run has its
 ///   own id.
+/// - On the runtime's root, exactly one `session.lane`, equal to 0, and none
+///   on the oracle's. It is dropped, because only the runtime path runs on a
+///   lane.
 /// - No span dropped an event.
 ///
 /// Span events are kept only when they come from `aura::logging`, the span
@@ -1687,6 +1694,18 @@ fn render_spans(captured: &CapturedSpans, run: RunId, ending: SpanEnding, side: 
                     *value = "<run>".to_owned();
                 }
             }
+            // The parity chat's only run takes its conversation's first lane.
+            let lanes: Vec<String> = attributes
+                .iter()
+                .filter(|(key, _)| key == "session.lane")
+                .map(|(_, value)| value.clone())
+                .collect();
+            let expected = match side {
+                Side::Runtime => vec![typed(&Value::I64(0))],
+                Side::Oracle => Vec::new(),
+            };
+            assert_eq!(lanes, expected, "the {side:?} root's session.lane");
+            attributes.retain(|(key, _)| key != "session.lane");
             // Only the runtime path has a park ending. The request-bound path
             // ends a parked run with status ok and no termination attribute.
             // The runtime's termination table records a park as status unset
