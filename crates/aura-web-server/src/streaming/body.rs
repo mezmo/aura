@@ -271,7 +271,9 @@ mod tests {
     use async_trait::async_trait;
     use aura::journal::JournalItem;
     use aura::run_context::RunContext;
-    use aura::runtime::{AgentForRun, AgentRuntime, Attach, RuntimeStores, StartRun, Subscription};
+    use aura::runtime::{
+        AgentForRun, AgentRuntime, Attach, RunTarget, RuntimeStores, StartRun, Subscription,
+    };
     use aura::streaming::{AgentRun, RunOptions};
     use aura::{Message, StreamError, StreamItem, StreamingAgent, ToolName, UsageState};
     use aura_events::agent::{AgentEvent, AgentEventPayload, ToolOutcome};
@@ -466,7 +468,7 @@ mod tests {
             .expect("the body's observer attaches");
         let run = runtime
             .start(StartRun {
-                session: Some(session()),
+                target: RunTarget::Session(session()),
                 timeout,
                 ..StartRun::new("q")
             })

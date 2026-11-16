@@ -9,6 +9,7 @@ pub mod approver_headers;
 pub mod bedrock_embedding;
 pub mod builder;
 pub mod config;
+pub mod conversation;
 pub mod env_flags;
 pub mod error;
 pub mod fallback_tool_parser;
@@ -59,6 +60,7 @@ pub use builder::{
     build_streaming_agent, build_streaming_agent_with_tools, no_run_tools,
 };
 pub use config::{AgentBuildContext, RunId, SessionId, ToolContextFactory};
+pub use conversation::{Conversation, LANES_PER_CONVERSATION, Landing, Lane, LaneNumber};
 // Pure config types are owned by `aura-config` and re-exported here for
 // ergonomic consumption (`aura::LlmConfig`, etc.).
 pub use aura_config::{
@@ -89,7 +91,8 @@ pub use rig::tool::{Tool as RigTool, ToolDyn};
 pub use rig_builder::{RigBuilder, resolve_mcp_headers_in};
 pub use run_context::{BoundRun, RunContext, RunInProgress, RunLease};
 pub use runtime::{
-    AgentRuntime, AgentState, BlockReason, RigBuilderPreparer, RuntimeStores, StartError, StartRun,
+    AgentRuntime, AgentState, BlockReason, RigBuilderPreparer, RunTarget, RuntimeStores,
+    StartError, StartRun,
 };
 pub use scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
 pub use streaming::StreamingAgent;

@@ -17,7 +17,7 @@ use tracing::{Instrument, error};
 use uuid::Uuid;
 
 use aura::journal::JournalItem;
-use aura::runtime::{Attach, AttachError, Caller, StartError, StartRun, Subscription};
+use aura::runtime::{Attach, AttachError, Caller, RunTarget, StartError, StartRun, Subscription};
 use aura_events::run::{
     LifecycleEvent, Liveness, LivenessPolicy, RunCancelReason, RunEnding, SessionEventPayload,
 };
@@ -294,7 +294,7 @@ pub(crate) async fn start_run(
             req_headers: Some(headers),
             client_tools,
             run_tools: state.run_tools(&config),
-            session: Some(session.clone()),
+            target: RunTarget::Session(session.clone()),
             continues: None,
             prompt,
             history,
@@ -3720,7 +3720,9 @@ source = '{}'
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
-        use aura::runtime::{AgentForRun, AgentRuntime, Attach, RuntimeStores, StartRun};
+        use aura::runtime::{
+            AgentForRun, AgentRuntime, Attach, RunTarget, RuntimeStores, StartRun,
+        };
         use aura_events::{EmittingAgent, RunId, SessionId};
         use aura_test_utils::mock_agent::{MockAgent, Step, items};
         use axum::Router;
@@ -3875,7 +3877,7 @@ source = '{}'
             let live = state
                 .runtime
                 .start(StartRun {
-                    session: Some(session()),
+                    target: RunTarget::Session(session()),
                     ..StartRun::new("first")
                 })
                 .await

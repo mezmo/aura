@@ -9,6 +9,7 @@ use aura_events::run::{CheckpointRef, Liveness};
 use aura_events::{RunId, SequenceNumber, SessionId, Timestamp, TokenUsage};
 use serde::{Deserialize, Serialize};
 
+use crate::conversation::{Conversation, Landing, Lane};
 use crate::hitl::DecisionId;
 
 /// The most runs a default [`RunFilter`] lists.
@@ -18,7 +19,8 @@ pub const DEFAULT_RUN_LIST_LIMIT: usize = 100;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunFacts {
     pub run_id: RunId,
-    pub session_id: SessionId,
+    /// The session the run is on.
+    pub landing: Landing,
     /// The agent that runs, by its `Config::agent_id`.
     pub agent: String,
     pub status: RunStatus,
@@ -38,6 +40,19 @@ pub struct RunFacts {
     pub checkpoint: Option<CheckpointRef>,
     /// The run this one continues.
     pub continues: Option<RunId>,
+}
+
+impl RunFacts {
+    /// The id of the session the run is on. For a run on a lane, this is
+    /// the lane's session id, not the chat id.
+    pub fn session_id(&self) -> SessionId {
+        self.landing.session_id()
+    }
+
+    /// The conversation's lane the run is on, if it is on one.
+    pub fn lane(&self) -> Option<&Lane> {
+        self.landing.lane()
+    }
 }
 
 /// Where a run stands.
@@ -65,6 +80,8 @@ impl RunStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunFilter {
     pub session: Option<SessionId>,
+    /// The conversation whose lanes the run was on.
+    pub conversation: Option<Conversation>,
     pub status: Option<RunStatus>,
     /// Whether the run is waiting on an approval.
     pub pending_approval: Option<bool>,
@@ -78,6 +95,7 @@ impl Default for RunFilter {
     fn default() -> Self {
         Self {
             session: None,
+            conversation: None,
             status: None,
             pending_approval: None,
             limit: DEFAULT_RUN_LIST_LIMIT,
@@ -93,7 +111,15 @@ impl RunFilter {
         let waiting = !facts.pending_approvals.is_empty();
         self.session
             .as_ref()
-            .is_none_or(|session| *session == facts.session_id)
+            .is_none_or(|session| match &facts.landing {
+                Landing::Session(id) => id == session,
+                Landing::Lane(lane) => lane.session_id() == *session,
+            })
+            && self.conversation.as_ref().is_none_or(|conversation| {
+                facts
+                    .lane()
+                    .is_some_and(|lane| lane.conversation() == conversation)
+            })
             && self.status.is_none_or(|status| status == facts.status)
             && self
                 .pending_approval
@@ -104,6 +130,7 @@ impl RunFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation::LaneNumber;
 
     #[test]
     fn only_preparing_and_running_are_live() {
@@ -120,7 +147,10 @@ mod tests {
     fn facts_round_trip_through_json() {
         let facts = RunFacts {
             run_id: RunId::mint(),
-            session_id: SessionId::new("sess-1").unwrap(),
+            landing: Landing::Lane(Lane::new(
+                Conversation::new(SessionId::new("chat-1").unwrap(), "math"),
+                LaneNumber::new(2).unwrap(),
+            )),
             agent: "math".to_owned(),
             status: RunStatus::Parked,
             liveness: Liveness::default(),
@@ -137,5 +167,13 @@ mod tests {
         let json = serde_json::to_string(&facts).unwrap();
         assert_eq!(serde_json::from_str::<RunFacts>(&json).unwrap(), facts);
         assert!(json.contains(r#""status":"parked""#), "{json}");
+
+        let on_session = RunFacts {
+            landing: Landing::Session(SessionId::new("sess-1").unwrap()),
+            ..facts
+        };
+        let json = serde_json::to_string(&on_session).unwrap();
+        assert_eq!(serde_json::from_str::<RunFacts>(&json).unwrap(), on_session);
+        assert!(json.contains(r#""landing":{"session":"sess-1"}"#), "{json}");
     }
 }
