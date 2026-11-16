@@ -1,0 +1,1046 @@
+{
+  "uid": "aura-agents",
+  "title": "AURA agents",
+  "description": "One section per agent name (main agents and workers alike), repeated from the Agent variable and narrowed by Config; the same instruments as AURA overview, read per agent instead of per agent-and-tool line. Opened from an agent series on the overview.",
+  "tags": [
+    "aura",
+    "genai"
+  ],
+  "editable": true,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "version": 1,
+  "timezone": "browser",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "text": "Prometheus",
+          "value": "prometheus"
+        },
+        "hide": 0,
+        "refresh": 1
+      },
+      {
+        "name": "instance",
+        "label": "Instance",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(target_info{service_name=\"aura\"}, instance)",
+          "refId": "instance"
+        },
+        "definition": "label_values(target_info{service_name=\"aura\"}, instance)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "sort": 1,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "config",
+        "label": "Config",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\"}, aura_agent)",
+          "refId": "config"
+        },
+        "definition": "label_values(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\"}, aura_agent)",
+        "description": "The loaded agent config ([agent].name). With several selected, same-named workers of different configs share one section.",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "sort": 1,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "agent",
+        "label": "Agent",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\"}, gen_ai_agent_name)",
+          "refId": "agent"
+        },
+        "definition": "label_values(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\"}, gen_ai_agent_name)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "sort": 1,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "links": [
+    {
+      "title": "AURA overview",
+      "type": "link",
+      "url": "/d/aura-overview/aura-overview",
+      "keepTime": true,
+      "includeVars": true
+    }
+  ],
+  "panels": [
+    {
+      "type": "row",
+      "title": "$agent",
+      "collapsed": false,
+      "id": 1,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": [],
+      "repeat": "agent"
+    },
+    {
+      "type": "stat",
+      "title": "LLM calls",
+      "id": 2,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum((increase(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__range]) + (min_over_time(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__range]) unless max_over_time(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__range)) or increase(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__range])))",
+          "legendFormat": "calls",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "wideLayout": true
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Input tokens",
+      "id": 3,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum((increase(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__range]) + (min_over_time(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__range]) unless max_over_time(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__range)) or increase(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__range])))",
+          "legendFormat": "in",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "wideLayout": true
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Cache hit ratio",
+      "id": 4,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum((increase(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__range]) + (min_over_time(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__range]) unless max_over_time(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__range)) or increase(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__range]))) / sum((increase(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__range]) + (min_over_time(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__range]) unless max_over_time(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__range)) or increase(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__range])))",
+          "legendFormat": "hit",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "wideLayout": true
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Tool executions",
+      "id": 5,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum((increase(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__range]) + (min_over_time(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__range]) unless max_over_time(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__range)) or increase(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__range])))",
+          "legendFormat": "tools",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "wideLayout": true
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Tool error ratio",
+      "id": 6,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum((increase(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[$__range]) + (min_over_time(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[$__range]) unless max_over_time(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[5m] offset $__range)) or increase(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[$__range]))) / sum((increase(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__range]) + (min_over_time(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__range]) unless max_over_time(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__range)) or increase(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__range])))",
+          "legendFormat": "err",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "wideLayout": true
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Tasks (as worker)",
+      "id": 7,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (aura_outcome) ((increase(aura_orchestration_task_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",aura_worker=~\"$agent\"}[$__range]) + (min_over_time(aura_orchestration_task_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",aura_worker=~\"$agent\"}[$__range]) unless max_over_time(aura_orchestration_task_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",aura_worker=~\"$agent\"}[5m] offset $__range)) or increase(aura_orchestration_task_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",aura_worker=~\"$agent\"}[$__range])))",
+          "legendFormat": "{{aura_outcome}}",
+          "refId": "A",
+          "range": false,
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "description": "Worker tasks this agent completed or failed, from aura.orchestration.task.duration under the coordinator that ran it. Empty for a main agent."
+    },
+    {
+      "type": "timeseries",
+      "title": "LLM calls per second",
+      "id": 8,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 0,
+        "y": 5
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (gen_ai_request_model, error_type) ((rate(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_client_inference_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
+          "legendFormat": "{{gen_ai_request_model}} {{error_type}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "LLM call duration",
+      "id": 9,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 6,
+        "y": 5
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.50, sum by (le) ((rate(gen_ai_client_inference_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_client_inference_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_client_inference_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_client_inference_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))))",
+          "legendFormat": "p50",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) ((rate(gen_ai_client_inference_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_client_inference_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_client_inference_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_client_inference_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))))",
+          "legendFormat": "p95",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Tokens per second",
+      "id": 10,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 12,
+        "y": 5
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum((rate(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_client_inference_usage_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
+          "legendFormat": "input",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum((rate(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_client_inference_usage_cache_read_input_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
+          "legendFormat": "cache read",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum((rate(gen_ai_client_inference_usage_output_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_client_inference_usage_output_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_client_inference_usage_output_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_client_inference_usage_output_tokens_total{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
+          "legendFormat": "output",
+          "refId": "C",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Tool executions per second",
+      "id": 11,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 18,
+        "y": 5
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (gen_ai_tool_name) ((rate(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
+          "legendFormat": "{{gen_ai_tool_name}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Tool execution errors per second",
+      "id": 12,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 0,
+        "y": 12
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (gen_ai_tool_name, error_type) ((rate(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[$__rate_interval]) + (min_over_time(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[5m] offset $__rate_interval)) or rate(gen_ai_execute_tool_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[$__rate_interval])))",
+          "legendFormat": "{{gen_ai_tool_name}} {{error_type}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Tool execution duration p95",
+      "id": 13,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 6,
+        "y": 12
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_tool_name) ((rate(gen_ai_execute_tool_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(gen_ai_execute_tool_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(gen_ai_execute_tool_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(gen_ai_execute_tool_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]))))",
+          "legendFormat": "{{gen_ai_tool_name}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "MCP calls per second",
+      "id": 14,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 12,
+        "y": 12
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (aura_mcp_server, gen_ai_tool_name) ((rate(mcp_client_operation_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) + (min_over_time(mcp_client_operation_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(mcp_client_operation_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[5m] offset $__rate_interval)) or rate(mcp_client_operation_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\"}[$__rate_interval])))",
+          "legendFormat": "{{aura_mcp_server}}/{{gen_ai_tool_name}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "MCP errors per second",
+      "id": 15,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 18,
+        "y": 12
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (aura_mcp_server, gen_ai_tool_name, error_type) ((rate(mcp_client_operation_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[$__rate_interval]) + (min_over_time(mcp_client_operation_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(mcp_client_operation_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[5m] offset $__rate_interval)) or rate(mcp_client_operation_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",gen_ai_agent_name=~\"$agent\",error_type!=\"\"}[$__rate_interval])))",
+          "legendFormat": "{{aura_mcp_server}}/{{gen_ai_tool_name}} {{error_type}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Task outcomes per second (as worker)",
+      "id": 16,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 19
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (aura_outcome) ((rate(aura_orchestration_task_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",aura_worker=~\"$agent\"}[$__rate_interval]) + (min_over_time(aura_orchestration_task_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",aura_worker=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(aura_orchestration_task_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",aura_worker=~\"$agent\"}[5m] offset $__rate_interval)) or rate(aura_orchestration_task_duration_seconds_count{instance=~\"$instance\",aura_agent=~\"$config\",aura_worker=~\"$agent\"}[$__rate_interval])))",
+          "legendFormat": "{{aura_outcome}}",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Empty for a main agent: tasks are recorded under the coordinator with this agent as aura.worker."
+    },
+    {
+      "type": "timeseries",
+      "title": "Task duration (as worker)",
+      "id": 17,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 19
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.50, sum by (le) ((rate(aura_orchestration_task_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",aura_worker=~\"$agent\"}[$__rate_interval]) + (min_over_time(aura_orchestration_task_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",aura_worker=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(aura_orchestration_task_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",aura_worker=~\"$agent\"}[5m] offset $__rate_interval)) or rate(aura_orchestration_task_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",aura_worker=~\"$agent\"}[$__rate_interval]))))",
+          "legendFormat": "p50",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) ((rate(aura_orchestration_task_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",aura_worker=~\"$agent\"}[$__rate_interval]) + (min_over_time(aura_orchestration_task_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",aura_worker=~\"$agent\"}[$__rate_interval]) / ($__rate_interval_ms / 1000) unless max_over_time(aura_orchestration_task_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",aura_worker=~\"$agent\"}[5m] offset $__rate_interval)) or rate(aura_orchestration_task_duration_seconds_bucket{instance=~\"$instance\",aura_agent=~\"$config\",aura_worker=~\"$agent\"}[$__rate_interval]))))",
+          "legendFormat": "p95",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 12,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ]
+}
