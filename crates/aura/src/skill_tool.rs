@@ -70,6 +70,12 @@ impl SkillInvocationRecorder {
         }
     }
 
+    /// The log this recorder writes to.
+    #[cfg(test)]
+    pub(crate) fn log(&self) -> &SkillLogKey {
+        &self.log
+    }
+
     /// Persist an invocation before the tool result returns, so a turn that
     /// follows immediately can rehydrate it. The store bounds its own
     /// request latency, and a failure only logs a warning: the turn already
