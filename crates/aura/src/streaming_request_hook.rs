@@ -1240,7 +1240,13 @@ mod tests {
     fn test_with_scratchpad_budget_stores_budget() {
         use crate::scratchpad::TiktokenCounter;
         let counter = Arc::new(TiktokenCounter::default_counter());
-        let budget = ContextBudget::new(128_000, 0.20, 0, counter);
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            counter,
+        );
         let (hook, _, _) = StreamingRequestHook::with_scratchpad_budget(
             crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
             "req_with_budget",

@@ -183,7 +183,7 @@ pub(crate) fn check_and_record_budget(
 ) -> Result<(), BudgetCheckError> {
     let tokens = check_budget(budget, content)?;
     budget.record_extracted(tokens);
-    crate::metrics::record_scratchpad_extract(tool, tokens as u64);
+    crate::metrics::record_scratchpad_extract(budget.agent(), tool, tokens as u64);
     Ok(())
 }
 
@@ -1879,7 +1879,13 @@ mod tests {
                 .unwrap(),
         );
         let counter = TiktokenCounter::default_counter();
-        let budget = ContextBudget::new(100_000, 0.20, 0, std::sync::Arc::new(counter));
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100_000,
+            0.20,
+            0,
+            std::sync::Arc::new(counter),
+        );
         (tmp, storage, budget)
     }
 
@@ -1946,8 +1952,14 @@ mod tests {
         let counter = TiktokenCounter::default_counter();
         let raw_selected: String = raw.lines().take(50).collect::<Vec<_>>().join("\n");
         let raw_tokens = counter.count_tokens(&raw_selected);
-        let tight_budget = ContextBudget::new(100_000, 0.20, 0, std::sync::Arc::new(counter))
-            .with_max_extraction_tokens(raw_tokens + 1);
+        let tight_budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100_000,
+            0.20,
+            0,
+            std::sync::Arc::new(counter),
+        )
+        .with_max_extraction_tokens(raw_tokens + 1);
 
         let tool = HeadTool::new(storage, Arc::new(BoundRun::pinned_budget(tight_budget)));
         let result = tool
@@ -2619,7 +2631,13 @@ mod tests {
     async fn test_iterate_over_budget_error_retry_narrows() {
         let (_tmp, storage, _budget) = setup().await;
         let counter = TiktokenCounter::default_counter();
-        let tiny_budget = ContextBudget::new(100, 0.20, 0, std::sync::Arc::new(counter));
+        let tiny_budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100,
+            0.20,
+            0,
+            std::sync::Arc::new(counter),
+        );
 
         let items: Vec<String> = (0..50)
             .map(|i| format!(r#"{{"id":{i},"title":"result number {i}"}}"#))
@@ -2653,7 +2671,13 @@ mod tests {
     async fn test_iterate_over_budget_error_single_item_no_retry() {
         let (_tmp, storage, _budget) = setup().await;
         let counter = TiktokenCounter::default_counter();
-        let tiny_budget = ContextBudget::new(100, 0.20, 0, std::sync::Arc::new(counter));
+        let tiny_budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100,
+            0.20,
+            0,
+            std::sync::Arc::new(counter),
+        );
 
         // One item whose single-line field alone exceeds the budget — a
         // narrower window cannot exist, so no paginated retry is offered.
@@ -2805,7 +2829,13 @@ mod tests {
     async fn test_item_schema_budget_error_suggests_pagination() {
         let (_tmp, storage, _budget) = setup().await;
         let counter = TiktokenCounter::default_counter();
-        let tiny_budget = ContextBudget::new(100, 0.20, 0, std::sync::Arc::new(counter));
+        let tiny_budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100,
+            0.20,
+            0,
+            std::sync::Arc::new(counter),
+        );
 
         // Generate enough items with varied keys to blow a tight budget.
         let items: Vec<String> = (0..50)
@@ -2870,7 +2900,13 @@ mod tests {
         let (_tmp, storage, _budget) = setup().await;
         // Create a small budget that will be exceeded
         let counter = TiktokenCounter::default_counter();
-        let tiny_budget = ContextBudget::new(100, 0.20, 0, std::sync::Arc::new(counter)); // 80 tokens usable
+        let tiny_budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100,
+            0.20,
+            0,
+            std::sync::Arc::new(counter),
+        ); // 80 tokens usable
 
         // Write a large file
         let large_content = "x".repeat(1000);
@@ -2984,8 +3020,14 @@ mod tests {
         let (_tmp, storage, _budget) = setup().await;
         // Tiny budget with per-call extraction limit
         let counter = TiktokenCounter::default_counter();
-        let tiny_budget = ContextBudget::new(1000, 0.20, 0, std::sync::Arc::new(counter))
-            .with_max_extraction_tokens(5); // very low per-call limit
+        let tiny_budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            1000,
+            0.20,
+            0,
+            std::sync::Arc::new(counter),
+        )
+        .with_max_extraction_tokens(5); // very low per-call limit
 
         // Write JSON with a large string value
         let big_str = (0..100)

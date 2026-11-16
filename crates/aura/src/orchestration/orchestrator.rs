@@ -1119,6 +1119,7 @@ impl Orchestrator {
                 };
 
                 let build = scratchpad::build_scratchpad(scratchpad::ScratchpadBuildInputs {
+                    agent: worker_build_context.agent_labels(),
                     sp_cfg,
                     storage_dir: &iter_dir,
                     read_root: Some(&read_root),
@@ -1147,6 +1148,7 @@ impl Orchestrator {
             let initial_used = self.worker_fixed_overhead(worker_cfg, &*token_counter);
             scratchpad_budget = Some(
                 scratchpad::ContextBudget::new(
+                    &worker_build_context.agent_labels(),
                     window as usize,
                     scratchpad::ScratchpadConfig::default().context_safety_margin,
                     initial_used,
@@ -3023,6 +3025,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .filter(|sp| sp.enabled && sp.coordinator);
         let Some(sp_cfg) = sp_cfg else {
             let budget = scratchpad::ContextBudget::new(
+                &self.agent_build_context.agent_labels(),
                 window as usize,
                 scratchpad::ScratchpadConfig::default().context_safety_margin,
                 0,
@@ -3047,6 +3050,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             (run_dir, read_root)
         };
         let build = scratchpad::build_scratchpad(scratchpad::ScratchpadBuildInputs {
+            agent: self.agent_build_context.agent_labels(),
             sp_cfg,
             storage_dir: &run_dir,
             read_root: Some(&read_root),

@@ -186,7 +186,11 @@ impl ScratchpadMiddleware {
                 }
 
                 budget.record_intercepted(token_count);
-                crate::metrics::record_scratchpad_intercept(&ctx.tool_name, token_count as u64);
+                crate::metrics::record_scratchpad_intercept(
+                    budget.agent(),
+                    &ctx.tool_name,
+                    token_count as u64,
+                );
 
                 tracing::debug!(
                     "Scratchpad: intercepted {} output (~{} tokens) → {} ({} companions)",
@@ -327,7 +331,13 @@ mod tests {
         let tools = HashMap::from([("list_pipelines".to_string(), 10)]);
 
         let counter = TiktokenCounter::default_counter();
-        let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            std::sync::Arc::new(counter),
+        );
         let wrapper = ScratchpadMiddleware::new(
             tools,
             storage.clone(),
@@ -371,7 +381,13 @@ mod tests {
 
         let tools = HashMap::from([("echo_large".to_string(), 10)]);
         let counter = TiktokenCounter::default_counter();
-        let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            std::sync::Arc::new(counter),
+        );
         let wrapper =
             ScratchpadMiddleware::new(tools, storage, Arc::new(BoundRun::pinned_budget(budget)));
 
@@ -401,7 +417,13 @@ mod tests {
         let tools = HashMap::from([("search_knowledge_base".to_string(), 10)]);
 
         let counter = TiktokenCounter::default_counter();
-        let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            std::sync::Arc::new(counter),
+        );
         let wrapper = ScratchpadMiddleware::new(
             tools,
             storage.clone(),
@@ -453,7 +475,13 @@ mod tests {
 
         let tools = HashMap::from([("execute_range_query".to_string(), 10)]);
         let counter = TiktokenCounter::default_counter();
-        let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            std::sync::Arc::new(counter),
+        );
         let wrapper = ScratchpadMiddleware::new(
             tools,
             storage.clone(),
@@ -510,7 +538,13 @@ mod tests {
         let tools = HashMap::from([("search_knowledge_base".to_string(), 1000)]);
 
         let counter = TiktokenCounter::default_counter();
-        let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            std::sync::Arc::new(counter),
+        );
         let wrapper = ScratchpadMiddleware::new(
             tools,
             storage.clone(),
@@ -550,7 +584,13 @@ mod tests {
         let tools = HashMap::from([("search_knowledge_base".to_string(), 100)]);
 
         let counter = TiktokenCounter::default_counter();
-        let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            std::sync::Arc::new(counter),
+        );
         let wrapper =
             ScratchpadMiddleware::new(tools, storage, Arc::new(BoundRun::pinned_budget(budget)));
 
@@ -577,7 +617,13 @@ mod tests {
         let tools = HashMap::from([("search_knowledge_base".to_string(), 10)]);
 
         let counter = TiktokenCounter::default_counter();
-        let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            std::sync::Arc::new(counter),
+        );
         let wrapper = ScratchpadMiddleware::new(
             tools,
             storage.clone(),
@@ -617,7 +663,13 @@ mod tests {
 
         // Set threshold to exactly the token count — should be intercepted (>=)
         let tools = HashMap::from([("tool_at_boundary".to_string(), exact_tokens)]);
-        let budget = ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            Arc::new(counter),
+        );
         let wrapper = ScratchpadMiddleware::new(
             tools,
             storage.clone(),
@@ -639,7 +691,13 @@ mod tests {
         // Now test one token below threshold — should pass through
         let tools_above = HashMap::from([("tool_at_boundary".to_string(), exact_tokens + 1)]);
         let counter2 = TiktokenCounter::default_counter();
-        let budget2 = ContextBudget::new(128_000, 0.20, 0, Arc::new(counter2));
+        let budget2 = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            Arc::new(counter2),
+        );
         let wrapper2 = ScratchpadMiddleware::new(
             tools_above,
             storage,
@@ -669,7 +727,13 @@ mod tests {
             .collect::<String>();
         let expected_tokens = counter.count_tokens(&content);
 
-        let budget = ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            Arc::new(counter),
+        );
         let wrapper = ScratchpadMiddleware::new(
             tools,
             storage,
@@ -709,7 +773,13 @@ mod tests {
 
         let tools = HashMap::from([("failing_tool".to_string(), 10)]);
         let counter = TiktokenCounter::default_counter();
-        let budget = ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            Arc::new(counter),
+        );
         let wrapper = ScratchpadMiddleware::new(
             tools,
             storage,
@@ -765,7 +835,13 @@ mod tests {
 
         let tools = HashMap::from([("nested_call".to_string(), 10)]);
         let counter = TiktokenCounter::default_counter();
-        let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            std::sync::Arc::new(counter),
+        );
         let wrapper = ScratchpadMiddleware::new(
             tools,
             storage.clone(),
@@ -831,7 +907,13 @@ mod tests {
         let tools = HashMap::from([("analyze_logs".to_string(), 10)]);
 
         let counter = TiktokenCounter::default_counter();
-        let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            std::sync::Arc::new(counter),
+        );
         let wrapper = ScratchpadMiddleware::new(
             tools,
             storage.clone(),

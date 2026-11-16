@@ -19,6 +19,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::metrics::AgentLabels;
+
 // ============================================================================
 // TokenCounter trait + implementations
 // ============================================================================
@@ -210,6 +212,8 @@ pub enum Fit {
 /// and tokens diverted from the context window by the scratchpad wrapper.
 #[derive(Debug, Clone)]
 pub struct ContextBudget {
+    /// How the agent this budget belongs to is named in its metrics.
+    agent: AgentLabels,
     /// Total model context window in tokens.
     context_window: usize,
     /// Safety margin (0.0–1.0) reserved for model reasoning.
@@ -236,12 +240,14 @@ impl ContextBudget {
     /// `initial_used` is the estimated tokens already consumed by prompts/schemas.
     /// `token_counter` is the provider-specific tokenizer.
     pub fn new(
+        agent: &AgentLabels,
         context_window: usize,
         safety_margin: f32,
         initial_used: usize,
         token_counter: Arc<dyn TokenCounter>,
     ) -> Self {
         Self {
+            agent: agent.clone(),
             context_window,
             safety_margin: safety_margin.clamp(0.0, 0.95),
             initial_used,
@@ -251,6 +257,11 @@ impl ContextBudget {
             tokens_extracted: Arc::new(AtomicUsize::new(0)),
             max_extraction_tokens: None,
         }
+    }
+
+    /// The agent this budget belongs to, as its metrics name it.
+    pub fn agent(&self) -> &AgentLabels {
+        &self.agent
     }
 
     /// Set the per-call extraction token limit.
@@ -270,6 +281,7 @@ impl ContextBudget {
         Self {
             max_extraction_tokens: self.max_extraction_tokens,
             ..Self::new(
+                &self.agent,
                 self.context_window,
                 self.safety_margin,
                 self.initial_used,
@@ -284,6 +296,7 @@ impl ContextBudget {
         Self {
             max_extraction_tokens: self.max_extraction_tokens,
             ..Self::new(
+                &self.agent,
                 self.context_window,
                 self.safety_margin,
                 initial_used,
@@ -566,7 +579,13 @@ mod tests {
 
     #[test]
     fn test_basic_budget() {
-        let budget = ContextBudget::new(100_000, 0.20, 0, test_counter());
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100_000,
+            0.20,
+            0,
+            test_counter(),
+        );
         let usable = budget.usable_budget();
         // f32 precision: 0.20 as f32 -> f64 introduces tiny error
         assert!((79_999..=80_000).contains(&usable));
@@ -575,7 +594,13 @@ mod tests {
 
     #[test]
     fn test_record_usage() {
-        let budget = ContextBudget::new(100_000, 0.20, 0, test_counter());
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100_000,
+            0.20,
+            0,
+            test_counter(),
+        );
         let usable = budget.usable_budget();
         budget.record_usage(10_000);
         assert_eq!(budget.remaining(), usable - 10_000);
@@ -583,7 +608,13 @@ mod tests {
 
     #[test]
     fn test_check_fits_ok() {
-        let budget = ContextBudget::new(100_000, 0.20, 0, test_counter());
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100_000,
+            0.20,
+            0,
+            test_counter(),
+        );
         // 400 chars = ~100 tokens with TestCounter
         let content = "x".repeat(400);
         assert!(budget.check_fits(&content).is_ok());
@@ -591,7 +622,13 @@ mod tests {
 
     #[test]
     fn test_check_fits_exceeded() {
-        let budget = ContextBudget::new(1000, 0.20, 0, test_counter());
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            1000,
+            0.20,
+            0,
+            test_counter(),
+        );
         let usable = budget.usable_budget();
         budget.record_usage(usable - 10);
         // 800 chars = ~200 tokens, but only ~10 remaining
@@ -603,7 +640,13 @@ mod tests {
 
     #[test]
     fn test_try_record_usage_success_and_accumulation() {
-        let budget = ContextBudget::new(100_000, 0.20, 0, test_counter());
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100_000,
+            0.20,
+            0,
+            test_counter(),
+        );
         let usable = budget.usable_budget();
         // 400 chars = 100 tokens with TestCounter
         let content = "x".repeat(400);
@@ -621,7 +664,13 @@ mod tests {
 
     #[test]
     fn test_try_record_usage_exceeds_budget() {
-        let budget = ContextBudget::new(1000, 0.20, 0, test_counter());
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            1000,
+            0.20,
+            0,
+            test_counter(),
+        );
         let usable = budget.usable_budget();
         // Fill most of the budget
         budget.record_usage(usable - 10);
@@ -638,7 +687,13 @@ mod tests {
 
     #[test]
     fn test_count_tokens() {
-        let budget = ContextBudget::new(100_000, 0.20, 0, test_counter());
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100_000,
+            0.20,
+            0,
+            test_counter(),
+        );
         assert_eq!(budget.count_tokens("abcd"), 1);
         assert_eq!(budget.count_tokens("abcdefgh"), 2);
         assert_eq!(budget.count_tokens(""), 0);
@@ -646,7 +701,13 @@ mod tests {
 
     #[test]
     fn test_window_hint_with_baseline() {
-        let budget = ContextBudget::new(100_000, 0.20, 2000, test_counter());
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100_000,
+            0.20,
+            2000,
+            test_counter(),
+        );
         budget.record_usage(3000);
         let hint = budget.window_hint();
         assert!(hint.contains("tokens remaining"));
@@ -657,7 +718,13 @@ mod tests {
 
     #[test]
     fn test_initial_used_reduces_remaining() {
-        let budget = ContextBudget::new(100_000, 0.20, 10_000, test_counter());
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100_000,
+            0.20,
+            10_000,
+            test_counter(),
+        );
         let usable = budget.usable_budget();
         // initial_used is seeded into estimated_used, so remaining is reduced
         assert_eq!(budget.remaining(), usable - 10_000);
@@ -758,8 +825,20 @@ mod tests {
     #[test]
     fn test_per_agent_budgets_are_independent() {
         // Each agent gets its own ContextBudget::new() — verify no shared state
-        let worker1 = ContextBudget::new(100_000, 0.20, 1000, test_counter());
-        let worker2 = ContextBudget::new(100_000, 0.20, 1000, test_counter());
+        let worker1 = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100_000,
+            0.20,
+            1000,
+            test_counter(),
+        );
+        let worker2 = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100_000,
+            0.20,
+            1000,
+            test_counter(),
+        );
 
         worker1.record_usage(5000);
         worker1.record_intercepted(500);
@@ -777,8 +856,20 @@ mod tests {
     #[test]
     fn test_per_agent_different_context_windows() {
         // Workers can have different context windows
-        let worker_small = ContextBudget::new(50_000, 0.20, 1000, test_counter());
-        let worker_large = ContextBudget::new(200_000, 0.20, 1000, test_counter());
+        let worker_small = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            50_000,
+            0.20,
+            1000,
+            test_counter(),
+        );
+        let worker_large = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            200_000,
+            0.20,
+            1000,
+            test_counter(),
+        );
 
         assert!(worker_large.usable_budget() > worker_small.usable_budget());
         assert!(worker_large.remaining() > worker_small.remaining());
@@ -787,7 +878,13 @@ mod tests {
     #[test]
     fn test_set_estimated_used_bumps_up_when_llm_reports_more() {
         // initial_used=1000 → estimated_used starts at 1000.
-        let budget = ContextBudget::new(100_000, 0.20, 1000, test_counter());
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100_000,
+            0.20,
+            1000,
+            test_counter(),
+        );
         let initial_remaining = budget.remaining();
 
         // LLM reports 5000 input + 200 output = 5200 total. That's higher
@@ -806,7 +903,13 @@ mod tests {
 
     #[test]
     fn test_set_estimated_used_does_not_lower_estimate() {
-        let budget = ContextBudget::new(100_000, 0.20, 0, test_counter());
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100_000,
+            0.20,
+            0,
+            test_counter(),
+        );
         // Push usage up via record_usage first.
         budget.record_usage(8000);
         let after_record = budget.remaining();
@@ -825,7 +928,13 @@ mod tests {
     fn test_set_estimated_used_is_independent_of_scratchpad_counters() {
         // LLM ground-truth feedback feeds estimated_used; tokens_intercepted
         // and tokens_extracted are tracked separately and must stay untouched.
-        let budget = ContextBudget::new(100_000, 0.20, 0, test_counter());
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100_000,
+            0.20,
+            0,
+            test_counter(),
+        );
         budget.record_intercepted(500);
         budget.record_extracted(200);
         budget.set_estimated_used(10_000, 1_000);
@@ -837,7 +946,13 @@ mod tests {
     fn test_set_estimated_used_with_zero_is_noop() {
         // First push estimated_used up via record_usage so we can verify
         // that set_estimated_used(0,0) doesn't reset it (max-only update).
-        let budget = ContextBudget::new(100_000, 0.20, 0, test_counter());
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100_000,
+            0.20,
+            0,
+            test_counter(),
+        );
         budget.record_usage(2_000);
         let before = budget.remaining();
         budget.set_estimated_used(0, 0);
@@ -863,7 +978,13 @@ mod tests {
 
     #[test]
     fn fit_reports_the_tokenizer_count_on_both_sides_of_the_allowance() {
-        let budget = ContextBudget::new(1_000, 0.0, 0, test_counter());
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            1_000,
+            0.0,
+            0,
+            test_counter(),
+        );
         let text = "word ".repeat(50);
         let expected = budget.count_tokens(&text);
         assert_eq!(budget.fit(&text, expected), Fit::Fits { tokens: expected });
@@ -879,7 +1000,13 @@ mod tests {
     #[test]
     fn fit_skips_the_tokenizer_past_the_byte_bound() {
         let bound = 10 * MAX_BYTES_PER_TOKEN;
-        let budget = ContextBudget::new(1_000, 0.0, 0, Arc::new(BoundedCounter { max_len: bound }));
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            1_000,
+            0.0,
+            0,
+            Arc::new(BoundedCounter { max_len: bound }),
+        );
         let text = "x".repeat(bound + 1);
         assert_eq!(
             budget.fit(&text, 10),
@@ -900,7 +1027,13 @@ mod tests {
 
     #[test]
     fn try_record_tokens_is_the_atomic_half_of_try_record_usage() {
-        let budget = ContextBudget::new(100, 0.0, 0, test_counter());
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100,
+            0.0,
+            0,
+            test_counter(),
+        );
         assert!(budget.try_record_tokens(60).is_ok());
         let err = budget.try_record_tokens(60).unwrap_err();
         assert_eq!(
@@ -912,7 +1045,13 @@ mod tests {
 
     #[test]
     fn test_count_message_tokens_counts_tool_result_content_not_debug() {
-        let budget = ContextBudget::new(100_000, 0.20, 0, test_counter());
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100_000,
+            0.20,
+            0,
+            test_counter(),
+        );
         let output: String = (0..200)
             .map(|i| format!("{{\"line\": {i}, \"msg\": \"say \\\"hi\\\"\"}}\n"))
             .collect();
@@ -928,7 +1067,13 @@ mod tests {
         use rig::OneOrMany;
         use rig::completion::message::{AssistantContent, Reasoning};
 
-        let budget = ContextBudget::new(100_000, 0.20, 0, test_counter());
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100_000,
+            0.20,
+            0,
+            test_counter(),
+        );
         assert_eq!(
             budget.count_message_tokens(&rig::completion::Message::user("hello there")),
             budget.count_tokens("hello there")
@@ -955,7 +1100,13 @@ mod tests {
 
     #[test]
     fn reset_request_input_stores_rather_than_raising() {
-        let budget = ContextBudget::new(100_000, 0.0, 1_000, test_counter());
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            100_000,
+            0.0,
+            1_000,
+            test_counter(),
+        );
         budget.reset_request_input(50_000);
         assert_eq!(budget.remaining(), 100_000 - 51_000);
         budget.reset_request_input(10_000);

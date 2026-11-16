@@ -392,6 +392,7 @@ impl PreparedAgent {
         ) + mcp_tool_tokens;
 
         let build = scratchpad::build_scratchpad(scratchpad::ScratchpadBuildInputs {
+            agent: build_context.agent_labels(),
             sp_cfg: &sp_cfg,
             storage_dir: std::path::Path::new(&memory_dir),
             read_root: None,
@@ -2555,7 +2556,13 @@ pub(crate) mod test_support {
     /// A scratchpad budget of 128k tokens with a fifth of it reserved.
     pub(crate) fn budget() -> scratchpad::ContextBudget {
         let counter = Arc::new(TiktokenCounter::default_counter());
-        scratchpad::ContextBudget::new(128_000, 0.20, 0, counter)
+        scratchpad::ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            counter,
+        )
     }
 }
 
@@ -3505,7 +3512,13 @@ timeout_secs = 60
                 .unwrap(),
         );
         let counter = TiktokenCounter::default_counter();
-        let sp_budget = scratchpad::ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
+        let sp_budget = scratchpad::ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            Arc::new(counter),
+        );
         let scratchpad = ScratchpadMiddleware::new(
             HashMap::from([("big_tool".to_string(), 10_usize)]),
             storage,
