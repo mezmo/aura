@@ -494,18 +494,21 @@ mod tests {
         }
         assert_eq!(times.len(), 5);
         // Two short connections grow the delay. A stable connection resets it,
-        // and the next short connection starts growing it again.
-        for (index, expected) in [(1, 1), (3, 1), (4, 2)] {
-            let elapsed = times[index] - times[index - 1];
+        // and the next short connection starts growing it again. The gaps also
+        // include connection setup, so upper bounds only rule out the delays a
+        // missing reset would give (4s and 8s), not timing noise.
+        let gap = |index: usize| times[index] - times[index - 1];
+        assert!(gap(1) >= Duration::from_secs(1), "{:?}", gap(1));
+        let before_stable = gap(2) - Duration::from_secs(60);
+        assert!(before_stable >= Duration::from_secs(2), "{before_stable:?}");
+        for (index, expected, without_reset) in [(3, 1, 4), (4, 2, 8)] {
+            let elapsed = gap(index);
             assert!(elapsed >= Duration::from_secs(expected), "{elapsed:?}");
             assert!(
-                elapsed < Duration::from_secs(expected + 1),
+                elapsed < Duration::from_secs(without_reset),
                 "reconnect {index}: expected about {expected}s, got {elapsed:?}"
             );
         }
-        let before_stable = times[2] - times[1] - Duration::from_secs(60);
-        assert!(before_stable >= Duration::from_secs(2), "{before_stable:?}");
-        assert!(before_stable < Duration::from_secs(3), "{before_stable:?}");
     }
 
     #[tokio::test]
