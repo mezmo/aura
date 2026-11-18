@@ -93,6 +93,20 @@ Determine if we should create a secret
 {{- end }}
 
 {{/*
+Container port that serves /metrics: metrics.port when set, else the API port
+*/}}
+{{- define "aura.metricsPort" -}}
+{{- default .Values.server.httpPort .Values.metrics.port }}
+{{- end }}
+
+{{/*
+Name of the Service/container port that serves /metrics
+*/}}
+{{- define "aura.metricsPortName" -}}
+{{- if .Values.metrics.port }}metrics{{ else }}http{{ end }}
+{{- end }}
+
+{{/*
 =======================================================================
 TOML Rendering Helpers
 =======================================================================

@@ -18,6 +18,11 @@ spec:
     metadata:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.metrics.podAnnotations.enabled }}
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: {{ include "aura.metricsPort" . | quote }}
+        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -54,6 +59,11 @@ spec:
             - name: http
               containerPort: {{ .Values.server.httpPort }}
               protocol: TCP
+            {{- if .Values.metrics.port }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+            {{- end }}
           env:
             # Server configuration
             - name: HOST
@@ -84,6 +94,13 @@ spec:
               value: {{ .Values.streaming.emitReasoning | quote }}
             - name: STREAMING_TIMEOUT_SECS
               value: {{ .Values.streaming.timeoutSecs | quote }}
+            # Metrics
+            {{- if .Values.metrics.port }}
+            - name: AURA_METRICS_LISTEN
+              value: {{ printf "%s:%v" .Values.server.host .Values.metrics.port | quote }}
+            {{- end }}
+            - name: AURA_METRICS_OTLP
+              value: {{ .Values.metrics.otlpPush | quote }}
             # Pod identity for instance ID derivation (downward API).
             # POD_NAME and POD_NAMESPACE feed the K8s tier of the env_seed
             # priority chain in aura::instance_id.
