@@ -62,7 +62,7 @@ impl ChatRequest {
 }
 
 /// A run started for a chat request. It holds the request's subscription to
-/// the lane its run landed on, and what the response still needs from the
+/// the lane its run is on, and what the response still needs from the
 /// request.
 pub(crate) struct StartedRun {
     pub(crate) run_id: aura::RunId,
@@ -439,7 +439,7 @@ fn runtime_stream_config(
 }
 
 /// Serves a streaming completion from the runtime. Returns the SSE body and
-/// the chat id for its headers. The request claims the lane its run lands
+/// the chat id for its headers. The request claims the lane its run is
 /// on, with presence, until the body has read the run's ending or the client
 /// stops reading. `run_span` creates the run's `agent.stream` span, as
 /// described on `start_run`.
@@ -490,7 +490,7 @@ pub async fn stream_chat(
 }
 
 /// Serves a non-streaming completion from the runtime. The request claims
-/// the lane its run lands on, without presence, until the run ends. A client
+/// the lane its run is on, without presence, until the run ends. A client
 /// that leaves before then lets go of the claim, and the run goes on to its
 /// ending. `run_span` creates the run's `agent.stream` span, as described on
 /// `start_run`.
@@ -3747,7 +3747,7 @@ source = '{}'
             AgentForRun, AgentRuntime, Attach, RunTarget, RuntimeStores, StartRun,
         };
         use aura::session_store::{RunFacts, RunFilter, RunStatus};
-        use aura::{Conversation, LANES_PER_CONVERSATION, Landing, Lane, LaneNumber};
+        use aura::{Conversation, LANES_PER_CONVERSATION, Lane, LaneNumber, RunSession};
         use aura_events::{EmittingAgent, RunId, SessionId};
         use aura_test_utils::mock_agent::{MockAgent, Step, items};
         use axum::Router;
@@ -4148,13 +4148,13 @@ source = '{}'
                     .await
                     .try_into()
                     .expect("one run for each agent");
-                assert_eq!(run.landing, Landing::Lane(lane(agent, 0)));
+                assert_eq!(run.session, RunSession::Lane(lane(agent, 0)));
             }
             drop((a, b));
             state.runtime.drain(Duration::ZERO).await;
         }
 
-        /// The client's chat id names a conversation. The run lands on one of
+        /// The client's chat id names a conversation. The run takes one of
         /// its lanes, and no run is started on a session named by the chat id
         /// itself.
         #[tokio::test]
@@ -4177,7 +4177,7 @@ source = '{}'
                 .await
                 .try_into()
                 .expect("one run on the conversation");
-            assert_eq!(run.landing, Landing::Lane(lane("solo", 0)));
+            assert_eq!(run.session, RunSession::Lane(lane("solo", 0)));
         }
 
         /// A refusal at the cap is recorded on the run's span, which the

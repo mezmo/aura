@@ -607,7 +607,7 @@ mod tests {
 
     use super::*;
     use crate::config::SessionId;
-    use crate::conversation::Landing;
+    use crate::conversation::RunSession;
     use crate::hitl::{
         AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, PROTOCOL_VERSION,
     };
@@ -1335,7 +1335,7 @@ mod tests {
     fn facts(n: u128, session: &str, status: RunStatus) -> RunFacts {
         RunFacts {
             run_id: run_id(n),
-            landing: Landing::Session(SessionId::new(session).unwrap()),
+            session: RunSession::Plain(SessionId::new(session).unwrap()),
             agent: "agent".to_owned(),
             status,
             liveness: aura_events::run::Liveness::default(),
@@ -1443,7 +1443,7 @@ mod tests {
 
         let math = Conversation::new(SessionId::new("chat-1").unwrap(), "math");
         let on = |n, conversation: &Conversation, lane| RunFacts {
-            landing: Landing::Lane(Lane::new(
+            session: RunSession::Lane(Lane::new(
                 conversation.clone(),
                 LaneNumber::new(lane).unwrap(),
             )),

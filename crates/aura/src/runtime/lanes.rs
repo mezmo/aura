@@ -1,4 +1,4 @@
-//! Picking the lane a conversation's start lands on.
+//! Picking a free lane for a conversation's run.
 
 use std::sync::{Arc, MutexGuard};
 

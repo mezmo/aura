@@ -1,4 +1,4 @@
-//! Lane tests: which lane a conversation's start lands on, why a lane is
+//! Lane tests: which lane a conversation's start takes, why a lane is
 //! busy, starting with an observer attached, and what a run on a lane shows
 //! its agent.
 
@@ -84,7 +84,7 @@ fn assert_stopped_by_a_failed_start(events: &[Arc<SessionEvent>]) {
     }
 }
 
-/// The first start on a conversation lands on its home lane. That lane's
+/// The first start on a conversation takes its home lane. That lane's
 /// session id is built from the chat id, and the chat id itself is not a
 /// session.
 #[tokio::test]
@@ -99,7 +99,7 @@ async fn a_conversations_first_start_lands_on_its_home_lane() {
 
     let home = Lane::home(conversation("c1", "a"));
     assert_eq!(facts.status, RunStatus::Finished);
-    assert_eq!(facts.landing, Landing::Lane(home.clone()));
+    assert_eq!(facts.session, RunSession::Lane(home.clone()));
     assert_eq!(facts.session_id().as_str(), "c1:a:0");
     assert_lane_is_the_agents(&facts);
     assert_eq!(kinds(&h.journal(&home.session_id()).await)[0], "started");
@@ -188,7 +188,7 @@ async fn a_lane_holding_only_an_ended_run_is_taken_again() {
     let second = h.runtime.start(on_chat("c1", "q")).await.unwrap();
     let second = h.ended(second).await;
 
-    assert_eq!(second.landing, first.landing);
+    assert_eq!(second.session, first.session);
     assert_eq!(second.first_seq, first.latest_seq.map(SequenceNumber::next));
 }
 
@@ -331,12 +331,12 @@ async fn two_agents_under_one_chat_id_each_take_their_own_home_lane() {
         .unwrap();
 
     assert_eq!(
-        h.runtime.facts(&a).unwrap().landing,
-        Landing::Lane(Lane::home(conversation("c1", "a")))
+        h.runtime.facts(&a).unwrap().session,
+        RunSession::Lane(Lane::home(conversation("c1", "a")))
     );
     assert_eq!(
-        h.runtime.facts(&b).unwrap().landing,
-        Landing::Lane(Lane::home(conversation("c1", "b")))
+        h.runtime.facts(&b).unwrap().session,
+        RunSession::Lane(Lane::home(conversation("c1", "b")))
     );
     one.notify_one();
     two.notify_one();
@@ -576,7 +576,7 @@ async fn next_event(sub: &mut Subscription) -> Arc<SessionEvent> {
     }
 }
 
-/// A start with an observer returns where the run landed and a
+/// A start with an observer returns the run's session and a
 /// subscription that starts at the observer's own attach event. The attach
 /// event has no run id, because the observer was added before the run
 /// existed, and the run's `Started` comes after it.
@@ -589,7 +589,7 @@ async fn a_claimed_start_attaches_to_its_lane_before_the_run_starts() {
 
     let Admitted {
         run,
-        landing,
+        session,
         mut subscription,
     } = h
         .runtime
@@ -597,8 +597,11 @@ async fn a_claimed_start_attaches_to_its_lane_before_the_run_starts() {
         .await
         .unwrap();
 
-    assert_eq!(landing, Landing::Lane(Lane::home(conversation("c1", "a"))));
-    assert_eq!(landing, h.runtime.facts(&run).unwrap().landing);
+    assert_eq!(
+        session,
+        RunSession::Lane(Lane::home(conversation("c1", "a")))
+    );
+    assert_eq!(session, h.runtime.facts(&run).unwrap().session);
     let mut seen = Vec::new();
     loop {
         let event = next_event(&mut subscription).await;
@@ -613,7 +616,7 @@ async fn a_claimed_start_attaches_to_its_lane_before_the_run_starts() {
     assert_eq!(seen[1].run_id, Some(run));
     assert_eq!(kinds(&seen).last(), Some(&"finished"));
     assert_eq!(
-        h.runtime.observer_counts(&landing.session_id()),
+        h.runtime.observer_counts(&session.id()),
         Some(ObserverCounts {
             collecting: 0,
             claiming: 1,
@@ -623,7 +626,7 @@ async fn a_claimed_start_attaches_to_its_lane_before_the_run_starts() {
     subscription.detach().await;
 }
 
-/// A start with a claiming observer on a named session lands on that
+/// A start with a claiming observer on a named session runs on that
 /// session. It is refused while the session has a claimant or a running
 /// run, and a refused start leaves no observer behind and starts nothing.
 #[tokio::test]
@@ -668,7 +671,7 @@ async fn a_claimed_start_on_a_busy_session_is_refused() {
         .start_attached(on_session("s1", "q"), Attach::claiming())
         .await
         .unwrap();
-    assert_eq!(admitted.landing, Landing::Session(s.clone()));
+    assert_eq!(admitted.session, RunSession::Plain(s.clone()));
     assert_eq!(h.ended(admitted.run).await.status, RunStatus::Finished);
     assert_eq!(*h.preparer.prepared.lock().unwrap(), ["a", "a"]);
     admitted.subscription.detach().await;

@@ -60,7 +60,7 @@ pub use builder::{
     build_streaming_agent, build_streaming_agent_with_tools, no_run_tools,
 };
 pub use config::{AgentBuildContext, RunId, SessionId, ToolContextFactory};
-pub use conversation::{Conversation, LANES_PER_CONVERSATION, Landing, Lane, LaneNumber};
+pub use conversation::{Conversation, LANES_PER_CONVERSATION, Lane, LaneNumber, RunSession};
 // Pure config types are owned by `aura-config` and re-exported here for
 // ergonomic consumption (`aura::LlmConfig`, etc.).
 pub use aura_config::{
