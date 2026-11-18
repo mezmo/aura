@@ -218,8 +218,8 @@ async fn execute(
     // The agent, the skill log and the span see the chat id, not the lane's
     // session id, so all lanes of a conversation share them. The journal,
     // the run store and the claim stay on the lane's session.
-    let landing = record.facts().landing;
-    let chat = landing.lane().map_or_else(
+    let run_session = record.facts().session;
+    let chat = run_session.lane().map_or_else(
         || session.id.clone(),
         |lane| lane.conversation().chat().clone(),
     );
@@ -330,7 +330,7 @@ async fn execute(
         model: model.to_owned(),
         run: record.id,
         session: chat,
-        lane: landing.lane().map(|lane| lane.number()),
+        lane: run_session.lane().map(|lane| lane.number()),
         prompt: prompt.clone(),
         user: user.filter(|user| !user.is_empty()),
         metadata_json: metadata

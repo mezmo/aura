@@ -50,7 +50,7 @@ use crate::session_store::{
     RunFilter, RunStatus, RunStore, SessionStoreError, SkillInvocationStore,
 };
 
-pub use crate::conversation::Landing;
+pub use crate::conversation::RunSession;
 pub use observe::{Attach, AttachError, ObserverCounts, Subscription};
 pub use otel::record_ending;
 #[cfg(feature = "test-support")]
@@ -194,7 +194,7 @@ impl AgentRuntime {
     /// gets a new session. A session runs one run at a time, so a start on a
     /// named session with a live run is refused with that run's id; the
     /// agent may change from one run to the next. A start on a conversation
-    /// lands on one of its lanes, picked by `Shared::admit_lane`. Once
+    /// takes one of its lanes, picked by `Shared::admit_lane`. Once
     /// [`drain`](Self::drain) has begun, every start is refused.
     pub async fn start(&self, start: StartRun) -> Result<RunId, StartError> {
         let launched = self.launch(start, |_, _| Ok(())).await?;
@@ -202,8 +202,8 @@ impl AgentRuntime {
     }
 
     /// Starts a run as [`start`](Self::start) does, attaches an observer as
-    /// `how` says to the session the run lands on, and returns the run's id,
-    /// where it landed, and the observer's subscription.
+    /// `how` says to the session the run is on, and returns the run's id,
+    /// its session, and the observer's subscription.
     ///
     /// The observer is added in the same hold of `admission` that picks the
     /// session, so no other start or claim can get in between. A claim on a
@@ -227,7 +227,7 @@ impl AgentRuntime {
         let Launched {
             record,
             session,
-            landing,
+            run_session,
             joined: write,
         } = self
             .launch(start, |state, session| {
@@ -250,7 +250,7 @@ impl AgentRuntime {
         let subscription = registered.write_attach(observer, how.from).await?;
         Ok(Admitted {
             run,
-            landing,
+            session: run_session,
             subscription,
         })
     }
@@ -280,23 +280,23 @@ impl AgentRuntime {
         // two starts on one session cannot both find it idle. Nothing below
         // awaits before the spawn. So a caller that drops this future cannot
         // leave the session holding a run that no task will finish.
-        let (_admitted, session, landing) = match &start.target {
+        let (_admitted, session, run_session) = match &start.target {
             RunTarget::Fresh => {
                 let id = new_session_id();
                 let (admitted, session) = self.shared.admit(&id).await?;
-                (admitted, session, Landing::Session(id))
+                (admitted, session, RunSession::Plain(id))
             }
             // The id is admitted as it is, even when it is a lane's session
             // id such as `c1:a:0`. The run then runs on that lane's session,
             // but its facts record a plain session, with no lane.
             RunTarget::Session(id) => {
                 let (admitted, session) = self.shared.admit(id).await?;
-                (admitted, session, Landing::Session(id.clone()))
+                (admitted, session, RunSession::Plain(id.clone()))
             }
             RunTarget::Conversation { chat } => {
                 let conversation = Conversation::new(chat.clone(), config.agent_id());
                 let (admitted, session, lane) = self.shared.admit_lane(&conversation).await?;
-                (admitted, session, Landing::Lane(lane))
+                (admitted, session, RunSession::Lane(lane))
             }
         };
         let run_id = RunId::mint();
@@ -308,7 +308,7 @@ impl AgentRuntime {
             let joined = join(&mut state, &session)?;
             let record = Arc::new(RunRecord::new(RunFacts {
                 run_id,
-                landing: landing.clone(),
+                session: run_session.clone(),
                 agent: config.agent_id().to_owned(),
                 status: RunStatus::Preparing,
                 liveness: start.liveness,
@@ -344,7 +344,7 @@ impl AgentRuntime {
         Ok(Launched {
             record,
             session,
-            landing,
+            run_session,
             joined,
         })
     }
@@ -719,7 +719,7 @@ impl From<Refused> for AttachError {
 struct Launched<T> {
     record: Arc<RunRecord>,
     session: Arc<SessionRecord>,
-    landing: Landing,
+    run_session: RunSession,
     /// What the start's `join` returned.
     joined: T,
 }

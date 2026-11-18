@@ -8,7 +8,7 @@ use aura_events::{RunId, SessionId};
 use rig::completion::Message;
 
 use crate::builder::{ClientTool, RunToolFactory, no_run_tools};
-use crate::conversation::{Conversation, LANES_PER_CONVERSATION, Landing, LaneNumber};
+use crate::conversation::{Conversation, LANES_PER_CONVERSATION, LaneNumber, RunSession};
 use crate::session_store::SessionStoreError;
 
 use super::observe::Subscription;
@@ -38,7 +38,7 @@ pub struct StartRun {
     pub span: tracing::Span,
 }
 
-/// The session a start lands on.
+/// The session a start asks for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RunTarget {
@@ -182,11 +182,11 @@ fn busy_lanes(lanes: &[BusyLane]) -> String {
         .join("; ")
 }
 
-/// A run started with an observer attached to the session it landed on.
+/// A run started with an observer attached to its session.
 #[derive(Debug)]
 #[must_use = "dropping the subscription detaches the observer"]
 pub struct Admitted {
     pub run: RunId,
-    pub landing: Landing,
+    pub session: RunSession,
     pub subscription: Subscription,
 }

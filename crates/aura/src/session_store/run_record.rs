@@ -9,7 +9,7 @@ use aura_events::run::{CheckpointRef, Liveness};
 use aura_events::{RunId, SequenceNumber, SessionId, Timestamp, TokenUsage};
 use serde::{Deserialize, Serialize};
 
-use crate::conversation::{Conversation, Landing, Lane};
+use crate::conversation::{Conversation, Lane, RunSession};
 use crate::hitl::DecisionId;
 
 /// The most runs a default [`RunFilter`] lists.
@@ -20,7 +20,7 @@ pub const DEFAULT_RUN_LIST_LIMIT: usize = 100;
 pub struct RunFacts {
     pub run_id: RunId,
     /// The session the run is on.
-    pub landing: Landing,
+    pub session: RunSession,
     /// The agent that runs, by its `Config::agent_id`.
     pub agent: String,
     pub status: RunStatus,
@@ -46,12 +46,12 @@ impl RunFacts {
     /// The id of the session the run is on. For a run on a lane, this is
     /// the lane's session id, not the chat id.
     pub fn session_id(&self) -> SessionId {
-        self.landing.session_id()
+        self.session.id()
     }
 
     /// The conversation's lane the run is on, if it is on one.
     pub fn lane(&self) -> Option<&Lane> {
-        self.landing.lane()
+        self.session.lane()
     }
 }
 
@@ -111,9 +111,9 @@ impl RunFilter {
         let waiting = !facts.pending_approvals.is_empty();
         self.session
             .as_ref()
-            .is_none_or(|session| match &facts.landing {
-                Landing::Session(id) => id == session,
-                Landing::Lane(lane) => lane.session_id() == *session,
+            .is_none_or(|session| match &facts.session {
+                RunSession::Plain(id) => id == session,
+                RunSession::Lane(lane) => lane.session_id() == *session,
             })
             && self.conversation.as_ref().is_none_or(|conversation| {
                 facts
@@ -147,7 +147,7 @@ mod tests {
     fn facts_round_trip_through_json() {
         let facts = RunFacts {
             run_id: RunId::mint(),
-            landing: Landing::Lane(Lane::new(
+            session: RunSession::Lane(Lane::new(
                 Conversation::new(SessionId::new("chat-1").unwrap(), "math"),
                 LaneNumber::new(2).unwrap(),
             )),
@@ -169,11 +169,11 @@ mod tests {
         assert!(json.contains(r#""status":"parked""#), "{json}");
 
         let on_session = RunFacts {
-            landing: Landing::Session(SessionId::new("sess-1").unwrap()),
+            session: RunSession::Plain(SessionId::new("sess-1").unwrap()),
             ..facts
         };
         let json = serde_json::to_string(&on_session).unwrap();
         assert_eq!(serde_json::from_str::<RunFacts>(&json).unwrap(), on_session);
-        assert!(json.contains(r#""landing":{"session":"sess-1"}"#), "{json}");
+        assert!(json.contains(r#""session":{"plain":"sess-1"}"#), "{json}");
     }
 }

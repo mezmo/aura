@@ -103,27 +103,27 @@ impl Lane {
     }
 }
 
-/// The session a run landed on: a plain session, or a lane of a
+/// The session a run is on: a plain session, or a lane of a
 /// conversation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
-pub enum Landing {
-    Session(SessionId),
+pub enum RunSession {
+    Plain(SessionId),
     Lane(Lane),
 }
 
-impl Landing {
-    pub fn session_id(&self) -> SessionId {
+impl RunSession {
+    pub fn id(&self) -> SessionId {
         match self {
-            Self::Session(id) => id.clone(),
+            Self::Plain(id) => id.clone(),
             Self::Lane(lane) => lane.session_id(),
         }
     }
 
     pub fn lane(&self) -> Option<&Lane> {
         match self {
-            Self::Session(_) => None,
+            Self::Plain(_) => None,
             Self::Lane(lane) => Some(lane),
         }
     }

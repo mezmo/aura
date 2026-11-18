@@ -1994,7 +1994,7 @@ async fn a_panicking_run_fails_and_frees_its_session() {
 fn preparing(run_id: RunId) -> RunFacts {
     RunFacts {
         run_id,
-        landing: Landing::Session(SessionId::new("s1").unwrap()),
+        session: RunSession::Plain(SessionId::new("s1").unwrap()),
         agent: "a".to_owned(),
         status: RunStatus::Preparing,
         liveness: Liveness::default(),
