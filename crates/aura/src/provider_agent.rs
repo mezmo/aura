@@ -17,6 +17,7 @@ use rig::streaming::{StreamingChat, StreamingPrompt};
 use std::collections::HashSet;
 use std::pin::Pin;
 
+use crate::metered_tool::MeteredTool;
 use crate::scratchpad::ContextBudget;
 use crate::streaming_request_hook::StreamingRequestHook;
 use aura_events::agent::AgentEvent;
@@ -314,6 +315,7 @@ impl ProviderAgent {
     /// Stream a prompt with timeout and cancellation support.
     ///
     /// Returns the run: its stream, the token that cancels it, and its usage.
+    #[allow(clippy::too_many_arguments)]
     pub async fn stream_prompt_with_timeout(
         &self,
         query: &str,
@@ -780,7 +782,9 @@ fn map_stream_item<R: rig::completion::GetTokenUsage>(
 /// Rig JSON-encodes a tool's output and passes a call's error as its plain
 /// display text, which is never JSON. A string output is decoded to its text;
 /// any other JSON output is kept as it is.
-fn read_tool_result(content: &rig::OneOrMany<ToolResultContent>) -> (String, ToolResultKind) {
+pub(crate) fn read_tool_result(
+    content: &rig::OneOrMany<ToolResultContent>,
+) -> (String, ToolResultKind) {
     let mut kind = ToolResultKind::Text;
     let text = content
         .iter()
@@ -808,11 +812,15 @@ fn read_tool_result(content: &rig::OneOrMany<ToolResultContent>) -> (String, Too
     (text, kind)
 }
 
-/// Builder state enum for handling AgentBuilder type transitions.
-///
-/// After the first `.tool()` call, `AgentBuilder<M>` transitions to
-/// `AgentBuilderSimple<M>`. This enum handles both states uniformly.
-pub(crate) enum BuilderState<M: CompletionModel> {
+/// A rig agent builder together with the labels of the agent it builds.
+pub(crate) struct BuilderState<M: CompletionModel> {
+    agent: crate::metrics::AgentLabels,
+    inner: Inner<M>,
+}
+
+/// The rig builder's state: after the first `.tool()` call, `AgentBuilder<M>`
+/// transitions to `AgentBuilderSimple<M>`, and this handles both uniformly.
+enum Inner<M: CompletionModel> {
     Initial(AgentBuilder<M>),
     WithTools(AgentBuilderSimple<M>),
 }
@@ -821,36 +829,54 @@ impl<M> BuilderState<M>
 where
     M: CompletionModel + Send + Sync,
 {
+    /// `agent` is how the agent's tool metrics name it, the same labels its
+    /// inference metrics use.
+    pub fn new(agent: &crate::metrics::AgentLabels, builder: AgentBuilder<M>) -> Self {
+        Self {
+            agent: agent.clone(),
+            inner: Inner::Initial(builder),
+        }
+    }
+
     /// Add a tool to the agent builder.
     pub fn add_tool<T>(self, tool: T) -> BuilderState<M>
     where
         T: rig::tool::Tool + Send + Sync + 'static,
     {
-        match self {
-            BuilderState::Initial(builder) => BuilderState::WithTools(builder.tool(tool)),
-            BuilderState::WithTools(builder) => BuilderState::WithTools(builder.tool(tool)),
-        }
+        self.add_tools_dyn(vec![Box::new(tool)])
     }
 
     /// Add multiple dynamic tools to the agent builder.
     ///
     /// This accepts pre-boxed `ToolDyn` objects, which is useful for adding
-    /// tools from external crates that implement `rig::tool::Tool`.
+    /// tools from external crates that implement `rig::tool::Tool`. Each
+    /// tool is registered behind a [`MeteredTool`] under this agent's name,
+    /// so every call it gets lands in the tool-execution metric.
     pub fn add_tools_dyn(self, tools: Vec<Box<dyn rig::tool::ToolDyn>>) -> BuilderState<M> {
         if tools.is_empty() {
             return self;
         }
-        match self {
-            BuilderState::Initial(builder) => BuilderState::WithTools(builder.tools(tools)),
-            BuilderState::WithTools(builder) => BuilderState::WithTools(builder.tools(tools)),
+        let tools = tools
+            .into_iter()
+            .map(|tool| {
+                Box::new(MeteredTool::new(self.agent.clone(), tool)) as Box<dyn rig::tool::ToolDyn>
+            })
+            .collect();
+        let inner = match self.inner {
+            Inner::Initial(builder) => Inner::WithTools(builder.tools(tools)),
+            Inner::WithTools(builder) => Inner::WithTools(builder.tools(tools)),
+        };
+        Self {
+            agent: self.agent,
+            inner,
         }
     }
 
     /// Build the final agent.
     pub fn build(self) -> rig::agent::Agent<M> {
-        match self {
-            BuilderState::Initial(builder) => builder.build(),
-            BuilderState::WithTools(builder) => builder.build(),
+        match self.inner {
+            Inner::Initial(builder) => builder.build(),
+            Inner::WithTools(builder) => builder.build(),
         }
     }
 }

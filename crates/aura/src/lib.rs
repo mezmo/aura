@@ -23,6 +23,8 @@ pub mod instance_id;
 pub mod journal;
 pub mod logging;
 pub mod mcp;
+mod metered_tool;
+pub mod metrics;
 #[cfg(feature = "otel")]
 pub mod openinference_exporter;
 pub mod orchestration;

@@ -151,7 +151,7 @@ impl ReadArtifactTool {
             }
         };
 
-        let tokens = match check_and_record_budget(&budget, &content) {
+        let tokens = match check_and_record_budget(&budget, Self::NAME, &content) {
             Ok(()) => return content,
             Err(check) => check.tokens(),
         };
@@ -592,6 +592,7 @@ mod tests {
     /// A standard 128k-window budget with the given per-call extraction limit.
     fn test_budget(max_extraction_tokens: usize) -> ContextBudget {
         ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
             128_000,
             0.20,
             0,
@@ -963,8 +964,14 @@ mod tests {
         let content: String = (0..60).map(|i| format!("entry number {i}\n")).collect();
         let counter = TiktokenCounter::default_counter();
         let tokens = counter.count_tokens(&content);
-        let budget = ContextBudget::new(tokens * 5 / 2, 0.0, 0, Arc::new(counter))
-            .with_max_extraction_tokens(tokens + 1);
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            tokens * 5 / 2,
+            0.0,
+            0,
+            Arc::new(counter),
+        )
+        .with_max_extraction_tokens(tokens + 1);
         let (tool, _dir) = setup_budgeted_tool(&content, budget.clone()).await;
 
         assert_eq!(read_result(&tool).await.content, content);
@@ -987,6 +994,7 @@ mod tests {
     /// A budget with `room` tokens left and no per-read cap.
     fn budget_with_room(room: usize) -> ContextBudget {
         ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
             100_000,
             0.0,
             100_000 - room,
@@ -1032,6 +1040,7 @@ mod tests {
     async fn test_budgeted_read_rejects_huge_content_without_tokenizing() {
         let big = "x".repeat(2_000_000);
         let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
             128_000,
             0.20,
             0,
@@ -1097,6 +1106,7 @@ mod tests {
             .await
             .unwrap();
         let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
             128_000,
             0.20,
             0,

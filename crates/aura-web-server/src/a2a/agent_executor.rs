@@ -29,6 +29,7 @@ use crate::{
     a2a::{LEGACY_PROTOCOL_VERSION, SharedTaskStore},
     types::{ActiveRequestGuard, AppState},
 };
+use aura::metrics::{AgentRole, Ingress, RunMeasure};
 
 const PLAIN_TEXT: &str = "text/plain";
 
@@ -243,6 +244,8 @@ impl AgentExecutor for AuraAgentExecutor {
         let pending_approvals = self.app_state.pending_approvals.clone();
         let hitl_hmac = self.app_state.hitl_webhook_hmac.clone();
         let run_tools = self.app_state.run_tools(&config);
+        let agent_name = config.agent.name.clone();
+        let orchestration = config.orchestration_enabled();
         let mut append_tracker: HashMap<(String, String, String), bool> = HashMap::new();
 
         // The run is polled inside this span, so its log lines, the agent's
@@ -341,6 +344,7 @@ impl AgentExecutor for AuraAgentExecutor {
 
             // A2A tasks have their own lifetime, so the run is unbounded here and
             // ends on cancelTask or shutdown.
+            let started = std::time::Instant::now();
             let run = agent
                 .stream(
                     &text,
@@ -350,6 +354,7 @@ impl AgentExecutor for AuraAgentExecutor {
                     &request_id,
                 )
                 .await;
+            let usage = run.usage().clone();
             let mut stream = run.into_events();
 
             // RAII guard: drop on any generator exit (loop break, early return, panic,
@@ -357,7 +362,7 @@ impl AgentExecutor for AuraAgentExecutor {
             // increment/decrement pair that previously raced with cancel() — a fast
             // cancel before this line, or a cancel mid-loop followed by natural
             // loop-exit cleanup, could double-decrement and wrap the counter.
-            let _request_guard = ActiveRequestGuard::new(active_request_tracker);
+            let _request_guard = ActiveRequestGuard::new(active_request_tracker, Ingress::A2a);
 
             let mut success = true; // assume everything is successful
 
@@ -555,6 +560,25 @@ impl AgentExecutor for AuraAgentExecutor {
                 &task_cancel_state,
                 &task_id,
             );
+            let error_type = if !success {
+                Some("stream_error")
+            } else if stopped_by_cancel && stream_shutdown_token.is_cancelled() {
+                Some("shutdown")
+            } else if stopped_by_cancel {
+                Some("cancelled")
+            } else {
+                None
+            };
+            aura::metrics::record_run(RunMeasure {
+                agent: &agent_name,
+                ingress: Ingress::A2a,
+                role: AgentRole::Main,
+                orchestration,
+                error_type,
+                duration: started.elapsed(),
+                inference_calls: Some(usage.llm_turns()),
+                tool_calls: (!orchestration).then(|| usage.tool_calls()),
+            });
 
             // Shutdown is the one cancel the executor cleans up after itself;
             // `cancel()` drives its own.

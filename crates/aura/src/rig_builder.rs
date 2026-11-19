@@ -94,6 +94,7 @@ impl RigBuilder {
 
         AgentBuildContext {
             llm: self.config.agent.llm.clone(),
+            config_agent: agent.name.clone(),
             agent,
             vector_stores: self.config.vector_stores.clone(),
             mcp: self.config.mcp.clone(),

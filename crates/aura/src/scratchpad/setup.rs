@@ -31,6 +31,8 @@ pub struct ScratchpadBuildInputs<'a> {
     pub token_counter: Arc<dyn TokenCounter>,
     /// The prepared agent's run slot.
     pub run: Arc<BoundRun>,
+    /// How the agent's metrics name it.
+    pub agent: crate::metrics::AgentLabels,
 }
 
 /// Output of `build_scratchpad`.
@@ -50,6 +52,7 @@ pub async fn build_scratchpad(
     inputs: ScratchpadBuildInputs<'_>,
 ) -> std::io::Result<ScratchpadBuild> {
     let budget = ContextBudget::new(
+        &inputs.agent,
         inputs.context_window,
         inputs.sp_cfg.context_safety_margin,
         inputs.initial_used,
@@ -286,6 +289,7 @@ mod tests {
         let run = Arc::new(BoundRun::default());
 
         let build = build_scratchpad(ScratchpadBuildInputs {
+            agent: crate::metrics::AgentLabels::main("test"),
             sp_cfg: &sp_cfg,
             storage_dir: tmp.path(),
             read_root: None,

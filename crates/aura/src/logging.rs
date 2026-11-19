@@ -316,14 +316,14 @@ fn ensure_operational_warnings(filter: EnvFilter) -> EnvFilter {
 ///
 /// Scheme comparison is case-insensitive because URI schemes are.
 #[cfg(feature = "otel")]
-fn endpoint_uses_tls(endpoint: &str) -> bool {
+pub(crate) fn endpoint_uses_tls(endpoint: &str) -> bool {
     endpoint.trim().to_ascii_lowercase().starts_with("https://")
 }
 
 /// Wire protocol carrying spans to the collector.
 #[cfg(feature = "otel")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OtlpProtocol {
+pub(crate) enum OtlpProtocol {
     Grpc,
     HttpProtobuf,
 }
@@ -342,14 +342,20 @@ fn parse_otlp_protocol(value: &str) -> Option<OtlpProtocol> {
     }
 }
 
-/// Resolve the export protocol from the environment, defaulting to gRPC.
-///
-/// `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` wins over the generic
-/// `OTEL_EXPORTER_OTLP_PROTOCOL`. An unrecognised value warns and falls back
-/// rather than dropping traces silently.
+/// Resolve the span export protocol from the environment, defaulting to gRPC.
 #[cfg(feature = "otel")]
 fn resolve_otlp_protocol() -> OtlpProtocol {
-    let configured = std::env::var("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
+    resolve_otlp_protocol_from("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
+}
+
+/// Resolve an export protocol from the environment, defaulting to gRPC.
+///
+/// The signal-specific variable `signal_var` wins over the generic
+/// `OTEL_EXPORTER_OTLP_PROTOCOL`. An unrecognised value warns and falls back
+/// rather than dropping the signal silently.
+#[cfg(feature = "otel")]
+pub(crate) fn resolve_otlp_protocol_from(signal_var: &str) -> OtlpProtocol {
+    let configured = std::env::var(signal_var)
         .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL"))
         .ok();
 

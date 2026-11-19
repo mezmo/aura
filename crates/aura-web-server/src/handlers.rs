@@ -30,6 +30,7 @@ use crate::streaming::{
     collect_stream_to_completion, process_sse_stream_full, sse_body,
 };
 use crate::types::*;
+use aura::metrics::{AgentRole, Ingress, RunMeasure};
 
 // ---------------------------------------------------------------------------
 // The runtime-backed chat path.
@@ -1149,13 +1150,15 @@ pub async fn execute_completion(
     config: CompletionConfig,
     delivery: DeliveryMode,
 ) {
-    let _active_guard = ActiveRequestGuard::new(config.active_requests.clone());
+    let _active_guard = ActiveRequestGuard::new(config.active_requests.clone(), Ingress::Http);
 
     let _resource_guard =
         RequestResourceGuard::new(config.request_id.clone(), config.pending_approvals.clone());
 
     let invocation_parameters = aura::logging::llm_invocation_parameters(&setup.config.agent.llm);
     let orchestration_enabled = setup.config.orchestration_enabled();
+    let agent_name = setup.config.agent.name.clone();
+    let started = std::time::Instant::now();
 
     // Destructure to move chat_history instead of cloning
     let RequestSetup {
@@ -1270,6 +1273,20 @@ pub async fn execute_completion(
     };
 
     otel_ctx.record_output(&termination);
+    aura::metrics::record_run(RunMeasure {
+        agent: &agent_name,
+        ingress: Ingress::Http,
+        role: AgentRole::Main,
+        orchestration: orchestration_enabled,
+        error_type: termination.error_type(),
+        duration: started.elapsed(),
+        inference_calls: Some(usage_state.llm_turns()),
+        // An orchestrated run gets no per-run tool count: the hook that
+        // counts them is only on a single agent's stream, and worker and
+        // coordinator tool calls are measured per tool in
+        // gen_ai.execute_tool.duration instead.
+        tool_calls: (!orchestration_enabled).then(|| usage_state.tool_calls()),
+    });
 
     match &termination {
         StreamTermination::Complete => {
