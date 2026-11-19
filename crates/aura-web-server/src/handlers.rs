@@ -540,7 +540,7 @@ pub async fn complete_chat(
             let billed = state
                 .runtime
                 .facts(&run_id)
-                .map(|facts| facts.usage)
+                .map(|facts| facts.run.usage)
                 .unwrap_or_default();
             (
                 billed.prompt_tokens.get(),
@@ -3805,7 +3805,7 @@ source = '{}'
                     let runs = runs_of(state, agent).await;
                     if runs
                         .iter()
-                        .filter(|run| run.status == RunStatus::Running)
+                        .filter(|facts| facts.run.status == RunStatus::Running)
                         .count()
                         == count
                     {
@@ -4556,8 +4556,11 @@ source = '{}'
             let ended = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     let runs = runs_of(&state, "solo").await;
-                    if runs.iter().all(|run| run.status.is_terminal()) {
-                        return runs.iter().map(|run| run.status).collect::<Vec<_>>();
+                    if runs.iter().all(|facts| facts.run.status.is_terminal()) {
+                        return runs
+                            .iter()
+                            .map(|facts| facts.run.status)
+                            .collect::<Vec<_>>();
                     }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }

@@ -152,8 +152,8 @@ fn fail_without_ending(shared: &Shared, session: &SessionRecord, record: &RunRec
     state.retained += 1;
     state.last_run = Some((record.id, RunStatus::Failed));
     record.update(|facts| {
-        facts.status = RunStatus::Failed;
-        facts.ended_at = Some(aura_events::Timestamp::now());
+        facts.run.status = RunStatus::Failed;
+        facts.run.ended_at = Some(aura_events::Timestamp::now());
     });
     record.unbind_context();
 }
@@ -439,9 +439,9 @@ async fn execute(
             }
         };
         record.update(|facts| {
-            facts.status = RunStatus::Running;
-            facts.first_event = Some(started.seq);
-            facts.latest_event = Some(started.seq);
+            facts.run.status = RunStatus::Running;
+            facts.run.first_event = Some(started.seq);
+            facts.run.latest_event = Some(started.seq);
         });
         put_facts(shared, record).await;
 
@@ -570,7 +570,7 @@ async fn drive(
                 }
                 if pending_changed {
                     let pending = approvals.pending.clone();
-                    record.update(|facts| facts.pending_approvals = pending);
+                    record.update(|facts| facts.run.pending_approvals = pending);
                     put_facts(shared, record).await;
                 }
             }
@@ -696,7 +696,7 @@ async fn append_agent_event(
     let stamped = journal
         .append(Some(record.id), SessionEventPayload::Agent(event))
         .await?;
-    record.update(|facts| facts.latest_event = Some(stamped.seq));
+    record.update(|facts| facts.run.latest_event = Some(stamped.seq));
     Ok(stamped)
 }
 
@@ -967,13 +967,13 @@ async fn journal_ending(
         .ok();
 
     let mut facts = record.facts();
-    facts.status = status;
-    facts.ended_at = Some(aura_events::Timestamp::now());
-    facts.usage = usage;
-    facts.pending_approvals = waiting.unwrap_or_default();
-    facts.checkpoint = checkpoint;
+    facts.run.status = status;
+    facts.run.ended_at = Some(aura_events::Timestamp::now());
+    facts.run.usage = usage;
+    facts.run.pending_approvals = waiting.unwrap_or_default();
+    facts.run.checkpoint = checkpoint;
     if let Some(stamped) = &stamped {
-        facts.latest_event = Some(stamped.seq);
+        facts.run.latest_event = Some(stamped.seq);
     }
     (stamped, facts)
 }
@@ -1005,7 +1005,7 @@ async fn release(
     {
         let mut state = session.lock();
         free(shared, &mut state, record);
-        state.last_run = Some((record.id, facts.status));
+        state.last_run = Some((record.id, facts.run.status));
         if retained {
             state.retained += 1;
         }

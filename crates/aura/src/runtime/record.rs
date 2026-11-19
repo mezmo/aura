@@ -263,7 +263,7 @@ enum Ending {
 impl RunRecord {
     pub(super) fn new(facts: RunFacts) -> Self {
         Self {
-            id: facts.run_id,
+            id: facts.run.run_id,
             cancel: CancellationToken::new(),
             stops: Mutex::new(Stops::default()),
             usage: OnceLock::new(),
@@ -317,17 +317,17 @@ impl RunRecord {
     }
 
     pub(super) fn liveness(&self) -> Liveness {
-        self.facts.borrow().liveness
+        self.facts.borrow().run.liveness
     }
 
     /// The run's facts. A live run's usage is read from its counters now,
     /// since the stored facts only get usage once the run ends.
     pub(super) fn facts(&self) -> RunFacts {
         let mut facts = self.facts.borrow().clone();
-        if !facts.status.is_terminal()
+        if !facts.run.status.is_terminal()
             && let Some(usage) = self.usage.get()
         {
-            facts.usage = token_usage(usage);
+            facts.run.usage = token_usage(usage);
         }
         facts
     }

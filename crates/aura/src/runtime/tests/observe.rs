@@ -123,7 +123,7 @@ async fn a_subscription_reads_the_sessions_stream_from_its_cursor() {
     let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
     let facts = h.ended(run).await;
     assert_eq!(
-        facts.status,
+        facts.run.status,
         RunStatus::Finished,
         "the claim held through the run"
     );
@@ -238,7 +238,7 @@ async fn a_run_started_under_a_claim_sees_it_from_the_start() {
     assert_eq!(worker.attendance(), attended);
 
     gate.notify_one();
-    assert_eq!(h.ended(run).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Finished);
     claim.detach().await;
 }
 
@@ -263,12 +263,15 @@ async fn a_live_run_whose_last_claimant_leaves_is_cancelled_as_unclaimed() {
 
     collector.detach().await;
     assert!(context.attendance().claimed);
-    assert_eq!(h.runtime.facts(&run).unwrap().status, RunStatus::Running);
+    assert_eq!(
+        h.runtime.facts(&run).unwrap().run.status,
+        RunStatus::Running
+    );
 
     claim.detach().await;
     assert!(!context.attendance().claimed);
     let facts = h.ended(run).await;
-    assert_eq!(facts.status, RunStatus::Cancelled);
+    assert_eq!(facts.run.status, RunStatus::Cancelled);
 
     let events = h.journal(&s).await;
     assert_eq!(
@@ -324,10 +327,13 @@ async fn a_run_under_continue_outlives_its_claimant() {
 
     claim.detach().await;
     h.journaled(&s, "claims_exhausted").await;
-    assert_eq!(h.runtime.facts(&run).unwrap().status, RunStatus::Running);
+    assert_eq!(
+        h.runtime.facts(&run).unwrap().run.status,
+        RunStatus::Running
+    );
 
     gate.notify_one();
-    assert_eq!(h.ended(run).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Finished);
 }
 
 /// Attaching and detaching during a run update the run's context at once.
@@ -362,7 +368,7 @@ async fn attaching_mid_run_reaches_the_runs_context() {
     assert!(context.attendance().claimed);
 
     claim.detach().await;
-    assert_eq!(h.ended(run).await.status, RunStatus::Cancelled);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Cancelled);
     let events = h.journal(&s).await;
     let attaches: Vec<_> = events
         .iter()
@@ -452,7 +458,7 @@ async fn a_reopened_fenced_session_keeps_its_observers() {
         .await
         .unwrap();
     let fenced = h.runtime.start(on_session("s1", "q")).await.unwrap();
-    assert_eq!(h.ended(fenced).await.status, RunStatus::Failed);
+    assert_eq!(h.ended(fenced).await.run.status, RunStatus::Failed);
 
     match h.runtime.attach(&s, Attach::claiming()).await {
         Err(AttachError::AlreadyClaimed { by }) => assert_eq!(by, claim.observer().id),
@@ -472,7 +478,7 @@ async fn a_reopened_fenced_session_keeps_its_observers() {
     assert_eq!(seen, ["observer_attached", "text_delta", "started"]);
 
     claim.detach().await;
-    assert_eq!(h.ended(run).await.status, RunStatus::Cancelled);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Cancelled);
     let events = h.journal(&s).await;
     let tail: Vec<_> = kinds(&events).into_iter().rev().take(4).collect();
     assert_eq!(
@@ -515,7 +521,7 @@ async fn a_claimant_leaving_as_the_run_ends_does_not_name_it() {
     claim.detach().await;
     gate.notify_one();
 
-    assert_eq!(h.ended(run).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Finished);
     let events = h.journal(&s).await;
     assert_eq!(
         kinds(&events),
@@ -706,7 +712,7 @@ async fn a_stalled_attach_does_not_hold_up_a_start() {
 
     gate.notify_one();
     let claim = attach.await.unwrap();
-    assert_eq!(h.ended(run).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Finished);
     let events = h.journal(&s).await;
     assert_eq!(kinds(&events)[..2], ["observer_attached", "started"]);
     assert_eq!(events[0].run_id, None, "no run had started at the attach");
@@ -745,7 +751,7 @@ async fn a_run_stopped_while_waiting_behind_an_attach_writes_no_started() {
 
     gate.notify_one();
     let observer = attach.await.unwrap();
-    assert_eq!(h.ended(run).await.status, RunStatus::Cancelled);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Cancelled);
     assert_eq!(
         kinds(&h.journal(&s).await),
         ["observer_attached", "cancelled"]
@@ -790,7 +796,7 @@ async fn a_detach_while_the_stream_opens_comes_before_started() {
     detaching.notify_one();
     finish.notify_one();
 
-    assert_eq!(h.ended(run).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Finished);
     assert_eq!(
         kinds(&h.journal(&s).await)[..3],
         ["observer_attached", "observer_detached", "started"]
@@ -824,7 +830,7 @@ async fn a_run_unclaimed_while_its_stream_opens_writes_no_started() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     detaching.notify_one();
 
-    assert_eq!(h.ended(run).await.status, RunStatus::Cancelled);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Cancelled);
     let kinds = kinds(&h.journal(&s).await);
     assert!(!kinds.contains(&"started"), "{kinds:?}");
 }
@@ -940,7 +946,7 @@ async fn losing_the_claim_stops_the_run_before_the_detach_is_written() {
     );
 
     journal_gate.notify_one();
-    assert_eq!(h.ended(run).await.status, RunStatus::Cancelled);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Cancelled);
     let events = h.journal(&s).await;
     let tail: Vec<_> = kinds(&events).into_iter().rev().take(4).collect();
     assert_eq!(
@@ -1089,7 +1095,7 @@ async fn a_claim_given_up_and_retaken_journals_in_order() {
     );
 
     gate.notify_one();
-    assert_eq!(h.ended(run).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Finished);
     drop(second);
 }
 

@@ -15,12 +15,18 @@ use crate::hitl::DecisionId;
 /// The most runs a default [`RunFilter`] lists.
 pub const DEFAULT_RUN_LIST_LIMIT: usize = 100;
 
-/// What is known about one run.
+/// What is known about one run: the session it is on, and the run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunFacts {
-    pub run_id: RunId,
     /// The session the run is on.
     pub session: RunSession,
+    pub run: RunDetails,
+}
+
+/// A run, apart from the session it is on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunDetails {
+    pub run_id: RunId,
     /// The agent that runs, by its `Config::agent_id`.
     pub agent: String,
     pub status: RunStatus,
@@ -108,7 +114,7 @@ impl RunFilter {
     /// Whether `facts` is a run this filter selects, ignoring `limit` and
     /// `after`, which select a page rather than a run.
     pub fn matches(&self, facts: &RunFacts) -> bool {
-        let waiting = !facts.pending_approvals.is_empty();
+        let waiting = !facts.run.pending_approvals.is_empty();
         self.session
             .as_ref()
             .is_none_or(|session| match &facts.session {
@@ -120,7 +126,7 @@ impl RunFilter {
                     .lane()
                     .is_some_and(|lane| lane.conversation() == conversation)
             })
-            && self.status.is_none_or(|status| status == facts.status)
+            && self.status.is_none_or(|status| status == facts.run.status)
             && self
                 .pending_approval
                 .is_none_or(|pending| pending == waiting)
@@ -146,22 +152,24 @@ mod tests {
     #[test]
     fn facts_round_trip_through_json() {
         let facts = RunFacts {
-            run_id: RunId::mint(),
             session: RunSession::Lane(Lane::new(
                 Conversation::new(SessionId::new("chat-1").unwrap(), "math"),
                 LaneNumber::new(2).unwrap(),
             )),
-            agent: "math".to_owned(),
-            status: RunStatus::Parked,
-            liveness: Liveness::default(),
-            started_at: Timestamp::from_unix_millis(10),
-            ended_at: Some(Timestamp::from_unix_millis(20)),
-            usage: TokenUsage::default(),
-            first_event: Some(SequenceNumber::FIRST),
-            latest_event: Some(SequenceNumber::FIRST.next()),
-            pending_approvals: vec![DecisionId::generate()],
-            checkpoint: Some(CheckpointRef::new("run:abc").unwrap()),
-            continues: Some(RunId::mint()),
+            run: RunDetails {
+                run_id: RunId::mint(),
+                agent: "math".to_owned(),
+                status: RunStatus::Parked,
+                liveness: Liveness::default(),
+                started_at: Timestamp::from_unix_millis(10),
+                ended_at: Some(Timestamp::from_unix_millis(20)),
+                usage: TokenUsage::default(),
+                first_event: Some(SequenceNumber::FIRST),
+                latest_event: Some(SequenceNumber::FIRST.next()),
+                pending_approvals: vec![DecisionId::generate()],
+                checkpoint: Some(CheckpointRef::new("run:abc").unwrap()),
+                continues: Some(RunId::mint()),
+            },
         };
 
         let json = serde_json::to_string(&facts).unwrap();

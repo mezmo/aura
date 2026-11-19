@@ -657,11 +657,14 @@ impl Harness {
             .run(&run)
             .expect("the runtime holds the run");
         let mut watch = record.watch();
-        tokio::time::timeout(PATIENCE, watch.wait_for(|facts| facts.status.is_terminal()))
-            .await
-            .expect("the run ends in time")
-            .expect("the run's record is alive")
-            .clone()
+        tokio::time::timeout(
+            PATIENCE,
+            watch.wait_for(|facts| facts.run.status.is_terminal()),
+        )
+        .await
+        .expect("the run ends in time")
+        .expect("the run's record is alive")
+        .clone()
     }
 
     /// Everything the store holds for `session`.
@@ -775,8 +778,8 @@ async fn start_returns_before_the_agent_is_prepared() {
     let session = SessionId::new("s1").unwrap();
 
     let facts = h.runtime.facts(&run).unwrap();
-    assert_eq!(facts.status, RunStatus::Preparing);
-    assert_eq!(facts.first_event, None);
+    assert_eq!(facts.run.status, RunStatus::Preparing);
+    assert_eq!(facts.run.first_event, None);
     assert_eq!(
         h.runtime.session_state(&session),
         Some(AgentState::Preparing)
@@ -784,7 +787,12 @@ async fn start_returns_before_the_agent_is_prepared() {
     assert!(h.journal(&session).await.is_empty());
     tokio::time::timeout(PATIENCE, async {
         loop {
-            let stored = h.runs.get(&run).await.unwrap().map(|facts| facts.status);
+            let stored = h
+                .runs
+                .get(&run)
+                .await
+                .unwrap()
+                .map(|facts| facts.run.status);
             if stored == Some(RunStatus::Preparing) {
                 break;
             }
@@ -858,11 +866,11 @@ async fn a_run_journals_its_lifecycle_around_the_agents_events() {
         }
         other => panic!("not Finished: {other:?}"),
     }
-    assert_eq!(facts.status, RunStatus::Finished);
-    assert_eq!(facts.usage, usage);
-    assert_eq!(facts.first_event, Some(events[0].seq));
-    assert_eq!(facts.latest_event, Some(events.last().unwrap().seq));
-    assert!(facts.ended_at.is_some());
+    assert_eq!(facts.run.status, RunStatus::Finished);
+    assert_eq!(facts.run.usage, usage);
+    assert_eq!(facts.run.first_event, Some(events[0].seq));
+    assert_eq!(facts.run.latest_event, Some(events.last().unwrap().seq));
+    assert!(facts.run.ended_at.is_some());
     assert_eq!(h.runs.get(&run).await.unwrap(), Some(facts));
     assert_eq!(
         h.runtime.session_state(&SessionId::new("s1").unwrap()),
@@ -885,8 +893,8 @@ async fn a_run_whose_agent_cannot_be_prepared_fails_without_starting() {
     let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
     let facts = h.ended(run).await;
 
-    assert_eq!(facts.status, RunStatus::Failed);
-    assert_eq!(facts.first_event, None);
+    assert_eq!(facts.run.status, RunStatus::Failed);
+    assert_eq!(facts.run.first_event, None);
     let events = h.journal(&SessionId::new("s1").unwrap()).await;
     assert_eq!(kinds(&events), vec!["failed"]);
     match &events[0].payload {
@@ -896,12 +904,16 @@ async fn a_run_whose_agent_cannot_be_prepared_fails_without_starting() {
         other => panic!("not Failed: {other:?}"),
     }
     assert_eq!(
-        h.runs.get(&run).await.unwrap().map(|facts| facts.status),
+        h.runs
+            .get(&run)
+            .await
+            .unwrap()
+            .map(|facts| facts.run.status),
         Some(RunStatus::Failed)
     );
 
     let next = h.runtime.start(on_session("s1", "again")).await.unwrap();
-    assert_eq!(h.ended(next).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(next).await.run.status, RunStatus::Finished);
 }
 
 /// A provider failure mid-run comes back as an error item, and fails the run.
@@ -915,7 +927,7 @@ async fn a_stream_error_fails_the_run() {
     let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
     let facts = h.ended(run).await;
 
-    assert_eq!(facts.status, RunStatus::Failed);
+    assert_eq!(facts.run.status, RunStatus::Failed);
     let events = h.journal(&SessionId::new("s1").unwrap()).await;
     assert_eq!(kinds(&events).first(), Some(&"started"));
     match &events.last().unwrap().payload {
@@ -966,7 +978,7 @@ async fn a_session_runs_one_run_at_a_time() {
         })
         .await
         .unwrap();
-    assert_eq!(h.ended(second).await.agent, "b");
+    assert_eq!(h.ended(second).await.run.agent, "b");
     assert_eq!(*h.preparer.prepared.lock().unwrap(), vec!["a", "b"]);
 }
 
@@ -987,7 +999,7 @@ async fn a_sessions_runs_continue_one_sequence() {
     let second = h
         .runtime
         .start(StartRun {
-            continues: Some(first.run_id),
+            continues: Some(first.run.run_id),
             ..on_session("s1", "q")
         })
         .await
@@ -995,18 +1007,21 @@ async fn a_sessions_runs_continue_one_sequence() {
     let second = h.ended(second).await;
 
     assert_eq!(
-        second.first_event,
-        first.latest_event.map(SequenceNumber::next),
+        second.run.first_event,
+        first.run.latest_event.map(SequenceNumber::next),
         "the second run's Started follows the first run's ending"
     );
-    assert_eq!(second.continues, Some(first.run_id));
+    assert_eq!(second.run.continues, Some(first.run.run_id));
     let events = h.journal(&SessionId::new("s1").unwrap()).await;
     let started: Vec<_> = events
         .iter()
         .filter(|event| kind(event) == "started")
         .map(|event| event.run_id)
         .collect();
-    assert_eq!(started, vec![Some(first.run_id), Some(second.run_id)]);
+    assert_eq!(
+        started,
+        vec![Some(first.run.run_id), Some(second.run.run_id)]
+    );
 }
 
 /// A run that parks ends `Parked`, pointing at the checkpoint its approvals
@@ -1031,13 +1046,13 @@ async fn a_run_that_parks_ends_parked() {
     let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
     let facts = h.ended(run).await;
 
-    assert_eq!(facts.status, RunStatus::Parked);
+    assert_eq!(facts.run.status, RunStatus::Parked);
     let checkpoint = format!("run:{run}");
     assert_eq!(
-        facts.checkpoint.as_ref().map(|c| c.as_str()),
+        facts.run.checkpoint.as_ref().map(|c| c.as_str()),
         Some(checkpoint.as_str())
     );
-    assert_eq!(facts.pending_approvals, vec![decision]);
+    assert_eq!(facts.run.pending_approvals, vec![decision]);
     match &h
         .journal(&SessionId::new("s1").unwrap())
         .await
@@ -1056,7 +1071,7 @@ async fn a_run_that_parks_ends_parked() {
     );
 
     let next = h.runtime.start(on_session("s1", "resume")).await.unwrap();
-    assert_eq!(h.ended(next).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(next).await.run.status, RunStatus::Finished);
 }
 
 /// The orchestrator reports a park as an item on the run's stream, not on
@@ -1081,13 +1096,13 @@ async fn a_run_the_orchestrator_parks_ends_parked() {
     let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
     let facts = h.ended(run).await;
 
-    assert_eq!(facts.status, RunStatus::Parked);
+    assert_eq!(facts.run.status, RunStatus::Parked);
     let checkpoint = format!("run:{run}");
     assert_eq!(
-        facts.checkpoint.as_ref().map(|c| c.as_str()),
+        facts.run.checkpoint.as_ref().map(|c| c.as_str()),
         Some(checkpoint.as_str())
     );
-    assert_eq!(facts.pending_approvals, vec![decision]);
+    assert_eq!(facts.run.pending_approvals, vec![decision]);
     assert_eq!(
         h.runtime.session_state(&SessionId::new("s1").unwrap()),
         Some(AgentState::Parked)
@@ -1123,7 +1138,7 @@ async fn an_open_approval_blocks_the_session_until_it_completes() {
     })
     .await;
     assert_eq!(
-        h.runtime.facts(&run).unwrap().pending_approvals,
+        h.runtime.facts(&run).unwrap().run.pending_approvals,
         vec![decision]
     );
     let waiting = RunFilter {
@@ -1132,18 +1147,25 @@ async fn an_open_approval_blocks_the_session_until_it_completes() {
     };
     let listed = h.runtime.list(&waiting).await.unwrap();
     assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].run_id, run);
+    assert_eq!(listed[0].run.run_id, run);
 
     raised.notify_one();
     eventually("the session is running again", || {
         h.runtime.session_state(&session) == Some(AgentState::Running)
     })
     .await;
-    assert!(h.runtime.facts(&run).unwrap().pending_approvals.is_empty());
+    assert!(
+        h.runtime
+            .facts(&run)
+            .unwrap()
+            .run
+            .pending_approvals
+            .is_empty()
+    );
     assert!(h.runtime.list(&waiting).await.unwrap().is_empty());
 
     decided.notify_one();
-    assert_eq!(h.ended(run).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Finished);
 }
 
 #[tokio::test]
@@ -1334,7 +1356,7 @@ async fn list_reads_runs_through_the_store() {
                 .await
                 .unwrap()
                 .into_iter()
-                .map(|facts| facts.run_id)
+                .map(|facts| facts.run.run_id)
                 .collect::<Vec<_>>()
         }
     };
@@ -1380,7 +1402,7 @@ async fn a_cancelled_run_ends_with_the_reason_it_was_given() {
     ));
     let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
     eventually("the run is running", || {
-        h.runtime.facts(&run).unwrap().status == RunStatus::Running
+        h.runtime.facts(&run).unwrap().run.status == RunStatus::Running
     })
     .await;
 
@@ -1391,7 +1413,7 @@ async fn a_cancelled_run_ends_with_the_reason_it_was_given() {
     ));
     let facts = h.ended(run).await;
 
-    assert_eq!(facts.status, RunStatus::Cancelled);
+    assert_eq!(facts.run.status, RunStatus::Cancelled);
     match last_lifecycle(&h.journal(&SessionId::new("s1").unwrap()).await) {
         LifecycleEvent::Cancelled {
             reason, message, ..
@@ -1426,13 +1448,13 @@ async fn a_run_stopped_mid_tool_call_ends_once_its_mcp_calls_are_cancelled() {
     ));
     let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
     eventually("the run is running", || {
-        h.runtime.facts(&run).unwrap().status == RunStatus::Running
+        h.runtime.facts(&run).unwrap().run.status == RunStatus::Running
     })
     .await;
 
     assert!(h.runtime.cancel(&run, RunCancelReason::External, None));
 
-    assert_eq!(h.ended(run).await.status, RunStatus::Cancelled);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Cancelled);
     assert_eq!(h.preparer.closed.lock().unwrap().len(), 1);
 }
 
@@ -1448,8 +1470,8 @@ async fn a_run_cancelled_while_preparing_ends_without_starting() {
     assert!(h.runtime.cancel(&run, RunCancelReason::External, None));
     let facts = h.ended(run).await;
 
-    assert_eq!(facts.status, RunStatus::Cancelled);
-    assert_eq!(facts.first_event, None);
+    assert_eq!(facts.run.status, RunStatus::Cancelled);
+    assert_eq!(facts.run.first_event, None);
     assert_eq!(
         kinds(&h.journal(&SessionId::new("s1").unwrap()).await),
         vec!["cancelled"]
@@ -1479,7 +1501,7 @@ async fn a_run_past_its_timeout_is_cancelled_for_the_deadline() {
 
     let facts = h.ended(run).await;
 
-    assert_eq!(facts.status, RunStatus::Cancelled);
+    assert_eq!(facts.run.status, RunStatus::Cancelled);
     let events = h.journal(&SessionId::new("s1").unwrap()).await;
     match last_lifecycle(&events) {
         LifecycleEvent::Cancelled { reason, .. } => {
@@ -1518,7 +1540,7 @@ async fn drain_cancels_live_runs_for_shutdown_and_refuses_new_starts() {
 
     for (run, session) in [(first, "s1"), (second, "s2")] {
         let stored = h.runs.get(&run).await.unwrap().unwrap();
-        assert_eq!(stored.status, RunStatus::Cancelled);
+        assert_eq!(stored.run.status, RunStatus::Cancelled);
         match last_lifecycle(&h.journal(&SessionId::new(session).unwrap()).await) {
             LifecycleEvent::Cancelled {
                 reason, message, ..
@@ -1556,15 +1578,15 @@ async fn drain_abandons_a_run_that_does_not_stop() {
     ));
     let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
     eventually("the run is running", || {
-        h.runtime.facts(&run).unwrap().status == RunStatus::Running
+        h.runtime.facts(&run).unwrap().run.status == RunStatus::Running
     })
     .await;
 
     h.runtime.drain(Duration::from_secs(1)).await;
 
     let facts = h.runs.get(&run).await.unwrap().unwrap();
-    assert_eq!(facts.status, RunStatus::Cancelled);
-    assert!(facts.ended_at.is_some());
+    assert_eq!(facts.run.status, RunStatus::Cancelled);
+    assert!(facts.run.ended_at.is_some());
     let events = h.journal(&SessionId::new("s1").unwrap()).await;
     match last_lifecycle(&events) {
         LifecycleEvent::Cancelled {
@@ -1613,7 +1635,7 @@ async fn a_stalled_journal_store_does_not_block_other_starts_or_a_drain() {
             .get(&other)
             .await
             .unwrap()
-            .is_some_and(|facts| facts.status.is_terminal()),
+            .is_some_and(|facts| facts.run.status.is_terminal()),
         "the other session's run ended"
     );
 
@@ -1663,7 +1685,7 @@ async fn an_abandoned_run_keeps_the_reason_it_was_first_stopped_for() {
     ));
     let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
     eventually("the run is running", || {
-        h.runtime.facts(&run).unwrap().status == RunStatus::Running
+        h.runtime.facts(&run).unwrap().run.status == RunStatus::Running
     })
     .await;
 
@@ -1717,7 +1739,7 @@ async fn the_next_start_is_admitted_while_the_last_run_writes_its_facts() {
     .await;
 
     assert_eq!(
-        h.runtime.facts(&first).map(|facts| facts.status),
+        h.runtime.facts(&first).map(|facts| facts.run.status),
         Some(RunStatus::Finished)
     );
     let next = h.runtime.start(on_session("s1", "q")).await;
@@ -1760,7 +1782,7 @@ async fn drain_waits_for_a_run_already_writing_its_ending() {
 
     let facts = h.runs.get(&run).await.unwrap().unwrap();
     assert_eq!(
-        facts.status,
+        facts.run.status,
         RunStatus::Finished,
         "the drain returned with the ending written"
     );
@@ -1804,7 +1826,7 @@ async fn an_ended_run_is_held_for_the_retention_window() {
             .unwrap()
             .journal,
     );
-    let mut late = journal.subscribe(crate::journal::Cursor::From(facts.first_event.unwrap()));
+    let mut late = journal.subscribe(crate::journal::Cursor::From(facts.run.first_event.unwrap()));
     let mut seen = Vec::new();
     while let Some(crate::journal::JournalItem::Event(event)) = late.next().await {
         let ended = event.ends_run();
@@ -1834,8 +1856,8 @@ async fn an_ended_run_is_held_for_the_retention_window() {
     let next = h.runtime.start(on_session("s1", "q")).await.unwrap();
     let next = h.ended(next).await;
     assert_eq!(
-        next.first_event,
-        facts.latest_event.map(SequenceNumber::next)
+        next.run.first_event,
+        facts.run.latest_event.map(SequenceNumber::next)
     );
 }
 
@@ -1860,7 +1882,7 @@ async fn retiring_a_run_keeps_a_session_whose_next_run_is_live() {
     h.ended(first).await;
     let second = h.runtime.start(on_session("s1", "q")).await.unwrap();
     eventually("the second run is running", || {
-        h.runtime.facts(&second).unwrap().status == RunStatus::Running
+        h.runtime.facts(&second).unwrap().run.status == RunStatus::Running
     })
     .await;
 
@@ -1876,7 +1898,7 @@ async fn retiring_a_run_keeps_a_session_whose_next_run_is_live() {
         "the session stays while its second run is live"
     );
     gate.notify_one();
-    assert_eq!(h.ended(second).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(second).await.run.status, RunStatus::Finished);
 }
 
 /// Letting an ended run go leaves the session's record alone once a later
@@ -1913,11 +1935,11 @@ async fn retiring_a_run_keeps_a_reopened_session_record() {
         .unwrap();
     // The second run meets the other writer, which fences the journal.
     let second = h.runtime.start(on_session("s1", "q")).await.unwrap();
-    assert_eq!(h.ended(second).await.status, RunStatus::Failed);
+    assert_eq!(h.ended(second).await.run.status, RunStatus::Failed);
     // The third start reopens the session under a record of its own.
     let third = h.runtime.start(on_session("s1", "q")).await.unwrap();
     eventually("the third run is running", || {
-        h.runtime.facts(&third).unwrap().status == RunStatus::Running
+        h.runtime.facts(&third).unwrap().run.status == RunStatus::Running
     })
     .await;
 
@@ -1933,7 +1955,7 @@ async fn retiring_a_run_keeps_a_reopened_session_record() {
         "the reopened record stays while its run is live"
     );
     gate.notify_one();
-    assert_eq!(h.ended(third).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(third).await.run.status, RunStatus::Finished);
 }
 
 // ---------------------------------------------------------------------------
@@ -1952,7 +1974,7 @@ async fn a_run_that_yields_to_a_client_tool_finishes() {
     let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
     let facts = h.ended(run).await;
 
-    assert_eq!(facts.status, RunStatus::Finished);
+    assert_eq!(facts.run.status, RunStatus::Finished);
     assert_eq!(
         kind(
             h.journal(&SessionId::new("s1").unwrap())
@@ -1979,7 +2001,7 @@ async fn a_panicking_run_fails_and_frees_its_session() {
     let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
     let facts = h.ended(run).await;
 
-    assert_eq!(facts.status, RunStatus::Failed);
+    assert_eq!(facts.run.status, RunStatus::Failed);
     match last_lifecycle(&h.journal(&SessionId::new("s1").unwrap()).await) {
         LifecycleEvent::Failed { error, .. } => {
             assert!(error.contains("the fake agent panicked"), "{error}");
@@ -1991,24 +2013,26 @@ async fn a_panicking_run_fails_and_frees_its_session() {
         Some(AgentState::Done)
     );
     let next = h.runtime.start(on_session("s1", "again")).await.unwrap();
-    assert_eq!(h.ended(next).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(next).await.run.status, RunStatus::Finished);
 }
 
 fn preparing(run_id: RunId) -> RunFacts {
     RunFacts {
-        run_id,
         session: RunSession::Plain(SessionId::new("s1").unwrap()),
-        agent: "a".to_owned(),
-        status: RunStatus::Preparing,
-        liveness: Liveness::default(),
-        started_at: aura_events::Timestamp::now(),
-        ended_at: None,
-        usage: TokenUsage::default(),
-        first_event: None,
-        latest_event: None,
-        pending_approvals: Vec::new(),
-        checkpoint: None,
-        continues: None,
+        run: RunDetails {
+            run_id,
+            agent: "a".to_owned(),
+            status: RunStatus::Preparing,
+            liveness: Liveness::default(),
+            started_at: aura_events::Timestamp::now(),
+            ended_at: None,
+            usage: TokenUsage::default(),
+            first_event: None,
+            latest_event: None,
+            pending_approvals: Vec::new(),
+            checkpoint: None,
+            continues: None,
+        },
     }
 }
 
@@ -2045,7 +2069,7 @@ async fn a_stopped_run_whose_stream_does_not_end_is_dropped_after_the_grace() {
     ));
     let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
     eventually("the run is running", || {
-        h.runtime.facts(&run).unwrap().status == RunStatus::Running
+        h.runtime.facts(&run).unwrap().run.status == RunStatus::Running
     })
     .await;
     let stopped_at = tokio::time::Instant::now();
@@ -2053,7 +2077,7 @@ async fn a_stopped_run_whose_stream_does_not_end_is_dropped_after_the_grace() {
     assert!(h.runtime.cancel(&run, RunCancelReason::External, None));
     let facts = h.ended(run).await;
 
-    assert_eq!(facts.status, RunStatus::Cancelled);
+    assert_eq!(facts.run.status, RunStatus::Cancelled);
     assert!(
         stopped_at.elapsed() >= STOP_GRACE,
         "the stream was given the grace: {:?}",
@@ -2076,7 +2100,7 @@ async fn a_stopped_run_whose_mcp_close_hangs_still_ends() {
     ));
     let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
     eventually("the run is running", || {
-        h.runtime.facts(&run).unwrap().status == RunStatus::Running
+        h.runtime.facts(&run).unwrap().run.status == RunStatus::Running
     })
     .await;
     let stopped_at = tokio::time::Instant::now();
@@ -2092,14 +2116,14 @@ async fn a_stopped_run_whose_mcp_close_hangs_still_ends() {
     let mut watch = record.watch();
     let facts = tokio::time::timeout(
         MCP_CLOSE_TIMEOUT + STOP_GRACE + PATIENCE,
-        watch.wait_for(|facts| facts.status.is_terminal()),
+        watch.wait_for(|facts| facts.run.status.is_terminal()),
     )
     .await
     .expect("the run ends in time")
     .expect("the run's record is alive")
     .clone();
 
-    assert_eq!(facts.status, RunStatus::Cancelled);
+    assert_eq!(facts.run.status, RunStatus::Cancelled);
     assert!(
         stopped_at.elapsed() >= MCP_CLOSE_TIMEOUT + STOP_GRACE,
         "the close and then the stream were each given their time: {:?}",
@@ -2144,14 +2168,14 @@ async fn a_fenced_journal_is_reopened_for_the_next_run() {
 
     let second = h.runtime.start(on_session("s1", "q")).await.unwrap();
     let second = h.ended(second).await;
-    assert_eq!(second.status, RunStatus::Failed);
+    assert_eq!(second.run.status, RunStatus::Failed);
     assert_eq!(h.runtime.session_state(&session), Some(AgentState::Done));
 
     let third = h.runtime.start(on_session("s1", "q")).await.unwrap();
     let third = h.ended(third).await;
-    assert_eq!(third.status, RunStatus::Finished);
+    assert_eq!(third.run.status, RunStatus::Finished);
     assert_eq!(
-        third.first_event,
+        third.run.first_event,
         Some(elsewhere.seq.next()),
         "the reopened journal continues after the other writer"
     );
@@ -2169,7 +2193,7 @@ async fn concurrent_drains_write_one_ending() {
     ));
     let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
     eventually("the run is running", || {
-        h.runtime.facts(&run).unwrap().status == RunStatus::Running
+        h.runtime.facts(&run).unwrap().run.status == RunStatus::Running
     })
     .await;
 
@@ -2184,7 +2208,7 @@ async fn concurrent_drains_write_one_ending() {
         kinds(&events)
     );
     assert_eq!(
-        h.runs.get(&run).await.unwrap().unwrap().status,
+        h.runs.get(&run).await.unwrap().unwrap().run.status,
         RunStatus::Cancelled
     );
 }
@@ -2207,7 +2231,7 @@ async fn drain_gives_up_on_an_ending_the_store_never_finishes() {
     );
     let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
     eventually("the run is running", || {
-        h.runtime.facts(&run).unwrap().status == RunStatus::Running
+        h.runtime.facts(&run).unwrap().run.status == RunStatus::Running
     })
     .await;
 
@@ -2248,7 +2272,7 @@ async fn a_run_whose_final_store_write_panics_keeps_its_ending() {
     let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
     let facts = h.ended(run).await;
 
-    assert_eq!(facts.status, RunStatus::Finished);
+    assert_eq!(facts.run.status, RunStatus::Finished);
     assert_eq!(kind(h.journal(&session).await.last().unwrap()), "finished");
     assert_eq!(h.runtime.session_state(&session), Some(AgentState::Done));
 
@@ -2284,7 +2308,7 @@ async fn a_run_whose_ending_panics_before_its_session_is_freed_fails() {
     let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
     let facts = h.ended(run).await;
 
-    assert_eq!(facts.status, RunStatus::Failed);
+    assert_eq!(facts.run.status, RunStatus::Failed);
     assert_eq!(h.runtime.session_state(&session), Some(AgentState::Done));
 
     tokio::time::sleep(retention + Duration::from_secs(1)).await;
@@ -2386,7 +2410,7 @@ async fn stored(h: &Harness, run: RunId) -> RunFacts {
     tokio::time::timeout(PATIENCE, async {
         loop {
             if let Some(facts) = h.runs.get(&run).await.unwrap()
-                && facts.status.is_terminal()
+                && facts.run.status.is_terminal()
             {
                 return facts;
             }
@@ -2534,8 +2558,8 @@ async fn a_single_agent_closes_with_what_it_billed_then_its_context_occupancy() 
         occupancy.payload
     );
     assert_eq!(ending_usage(&events[6]), billed);
-    assert_eq!(facts.usage, billed);
-    assert_eq!(stored(&h, run).await.usage, billed);
+    assert_eq!(facts.run.usage, billed);
+    assert_eq!(stored(&h, run).await.run.usage, billed);
 }
 
 /// A prepared agent's tool turn produces no text, so the usage counters
@@ -2582,7 +2606,7 @@ async fn a_prepared_agent_is_billed_for_a_tool_turn_its_counters_missed() {
             if context_tokens.get() == 10 && response_tokens.get() == 5
     ));
     assert_eq!(ending_usage(events.last().unwrap()), billed);
-    assert_eq!(facts.usage, billed);
+    assert_eq!(facts.run.usage, billed);
 }
 
 /// An orchestrated run closes with one `Usage` event, attributed to the
@@ -2620,7 +2644,7 @@ async fn an_orchestrated_run_closes_with_what_it_billed_alone() {
         AgentEventPayload::Usage { usage, cache_read_input_tokens: None, .. } if usage == billed
     ));
     assert_eq!(ending_usage(&events[3]), billed);
-    assert_eq!(facts.usage, billed);
+    assert_eq!(facts.run.usage, billed);
 }
 
 /// `idle` resolves at once when no run is live. Otherwise it resolves once
@@ -2644,7 +2668,7 @@ async fn idle_resolves_once_the_last_live_run_ends() {
 
     let first = h.runtime.start(on_session("s1", "q")).await.unwrap();
     eventually("the first run is running", || {
-        h.runtime.facts(&first).unwrap().status == RunStatus::Running
+        h.runtime.facts(&first).unwrap().run.status == RunStatus::Running
     })
     .await;
     let second = h.runtime.start(on_session("s2", "q")).await.unwrap();
@@ -2689,7 +2713,7 @@ async fn idle_resolves_after_a_failed_preparation_and_a_drain() {
 
     let stalled = h.runtime.start(on_session("s1", "q")).await.unwrap();
     eventually("the run is running", || {
-        h.runtime.facts(&stalled).unwrap().status == RunStatus::Running
+        h.runtime.facts(&stalled).unwrap().run.status == RunStatus::Running
     })
     .await;
     assert!(h.runtime.idle().now_or_never().is_none(), "the run is live");
@@ -2782,7 +2806,7 @@ mod spans {
     }
 
     fn running(h: &Harness, run: RunId) -> impl FnMut() -> bool + '_ {
-        move || h.runtime.facts(&run).unwrap().status == RunStatus::Running
+        move || h.runtime.facts(&run).unwrap().run.status == RunStatus::Running
     }
 
     /// The span handed to a run stays a root span. Once the agent is
@@ -2816,7 +2840,7 @@ mod spans {
             .await
             .unwrap();
         drop(request);
-        assert_eq!(h.ended(run).await.status, RunStatus::Finished);
+        assert_eq!(h.ended(run).await.run.status, RunStatus::Finished);
         let stream = exported(&captured, "agent.stream").await;
         let request = exported(&captured, "chat_completions").await;
 
@@ -2915,7 +2939,7 @@ mod spans {
             .await
             .unwrap();
         let run = h.runtime.start(on_chat(agent_stream())).await.unwrap();
-        assert_eq!(h.ended(run).await.status, RunStatus::Finished);
+        assert_eq!(h.ended(run).await.run.status, RunStatus::Finished);
         exported(&captured, "agent.stream").await;
 
         let attribute = |key| captured.attribute("agent.stream", key);
@@ -2942,7 +2966,7 @@ mod spans {
             .await
             .unwrap();
         drop(request);
-        assert_eq!(h.ended(run).await.status, RunStatus::Finished);
+        assert_eq!(h.ended(run).await.run.status, RunStatus::Finished);
         let request = exported(&captured, "chat_completions").await;
         let prepare = exported(&captured, "test.prepare").await;
 
@@ -2978,7 +3002,7 @@ mod spans {
             })
             .await
             .unwrap();
-        assert_eq!(h.ended(run).await.status, RunStatus::Failed);
+        assert_eq!(h.ended(run).await.run.status, RunStatus::Failed);
         let stream = exported(&captured, "agent.stream").await;
 
         for key in [
@@ -3041,7 +3065,7 @@ mod spans {
             })
             .await
             .unwrap();
-        assert_eq!(h.ended(run).await.status, RunStatus::Failed);
+        assert_eq!(h.ended(run).await.run.status, RunStatus::Failed);
         let LifecycleEvent::Failed { error, .. } =
             last_lifecycle(&h.journal(&SessionId::new("s1").unwrap()).await).clone()
         else {
@@ -3076,7 +3100,7 @@ mod spans {
             })
             .await
             .unwrap();
-        assert_eq!(h.ended(run).await.status, RunStatus::Failed);
+        assert_eq!(h.ended(run).await.run.status, RunStatus::Failed);
 
         assert_ends(
             &captured,
@@ -3108,7 +3132,7 @@ mod spans {
             .unwrap();
         eventually("the run is running", running(&h, run)).await;
         assert!(h.runtime.cancel(&run, RunCancelReason::External, None));
-        assert_eq!(h.ended(run).await.status, RunStatus::Cancelled);
+        assert_eq!(h.ended(run).await.run.status, RunStatus::Cancelled);
 
         assert_ends(&captured, run, Some("cancelled"), Status::Unset).await;
     }
@@ -3132,7 +3156,7 @@ mod spans {
             })
             .await
             .unwrap();
-        assert_eq!(h.ended(run).await.status, RunStatus::Cancelled);
+        assert_eq!(h.ended(run).await.run.status, RunStatus::Cancelled);
 
         assert_ends(&captured, run, None, Status::error("timeout")).await;
     }
@@ -3189,7 +3213,7 @@ mod spans {
             .unwrap();
         eventually("the run is running", running(&h, run)).await;
         claim.detach().await;
-        assert_eq!(h.ended(run).await.status, RunStatus::Cancelled);
+        assert_eq!(h.ended(run).await.run.status, RunStatus::Cancelled);
 
         assert_ends(&captured, run, Some("disconnected"), Status::Unset).await;
     }
@@ -3220,7 +3244,7 @@ mod spans {
             })
             .await
             .unwrap();
-        assert_eq!(h.ended(run).await.status, RunStatus::Parked);
+        assert_eq!(h.ended(run).await.run.status, RunStatus::Parked);
 
         assert_ends(&captured, run, Some("parked"), Status::Unset).await;
     }

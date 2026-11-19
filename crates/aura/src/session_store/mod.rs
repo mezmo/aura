@@ -43,7 +43,7 @@ pub use memory::{
     InMemorySkillInvocationStore,
 };
 pub use record::{DecisionRecord, InvalidRecord, OriginRecord, ParkedApprovalRecord, ScopeRecord};
-pub use run_record::{DEFAULT_RUN_LIST_LIMIT, RunFacts, RunFilter, RunStatus};
+pub use run_record::{DEFAULT_RUN_LIST_LIMIT, RunDetails, RunFacts, RunFilter, RunStatus};
 pub use skill_record::{
     SKILL_INVOCATION_RECORD_VERSION, SkillInvocation, SkillInvocationRecord, SkillRecordDecodeError,
 };
