@@ -46,8 +46,8 @@ use crate::conversation::Conversation;
 use crate::hitl::PendingApprovals;
 use crate::journal::{Cursor, SessionJournal};
 use crate::session_store::{
-    InMemoryJournalStore, InMemoryRunStore, InMemorySkillInvocationStore, JournalStore, RunFacts,
-    RunFilter, RunStatus, RunStore, SessionStoreError, SkillInvocationStore,
+    InMemoryJournalStore, InMemoryRunStore, InMemorySkillInvocationStore, JournalStore, RunDetails,
+    RunFacts, RunFilter, RunStatus, RunStore, SessionStoreError, SkillInvocationStore,
 };
 
 pub use crate::conversation::RunSession;
@@ -307,19 +307,21 @@ impl AgentRuntime {
             }
             let joined = join(&mut state, &session)?;
             let record = Arc::new(RunRecord::new(RunFacts {
-                run_id,
                 session: run_session.clone(),
-                agent: config.agent_id().to_owned(),
-                status: RunStatus::Preparing,
-                liveness: start.liveness,
-                started_at: aura_events::Timestamp::now(),
-                ended_at: None,
-                usage: aura_events::TokenUsage::default(),
-                first_event: None,
-                latest_event: None,
-                pending_approvals: Vec::new(),
-                checkpoint: None,
-                continues: start.continues,
+                run: RunDetails {
+                    run_id,
+                    agent: config.agent_id().to_owned(),
+                    status: RunStatus::Preparing,
+                    liveness: start.liveness,
+                    started_at: aura_events::Timestamp::now(),
+                    ended_at: None,
+                    usage: aura_events::TokenUsage::default(),
+                    first_event: None,
+                    latest_event: None,
+                    pending_approvals: Vec::new(),
+                    checkpoint: None,
+                    continues: start.continues,
+                },
             }));
             state.live = Some(Arc::clone(&record));
             self.shared.live_runs.send_modify(|live| *live += 1);
@@ -520,11 +522,11 @@ impl AgentRuntime {
         let session = self.shared.lock_sessions().get(session).cloned()?;
         let state = session.lock();
         if let Some(live) = &state.live {
-            let RunFacts {
+            let RunDetails {
                 status,
                 pending_approvals,
                 ..
-            } = live.facts();
+            } = live.facts().run;
             return Some(match status {
                 RunStatus::Preparing => AgentState::Preparing,
                 _ if !pending_approvals.is_empty() => AgentState::Blocked {

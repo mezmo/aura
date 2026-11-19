@@ -482,11 +482,11 @@ impl RunStore for InMemoryRunStore {
     /// map's first entries are the oldest.
     async fn put(&self, facts: &RunFacts) -> Result<(), SessionStoreError> {
         let mut runs = self.lock();
-        runs.insert(facts.run_id, facts.clone());
+        runs.insert(facts.run.run_id, facts.clone());
         if runs.len() > self.max_runs {
             let evict = runs
                 .iter()
-                .find(|(_, facts)| facts.status.is_terminal())
+                .find(|(_, facts)| facts.run.status.is_terminal())
                 .or_else(|| runs.iter().next())
                 .map(|(id, _)| *id);
             if let Some(evict) = evict {
@@ -611,7 +611,7 @@ mod tests {
     use crate::hitl::{
         AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, PROTOCOL_VERSION,
     };
-    use crate::session_store::RunStatus;
+    use crate::session_store::{RunDetails, RunStatus};
 
     fn parked(request_id: &str) -> ParkedApproval {
         let now = chrono::Utc::now();
@@ -1334,19 +1334,21 @@ mod tests {
 
     fn facts(n: u128, session: &str, status: RunStatus) -> RunFacts {
         RunFacts {
-            run_id: run_id(n),
             session: RunSession::Plain(SessionId::new(session).unwrap()),
-            agent: "agent".to_owned(),
-            status,
-            liveness: aura_events::run::Liveness::default(),
-            started_at: aura_events::Timestamp::from_unix_millis(n as u64),
-            ended_at: None,
-            usage: aura_events::TokenUsage::default(),
-            first_event: None,
-            latest_event: None,
-            pending_approvals: Vec::new(),
-            checkpoint: None,
-            continues: None,
+            run: RunDetails {
+                run_id: run_id(n),
+                agent: "agent".to_owned(),
+                status,
+                liveness: aura_events::run::Liveness::default(),
+                started_at: aura_events::Timestamp::from_unix_millis(n as u64),
+                ended_at: None,
+                usage: aura_events::TokenUsage::default(),
+                first_event: None,
+                latest_event: None,
+                pending_approvals: Vec::new(),
+                checkpoint: None,
+                continues: None,
+            },
         }
     }
 
@@ -1356,7 +1358,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .map(|facts| facts.run_id.as_uuid().as_u128())
+            .map(|facts| facts.run.run_id.as_uuid().as_u128())
             .collect()
     }
 
@@ -1397,7 +1399,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.get(&run_id(1)).await.unwrap().unwrap().status,
+            store.get(&run_id(1)).await.unwrap().unwrap().run.status,
             Finished
         );
     }
@@ -1480,7 +1482,7 @@ mod tests {
         use RunStatus::*;
         let store = InMemoryRunStore::new();
         let mut waiting = facts(2, "sess-a", Running);
-        waiting.pending_approvals = vec![DecisionId::generate()];
+        waiting.run.pending_approvals = vec![DecisionId::generate()];
         store.put(&facts(1, "sess-a", Running)).await.unwrap();
         store.put(&waiting).await.unwrap();
 

@@ -50,7 +50,7 @@ impl Harness {
         eventually("the run is running", || {
             self.runtime
                 .facts(&run)
-                .is_some_and(|facts| facts.status == RunStatus::Running)
+                .is_some_and(|facts| facts.run.status == RunStatus::Running)
         })
         .await;
     }
@@ -59,7 +59,7 @@ impl Harness {
 /// Checks that the run's lane belongs to the agent that ran it.
 fn assert_lane_is_the_agents(facts: &RunFacts) {
     let lane = facts.lane().expect("the run is on a lane");
-    assert_eq!(lane.conversation().agent(), facts.agent);
+    assert_eq!(lane.conversation().agent(), facts.run.agent);
 }
 
 /// Checks the stream of a run that a failed claimed start stopped: no
@@ -98,7 +98,7 @@ async fn a_conversations_first_start_lands_on_its_home_lane() {
     let facts = h.ended(run).await;
 
     let home = Lane::home(conversation("c1", "a"));
-    assert_eq!(facts.status, RunStatus::Finished);
+    assert_eq!(facts.run.status, RunStatus::Finished);
     assert_eq!(facts.session, RunSession::Lane(home.clone()));
     assert_eq!(facts.session_id().as_str(), "c1:a:0");
     assert_lane_is_the_agents(&facts);
@@ -128,7 +128,7 @@ async fn an_overlapping_start_takes_the_next_lane_and_both_run() {
     two.notify_one();
     for run in [first, second] {
         let facts = h.ended(run).await;
-        assert_eq!(facts.status, RunStatus::Finished);
+        assert_eq!(facts.run.status, RunStatus::Finished);
         assert_lane_is_the_agents(&facts);
     }
     let listed: Vec<RunId> = h
@@ -140,7 +140,7 @@ async fn an_overlapping_start_takes_the_next_lane_and_both_run() {
         .await
         .unwrap()
         .into_iter()
-        .map(|facts| facts.run_id)
+        .map(|facts| facts.run.run_id)
         .collect();
     assert_eq!(listed, [first, second]);
 }
@@ -163,7 +163,7 @@ async fn a_lane_whose_stopped_run_has_not_ended_is_skipped() {
 
     let next = h.runtime.start(on_chat("c1", "q")).await.unwrap();
     assert_eq!(h.lane_of(next), 1);
-    assert_eq!(h.ended(next).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(next).await.run.status, RunStatus::Finished);
 }
 
 /// A lane whose run has ended is free even while the runtime still keeps
@@ -182,7 +182,7 @@ async fn a_lane_holding_only_an_ended_run_is_taken_again() {
     let first = h.runtime.start(on_chat("c1", "q")).await.unwrap();
     let first = h.ended(first).await;
     assert!(
-        h.runtime.facts(&first.run_id).is_some(),
+        h.runtime.facts(&first.run.run_id).is_some(),
         "the runtime still keeps the ended run"
     );
     let second = h.runtime.start(on_chat("c1", "q")).await.unwrap();
@@ -190,8 +190,8 @@ async fn a_lane_holding_only_an_ended_run_is_taken_again() {
 
     assert_eq!(second.session, first.session);
     assert_eq!(
-        second.first_event,
-        first.latest_event.map(SequenceNumber::next)
+        second.run.first_event,
+        first.run.latest_event.map(SequenceNumber::next)
     );
 }
 
@@ -308,7 +308,7 @@ async fn a_start_on_a_conversation_with_every_lane_busy_is_refused() {
     );
 
     let elsewhere = h.runtime.start(on_chat("c2", "q")).await.unwrap();
-    assert_eq!(h.ended(elsewhere).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(elsewhere).await.run.status, RunStatus::Finished);
     assert_eq!(LANES_PER_CONVERSATION, expected.len());
     h.runtime.drain(PATIENCE).await;
 }
@@ -345,7 +345,7 @@ async fn two_agents_under_one_chat_id_each_take_their_own_home_lane() {
     two.notify_one();
     for run in [a, b] {
         let facts = h.ended(run).await;
-        assert_eq!(facts.status, RunStatus::Finished);
+        assert_eq!(facts.run.status, RunStatus::Finished);
         assert_lane_is_the_agents(&facts);
     }
 }
@@ -480,8 +480,8 @@ async fn a_lane_let_go_after_retention_is_reopened_with_its_sequence_continued()
     let fourth = h.ended(fourth).await;
     assert_eq!(fourth.session_id(), lane_1);
     assert_eq!(
-        fourth.first_event,
-        second.latest_event.map(SequenceNumber::next),
+        fourth.run.first_event,
+        second.run.latest_event.map(SequenceNumber::next),
         "lane 1 carries on its sequence"
     );
     three.notify_one();
@@ -522,7 +522,7 @@ async fn a_fenced_idle_lane_is_reopened() {
     let second = h.runtime.start(on_chat("c1", "q")).await.unwrap();
     let second = h.ended(second).await;
     assert_eq!(
-        second.status,
+        second.run.status,
         RunStatus::Failed,
         "the old journal is fenced"
     );
@@ -530,9 +530,9 @@ async fn a_fenced_idle_lane_is_reopened() {
 
     let third = h.runtime.start(on_chat("c1", "q")).await.unwrap();
     let third = h.ended(third).await;
-    assert_eq!(third.status, RunStatus::Finished);
+    assert_eq!(third.run.status, RunStatus::Finished);
     assert_eq!(third.session_id(), home);
-    assert_eq!(third.first_event, Some(elsewhere.seq.next()));
+    assert_eq!(third.run.first_event, Some(elsewhere.seq.next()));
 }
 
 /// A drain stops the runs on every lane, refuses later starts, and lets
@@ -552,7 +552,7 @@ async fn drain_stops_lane_runs_and_idle_resolves() {
     h.runtime.drain(PATIENCE).await;
     for run in [first, second] {
         let facts = stored(&h, run).await;
-        assert_eq!(facts.status, RunStatus::Cancelled);
+        assert_eq!(facts.run.status, RunStatus::Cancelled);
     }
     tokio::time::timeout(PATIENCE, h.runtime.idle())
         .await
@@ -675,7 +675,7 @@ async fn a_claimed_start_on_a_busy_session_is_refused() {
         .await
         .unwrap();
     assert_eq!(admitted.session, RunSession::Plain(s.clone()));
-    assert_eq!(h.ended(admitted.run).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(admitted.run).await.run.status, RunStatus::Finished);
     assert_eq!(*h.preparer.prepared.lock().unwrap(), ["a", "a"]);
     admitted.subscription.detach().await;
 }
@@ -698,7 +698,7 @@ async fn dropping_a_claimed_starts_subscription_stops_its_run() {
     drop(admitted.subscription);
 
     let facts = h.ended(run).await;
-    assert_eq!(facts.status, RunStatus::Cancelled);
+    assert_eq!(facts.run.status, RunStatus::Cancelled);
     let events = h.journal(&facts.session_id()).await;
     assert!(kinds(&events).contains(&"claims_exhausted"));
     match last_lifecycle(&events) {
@@ -767,7 +767,7 @@ async fn only_run(h: &Harness) -> RunId {
     .await
     .expect("the store lists the run");
     assert_eq!(runs.len(), 1);
-    runs[0].run_id
+    runs[0].run.run_id
 }
 
 /// When the journal refuses the attach event, the start fails with the
@@ -814,7 +814,7 @@ async fn a_claimed_start_whose_attach_is_refused_stops_its_run() {
 
         let run = only_run(&h).await;
         let facts = stored(&h, run).await;
-        assert_eq!(facts.status, RunStatus::Cancelled, "{policy:?}");
+        assert_eq!(facts.run.status, RunStatus::Cancelled, "{policy:?}");
         assert_stopped_by_a_failed_start(&h.journal(&facts.session_id()).await);
         assert_eq!(
             h.runtime
@@ -849,6 +849,6 @@ async fn a_claimed_start_dropped_while_attaching_stops_its_run() {
 
     let run = only_run(&h).await;
     let facts = stored(&h, run).await;
-    assert_eq!(facts.status, RunStatus::Cancelled);
+    assert_eq!(facts.run.status, RunStatus::Cancelled);
     assert_stopped_by_a_failed_start(&h.journal(&facts.session_id()).await);
 }
