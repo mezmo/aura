@@ -776,7 +776,7 @@ async fn start_returns_before_the_agent_is_prepared() {
 
     let facts = h.runtime.facts(&run).unwrap();
     assert_eq!(facts.status, RunStatus::Preparing);
-    assert_eq!(facts.first_seq, None);
+    assert_eq!(facts.first_event, None);
     assert_eq!(
         h.runtime.session_state(&session),
         Some(AgentState::Preparing)
@@ -860,8 +860,8 @@ async fn a_run_journals_its_lifecycle_around_the_agents_events() {
     }
     assert_eq!(facts.status, RunStatus::Finished);
     assert_eq!(facts.usage, usage);
-    assert_eq!(facts.first_seq, Some(events[0].seq));
-    assert_eq!(facts.latest_seq, Some(events.last().unwrap().seq));
+    assert_eq!(facts.first_event, Some(events[0].seq));
+    assert_eq!(facts.latest_event, Some(events.last().unwrap().seq));
     assert!(facts.ended_at.is_some());
     assert_eq!(h.runs.get(&run).await.unwrap(), Some(facts));
     assert_eq!(
@@ -886,7 +886,7 @@ async fn a_run_whose_agent_cannot_be_prepared_fails_without_starting() {
     let facts = h.ended(run).await;
 
     assert_eq!(facts.status, RunStatus::Failed);
-    assert_eq!(facts.first_seq, None);
+    assert_eq!(facts.first_event, None);
     let events = h.journal(&SessionId::new("s1").unwrap()).await;
     assert_eq!(kinds(&events), vec!["failed"]);
     match &events[0].payload {
@@ -995,8 +995,8 @@ async fn a_sessions_runs_continue_one_sequence() {
     let second = h.ended(second).await;
 
     assert_eq!(
-        second.first_seq,
-        first.latest_seq.map(SequenceNumber::next),
+        second.first_event,
+        first.latest_event.map(SequenceNumber::next),
         "the second run's Started follows the first run's ending"
     );
     assert_eq!(second.continues, Some(first.run_id));
@@ -1449,7 +1449,7 @@ async fn a_run_cancelled_while_preparing_ends_without_starting() {
     let facts = h.ended(run).await;
 
     assert_eq!(facts.status, RunStatus::Cancelled);
-    assert_eq!(facts.first_seq, None);
+    assert_eq!(facts.first_event, None);
     assert_eq!(
         kinds(&h.journal(&SessionId::new("s1").unwrap()).await),
         vec!["cancelled"]
@@ -1804,7 +1804,7 @@ async fn an_ended_run_is_held_for_the_retention_window() {
             .unwrap()
             .journal,
     );
-    let mut late = journal.subscribe(crate::journal::Cursor::From(facts.first_seq.unwrap()));
+    let mut late = journal.subscribe(crate::journal::Cursor::From(facts.first_event.unwrap()));
     let mut seen = Vec::new();
     while let Some(crate::journal::JournalItem::Event(event)) = late.next().await {
         let ended = event.ends_run();
@@ -1833,7 +1833,10 @@ async fn an_ended_run_is_held_for_the_retention_window() {
 
     let next = h.runtime.start(on_session("s1", "q")).await.unwrap();
     let next = h.ended(next).await;
-    assert_eq!(next.first_seq, facts.latest_seq.map(SequenceNumber::next));
+    assert_eq!(
+        next.first_event,
+        facts.latest_event.map(SequenceNumber::next)
+    );
 }
 
 /// Letting an ended run go leaves its session alone while a later run on it
@@ -2001,8 +2004,8 @@ fn preparing(run_id: RunId) -> RunFacts {
         started_at: aura_events::Timestamp::now(),
         ended_at: None,
         usage: TokenUsage::default(),
-        first_seq: None,
-        latest_seq: None,
+        first_event: None,
+        latest_event: None,
         pending_approvals: Vec::new(),
         checkpoint: None,
         continues: None,
@@ -2148,7 +2151,7 @@ async fn a_fenced_journal_is_reopened_for_the_next_run() {
     let third = h.ended(third).await;
     assert_eq!(third.status, RunStatus::Finished);
     assert_eq!(
-        third.first_seq,
+        third.first_event,
         Some(elsewhere.seq.next()),
         "the reopened journal continues after the other writer"
     );

@@ -31,9 +31,9 @@ pub struct RunFacts {
     /// Cumulative provider-billed tokens across every turn of the run.
     pub usage: TokenUsage,
     /// The sequence number of the run's `Started` event.
-    pub first_seq: Option<SequenceNumber>,
+    pub first_event: Option<SequenceNumber>,
     /// The sequence number of the run's newest event.
-    pub latest_seq: Option<SequenceNumber>,
+    pub latest_event: Option<SequenceNumber>,
     /// Approvals the run is waiting on.
     pub pending_approvals: Vec<DecisionId>,
     /// Where a parked run's checkpoint is.
@@ -157,8 +157,8 @@ mod tests {
             started_at: Timestamp::from_unix_millis(10),
             ended_at: Some(Timestamp::from_unix_millis(20)),
             usage: TokenUsage::default(),
-            first_seq: Some(SequenceNumber::FIRST),
-            latest_seq: Some(SequenceNumber::FIRST.next()),
+            first_event: Some(SequenceNumber::FIRST),
+            latest_event: Some(SequenceNumber::FIRST.next()),
             pending_approvals: vec![DecisionId::generate()],
             checkpoint: Some(CheckpointRef::new("run:abc").unwrap()),
             continues: Some(RunId::mint()),
