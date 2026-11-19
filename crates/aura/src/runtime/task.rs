@@ -440,8 +440,8 @@ async fn execute(
         };
         record.update(|facts| {
             facts.status = RunStatus::Running;
-            facts.first_seq = Some(started.seq);
-            facts.latest_seq = Some(started.seq);
+            facts.first_event = Some(started.seq);
+            facts.latest_event = Some(started.seq);
         });
         put_facts(shared, record).await;
 
@@ -696,7 +696,7 @@ async fn append_agent_event(
     let stamped = journal
         .append(Some(record.id), SessionEventPayload::Agent(event))
         .await?;
-    record.update(|facts| facts.latest_seq = Some(stamped.seq));
+    record.update(|facts| facts.latest_event = Some(stamped.seq));
     Ok(stamped)
 }
 
@@ -973,7 +973,7 @@ async fn journal_ending(
     facts.pending_approvals = waiting.unwrap_or_default();
     facts.checkpoint = checkpoint;
     if let Some(stamped) = &stamped {
-        facts.latest_seq = Some(stamped.seq);
+        facts.latest_event = Some(stamped.seq);
     }
     (stamped, facts)
 }

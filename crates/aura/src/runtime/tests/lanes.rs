@@ -189,7 +189,10 @@ async fn a_lane_holding_only_an_ended_run_is_taken_again() {
     let second = h.ended(second).await;
 
     assert_eq!(second.session, first.session);
-    assert_eq!(second.first_seq, first.latest_seq.map(SequenceNumber::next));
+    assert_eq!(
+        second.first_event,
+        first.latest_event.map(SequenceNumber::next)
+    );
 }
 
 /// A lane with a claimant and no run is busy, so the start goes to the next
@@ -477,8 +480,8 @@ async fn a_lane_let_go_after_retention_is_reopened_with_its_sequence_continued()
     let fourth = h.ended(fourth).await;
     assert_eq!(fourth.session_id(), lane_1);
     assert_eq!(
-        fourth.first_seq,
-        second.latest_seq.map(SequenceNumber::next),
+        fourth.first_event,
+        second.latest_event.map(SequenceNumber::next),
         "lane 1 carries on its sequence"
     );
     three.notify_one();
@@ -529,7 +532,7 @@ async fn a_fenced_idle_lane_is_reopened() {
     let third = h.ended(third).await;
     assert_eq!(third.status, RunStatus::Finished);
     assert_eq!(third.session_id(), home);
-    assert_eq!(third.first_seq, Some(elsewhere.seq.next()));
+    assert_eq!(third.first_event, Some(elsewhere.seq.next()));
 }
 
 /// A drain stops the runs on every lane, refuses later starts, and lets
