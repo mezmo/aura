@@ -719,6 +719,65 @@ async fn a_stalled_attach_does_not_hold_up_a_start() {
     drop(claim);
 }
 
+/// A run's wait before opening its stream covers the attaches counted before
+/// the wait began, not one counted after it that is still waiting its turn.
+/// That later attach still lands before `Started`, since it was counted
+/// before the stream opened.
+#[tokio::test]
+async fn a_run_does_not_wait_for_an_attach_counted_after_it() {
+    let gate = Arc::new(Notify::new());
+    let h = harness_gating(
+        TestPreparer::new(
+            &["a"],
+            vec![Prepared::Fake(vec![Step::Wait(Arc::new(Notify::new()))])],
+        ),
+        DEFAULT_RETENTION,
+        &gate,
+        observer_attached,
+    );
+    let s = session("s1");
+
+    let mut first = Box::pin(h.runtime.attach(&s, Attach::claiming()));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), first.as_mut())
+            .await
+            .is_err(),
+        "the first attach is waiting on its write"
+    );
+    let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
+    eventually("the run's agent is prepared", || {
+        !h.preparer.prepared.lock().unwrap().is_empty()
+    })
+    .await;
+    let mut second = Box::pin(h.runtime.attach(&s, Attach::collecting()));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), second.as_mut())
+            .await
+            .is_err(),
+        "the second attach waits its turn behind the first"
+    );
+
+    gate.notify_one();
+    let claim = tokio::time::timeout(PATIENCE, first)
+        .await
+        .expect("the first attach is written")
+        .unwrap();
+    h.context(run).await;
+
+    gate.notify_one();
+    let collecting = tokio::time::timeout(PATIENCE, second)
+        .await
+        .expect("the second attach is written")
+        .unwrap();
+    h.journaled(&s, "started").await;
+    assert_eq!(
+        kinds(&h.journal(&s).await)[..3],
+        ["observer_attached", "observer_attached", "started"]
+    );
+    drop(collecting);
+    drop(claim);
+}
+
 /// A run stopped after its agent was prepared, while it waits behind an
 /// attach being written, ends without a `Started` event and never opens its
 /// stream.

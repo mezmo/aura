@@ -350,8 +350,8 @@ async fn execute(
     *traced = Some(attributes);
 
     async {
-        // An observer attach or detach still being written goes on the
-        // stream first. A run stopped after its agent was prepared, or while
+        // An observer attach or detach already counted goes on the stream
+        // first. A run stopped after its agent was prepared, or while
         // it waited, ends here without a `Started` event and without opening
         // its stream. `Registered`'s `Drop` relies on this when a claimed
         // start's attach fails.
@@ -875,9 +875,9 @@ async fn end(
 ///   context tokens. An orchestrated run's agents report their own context
 ///   usage as they go.
 ///
-/// Any observer attach or detach already being written goes on the stream
-/// first. One that starts after that can still land between the readings
-/// and the ending.
+/// Any observer attach or detach already counted goes on the stream first.
+/// One counted after that can still land between the readings and the
+/// ending.
 async fn append_closing_readings(
     session: &SessionRecord,
     record: &RunRecord,
@@ -954,7 +954,7 @@ async fn journal_ending(
         LifecycleEvent::Parked { checkpoint, .. } => Some(checkpoint.clone()),
         _ => None,
     };
-    // An observer detach still being written goes on the stream first, so a
+    // An observer detach already counted goes on the stream first, so a
     // claim that went while the run was live shows before the run's ending.
     session.observer_writes_done().await;
     let stamped = session
