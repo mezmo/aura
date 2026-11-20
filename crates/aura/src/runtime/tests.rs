@@ -15,7 +15,7 @@ use aura_events::{
 use rig::completion::Message;
 use tokio::sync::Notify;
 
-use aura_events::run::RunCancelReason;
+use aura_events::run::CancelCause;
 
 use super::prepare::{PrepareRequest, PreparedForRun};
 use super::record::RunRecord;
@@ -1391,11 +1391,11 @@ fn last_lifecycle(events: &[Arc<SessionEvent>]) -> &LifecycleEvent {
     }
 }
 
-/// A cancelled run ends `Cancelled` with the reason and the caller's words,
+/// A cancelled run ends `Cancelled` with the cause and the caller's words,
 /// its token is cancelled, and its MCP calls are cancelled on their servers.
 /// Cancelling a run that has ended does nothing.
 #[tokio::test]
-async fn a_cancelled_run_ends_with_the_reason_it_was_given() {
+async fn a_cancelled_run_ends_with_the_cause_it_was_given() {
     let h = harness(TestPreparer::new(
         &["a"],
         vec![Prepared::Fake(vec![Step::Wait(Arc::new(Notify::new()))])],
@@ -1408,17 +1408,15 @@ async fn a_cancelled_run_ends_with_the_reason_it_was_given() {
 
     assert!(h.runtime.cancel(
         &run,
-        RunCancelReason::External,
+        CancelCause::External,
         Some("the user pressed stop".to_owned())
     ));
     let facts = h.ended(run).await;
 
     assert_eq!(facts.run.status, RunStatus::Cancelled);
     match last_lifecycle(&h.journal(&SessionId::new("s1").unwrap()).await) {
-        LifecycleEvent::Cancelled {
-            reason, message, ..
-        } => {
-            assert_eq!(*reason, RunCancelReason::External);
+        LifecycleEvent::Cancelled { cause, message, .. } => {
+            assert_eq!(*cause, CancelCause::External);
             assert_eq!(message.as_deref(), Some("the user pressed stop"));
         }
         other => panic!("not Cancelled: {other:?}"),
@@ -1429,12 +1427,12 @@ async fn a_cancelled_run_ends_with_the_reason_it_was_given() {
         vec![(run.to_string(), "run cancelled".to_owned())]
     );
     assert!(
-        !h.runtime.cancel(&run, RunCancelReason::External, None),
+        !h.runtime.cancel(&run, CancelCause::External, None),
         "an ended run cannot be cancelled"
     );
     assert!(
         !h.runtime
-            .cancel(&RunId::mint(), RunCancelReason::External, None)
+            .cancel(&RunId::mint(), CancelCause::External, None)
     );
 }
 
@@ -1452,7 +1450,7 @@ async fn a_run_stopped_mid_tool_call_ends_once_its_mcp_calls_are_cancelled() {
     })
     .await;
 
-    assert!(h.runtime.cancel(&run, RunCancelReason::External, None));
+    assert!(h.runtime.cancel(&run, CancelCause::External, None));
 
     assert_eq!(h.ended(run).await.run.status, RunStatus::Cancelled);
     assert_eq!(h.preparer.closed.lock().unwrap().len(), 1);
@@ -1467,7 +1465,7 @@ async fn a_run_cancelled_while_preparing_ends_without_starting() {
     );
     let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
 
-    assert!(h.runtime.cancel(&run, RunCancelReason::External, None));
+    assert!(h.runtime.cancel(&run, CancelCause::External, None));
     let facts = h.ended(run).await;
 
     assert_eq!(facts.run.status, RunStatus::Cancelled);
@@ -1504,8 +1502,8 @@ async fn a_run_past_its_timeout_is_cancelled_for_the_deadline() {
     assert_eq!(facts.run.status, RunStatus::Cancelled);
     let events = h.journal(&SessionId::new("s1").unwrap()).await;
     match last_lifecycle(&events) {
-        LifecycleEvent::Cancelled { reason, .. } => {
-            assert_eq!(*reason, RunCancelReason::Deadline { after });
+        LifecycleEvent::Cancelled { cause, .. } => {
+            assert_eq!(*cause, CancelCause::Deadline { after });
         }
         other => panic!("not Cancelled: {other:?}"),
     }
@@ -1542,10 +1540,8 @@ async fn drain_cancels_live_runs_for_shutdown_and_refuses_new_starts() {
         let stored = h.runs.get(&run).await.unwrap().unwrap();
         assert_eq!(stored.run.status, RunStatus::Cancelled);
         match last_lifecycle(&h.journal(&SessionId::new(session).unwrap()).await) {
-            LifecycleEvent::Cancelled {
-                reason, message, ..
-            } => {
-                assert_eq!(*reason, RunCancelReason::Shutdown);
+            LifecycleEvent::Cancelled { cause, message, .. } => {
+                assert_eq!(*cause, CancelCause::Shutdown);
                 assert_eq!(*message, None, "the drain stopped the run");
             }
             other => panic!("not Cancelled: {other:?}"),
@@ -1589,10 +1585,8 @@ async fn drain_abandons_a_run_that_does_not_stop() {
     assert!(facts.run.ended_at.is_some());
     let events = h.journal(&SessionId::new("s1").unwrap()).await;
     match last_lifecycle(&events) {
-        LifecycleEvent::Cancelled {
-            reason, message, ..
-        } => {
-            assert_eq!(*reason, RunCancelReason::Shutdown);
+        LifecycleEvent::Cancelled { cause, message, .. } => {
+            assert_eq!(*cause, CancelCause::Shutdown);
             assert!(
                 message.as_deref().is_some_and(|m| m.contains("grace")),
                 "{message:?}"
@@ -1676,9 +1670,9 @@ async fn two_starts_racing_on_a_new_session_admit_one_run() {
 }
 
 /// When a caller stops a run before a drain does, the run keeps the caller's
-/// reason and message, even if the drain has to abandon it.
+/// cause and message, even if the drain has to abandon it.
 #[tokio::test(start_paused = true)]
-async fn an_abandoned_run_keeps_the_reason_it_was_first_stopped_for() {
+async fn an_abandoned_run_keeps_the_cause_it_was_first_stopped_for() {
     let h = harness(TestPreparer::new(
         &["a"],
         vec![Prepared::Fake(vec![Step::Stall])],
@@ -1691,17 +1685,15 @@ async fn an_abandoned_run_keeps_the_reason_it_was_first_stopped_for() {
 
     assert!(h.runtime.cancel(
         &run,
-        RunCancelReason::External,
+        CancelCause::External,
         Some("the user pressed stop".to_owned())
     ));
     h.runtime.drain(STOP_GRACE / 5).await;
 
     let events = h.journal(&SessionId::new("s1").unwrap()).await;
     match last_lifecycle(&events) {
-        LifecycleEvent::Cancelled {
-            reason, message, ..
-        } => {
-            assert_eq!(*reason, RunCancelReason::External);
+        LifecycleEvent::Cancelled { cause, message, .. } => {
+            assert_eq!(*cause, CancelCause::External);
             assert_eq!(message.as_deref(), Some("the user pressed stop"));
         }
         other => panic!("not Cancelled: {other:?}"),
@@ -2036,25 +2028,25 @@ fn preparing(run_id: RunId) -> RunFacts {
     }
 }
 
-/// The first stop's reason is the one kept. Once the run's stream has ended,
+/// The first stop's cause is the one kept. Once the run's stream has ended,
 /// stops are refused, so the run keeps the ending it reached.
 #[test]
 fn a_stop_after_the_stream_ended_is_refused() {
     let record = RunRecord::new(preparing(RunId::mint()));
-    assert!(record.stop(RunCancelReason::External, Some("first".to_owned())));
+    assert!(record.stop(CancelCause::External, Some("first".to_owned())));
     assert!(
-        record.stop(RunCancelReason::Shutdown, None),
+        record.stop(CancelCause::Shutdown, None),
         "a later stop still stops"
     );
     assert_eq!(
         record.stopped(),
-        Some((RunCancelReason::External, Some("first".to_owned())))
+        Some((CancelCause::External, Some("first".to_owned())))
     );
     assert!(record.cancel.is_cancelled());
 
     let record = RunRecord::new(preparing(RunId::mint()));
     record.close_to_stops();
-    assert!(!record.stop(RunCancelReason::External, None));
+    assert!(!record.stop(CancelCause::External, None));
     assert_eq!(record.stopped(), None);
     assert!(!record.cancel.is_cancelled());
 }
@@ -2074,7 +2066,7 @@ async fn a_stopped_run_whose_stream_does_not_end_is_dropped_after_the_grace() {
     .await;
     let stopped_at = tokio::time::Instant::now();
 
-    assert!(h.runtime.cancel(&run, RunCancelReason::External, None));
+    assert!(h.runtime.cancel(&run, CancelCause::External, None));
     let facts = h.ended(run).await;
 
     assert_eq!(facts.run.status, RunStatus::Cancelled);
@@ -2105,7 +2097,7 @@ async fn a_stopped_run_whose_mcp_close_hangs_still_ends() {
     .await;
     let stopped_at = tokio::time::Instant::now();
 
-    assert!(h.runtime.cancel(&run, RunCancelReason::External, None));
+    assert!(h.runtime.cancel(&run, CancelCause::External, None));
     // Longer than `Harness::ended` waits, which is the close and the grace
     // together.
     let record = h
@@ -3131,7 +3123,7 @@ mod spans {
             .await
             .unwrap();
         eventually("the run is running", running(&h, run)).await;
-        assert!(h.runtime.cancel(&run, RunCancelReason::External, None));
+        assert!(h.runtime.cancel(&run, CancelCause::External, None));
         assert_eq!(h.ended(run).await.run.status, RunStatus::Cancelled);
 
         assert_ends(&captured, run, Some("cancelled"), Status::Unset).await;

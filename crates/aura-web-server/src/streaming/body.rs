@@ -9,7 +9,7 @@ use aura::inactivity::{InactivityDeadline, STALL_MESSAGE};
 use aura::journal::JournalItem;
 use aura::runtime::{AgentRuntime, RunActivity, Subscription};
 use aura_events::RunId;
-use aura_events::run::RunCancelReason;
+use aura_events::run::CancelCause;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
@@ -214,8 +214,8 @@ pub async fn collect_body(
 /// own timeouts. If the run has already ended, it keeps its own ending, which
 /// the body is about to read.
 fn stop(runtime: &AgentRuntime, run: RunId, window: Duration, message: String) {
-    let reason = RunCancelReason::Deadline { after: window };
-    if !runtime.cancel(&run, reason, Some(message)) {
+    let cause = CancelCause::Deadline { after: window };
+    if !runtime.cancel(&run, cause, Some(message)) {
         tracing::debug!(run_id = %run, "the run had already ended when its window elapsed");
     }
 }
@@ -277,7 +277,7 @@ mod tests {
     use aura::streaming::{AgentRun, RunOptions};
     use aura::{Message, StreamError, StreamItem, StreamingAgent, ToolName, UsageState};
     use aura_events::agent::{AgentEvent, AgentEventPayload, ToolOutcome};
-    use aura_events::run::{LifecycleEvent, RunCancelReason, SessionEventPayload};
+    use aura_events::run::{CancelCause, LifecycleEvent, SessionEventPayload};
     use aura_events::{EmittingAgent, RunId, SessionId, TokenCount, TokenUsage, ToolCallId};
     use aura_test_utils::sse::parse_sse_stream;
     use futures_util::StreamExt;
@@ -610,7 +610,7 @@ mod tests {
 
     fn assert_cancelled_by_window(ending: &LifecycleEvent, window: Duration, message_start: &str) {
         let LifecycleEvent::Cancelled {
-            reason: RunCancelReason::Deadline { after },
+            cause: CancelCause::Deadline { after },
             message: Some(message),
             ..
         } = ending
@@ -766,7 +766,7 @@ mod tests {
                 matches!(
                     served.ending,
                     LifecycleEvent::Cancelled {
-                        reason: RunCancelReason::Deadline { after },
+                        cause: CancelCause::Deadline { after },
                         message: None,
                         ..
                     } if after == Duration::from_secs(300)
@@ -1037,7 +1037,7 @@ mod tests {
                 matches!(
                     served.ending,
                     LifecycleEvent::Cancelled {
-                        reason: RunCancelReason::Deadline { after },
+                        cause: CancelCause::Deadline { after },
                         ..
                     } if after == WINDOW
                 ),
@@ -1055,7 +1055,7 @@ mod tests {
             let run = running.run;
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(10)).await;
-                canceller.cancel(&run, RunCancelReason::External, Some("enough".to_string()));
+                canceller.cancel(&run, CancelCause::External, Some("enough".to_string()));
             });
             let served = read(&runtime, running, true, Timeouts::default()).await;
 
@@ -1064,7 +1064,7 @@ mod tests {
                 matches!(
                     &served.ending,
                     LifecycleEvent::Cancelled {
-                        reason: RunCancelReason::External,
+                        cause: CancelCause::External,
                         message: Some(message),
                         ..
                     } if message == "enough"
@@ -1090,7 +1090,7 @@ mod tests {
                 matches!(
                     served.ending,
                     LifecycleEvent::Cancelled {
-                        reason: RunCancelReason::Shutdown,
+                        cause: CancelCause::Shutdown,
                         ..
                     }
                 ),
@@ -1121,7 +1121,7 @@ mod tests {
                 matches!(
                     served.ending,
                     LifecycleEvent::Cancelled {
-                        reason: RunCancelReason::Unclaimed,
+                        cause: CancelCause::Unclaimed,
                         ..
                     }
                 ),

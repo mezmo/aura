@@ -9,7 +9,7 @@ use std::time::Duration;
 use aura_config::Config;
 use aura_events::agent::{AgentEvent, AgentEventPayload};
 use aura_events::run::{
-    CheckpointRef, LifecycleEvent, RunCancelReason, SessionEvent, SessionEventPayload,
+    CancelCause, CheckpointRef, LifecycleEvent, SessionEvent, SessionEventPayload,
 };
 use aura_events::{EmittingAgent, RunId, TokenCount, TokenUsage};
 use futures::stream::BoxStream;
@@ -511,7 +511,7 @@ async fn execute(
 /// whatever it still buffers is appended before this returns. At that point
 /// the run's ending is decided, so later stops are refused.
 ///
-/// At `deadline` the run is stopped for [`RunCancelReason::Deadline`]. A
+/// At `deadline` the run is stopped for [`CancelCause::Deadline`]. A
 /// single agent also checks the timeout itself between turns, and ends its
 /// stream with an error. An error that ends the stream at or after the
 /// deadline counts as the deadline, so both kinds of agent end the same way.
@@ -584,7 +584,7 @@ async fn drive(
                 stop_seen = true;
                 let label = record
                     .stopped()
-                    .map_or("run cancelled", |(reason, _)| stop_label(&reason));
+                    .map_or("run cancelled", |(cause, _)| stop_label(&cause));
                 let request_id = record.id.to_string();
                 let close = agent.cancel_and_close_mcp(&request_id, label);
                 if tokio::time::timeout(MCP_CLOSE_TIMEOUT, close).await.is_err() {
@@ -600,7 +600,7 @@ async fn drive(
             () = &mut expiry, if deadline_armed && items.is_some() => {
                 deadline_armed = false;
                 if let Some(deadline) = deadline {
-                    record.stop(RunCancelReason::Deadline { after: deadline.after }, None);
+                    record.stop(CancelCause::Deadline { after: deadline.after }, None);
                 }
             }
             item = next_item(&mut items), if items.is_some() => {
@@ -617,7 +617,7 @@ async fn drive(
                             && outcome.error.is_some()
                             && Instant::now() >= deadline.at
                         {
-                            record.stop(RunCancelReason::Deadline { after: deadline.after }, None);
+                            record.stop(CancelCause::Deadline { after: deadline.after }, None);
                         }
                         record.close_to_stops();
                     }
@@ -781,7 +781,7 @@ fn decision_id(run: RunId, raw: &str) -> Option<DecisionId> {
 ///
 /// 1. The journal refused one of the run's events, including its closing
 ///    readings: `Failed`.
-/// 2. The run was stopped: `Cancelled`, with the stop's reason.
+/// 2. The run was stopped: `Cancelled`, with the stop's cause.
 /// 3. The run yielded to a client tool: `Finished`.
 /// 4. The run's stream returned an error: `Failed`.
 /// 5. The run parked: `Parked`.
@@ -834,8 +834,8 @@ async fn end(
             format!("the session journal refused the run's events: {journal_error}"),
             usage,
         )
-    } else if let Some((reason, message)) = record.stopped() {
-        cancelled(reason, message, usage)
+    } else if let Some((cause, message)) = record.stopped() {
+        cancelled(cause, message, usage)
     } else if yielded {
         (LifecycleEvent::Finished { usage }, RunStatus::Finished)
     } else if let Some(error) = error {
@@ -921,19 +921,17 @@ async fn append_closing_readings(
 }
 
 /// Writes the ending for a run after a drain aborted its task. The ending is
-/// `Cancelled` with the reason the run was first stopped for, which is what
+/// `Cancelled` with the cause the run was first stopped for, which is what
 /// the run would have written itself if it had stopped in time. If that stop
 /// came without a message, the message says the run did not stop within the
 /// grace period.
 pub(super) async fn end_abandoned(shared: &Shared, session: &SessionRecord, record: &RunRecord) {
     record.close_to_stops();
     let usage = record.usage();
-    let (reason, message) = record
-        .stopped()
-        .unwrap_or((RunCancelReason::Shutdown, None));
+    let (cause, message) = record.stopped().unwrap_or((CancelCause::Shutdown, None));
     let message = message
         .unwrap_or_else(|| "the run did not stop within the shutdown grace period".to_owned());
-    let (terminal, status) = cancelled(reason, Some(message), usage);
+    let (terminal, status) = cancelled(cause, Some(message), usage);
     let (stamped, facts) = journal_ending(session, record, terminal, status, None, usage).await;
     release(shared, session, record, stamped, facts, false).await;
 }
@@ -1033,13 +1031,13 @@ fn failed(error: String, usage: TokenUsage) -> (LifecycleEvent, RunStatus) {
 }
 
 fn cancelled(
-    reason: RunCancelReason,
+    cause: CancelCause,
     message: Option<String>,
     usage: TokenUsage,
 ) -> (LifecycleEvent, RunStatus) {
     (
         LifecycleEvent::Cancelled {
-            reason,
+            cause,
             message,
             usage,
         },
@@ -1048,11 +1046,11 @@ fn cancelled(
 }
 
 /// The reason sent to MCP servers when a stopped run's calls are cancelled.
-fn stop_label(reason: &RunCancelReason) -> &'static str {
-    match reason {
-        RunCancelReason::Deadline { .. } => "run timed out",
-        RunCancelReason::Shutdown => "server shutting down",
-        RunCancelReason::Unclaimed => "run unclaimed",
+fn stop_label(cause: &CancelCause) -> &'static str {
+    match cause {
+        CancelCause::Deadline { .. } => "run timed out",
+        CancelCause::Shutdown => "server shutting down",
+        CancelCause::Unclaimed => "run unclaimed",
         _ => "run cancelled",
     }
 }

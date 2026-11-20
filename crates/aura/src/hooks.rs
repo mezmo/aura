@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-pub use aura_events::run::RunCancelReason;
+pub use aura_events::run::CancelCause;
 
 /// Why a hook ends a run before its next turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,13 +23,13 @@ pub enum StopReason {
 }
 
 impl StopReason {
-    /// The cancel reason this stop puts on the wire. A client-tool stop puts
+    /// The cancel cause this stop puts on the wire. A client-tool stop puts
     /// none: that run ends as a finish, with `finish_reason: "tool_calls"`,
     /// not as a cancel.
-    pub fn cancel_reason(self) -> Option<RunCancelReason> {
+    pub fn cancel_cause(self) -> Option<CancelCause> {
         match self {
-            Self::Deadline { after } => Some(RunCancelReason::Deadline { after }),
-            Self::External => Some(RunCancelReason::External),
+            Self::Deadline { after } => Some(CancelCause::Deadline { after }),
+            Self::External => Some(CancelCause::External),
             Self::ClientTool => None,
         }
     }
@@ -286,13 +286,13 @@ mod tests {
     fn a_client_tool_stop_is_not_a_cancel_on_the_wire() {
         let after = std::time::Duration::from_secs(30);
         assert_eq!(
-            StopReason::Deadline { after }.cancel_reason(),
-            Some(RunCancelReason::Deadline { after })
+            StopReason::Deadline { after }.cancel_cause(),
+            Some(CancelCause::Deadline { after })
         );
         assert_eq!(
-            StopReason::External.cancel_reason(),
-            Some(RunCancelReason::External)
+            StopReason::External.cancel_cause(),
+            Some(CancelCause::External)
         );
-        assert_eq!(StopReason::ClientTool.cancel_reason(), None);
+        assert_eq!(StopReason::ClientTool.cancel_cause(), None);
     }
 }

@@ -45,7 +45,7 @@
 //! under `event`, so no field of any event can collide with the envelope's tag.
 //! A lifecycle event is internally tagged by `type`, as
 //! [`AgentEventPayload`](crate::agent::AgentEventPayload) is, so a lifecycle
-//! field named `type` — or `reason`, which [`RunCancelReason`] flattens into
+//! field named `type` — or `cause`, which [`CancelCause`] flattens into
 //! [`LifecycleEvent::Cancelled`] — would collide; the roundtrip test over
 //! every variant is what catches one.
 //!
@@ -164,9 +164,9 @@ impl Default for Liveness {
 
 /// Why a run was ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "reason", rename_all = "snake_case")]
+#[serde(tag = "cause", rename_all = "snake_case")]
 #[non_exhaustive]
-pub enum RunCancelReason {
+pub enum CancelCause {
     /// The run outlived the bound it was started with.
     Deadline {
         #[serde(rename = "after_ms", with = "crate::duration_ms")]
@@ -183,9 +183,9 @@ pub enum RunCancelReason {
     Unknown,
 }
 
-impl std::fmt::Display for RunCancelReason {
-    /// Writes the reason's wire tag, such as `shutdown`. A deadline also
-    /// shows its bound, as in `deadline after 30s`. A reason this version
+impl std::fmt::Display for CancelCause {
+    /// Writes the cause's wire tag, such as `shutdown`. A deadline also
+    /// shows its bound, as in `deadline after 30s`. A cause this version
     /// does not know shows as `unknown`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -260,7 +260,7 @@ pub enum LifecycleEvent {
     /// The run was ended before completing.
     Cancelled {
         #[serde(flatten)]
-        reason: RunCancelReason,
+        cause: CancelCause,
         /// The caller's own words.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
@@ -298,7 +298,7 @@ pub enum RunEnding {
     Finished,
     Parked,
     Cancelled {
-        reason: RunCancelReason,
+        cause: CancelCause,
         /// Text from the caller, for diagnostics only.
         message: Option<String>,
     },
@@ -316,10 +316,8 @@ impl LifecycleEvent {
         match self {
             Self::Finished { .. } => Some(RunEnding::Finished),
             Self::Parked { .. } => Some(RunEnding::Parked),
-            Self::Cancelled {
-                reason, message, ..
-            } => Some(RunEnding::Cancelled {
-                reason: *reason,
+            Self::Cancelled { cause, message, .. } => Some(RunEnding::Cancelled {
+                cause: *cause,
                 message: message.clone(),
             }),
             Self::Failed { error, .. } => Some(RunEnding::Failed {
@@ -511,9 +509,9 @@ mod tests {
         assert_eq!(roundtrip(&event).run_id, None);
     }
 
-    /// Every lifecycle variant, every cancel reason and every detach cause
+    /// Every lifecycle variant, every cancel cause and every detach cause
     /// survives a roundtrip. A field named after a tag — `type` on a lifecycle
-    /// variant, `reason` beside a flattened cancel reason — serializes as a
+    /// variant, `cause` beside a flattened cancel cause — serializes as a
     /// duplicate key and fails here.
     #[test]
     fn every_lifecycle_variant_survives_a_roundtrip() {
@@ -550,24 +548,24 @@ mod tests {
             },
             LifecycleEvent::Finished { usage: usage() },
             LifecycleEvent::Cancelled {
-                reason: RunCancelReason::Deadline {
+                cause: CancelCause::Deadline {
                     after: Duration::from_millis(1500),
                 },
                 message: None,
                 usage: usage(),
             },
             LifecycleEvent::Cancelled {
-                reason: RunCancelReason::External,
+                cause: CancelCause::External,
                 message: Some("operator stopped it".to_string()),
                 usage: usage(),
             },
             LifecycleEvent::Cancelled {
-                reason: RunCancelReason::Unclaimed,
+                cause: CancelCause::Unclaimed,
                 message: None,
                 usage: usage(),
             },
             LifecycleEvent::Cancelled {
-                reason: RunCancelReason::Shutdown,
+                cause: CancelCause::Shutdown,
                 message: None,
                 usage: usage(),
             },
@@ -631,14 +629,14 @@ mod tests {
         ));
     }
 
-    /// The cancel reason flattens under the event the way a tool outcome
+    /// The cancel cause flattens under the event the way a tool outcome
     /// flattens under `tool_complete`, and the caller's words ride beside it.
     #[test]
-    fn a_cancel_reason_flattens_beside_the_callers_message() {
+    fn a_cancel_cause_flattens_beside_the_callers_message() {
         let json = serde_json::to_value(lifecycle(
             9,
             LifecycleEvent::Cancelled {
-                reason: RunCancelReason::Deadline {
+                cause: CancelCause::Deadline {
                     after: Duration::from_secs(300),
                 },
                 message: Some("request timeout".to_string()),
@@ -651,7 +649,7 @@ mod tests {
             json["payload"]["event"],
             json!({
                 "type": "cancelled",
-                "reason": "deadline",
+                "cause": "deadline",
                 "after_ms": 300_000,
                 "message": "request timeout",
                 "prompt_tokens": 10,
@@ -660,15 +658,15 @@ mod tests {
             })
         );
 
-        for (reason, tag) in [
-            (RunCancelReason::External, "external"),
-            (RunCancelReason::Unclaimed, "unclaimed"),
-            (RunCancelReason::Shutdown, "shutdown"),
+        for (cause, tag) in [
+            (CancelCause::External, "external"),
+            (CancelCause::Unclaimed, "unclaimed"),
+            (CancelCause::Shutdown, "shutdown"),
         ] {
             let json = serde_json::to_value(lifecycle(
                 9,
                 LifecycleEvent::Cancelled {
-                    reason,
+                    cause,
                     message: None,
                     usage: usage(),
                 },
@@ -678,7 +676,7 @@ mod tests {
                 json["payload"]["event"],
                 json!({
                     "type": "cancelled",
-                    "reason": tag,
+                    "cause": tag,
                     "prompt_tokens": 10,
                     "completion_tokens": 5,
                     "total_tokens": 15
@@ -687,22 +685,22 @@ mod tests {
         }
     }
 
-    /// A reason displays as its wire tag. A deadline also shows its bound.
+    /// A cause displays as its wire tag. A deadline also shows its bound.
     #[test]
-    fn a_cancel_reason_displays_as_its_wire_tag() {
-        for (reason, shown) in [
+    fn a_cancel_cause_displays_as_its_wire_tag() {
+        for (cause, shown) in [
             (
-                RunCancelReason::Deadline {
+                CancelCause::Deadline {
                     after: Duration::from_secs(30),
                 },
                 "deadline after 30s",
             ),
-            (RunCancelReason::External, "external"),
-            (RunCancelReason::Unclaimed, "unclaimed"),
-            (RunCancelReason::Shutdown, "shutdown"),
-            (RunCancelReason::Unknown, "unknown"),
+            (CancelCause::External, "external"),
+            (CancelCause::Unclaimed, "unclaimed"),
+            (CancelCause::Shutdown, "shutdown"),
+            (CancelCause::Unknown, "unknown"),
         ] {
-            assert_eq!(reason.to_string(), shown);
+            assert_eq!(cause.to_string(), shown);
         }
     }
 
@@ -710,16 +708,16 @@ mod tests {
     /// dropped, and nothing rounds up.
     #[test]
     fn a_duration_is_whole_milliseconds_on_the_wire() {
-        let before = RunCancelReason::Deadline {
+        let before = CancelCause::Deadline {
             after: Duration::from_micros(1_500_999),
         };
         let json = serde_json::to_value(before).unwrap();
-        assert_eq!(json, json!({ "reason": "deadline", "after_ms": 1500 }));
+        assert_eq!(json, json!({ "cause": "deadline", "after_ms": 1500 }));
 
-        let after: RunCancelReason = serde_json::from_value(json).unwrap();
+        let after: CancelCause = serde_json::from_value(json).unwrap();
         assert_eq!(
             after,
-            RunCancelReason::Deadline {
+            CancelCause::Deadline {
                 after: Duration::from_millis(1500)
             }
         );
@@ -794,7 +792,7 @@ mod tests {
             },
             LifecycleEvent::Finished { usage: usage() },
             LifecycleEvent::Cancelled {
-                reason: RunCancelReason::External,
+                cause: CancelCause::External,
                 message: None,
                 usage: usage(),
             },
@@ -958,7 +956,7 @@ mod tests {
         assert_ne!(RunId::mint(), RunId::mint());
     }
 
-    /// Each terminal event maps to its ending, with a cancel's reason and
+    /// Each terminal event maps to its ending, with a cancel's cause and
     /// message and a failure's error carried over. No other event has an
     /// ending.
     #[test]
@@ -977,12 +975,12 @@ mod tests {
             ),
             (
                 LifecycleEvent::Cancelled {
-                    reason: RunCancelReason::External,
+                    cause: CancelCause::External,
                     message: Some("operator stopped it".to_string()),
                     usage: usage(),
                 },
                 RunEnding::Cancelled {
-                    reason: RunCancelReason::External,
+                    cause: CancelCause::External,
                     message: Some("operator stopped it".to_string()),
                 },
             ),
@@ -1036,7 +1034,7 @@ mod tests {
             },
             LifecycleEvent::Finished { usage: usage() },
             LifecycleEvent::Cancelled {
-                reason: RunCancelReason::External,
+                cause: CancelCause::External,
                 message: None,
                 usage: usage(),
             },
@@ -1156,7 +1154,7 @@ mod tests {
 
         let cancelled: LifecycleEvent = serde_json::from_value(json!({
             "type": "cancelled",
-            "reason": "preempted",
+            "cause": "preempted",
             "prompt_tokens": 10,
             "completion_tokens": 5,
             "total_tokens": 15
@@ -1165,7 +1163,7 @@ mod tests {
         assert!(matches!(
             cancelled,
             LifecycleEvent::Cancelled {
-                reason: RunCancelReason::Unknown,
+                cause: CancelCause::Unknown,
                 message: None,
                 ..
             }
@@ -1212,7 +1210,7 @@ mod tests {
     #[test]
     fn an_unknown_variant_cannot_be_serialized() {
         assert!(serde_json::to_value(LifecycleEvent::Unknown).is_err());
-        assert!(serde_json::to_value(RunCancelReason::Unknown).is_err());
+        assert!(serde_json::to_value(CancelCause::Unknown).is_err());
         assert!(serde_json::to_value(LivenessPolicy::Unknown).is_err());
         assert!(serde_json::to_value(ObserverKind::Unknown).is_err());
         assert!(serde_json::to_value(DetachCause::Unknown).is_err());

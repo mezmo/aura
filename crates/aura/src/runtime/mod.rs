@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use aura_config::Config;
 use aura_events::run::{
-    LifecycleEvent, Liveness, LivenessPolicy, Observer, ObserverId, RunCancelReason,
+    CancelCause, LifecycleEvent, Liveness, LivenessPolicy, Observer, ObserverId,
     SessionEventPayload,
 };
 use aura_events::{RunId, SessionId};
@@ -353,11 +353,11 @@ impl AgentRuntime {
 
     /// Stops the run and returns whether it was stopped. Returns `false` for
     /// a run that has ended or that this process does not hold. The run's
-    /// task writes the `Cancelled` ending, with `reason` and `message`.
-    pub fn cancel(&self, run: &RunId, reason: RunCancelReason, message: Option<String>) -> bool {
+    /// task writes the `Cancelled` ending, with `cause` and `message`.
+    pub fn cancel(&self, run: &RunId, cause: CancelCause, message: Option<String>) -> bool {
         self.shared
             .run(run)
-            .is_some_and(|record| record.stop(reason, message))
+            .is_some_and(|record| record.stop(cause, message))
     }
 
     /// Follows the activity of `run`, or `None` for a run this process does
@@ -369,7 +369,7 @@ impl AgentRuntime {
     /// Shuts the runtime down, in four steps:
     ///
     /// 1. Refuses every later start with [`StartError::ShuttingDown`].
-    /// 2. Stops every live run for [`RunCancelReason::Shutdown`], and waits
+    /// 2. Stops every live run for [`CancelCause::Shutdown`], and waits
     ///    up to `grace` for them to end.
     /// 3. Abandons any run still going: aborts its task and writes its
     ///    `Cancelled` ending for it. Writing those endings, and waiting for
@@ -396,7 +396,7 @@ impl AgentRuntime {
                 .collect()
         };
         for record in &live {
-            record.stop(RunCancelReason::Shutdown, None);
+            record.stop(CancelCause::Shutdown, None);
         }
         if tokio::time::timeout(grace, all_settled(&live))
             .await
@@ -849,7 +849,7 @@ impl Drop for Registered {
             // checks for a stop once that write is done.
             if let Some(AttachedRun::StartedWith(run)) = &self.run {
                 run.stop(
-                    RunCancelReason::External,
+                    CancelCause::External,
                     Some("the start failed before its observer was attached".to_owned()),
                 );
             }

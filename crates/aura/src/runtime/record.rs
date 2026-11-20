@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
-use aura_events::run::{Liveness, RunCancelReason};
+use aura_events::run::{CancelCause, Liveness};
 use aura_events::{RunId, SessionId, TokenCount, TokenUsage};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
@@ -232,8 +232,8 @@ impl RunActivity {
 /// Whether and why a run was stopped.
 #[derive(Default)]
 struct Stops {
-    /// The reason and message the run was stopped with.
-    reason: Option<(RunCancelReason, Option<String>)>,
+    /// The cause and message the run was stopped with.
+    stopped_with: Option<(CancelCause, Option<String>)>,
     /// Whether the run can no longer be stopped.
     closed: bool,
 }
@@ -358,16 +358,16 @@ impl RunRecord {
         self.stops.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Stops the run for `reason` and returns whether it did. The first
-    /// reason given is the one the run ends with, and a later stop does not
+    /// Stops the run for `cause` and returns whether it did. The first
+    /// cause given is the one the run ends with, and a later stop does not
     /// change it. Returns `false` once the run's stream has ended, because
     /// by then the run's ending is already decided.
-    pub(super) fn stop(&self, reason: RunCancelReason, message: Option<String>) -> bool {
+    pub(super) fn stop(&self, cause: CancelCause, message: Option<String>) -> bool {
         let mut stops = self.stops();
         if stops.closed {
             return false;
         }
-        stops.reason.get_or_insert((reason, message));
+        stops.stopped_with.get_or_insert((cause, message));
         self.cancel.cancel();
         true
     }
@@ -382,9 +382,9 @@ impl RunRecord {
         self.stops().closed = true;
     }
 
-    /// The reason and message the run was stopped with, if it was stopped.
-    pub(super) fn stopped(&self) -> Option<(RunCancelReason, Option<String>)> {
-        self.stops().reason.clone()
+    /// The cause and message the run was stopped with, if it was stopped.
+    pub(super) fn stopped(&self) -> Option<(CancelCause, Option<String>)> {
+        self.stops().stopped_with.clone()
     }
 
     fn task(&self) -> MutexGuard<'_, Option<JoinHandle<()>>> {
