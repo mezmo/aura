@@ -258,6 +258,17 @@ per-cycle `beta` (`X.Y.Z-beta.N`), and `main` (stable `X.Y.Z`, what
   first clause: the anti-pattern often hides as a trailing "; …when…" or "; …
   becomes…" appended to an otherwise-correct definition.
 
+## Parse, Don't Validate
+
+- A check that learns something about a value returns a type that carries
+  it, and the caller stores that type. A check that returns `Result<(), E>`
+  and leaves a raw `String` behind sends every reader back to re-check it,
+  usually with `.expect("validated ...")`.
+- For config, make deserialization the parse: a type with a private field
+  and `#[serde(try_from = "String")]`, as `McpUserAgent` does, so no
+  unchecked value of the type exists.
+- Run every fallible check on an input before its first side effect.
+
 ## Commit and Contribution Rules
 
 - **No AI co-authorship**: Never add `Co-Authored-By` lines for Claude or any AI assistant. Claude cannot accept the CLA.
