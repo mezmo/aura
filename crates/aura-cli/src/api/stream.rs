@@ -7,11 +7,57 @@ use anyhow::Result;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use reqwest::Response;
+use serde::Deserialize;
 
-use aura_events::{ApprovalCompleted, ApprovalPending, ApprovalRequested, AuraStreamEvent};
+use aura_events::{ApprovalCompleted, ApprovalPending, ApprovalRequested};
 
 use crate::api::types::{AccumulatedToolCall, ChatCompletionChunk};
 use crate::event_names;
+
+#[derive(Deserialize)]
+struct ToolRequestedPayload {
+    tool_id: String,
+    tool_name: String,
+    arguments: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct ToolStartPayload {
+    tool_id: String,
+    tool_name: String,
+}
+
+#[derive(Deserialize)]
+struct ToolCompletePayload {
+    tool_id: String,
+    tool_name: String,
+    duration_ms: u64,
+    result: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UsagePayload {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct ToolUsagePayload {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+
+#[derive(Deserialize)]
+struct ContextUsagePayload {
+    context_tokens: u64,
+    response_tokens: u64,
+    context_window: Option<u64>,
+    #[serde(default)]
+    agent_id: String,
+}
 
 /// Result of processing a stream — either a text response or tool calls.
 #[derive(Debug)]
@@ -211,18 +257,16 @@ where
             handler.on_raw_event(event_name, &event.data);
         }
 
-        // Parse aura-specific events using shared types from aura-events crate.
-        // The event name tells us which variant to expect; serde's untagged
-        // deserialization handles the JSON → enum mapping.
+        // Select the payload by event name so extra fields cannot make an
+        // untagged enum choose a different event's shape.
         if event_name.starts_with("aura.") {
             match event_name.as_str() {
                 event_names::TOOL_REQUESTED => {
-                    if let Ok(AuraStreamEvent::ToolRequested {
+                    if let Ok(ToolRequestedPayload {
                         tool_id,
                         tool_name,
                         arguments,
-                        ..
-                    }) = serde_json::from_str::<AuraStreamEvent>(&event.data)
+                    }) = serde_json::from_str::<ToolRequestedPayload>(&event.data)
                     {
                         let args = match &arguments {
                             serde_json::Value::Object(map) => {
@@ -234,23 +278,21 @@ where
                     }
                 }
                 event_names::TOOL_START => {
-                    if let Ok(AuraStreamEvent::ToolStart {
-                        tool_id, tool_name, ..
-                    }) = serde_json::from_str::<AuraStreamEvent>(&event.data)
+                    if let Ok(ToolStartPayload { tool_id, tool_name }) =
+                        serde_json::from_str::<ToolStartPayload>(&event.data)
                     {
                         tool_timers.insert(tool_id.clone(), Instant::now());
                         handler.on_tool_start(&tool_id, &tool_name);
                     }
                 }
                 event_names::TOOL_COMPLETE => {
-                    if let Ok(AuraStreamEvent::ToolComplete {
+                    if let Ok(ToolCompletePayload {
                         tool_id,
                         tool_name,
                         duration_ms,
                         result,
                         error,
-                        ..
-                    }) = serde_json::from_str::<AuraStreamEvent>(&event.data)
+                    }) = serde_json::from_str::<ToolCompletePayload>(&event.data)
                     {
                         let elapsed = Duration::from_millis(duration_ms);
                         tool_timers.remove(&tool_id);
@@ -266,13 +308,12 @@ where
                     }
                 }
                 event_names::USAGE => {
-                    if let Ok(AuraStreamEvent::Usage {
+                    if let Ok(UsagePayload {
                         prompt_tokens,
                         completion_tokens,
                         cache_read_input_tokens,
                         cache_creation_input_tokens,
-                        ..
-                    }) = serde_json::from_str::<AuraStreamEvent>(&event.data)
+                    }) = serde_json::from_str::<UsagePayload>(&event.data)
                     {
                         let cache_usage =
                             match (cache_read_input_tokens, cache_creation_input_tokens) {
@@ -285,28 +326,26 @@ where
                     }
                 }
                 event_names::CONTEXT_USAGE => {
-                    if let Ok(AuraStreamEvent::ContextUsage {
+                    if let Ok(ContextUsagePayload {
                         context_tokens,
                         response_tokens,
                         context_window,
-                        agent,
-                        ..
-                    }) = serde_json::from_str::<AuraStreamEvent>(&event.data)
+                        agent_id,
+                    }) = serde_json::from_str::<ContextUsagePayload>(&event.data)
                     {
                         handler.on_context_usage(
                             context_tokens,
                             response_tokens,
                             context_window,
-                            &agent.agent_id,
+                            &agent_id,
                         );
                     }
                 }
                 event_names::TOOL_USAGE => {
-                    if let Ok(AuraStreamEvent::ToolUsage {
+                    if let Ok(ToolUsagePayload {
                         prompt_tokens,
                         completion_tokens,
-                        ..
-                    }) = serde_json::from_str::<AuraStreamEvent>(&event.data)
+                    }) = serde_json::from_str::<ToolUsagePayload>(&event.data)
                     {
                         handler.on_tool_usage(prompt_tokens, completion_tokens);
                     }
@@ -505,6 +544,7 @@ mod tests {
         tools_completed: Vec<(String, String, Option<String>)>,
         usages: Vec<(u64, u64)>,
         tool_usages: Vec<(u64, u64)>,
+        context_usages: Vec<(u64, u64, Option<u64>, String)>,
         reasoning: Vec<(String, String)>,
         raw_events: Vec<(String, String)>,
         orchestrator_events: Vec<(String, serde_json::Value)>,
@@ -550,6 +590,20 @@ mod tests {
             _cache_usage: Option<(u64, u64)>,
         ) {
             self.usages.push((prompt_tokens, completion_tokens));
+        }
+        fn on_context_usage(
+            &mut self,
+            context_tokens: u64,
+            response_tokens: u64,
+            context_window: Option<u64>,
+            agent_id: &str,
+        ) {
+            self.context_usages.push((
+                context_tokens,
+                response_tokens,
+                context_window,
+                agent_id.to_string(),
+            ));
         }
         fn on_tool_usage(&mut self, prompt_tokens: u64, completion_tokens: u64) {
             self.tool_usages.push((prompt_tokens, completion_tokens));
@@ -758,6 +812,118 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
+    async fn tool_events_with_extra_fields_follow_the_event_name() {
+        let data = serde_json::json!({
+            "tool_id": "call_1",
+            "tool_name": "Shell",
+            "arguments": {"command": "ls"},
+            "duration_ms": 1500,
+            "success": true,
+            "result": "file_output",
+            "model": "future-model",
+            "agent_id": "main",
+            "session_id": "s1"
+        })
+        .to_string();
+        let events = vec![
+            sse(event_names::TOOL_REQUESTED, &data),
+            sse(event_names::TOOL_START, &data),
+            sse(event_names::TOOL_COMPLETE, &data),
+            sse(
+                "",
+                &tool_call_chunk(
+                    0,
+                    Some("call_1"),
+                    Some("Shell"),
+                    Some("{}"),
+                    Some("tool_calls"),
+                ),
+            ),
+        ];
+        let (result, caps) = run_stream(events).await;
+        assert_eq!(caps.tools_requested.len(), 1);
+        assert_eq!(caps.tools_requested[0].2["command"], "ls");
+        assert_eq!(caps.tools_started, vec![("call_1".into(), "Shell".into())]);
+        assert_eq!(
+            caps.tools_completed,
+            vec![("call_1".into(), "Shell".into(), Some("file_output".into()))]
+        );
+        match result.unwrap() {
+            StreamResult::ToolCalls { server_results, .. } => {
+                assert_eq!(server_results["call_1"], "file_output");
+            }
+            other => panic!("expected ToolCalls, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_events_with_extra_fields_follow_the_event_name() {
+        let data = serde_json::json!({
+            "tool_ids": ["call_1"],
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "context_tokens": 80,
+            "response_tokens": 10,
+            "context_window": 1000,
+            "model": "future-model",
+            "agent_id": "worker",
+            "session_id": "s1"
+        })
+        .to_string();
+        let (result, caps) = run_stream(vec![
+            sse(event_names::USAGE, &data),
+            sse(event_names::TOOL_USAGE, &data),
+            sse(event_names::CONTEXT_USAGE, &data),
+        ])
+        .await;
+        result.unwrap();
+        assert_eq!(caps.usages, vec![(100, 20)]);
+        assert_eq!(caps.tool_usages, vec![(100, 20)]);
+        assert_eq!(
+            caps.context_usages,
+            vec![(80, 10, Some(1000), "worker".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_named_payloads_are_skipped_without_losing_text() {
+        let data = serde_json::json!({
+            "tool_id": 42,
+            "tool_name": false,
+            "arguments": {},
+            "duration_ms": "later",
+            "prompt_tokens": "many",
+            "completion_tokens": {},
+            "context_tokens": "many",
+            "response_tokens": {}
+        })
+        .to_string();
+        let mut events = [
+            event_names::TOOL_REQUESTED,
+            event_names::TOOL_START,
+            event_names::TOOL_COMPLETE,
+            event_names::USAGE,
+            event_names::TOOL_USAGE,
+            event_names::CONTEXT_USAGE,
+        ]
+        .into_iter()
+        .map(|name| sse(name, &data))
+        .collect::<Vec<_>>();
+        events.push(sse("", &text_chunk("still here", Some("stop"))));
+        let (result, caps) = run_stream(events).await;
+        assert!(
+            matches!(result.unwrap(), StreamResult::TextResponse(text) if text == "still here")
+        );
+        assert!(caps.tools_requested.is_empty());
+        assert!(caps.tools_started.is_empty());
+        assert!(caps.tools_completed.is_empty());
+        assert!(caps.usages.is_empty());
+        assert!(caps.tool_usages.is_empty());
+        assert!(caps.context_usages.is_empty());
+    }
+
+    #[tokio::test]
     async fn aura_tool_requested_callback() {
         let data = serde_json::json!({
             "tool_id": "call_1",
@@ -833,6 +999,7 @@ mod tests {
             "duration_ms": 50,
             "success": false,
             "error": "command not found",
+            "arguments": {"command": "missing"},
             "agent_id": "main",
             "session_id": "s1"
         });
