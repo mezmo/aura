@@ -169,7 +169,7 @@ mod tests {
     fn cancelled(cause: CancelCause) -> RunEnding {
         RunEnding::Cancelled {
             cause,
-            message: None,
+            reason: None,
         }
     }
 

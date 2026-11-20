@@ -1415,9 +1415,9 @@ async fn a_cancelled_run_ends_with_the_cause_it_was_given() {
 
     assert_eq!(facts.run.status, RunStatus::Cancelled);
     match last_lifecycle(&h.journal(&SessionId::new("s1").unwrap()).await) {
-        LifecycleEvent::Cancelled { cause, message, .. } => {
+        LifecycleEvent::Cancelled { cause, reason, .. } => {
             assert_eq!(*cause, CancelCause::External);
-            assert_eq!(message.as_deref(), Some("the user pressed stop"));
+            assert_eq!(reason.as_deref(), Some("the user pressed stop"));
         }
         other => panic!("not Cancelled: {other:?}"),
     }
@@ -1521,7 +1521,7 @@ async fn a_run_past_its_timeout_is_cancelled_for_the_deadline() {
 
 /// Draining stops every live run for shutdown, refuses later starts, and
 /// lets go of every run and session it held. A run the drain stopped ends
-/// with no message; one it had to abandon would say it did not stop in time.
+/// with no reason; one it had to abandon would say it did not stop in time.
 #[tokio::test]
 async fn drain_cancels_live_runs_for_shutdown_and_refuses_new_starts() {
     let h = harness(TestPreparer::new(
@@ -1540,9 +1540,9 @@ async fn drain_cancels_live_runs_for_shutdown_and_refuses_new_starts() {
         let stored = h.runs.get(&run).await.unwrap().unwrap();
         assert_eq!(stored.run.status, RunStatus::Cancelled);
         match last_lifecycle(&h.journal(&SessionId::new(session).unwrap()).await) {
-            LifecycleEvent::Cancelled { cause, message, .. } => {
+            LifecycleEvent::Cancelled { cause, reason, .. } => {
                 assert_eq!(*cause, CancelCause::Shutdown);
-                assert_eq!(*message, None, "the drain stopped the run");
+                assert_eq!(*reason, None, "the drain stopped the run");
             }
             other => panic!("not Cancelled: {other:?}"),
         }
@@ -1585,11 +1585,11 @@ async fn drain_abandons_a_run_that_does_not_stop() {
     assert!(facts.run.ended_at.is_some());
     let events = h.journal(&SessionId::new("s1").unwrap()).await;
     match last_lifecycle(&events) {
-        LifecycleEvent::Cancelled { cause, message, .. } => {
+        LifecycleEvent::Cancelled { cause, reason, .. } => {
             assert_eq!(*cause, CancelCause::Shutdown);
             assert!(
-                message.as_deref().is_some_and(|m| m.contains("grace")),
-                "{message:?}"
+                reason.as_deref().is_some_and(|m| m.contains("grace")),
+                "{reason:?}"
             );
         }
         other => panic!("not Cancelled: {other:?}"),
@@ -1670,7 +1670,7 @@ async fn two_starts_racing_on_a_new_session_admit_one_run() {
 }
 
 /// When a caller stops a run before a drain does, the run keeps the caller's
-/// cause and message, even if the drain has to abandon it.
+/// cause and reason, even if the drain has to abandon it.
 #[tokio::test(start_paused = true)]
 async fn an_abandoned_run_keeps_the_cause_it_was_first_stopped_for() {
     let h = harness(TestPreparer::new(
@@ -1692,9 +1692,9 @@ async fn an_abandoned_run_keeps_the_cause_it_was_first_stopped_for() {
 
     let events = h.journal(&SessionId::new("s1").unwrap()).await;
     match last_lifecycle(&events) {
-        LifecycleEvent::Cancelled { cause, message, .. } => {
+        LifecycleEvent::Cancelled { cause, reason, .. } => {
             assert_eq!(*cause, CancelCause::External);
-            assert_eq!(message.as_deref(), Some("the user pressed stop"));
+            assert_eq!(reason.as_deref(), Some("the user pressed stop"));
         }
         other => panic!("not Cancelled: {other:?}"),
     }

@@ -74,10 +74,10 @@ fn assert_stopped_by_a_failed_start(events: &[Arc<SessionEvent>]) {
     match last_lifecycle(events) {
         LifecycleEvent::Cancelled {
             cause: CancelCause::External,
-            message,
+            reason,
             ..
         } => assert_eq!(
-            message.as_deref(),
+            reason.as_deref(),
             Some("the start failed before its observer was attached")
         ),
         other => panic!("not cancelled by the failed start: {other:?}"),

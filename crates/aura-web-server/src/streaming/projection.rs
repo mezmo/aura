@@ -1380,7 +1380,7 @@ mod tests {
         fn a_finished_a_parked_and_a_cancelled_run_end_with_the_final_chunk() {
             let cancelled = |cause| LifecycleEvent::Cancelled {
                 cause,
-                message: None,
+                reason: None,
                 usage: TokenUsage::default(),
             };
             let endings = [
@@ -1400,21 +1400,21 @@ mod tests {
                         cause: CancelCause::Deadline {
                             after: std::time::Duration::from_secs(30),
                         },
-                        message: None,
+                        reason: None,
                     },
                 ),
                 (
                     cancelled(CancelCause::External),
                     RunEnding::Cancelled {
                         cause: CancelCause::External,
-                        message: None,
+                        reason: None,
                     },
                 ),
                 (
                     cancelled(CancelCause::Shutdown),
                     RunEnding::Cancelled {
                         cause: CancelCause::Shutdown,
-                        message: None,
+                        reason: None,
                     },
                 ),
                 // A cause a newer writer journaled, which this binary does
@@ -1423,7 +1423,7 @@ mod tests {
                     cancelled(CancelCause::Unknown),
                     RunEnding::Cancelled {
                         cause: CancelCause::Unknown,
-                        message: None,
+                        reason: None,
                     },
                 ),
             ];
@@ -1443,7 +1443,7 @@ mod tests {
                 &mut projector(true),
                 LifecycleEvent::Cancelled {
                     cause: CancelCause::Unclaimed,
-                    message: None,
+                    reason: None,
                     usage: TokenUsage::default(),
                 },
             );
@@ -1452,7 +1452,7 @@ mod tests {
                 ending,
                 Ending::Run(RunEnding::Cancelled {
                     cause: CancelCause::Unclaimed,
-                    message: None,
+                    reason: None,
                 })
             );
         }

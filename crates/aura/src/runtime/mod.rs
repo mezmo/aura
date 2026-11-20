@@ -353,11 +353,11 @@ impl AgentRuntime {
 
     /// Stops the run and returns whether it was stopped. Returns `false` for
     /// a run that has ended or that this process does not hold. The run's
-    /// task writes the `Cancelled` ending, with `cause` and `message`.
-    pub fn cancel(&self, run: &RunId, cause: CancelCause, message: Option<String>) -> bool {
+    /// task writes the `Cancelled` ending, with `cause` and `reason`.
+    pub fn cancel(&self, run: &RunId, cause: CancelCause, reason: Option<String>) -> bool {
         self.shared
             .run(run)
-            .is_some_and(|record| record.stop(cause, message))
+            .is_some_and(|record| record.stop(cause, reason))
     }
 
     /// Follows the activity of `run`, or `None` for a run this process does

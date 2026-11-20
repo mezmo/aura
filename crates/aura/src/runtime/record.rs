@@ -232,7 +232,7 @@ impl RunActivity {
 /// Whether and why a run was stopped.
 #[derive(Default)]
 struct Stops {
-    /// The cause and message the run was stopped with.
+    /// The cause and reason the run was stopped with.
     stopped_with: Option<(CancelCause, Option<String>)>,
     /// Whether the run can no longer be stopped.
     closed: bool,
@@ -362,12 +362,12 @@ impl RunRecord {
     /// cause given is the one the run ends with, and a later stop does not
     /// change it. Returns `false` once the run's stream has ended, because
     /// by then the run's ending is already decided.
-    pub(super) fn stop(&self, cause: CancelCause, message: Option<String>) -> bool {
+    pub(super) fn stop(&self, cause: CancelCause, reason: Option<String>) -> bool {
         let mut stops = self.stops();
         if stops.closed {
             return false;
         }
-        stops.stopped_with.get_or_insert((cause, message));
+        stops.stopped_with.get_or_insert((cause, reason));
         self.cancel.cancel();
         true
     }
@@ -382,7 +382,7 @@ impl RunRecord {
         self.stops().closed = true;
     }
 
-    /// The cause and message the run was stopped with, if it was stopped.
+    /// The cause and reason the run was stopped with, if it was stopped.
     pub(super) fn stopped(&self) -> Option<(CancelCause, Option<String>)> {
         self.stops().stopped_with.clone()
     }

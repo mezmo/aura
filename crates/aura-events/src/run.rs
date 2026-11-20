@@ -263,7 +263,7 @@ pub enum LifecycleEvent {
         cause: CancelCause,
         /// The caller's own words.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        message: Option<String>,
+        reason: Option<String>,
         /// As [`Finished`](Self::Finished)'s.
         #[serde(flatten)]
         usage: TokenUsage,
@@ -300,7 +300,7 @@ pub enum RunEnding {
     Cancelled {
         cause: CancelCause,
         /// Text from the caller, for diagnostics only.
-        message: Option<String>,
+        reason: Option<String>,
     },
     Failed {
         /// Text from the run describing the failure, for diagnostics only.
@@ -316,9 +316,9 @@ impl LifecycleEvent {
         match self {
             Self::Finished { .. } => Some(RunEnding::Finished),
             Self::Parked { .. } => Some(RunEnding::Parked),
-            Self::Cancelled { cause, message, .. } => Some(RunEnding::Cancelled {
+            Self::Cancelled { cause, reason, .. } => Some(RunEnding::Cancelled {
                 cause: *cause,
-                message: message.clone(),
+                reason: reason.clone(),
             }),
             Self::Failed { error, .. } => Some(RunEnding::Failed {
                 error: error.clone(),
@@ -551,22 +551,22 @@ mod tests {
                 cause: CancelCause::Deadline {
                     after: Duration::from_millis(1500),
                 },
-                message: None,
+                reason: None,
                 usage: usage(),
             },
             LifecycleEvent::Cancelled {
                 cause: CancelCause::External,
-                message: Some("operator stopped it".to_string()),
+                reason: Some("operator stopped it".to_string()),
                 usage: usage(),
             },
             LifecycleEvent::Cancelled {
                 cause: CancelCause::Unclaimed,
-                message: None,
+                reason: None,
                 usage: usage(),
             },
             LifecycleEvent::Cancelled {
                 cause: CancelCause::Shutdown,
-                message: None,
+                reason: None,
                 usage: usage(),
             },
             LifecycleEvent::Failed {
@@ -632,14 +632,14 @@ mod tests {
     /// The cancel cause flattens under the event the way a tool outcome
     /// flattens under `tool_complete`, and the caller's words ride beside it.
     #[test]
-    fn a_cancel_cause_flattens_beside_the_callers_message() {
+    fn a_cancel_cause_flattens_beside_the_callers_reason() {
         let json = serde_json::to_value(lifecycle(
             9,
             LifecycleEvent::Cancelled {
                 cause: CancelCause::Deadline {
                     after: Duration::from_secs(300),
                 },
-                message: Some("request timeout".to_string()),
+                reason: Some("request timeout".to_string()),
                 usage: usage(),
             },
         ))
@@ -651,7 +651,7 @@ mod tests {
                 "type": "cancelled",
                 "cause": "deadline",
                 "after_ms": 300_000,
-                "message": "request timeout",
+                "reason": "request timeout",
                 "prompt_tokens": 10,
                 "completion_tokens": 5,
                 "total_tokens": 15
@@ -667,7 +667,7 @@ mod tests {
                 9,
                 LifecycleEvent::Cancelled {
                     cause,
-                    message: None,
+                    reason: None,
                     usage: usage(),
                 },
             ))
@@ -793,7 +793,7 @@ mod tests {
             LifecycleEvent::Finished { usage: usage() },
             LifecycleEvent::Cancelled {
                 cause: CancelCause::External,
-                message: None,
+                reason: None,
                 usage: usage(),
             },
             LifecycleEvent::Failed {
@@ -957,7 +957,7 @@ mod tests {
     }
 
     /// Each terminal event maps to its ending, with a cancel's cause and
-    /// message and a failure's error carried over. No other event has an
+    /// reason and a failure's error carried over. No other event has an
     /// ending.
     #[test]
     fn every_terminal_event_has_an_ending_and_no_other_does() {
@@ -976,12 +976,12 @@ mod tests {
             (
                 LifecycleEvent::Cancelled {
                     cause: CancelCause::External,
-                    message: Some("operator stopped it".to_string()),
+                    reason: Some("operator stopped it".to_string()),
                     usage: usage(),
                 },
                 RunEnding::Cancelled {
                     cause: CancelCause::External,
-                    message: Some("operator stopped it".to_string()),
+                    reason: Some("operator stopped it".to_string()),
                 },
             ),
             (
@@ -1035,7 +1035,7 @@ mod tests {
             LifecycleEvent::Finished { usage: usage() },
             LifecycleEvent::Cancelled {
                 cause: CancelCause::External,
-                message: None,
+                reason: None,
                 usage: usage(),
             },
             LifecycleEvent::Failed {
@@ -1164,7 +1164,7 @@ mod tests {
             cancelled,
             LifecycleEvent::Cancelled {
                 cause: CancelCause::Unknown,
-                message: None,
+                reason: None,
                 ..
             }
         ));
