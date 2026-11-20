@@ -834,8 +834,8 @@ async fn end(
             format!("the session journal refused the run's events: {journal_error}"),
             usage,
         )
-    } else if let Some((cause, message)) = record.stopped() {
-        cancelled(cause, message, usage)
+    } else if let Some((cause, reason)) = record.stopped() {
+        cancelled(cause, reason, usage)
     } else if yielded {
         (LifecycleEvent::Finished { usage }, RunStatus::Finished)
     } else if let Some(error) = error {
@@ -923,15 +923,15 @@ async fn append_closing_readings(
 /// Writes the ending for a run after a drain aborted its task. The ending is
 /// `Cancelled` with the cause the run was first stopped for, which is what
 /// the run would have written itself if it had stopped in time. If that stop
-/// came without a message, the message says the run did not stop within the
+/// came without a reason, the reason says the run did not stop within the
 /// grace period.
 pub(super) async fn end_abandoned(shared: &Shared, session: &SessionRecord, record: &RunRecord) {
     record.close_to_stops();
     let usage = record.usage();
-    let (cause, message) = record.stopped().unwrap_or((CancelCause::Shutdown, None));
-    let message = message
+    let (cause, reason) = record.stopped().unwrap_or((CancelCause::Shutdown, None));
+    let reason = reason
         .unwrap_or_else(|| "the run did not stop within the shutdown grace period".to_owned());
-    let (terminal, status) = cancelled(cause, Some(message), usage);
+    let (terminal, status) = cancelled(cause, Some(reason), usage);
     let (stamped, facts) = journal_ending(session, record, terminal, status, None, usage).await;
     release(shared, session, record, stamped, facts, false).await;
 }
@@ -1032,13 +1032,13 @@ fn failed(error: String, usage: TokenUsage) -> (LifecycleEvent, RunStatus) {
 
 fn cancelled(
     cause: CancelCause,
-    message: Option<String>,
+    reason: Option<String>,
     usage: TokenUsage,
 ) -> (LifecycleEvent, RunStatus) {
     (
         LifecycleEvent::Cancelled {
             cause,
-            message,
+            reason,
             usage,
         },
         RunStatus::Cancelled,

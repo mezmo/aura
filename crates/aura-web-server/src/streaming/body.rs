@@ -213,9 +213,9 @@ pub async fn collect_body(
 /// run's span records a timeout error, as the request-bound path records its
 /// own timeouts. If the run has already ended, it keeps its own ending, which
 /// the body is about to read.
-fn stop(runtime: &AgentRuntime, run: RunId, window: Duration, message: String) {
+fn stop(runtime: &AgentRuntime, run: RunId, window: Duration, reason: String) {
     let cause = CancelCause::Deadline { after: window };
-    if !runtime.cancel(&run, cause, Some(message)) {
+    if !runtime.cancel(&run, cause, Some(reason)) {
         tracing::debug!(run_id = %run, "the run had already ended when its window elapsed");
     }
 }
@@ -608,17 +608,17 @@ mod tests {
             .collect()
     }
 
-    fn assert_cancelled_by_window(ending: &LifecycleEvent, window: Duration, message_start: &str) {
+    fn assert_cancelled_by_window(ending: &LifecycleEvent, window: Duration, reason_start: &str) {
         let LifecycleEvent::Cancelled {
             cause: CancelCause::Deadline { after },
-            message: Some(message),
+            reason: Some(reason),
             ..
         } = ending
         else {
             panic!("expected the body to cancel the run, got {ending:?}");
         };
         assert_eq!(*after, window, "the cancel names the window that ran out");
-        assert!(message.starts_with(message_start), "got: {message}");
+        assert!(reason.starts_with(reason_start), "got: {reason}");
     }
 
     fn assert_finished(ending: &LifecycleEvent) {
@@ -767,7 +767,7 @@ mod tests {
                     served.ending,
                     LifecycleEvent::Cancelled {
                         cause: CancelCause::Deadline { after },
-                        message: None,
+                        reason: None,
                         ..
                     } if after == Duration::from_secs(300)
                 ),
@@ -1065,9 +1065,9 @@ mod tests {
                     &served.ending,
                     LifecycleEvent::Cancelled {
                         cause: CancelCause::External,
-                        message: Some(message),
+                        reason: Some(reason),
                         ..
-                    } if message == "enough"
+                    } if reason == "enough"
                 ),
                 "got {:?}",
                 served.ending
