@@ -6,7 +6,7 @@ use aura::stream_events::{AuraStreamEvent, CorrelationContext, EmittingAgent};
 use aura::{RunId, ToolCall, ToolResult, ToolResultKind};
 use aura_events::TokenCount;
 use aura_events::agent::{AgentEvent, AgentEventPayload, ResultFormat, ToolOutcome};
-use aura_events::run::{RunCancelReason, RunEnding, SessionEventPayload};
+use aura_events::run::{CancelCause, RunEnding, SessionEventPayload};
 use bytes::Bytes;
 
 use super::handlers::{
@@ -374,7 +374,7 @@ impl SseProjector {
             // The run stopped because its last claimant left, so nobody is
             // reading. Nothing more goes out, not even the closing readings.
             Ending::Run(RunEnding::Cancelled {
-                reason: RunCancelReason::Unclaimed,
+                cause: CancelCause::Unclaimed,
                 ..
             }) => Vec::new(),
             Ending::Run(RunEnding::Finished | RunEnding::Parked | RunEnding::Cancelled { .. }) => {
@@ -452,8 +452,7 @@ mod tests {
     use aura_events::agent::{AgentEvent, AgentEventPayload, ResultFormat, ToolOutcome};
     use aura_events::event_names;
     use aura_events::run::{
-        CheckpointRef, LifecycleEvent, RunCancelReason, RunEnding, SessionEvent,
-        SessionEventPayload,
+        CancelCause, CheckpointRef, LifecycleEvent, RunEnding, SessionEvent, SessionEventPayload,
     };
     use aura_events::{
         EmittingAgent, RunId, SequenceNumber, SessionId, Timestamp, TokenCount, TokenUsage,
@@ -1379,8 +1378,8 @@ mod tests {
 
         #[test]
         fn a_finished_a_parked_and_a_cancelled_run_end_with_the_final_chunk() {
-            let cancelled = |reason| LifecycleEvent::Cancelled {
-                reason,
+            let cancelled = |cause| LifecycleEvent::Cancelled {
+                cause,
                 message: None,
                 usage: TokenUsage::default(),
             };
@@ -1394,36 +1393,36 @@ mod tests {
                     RunEnding::Parked,
                 ),
                 (
-                    cancelled(RunCancelReason::Deadline {
+                    cancelled(CancelCause::Deadline {
                         after: std::time::Duration::from_secs(30),
                     }),
                     RunEnding::Cancelled {
-                        reason: RunCancelReason::Deadline {
+                        cause: CancelCause::Deadline {
                             after: std::time::Duration::from_secs(30),
                         },
                         message: None,
                     },
                 ),
                 (
-                    cancelled(RunCancelReason::External),
+                    cancelled(CancelCause::External),
                     RunEnding::Cancelled {
-                        reason: RunCancelReason::External,
+                        cause: CancelCause::External,
                         message: None,
                     },
                 ),
                 (
-                    cancelled(RunCancelReason::Shutdown),
+                    cancelled(CancelCause::Shutdown),
                     RunEnding::Cancelled {
-                        reason: RunCancelReason::Shutdown,
+                        cause: CancelCause::Shutdown,
                         message: None,
                     },
                 ),
-                // A reason a newer writer journaled, which this binary does
+                // A cause a newer writer journaled, which this binary does
                 // not know.
                 (
-                    cancelled(RunCancelReason::Unknown),
+                    cancelled(CancelCause::Unknown),
                     RunEnding::Cancelled {
-                        reason: RunCancelReason::Unknown,
+                        cause: CancelCause::Unknown,
                         message: None,
                     },
                 ),
@@ -1443,7 +1442,7 @@ mod tests {
             let (frames, ending) = end_of(
                 &mut projector(true),
                 LifecycleEvent::Cancelled {
-                    reason: RunCancelReason::Unclaimed,
+                    cause: CancelCause::Unclaimed,
                     message: None,
                     usage: TokenUsage::default(),
                 },
@@ -1452,7 +1451,7 @@ mod tests {
             assert_eq!(
                 ending,
                 Ending::Run(RunEnding::Cancelled {
-                    reason: RunCancelReason::Unclaimed,
+                    cause: CancelCause::Unclaimed,
                     message: None,
                 })
             );

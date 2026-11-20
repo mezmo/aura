@@ -294,7 +294,7 @@ async fn a_live_run_whose_last_claimant_leaves_is_cancelled_as_unclaimed() {
     );
     match last_lifecycle(&events) {
         LifecycleEvent::Cancelled {
-            reason: RunCancelReason::Unclaimed,
+            cause: CancelCause::Unclaimed,
             ..
         } => {}
         other => panic!("not cancelled as unclaimed: {other:?}"),
@@ -806,7 +806,7 @@ async fn a_run_stopped_while_waiting_behind_an_attach_writes_no_started() {
         !h.preparer.prepared.lock().unwrap().is_empty()
     })
     .await;
-    assert!(h.runtime.cancel(&run, RunCancelReason::External, None));
+    assert!(h.runtime.cancel(&run, CancelCause::External, None));
 
     gate.notify_one();
     let observer = attach.await.unwrap();
@@ -995,7 +995,7 @@ async fn losing_the_claim_stops_the_run_before_the_detach_is_written() {
     drop(claim);
     assert_eq!(
         record.stopped(),
-        Some((RunCancelReason::Unclaimed, None)),
+        Some((CancelCause::Unclaimed, None)),
         "the run is stopped as the claim goes"
     );
     eventually("the run's stream ends", || !record.stoppable()).await;

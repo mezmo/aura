@@ -19,7 +19,7 @@ use uuid::Uuid;
 use aura::journal::JournalItem;
 use aura::runtime::{Admitted, Attach, Caller, RunTarget, StartError, StartRun, Subscription};
 use aura_events::run::{
-    LifecycleEvent, Liveness, LivenessPolicy, RunCancelReason, RunEnding, SessionEventPayload,
+    CancelCause, LifecycleEvent, Liveness, LivenessPolicy, RunEnding, SessionEventPayload,
 };
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
@@ -98,11 +98,11 @@ pub enum StartChatError {
     #[error("the run failed before it started: {error}")]
     FailedBeforeStart { error: String },
     #[error(
-        "the run was cancelled before it started: {reason}{}",
+        "the run was cancelled before it started: {cause}{}",
         .message.as_deref().map_or_else(String::new, |message| format!(" ({message})"))
     )]
     CancelledBeforeStart {
-        reason: RunCancelReason,
+        cause: CancelCause,
         /// The message the cancel came with.
         message: Option<String>,
     },
@@ -146,7 +146,7 @@ impl StartChatError {
             ),
             Self::Start(StartError::ShuttingDown)
             | Self::CancelledBeforeStart {
-                reason: RunCancelReason::Shutdown,
+                cause: CancelCause::Shutdown,
                 ..
             } => shutting_down_response(),
             Self::Start(_)
@@ -357,12 +357,12 @@ pub(crate) async fn start_run(
 /// ending as well. Any other refusal is an error with the refusal's text.
 fn record_refusal(span: &tracing::Span, refused: &StartChatError) {
     let ending = match refused {
-        StartChatError::CancelledBeforeStart { reason, message } => RunEnding::Cancelled {
-            reason: *reason,
+        StartChatError::CancelledBeforeStart { cause, message } => RunEnding::Cancelled {
+            cause: *cause,
             message: message.clone(),
         },
         StartChatError::Start(StartError::ShuttingDown) => RunEnding::Cancelled {
-            reason: RunCancelReason::Shutdown,
+            cause: CancelCause::Shutdown,
             message: None,
         },
         StartChatError::Start(_)
@@ -404,8 +404,8 @@ async fn read_to_started(
             Some(RunEnding::Failed { error }) => {
                 return Err(StartChatError::FailedBeforeStart { error });
             }
-            Some(RunEnding::Cancelled { reason, message }) => {
-                return Err(StartChatError::CancelledBeforeStart { reason, message });
+            Some(RunEnding::Cancelled { cause, message }) => {
+                return Err(StartChatError::CancelledBeforeStart { cause, message });
             }
             // A run finishes or parks only after it has streamed, and that
             // comes after `Started`. This arm is defensive, and it counts as
@@ -4316,7 +4316,7 @@ source = '{}'
         fn a_refusal_records_what_its_cancel_means_on_the_span() {
             use super::super::StartChatError;
             use aura::runtime::StartError;
-            use aura_events::run::RunCancelReason;
+            use aura_events::run::CancelCause;
             use opentelemetry::trace::Status;
 
             fn recorded(refused: StartChatError) -> (Status, Option<String>) {
@@ -4341,7 +4341,7 @@ source = '{}'
             }
 
             let (status, termination) = recorded(StartChatError::CancelledBeforeStart {
-                reason: RunCancelReason::Shutdown,
+                cause: CancelCause::Shutdown,
                 message: None,
             });
             assert_eq!(status, Status::Unset, "a shutdown is not an error");
@@ -4439,12 +4439,12 @@ source = '{}'
         }
 
         /// A cancel before `Started` is 503 for a shutdown and 500 otherwise.
-        /// The 500 message names the reason by its wire tag and includes the
+        /// The 500 message names the cause by its wire tag and includes the
         /// cancel's message.
         #[tokio::test]
-        async fn a_cancel_before_the_start_maps_by_its_reason() {
+        async fn a_cancel_before_the_start_maps_by_its_cause() {
             let shutdown = super::super::StartChatError::CancelledBeforeStart {
-                reason: aura_events::run::RunCancelReason::Shutdown,
+                cause: aura_events::run::CancelCause::Shutdown,
                 message: None,
             };
             assert_eq!(
@@ -4453,7 +4453,7 @@ source = '{}'
             );
 
             let external = super::super::StartChatError::CancelledBeforeStart {
-                reason: aura_events::run::RunCancelReason::External,
+                cause: aura_events::run::CancelCause::External,
                 message: Some("first chunk timeout".to_owned()),
             };
             let (status, message, kind) = refusal(external.into_http_response()).await;

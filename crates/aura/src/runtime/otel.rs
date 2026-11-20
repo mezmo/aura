@@ -1,7 +1,7 @@
 //! What the runtime records on a run's `agent.stream` span when the run
 //! starts and when it ends.
 
-use aura_events::run::{RunCancelReason, RunEnding};
+use aura_events::run::{CancelCause, RunEnding};
 use aura_events::{RunId, SessionId};
 
 use crate::conversation::LaneNumber;
@@ -138,7 +138,7 @@ pub(crate) struct Termination {
 ///   no status.
 /// - Cancelled because its last claimant left: `stream.termination` set to
 ///   `disconnected`, and no status.
-/// - Cancelled externally, or for a reason this version does not know:
+/// - Cancelled externally, or for a cause this version does not know:
 ///   `stream.termination` set to `cancelled`, and no status.
 /// - Parked: `stream.termination` set to `parked`, and no status.
 ///
@@ -149,11 +149,11 @@ pub(crate) fn termination(end: &RunEnding) -> Termination {
     let (attribute, status) = match end {
         RunEnding::Finished => (None, SpanStatus::Ok),
         RunEnding::Failed { error } => (None, SpanStatus::Error(logging::truncate_for_otel(error))),
-        RunEnding::Cancelled { reason, .. } => match reason {
-            RunCancelReason::Deadline { .. } => (None, SpanStatus::Error("timeout".to_owned())),
-            RunCancelReason::Shutdown => (Some("shutdown"), SpanStatus::Unset),
-            RunCancelReason::Unclaimed => (Some("disconnected"), SpanStatus::Unset),
-            RunCancelReason::External => (Some("cancelled"), SpanStatus::Unset),
+        RunEnding::Cancelled { cause, .. } => match cause {
+            CancelCause::Deadline { .. } => (None, SpanStatus::Error("timeout".to_owned())),
+            CancelCause::Shutdown => (Some("shutdown"), SpanStatus::Unset),
+            CancelCause::Unclaimed => (Some("disconnected"), SpanStatus::Unset),
+            CancelCause::External => (Some("cancelled"), SpanStatus::Unset),
             _ => (Some("cancelled"), SpanStatus::Unset),
         },
         RunEnding::Parked => (Some("parked"), SpanStatus::Unset),
@@ -166,9 +166,9 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn cancelled(reason: RunCancelReason) -> RunEnding {
+    fn cancelled(cause: CancelCause) -> RunEnding {
         RunEnding::Cancelled {
-            reason,
+            cause,
             message: None,
         }
     }
@@ -185,24 +185,24 @@ mod tests {
                 SpanStatus::Error("boom".to_owned()),
             ),
             (
-                cancelled(RunCancelReason::Deadline {
+                cancelled(CancelCause::Deadline {
                     after: Duration::from_secs(1),
                 }),
                 None,
                 SpanStatus::Error("timeout".to_owned()),
             ),
             (
-                cancelled(RunCancelReason::Shutdown),
+                cancelled(CancelCause::Shutdown),
                 Some("shutdown"),
                 SpanStatus::Unset,
             ),
             (
-                cancelled(RunCancelReason::Unclaimed),
+                cancelled(CancelCause::Unclaimed),
                 Some("disconnected"),
                 SpanStatus::Unset,
             ),
             (
-                cancelled(RunCancelReason::External),
+                cancelled(CancelCause::External),
                 Some("cancelled"),
                 SpanStatus::Unset,
             ),
@@ -242,9 +242,9 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_cancel_reason_reads_as_cancelled() {
-        let unknown: RunCancelReason =
-            serde_json::from_value(serde_json::json!({ "reason": "later" })).unwrap();
+    fn an_unknown_cancel_cause_reads_as_cancelled() {
+        let unknown: CancelCause =
+            serde_json::from_value(serde_json::json!({ "cause": "later" })).unwrap();
         assert_eq!(
             termination(&cancelled(unknown)),
             Termination {

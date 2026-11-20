@@ -73,7 +73,7 @@ fn assert_stopped_by_a_failed_start(events: &[Arc<SessionEvent>]) {
     assert!(!kinds.contains(&"claims_exhausted"), "{kinds:?}");
     match last_lifecycle(events) {
         LifecycleEvent::Cancelled {
-            reason: RunCancelReason::External,
+            cause: CancelCause::External,
             message,
             ..
         } => assert_eq!(
@@ -159,7 +159,7 @@ async fn a_lane_whose_stopped_run_has_not_ended_is_skipped() {
 
     let stalled = h.runtime.start(on_chat("c1", "q")).await.unwrap();
     h.running(stalled).await;
-    assert!(h.runtime.cancel(&stalled, RunCancelReason::External, None));
+    assert!(h.runtime.cancel(&stalled, CancelCause::External, None));
 
     let next = h.runtime.start(on_chat("c1", "q")).await.unwrap();
     assert_eq!(h.lane_of(next), 1);
@@ -703,7 +703,7 @@ async fn dropping_a_claimed_starts_subscription_stops_its_run() {
     assert!(kinds(&events).contains(&"claims_exhausted"));
     match last_lifecycle(&events) {
         LifecycleEvent::Cancelled {
-            reason: RunCancelReason::Unclaimed,
+            cause: CancelCause::Unclaimed,
             ..
         } => {}
         other => panic!("not cancelled as unclaimed: {other:?}"),
