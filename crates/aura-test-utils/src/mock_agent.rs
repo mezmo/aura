@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use aura::stream_events::McpServerStatus;
 use aura::streaming::AgentRun;
-use aura::{Message, StreamError, StreamItem, StreamingAgent, UsageState};
+use aura::{Message, RunContext, StreamError, StreamItem, StreamingAgent, UsageState};
 use aura::{StreamedAssistantContent, StreamedUserContent, ToolCall, ToolResult, ToolResultKind};
 use futures::stream::{self, BoxStream, StreamExt};
 
@@ -28,6 +29,8 @@ const SETTLE: Duration = Duration::from_millis(10);
 pub enum Step {
     Item(Result<StreamItem, StreamError>),
     Effect(EffectHook),
+    /// Runs an effect and yields an item in the same step.
+    Emitted(Result<StreamItem, StreamError>, EffectHook),
 }
 
 impl Step {
@@ -42,6 +45,23 @@ impl Step {
         Fut: Future<Output = ()> + Send + 'static,
     {
         Self::Effect(Arc::new(move |request_id| Box::pin(effect(request_id))))
+    }
+
+    /// Runs `effect` and yields `item` in the same step.
+    ///
+    /// This models an event that an agent puts on both its item stream and
+    /// the run's event channel. `effect` sends the event on the channel, and
+    /// `item` carries the same event on the stream. `effect` is passed the
+    /// current call's `request_id`.
+    pub fn emitted<F, Fut>(item: Result<StreamItem, StreamError>, effect: F) -> Self
+    where
+        F: Fn(String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        Self::Emitted(
+            item,
+            Arc::new(move |request_id| Box::pin(effect(request_id))),
+        )
     }
 }
 
@@ -99,6 +119,9 @@ pub struct MockAgent {
     script: Script,
     run_id: aura::RunId,
     stream_claim: aura::streaming::StreamClaim,
+    /// Whether each run gets its own `RunContext`.
+    run_context: bool,
+    mcp_status: Vec<McpServerStatus>,
 }
 
 impl MockAgent {
@@ -109,6 +132,8 @@ impl MockAgent {
             script: Script::Pending,
             run_id: aura::RunId::mint(),
             stream_claim: aura::streaming::StreamClaim::default(),
+            run_context: false,
+            mcp_status: Vec::new(),
         }
     }
 
@@ -127,7 +152,31 @@ impl MockAgent {
             script: Script::Steps(Mutex::new(Some(steps))),
             run_id: aura::RunId::mint(),
             stream_claim: aura::streaming::StreamClaim::default(),
+            run_context: false,
+            mcp_status: Vec::new(),
         }
+    }
+
+    /// Streams under `run_id` instead of the id minted when the agent was built.
+    pub fn for_run(mut self, run_id: aura::RunId) -> Self {
+        self.run_id = run_id;
+        self
+    }
+
+    /// Gives each run its own `RunContext`, built on the cancel token from
+    /// the run's options. The context is in scope while the script runs, so
+    /// an effect step can send events through `aura::run_context::emit`. The
+    /// returned `AgentRun` holds the context (`run_context()`) and the
+    /// receiver of its event channel (`take_agent_events()`).
+    pub fn with_run_context(mut self) -> Self {
+        self.run_context = true;
+        self
+    }
+
+    /// Reports `servers` as the status of its MCP servers.
+    pub fn with_mcp_status(mut self, servers: Vec<McpServerStatus>) -> Self {
+        self.mcp_status = servers;
+        self
     }
 
     /// Awaited before `stream` produces its stream, and passed that
@@ -160,15 +209,24 @@ impl MockAgent {
                         .then(move |step| {
                             let request_id = request_id.clone();
                             async move {
-                                let item = match step {
-                                    Step::Item(item) => Some(item),
+                                match step {
+                                    Step::Item(item) => {
+                                        tokio::time::sleep(SETTLE).await;
+                                        Some(item)
+                                    }
                                     Step::Effect(effect) => {
                                         effect(request_id).await;
+                                        tokio::time::sleep(SETTLE).await;
                                         None
                                     }
-                                };
-                                tokio::time::sleep(SETTLE).await;
-                                item
+                                    // Settle first, so that the effect's event and
+                                    // the item arrive with no pause between them.
+                                    Step::Emitted(item, effect) => {
+                                        tokio::time::sleep(SETTLE).await;
+                                        effect(request_id).await;
+                                        Some(item)
+                                    }
+                                }
                             }
                         })
                         .filter_map(std::future::ready),
@@ -201,19 +259,27 @@ impl StreamingAgent for MockAgent {
         if let Err(refused) = self.stream_claim.claim(self.run_id, request_id) {
             return AgentRun::refused(refused);
         }
-        let stream = self.start(request_id).await;
         // Carries a caller-supplied token so `cancel_token()` returns the one the
         // caller named. The scripts do not race it, so cancelling does not end a
         // mock stream.
-        AgentRun::new(
-            stream,
-            options.into_parts().1.unwrap_or_default(),
-            UsageState::new(),
-        )
+        let cancel = options.into_parts().1.unwrap_or_default();
+        let stream = self.start(request_id).await;
+        if !self.run_context {
+            return AgentRun::new(stream, cancel, UsageState::new());
+        }
+        let (run, events) = RunContext::channel_on(self.run_id, cancel.clone());
+        let scoped = aura::run_context::scope_stream(Arc::clone(&run), stream);
+        AgentRun::new(Box::pin(scoped), cancel, UsageState::new())
+            .observed_by(events)
+            .within(run)
     }
 
     async fn cancel_and_close_mcp(&self, _request_id: &str, _reason: &str) -> usize {
         0
+    }
+
+    fn mcp_server_status(&self) -> Vec<McpServerStatus> {
+        self.mcp_status.clone()
     }
 }
 
@@ -392,6 +458,120 @@ mod tests {
             error.downcast_ref::<aura::streaming::StreamRefused>(),
             Some(aura::streaming::StreamRefused::AlreadyStreamed { .. })
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_agent_for_a_named_run_streams_under_that_run() {
+        let run = aura::RunId::mint();
+        let agent = MockAgent::yielding([items::text("hi")]).for_run(run);
+        assert_eq!(agent.run_id(), run);
+
+        let items: Vec<_> = agent
+            .stream(
+                "q",
+                vec![],
+                aura::streaming::RunOptions::default(),
+                &run.to_string(),
+            )
+            .await
+            .into_events()
+            .collect()
+            .await;
+        assert!(matches!(items.as_slice(), [Ok(_)]), "{items:?}");
+    }
+
+    /// The context has the run's id and the caller's cancel token, and it is
+    /// in scope for both effect steps and emitted steps.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_context_is_on_the_callers_token_and_in_scope_for_each_step() {
+        let run = aura::RunId::mint();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (effect_seen, emitted_seen) = (Arc::clone(&seen), Arc::clone(&seen));
+        let agent = MockAgent::scripted(vec![
+            Step::effect(move |_| {
+                let seen = Arc::clone(&effect_seen);
+                async move {
+                    seen.lock()
+                        .expect("seen lock")
+                        .push(aura::run_context::current_run_id())
+                }
+            }),
+            Step::emitted(items::text("carried"), move |_| {
+                let seen = Arc::clone(&emitted_seen);
+                async move {
+                    seen.lock()
+                        .expect("seen lock")
+                        .push(aura::run_context::current_run_id())
+                }
+            }),
+        ])
+        .for_run(run)
+        .with_run_context();
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let mut handle = agent
+            .stream(
+                "q",
+                vec![],
+                aura::streaming::RunOptions::on_token(None, token.clone()),
+                &run.to_string(),
+            )
+            .await;
+        let context = Arc::clone(handle.run_context().expect("the run has a context"));
+        assert_eq!(context.id(), run);
+        assert!(
+            handle.take_agent_events().is_some(),
+            "the observer gets the channel"
+        );
+        token.cancel();
+        assert!(
+            context.cancel_token().is_cancelled(),
+            "the context is on the caller's token"
+        );
+
+        let items: Vec<_> = handle.into_events().collect().await;
+        assert!(
+            matches!(
+                items.as_slice(),
+                [Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text)))]
+                    if text == "carried"
+            ),
+            "an emitted step yields its item: {items:?}"
+        );
+        assert_eq!(
+            seen.lock().expect("seen lock").as_slice(),
+            [Some(run), Some(run)],
+            "both effects ran with the run in scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_run_context_the_run_has_none() {
+        let agent = MockAgent::pending();
+        let mut handle = agent
+            .stream(
+                "q",
+                vec![],
+                aura::streaming::RunOptions::default(),
+                &agent.run_id().to_string(),
+            )
+            .await;
+        assert!(handle.run_context().is_none());
+        assert!(handle.take_agent_events().is_none());
+    }
+
+    #[test]
+    fn the_mcp_status_is_what_the_agent_was_given() {
+        let servers = vec![McpServerStatus {
+            server_name: "files".to_string(),
+            transport: "stdio".to_string(),
+            status: "connected".to_string(),
+            tools_count: 2,
+            reason: None,
+        }];
+        let agent = MockAgent::pending().with_mcp_status(servers.clone());
+        assert_eq!(agent.mcp_server_status(), servers);
+        assert!(MockAgent::pending().mcp_server_status().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

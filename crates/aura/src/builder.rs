@@ -1463,11 +1463,15 @@ impl PreparedAgent {
     ///
     /// This handles Ollama models (e.g., qwen3-coder) that output tool calls as text
     /// instead of using native tool_call structures.
+    ///
+    /// `stream_id` is the id of the stream being wrapped, when it has one. The
+    /// executor announces its calls to the run only from the run's own stream.
     fn maybe_wrap_with_fallback(
         &self,
         stream: Pin<
             Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>,
         >,
+        stream_id: Option<&str>,
     ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
         // Early return if fallback not enabled or no tools available
         if !self.fallback_tool_parsing || self.fallback_tool_names.is_empty() {
@@ -1481,6 +1485,10 @@ impl PreparedAgent {
                 self.fallback_tool_names.clone(),
                 self.fallback_mcp_filter.clone(),
             );
+            let executor = match stream_id {
+                Some(stream_id) => executor.for_stream(stream_id),
+                None => executor,
+            };
             return executor.wrap_stream(Box::pin(stream));
         }
 
@@ -1740,7 +1748,7 @@ impl Agent {
             .await;
         self.hold_run(
             self.prepared
-                .maybe_wrap_with_fallback(self.count_turns(stream)),
+                .maybe_wrap_with_fallback(self.count_turns(stream), None),
         )
     }
 
@@ -1757,7 +1765,7 @@ impl Agent {
             .await;
         self.hold_run(
             self.prepared
-                .maybe_wrap_with_fallback(self.count_turns(stream)),
+                .maybe_wrap_with_fallback(self.count_turns(stream), None),
         )
     }
 
@@ -1781,7 +1789,7 @@ impl Agent {
             .await;
         self.hold_run(
             self.prepared
-                .maybe_wrap_with_fallback(self.count_turns(stream)),
+                .maybe_wrap_with_fallback(self.count_turns(stream), None),
         )
     }
 
@@ -1891,7 +1899,7 @@ impl Agent {
                 self.hold_run(
                     self.append_scratchpad_usage(
                         self.prepared
-                            .maybe_wrap_with_fallback(self.count_turns(stream)),
+                            .maybe_wrap_with_fallback(self.count_turns(stream), Some(request_id)),
                     ),
                 )
             })
@@ -1932,7 +1940,7 @@ impl Agent {
                 self.hold_run(
                     self.append_scratchpad_usage(
                         self.prepared
-                            .maybe_wrap_with_fallback(self.count_turns(stream)),
+                            .maybe_wrap_with_fallback(self.count_turns(stream), Some(request_id)),
                     ),
                 )
             })
@@ -2085,16 +2093,7 @@ impl StreamingAgent for Agent {
 
         let context = Arc::clone(&run);
         let started = started
-            .map_stream(move |stream| {
-                Box::pin(crate::run_context::scope_stream(
-                    Arc::clone(&run),
-                    Box::pin(crate::streaming::tee_content(
-                        run,
-                        aura_events::EmittingAgent::single_agent(),
-                        stream,
-                    )),
-                ))
-            })
+            .map_stream(move |stream| Box::pin(crate::run_context::scope_stream(run, stream)))
             .within(context);
         // One observer per run: the first stream hands the receiver over,
         // a later stream of the same run has no second one to give.

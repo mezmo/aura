@@ -13,7 +13,7 @@ use std::time::Duration;
 use aura_events::agent::{AgentEvent, AgentEventPayload};
 use aura_events::{
     AgentScopeWire, ApprovalCompleted, ApprovalOriginWire, ApprovalOutcomeWire, ApprovalPending,
-    ApprovalRequested, COORDINATOR_AGENT_ID, CancelReasonWire, EmittingAgent,
+    ApprovalRequested, CancelReasonWire, EmittingAgent,
 };
 
 use super::decision::{
@@ -30,7 +30,7 @@ fn agent_of(scope: &AgentScope) -> EmittingAgent {
     match scope {
         AgentScope::Single { .. } => EmittingAgent::single_agent(),
         AgentScope::Worker { task, .. } => match &task.worker {
-            Some(worker) => EmittingAgent::worker(worker, None, COORDINATOR_AGENT_ID),
+            Some(worker) => EmittingAgent::orchestrated(worker),
             None => EmittingAgent::coordinator(),
         },
         AgentScope::Coordinator { .. } => EmittingAgent::coordinator(),

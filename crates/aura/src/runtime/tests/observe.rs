@@ -123,7 +123,7 @@ async fn a_subscription_reads_the_sessions_stream_from_its_cursor() {
     let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
     let facts = h.ended(run).await;
     assert_eq!(
-        facts.status,
+        facts.run.status,
         RunStatus::Finished,
         "the claim held through the run"
     );
@@ -238,7 +238,7 @@ async fn a_run_started_under_a_claim_sees_it_from_the_start() {
     assert_eq!(worker.attendance(), attended);
 
     gate.notify_one();
-    assert_eq!(h.ended(run).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Finished);
     claim.detach().await;
 }
 
@@ -263,12 +263,15 @@ async fn a_live_run_whose_last_claimant_leaves_is_cancelled_as_unclaimed() {
 
     collector.detach().await;
     assert!(context.attendance().claimed);
-    assert_eq!(h.runtime.facts(&run).unwrap().status, RunStatus::Running);
+    assert_eq!(
+        h.runtime.facts(&run).unwrap().run.status,
+        RunStatus::Running
+    );
 
     claim.detach().await;
     assert!(!context.attendance().claimed);
     let facts = h.ended(run).await;
-    assert_eq!(facts.status, RunStatus::Cancelled);
+    assert_eq!(facts.run.status, RunStatus::Cancelled);
 
     let events = h.journal(&s).await;
     assert_eq!(
@@ -281,6 +284,7 @@ async fn a_live_run_whose_last_claimant_leaves_is_cancelled_as_unclaimed() {
             "observer_detached",
             "observer_detached",
             "claims_exhausted",
+            "usage",
             "cancelled",
         ]
     );
@@ -290,7 +294,7 @@ async fn a_live_run_whose_last_claimant_leaves_is_cancelled_as_unclaimed() {
     );
     match last_lifecycle(&events) {
         LifecycleEvent::Cancelled {
-            reason: RunCancelReason::Unclaimed,
+            cause: CancelCause::Unclaimed,
             ..
         } => {}
         other => panic!("not cancelled as unclaimed: {other:?}"),
@@ -323,10 +327,13 @@ async fn a_run_under_continue_outlives_its_claimant() {
 
     claim.detach().await;
     h.journaled(&s, "claims_exhausted").await;
-    assert_eq!(h.runtime.facts(&run).unwrap().status, RunStatus::Running);
+    assert_eq!(
+        h.runtime.facts(&run).unwrap().run.status,
+        RunStatus::Running
+    );
 
     gate.notify_one();
-    assert_eq!(h.ended(run).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Finished);
 }
 
 /// Attaching and detaching during a run update the run's context at once.
@@ -361,7 +368,7 @@ async fn attaching_mid_run_reaches_the_runs_context() {
     assert!(context.attendance().claimed);
 
     claim.detach().await;
-    assert_eq!(h.ended(run).await.status, RunStatus::Cancelled);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Cancelled);
     let events = h.journal(&s).await;
     let attaches: Vec<_> = events
         .iter()
@@ -451,7 +458,7 @@ async fn a_reopened_fenced_session_keeps_its_observers() {
         .await
         .unwrap();
     let fenced = h.runtime.start(on_session("s1", "q")).await.unwrap();
-    assert_eq!(h.ended(fenced).await.status, RunStatus::Failed);
+    assert_eq!(h.ended(fenced).await.run.status, RunStatus::Failed);
 
     match h.runtime.attach(&s, Attach::claiming()).await {
         Err(AttachError::AlreadyClaimed { by }) => assert_eq!(by, claim.observer().id),
@@ -471,10 +478,18 @@ async fn a_reopened_fenced_session_keeps_its_observers() {
     assert_eq!(seen, ["observer_attached", "text_delta", "started"]);
 
     claim.detach().await;
-    assert_eq!(h.ended(run).await.status, RunStatus::Cancelled);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Cancelled);
     let events = h.journal(&s).await;
-    let tail: Vec<_> = kinds(&events).into_iter().rev().take(3).collect();
-    assert_eq!(tail, ["cancelled", "claims_exhausted", "observer_detached"]);
+    let tail: Vec<_> = kinds(&events).into_iter().rev().take(4).collect();
+    assert_eq!(
+        tail,
+        [
+            "cancelled",
+            "usage",
+            "claims_exhausted",
+            "observer_detached"
+        ]
+    );
 }
 
 /// A claimant that leaves while the run is writing its ending is recorded
@@ -506,7 +521,7 @@ async fn a_claimant_leaving_as_the_run_ends_does_not_name_it() {
     claim.detach().await;
     gate.notify_one();
 
-    assert_eq!(h.ended(run).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Finished);
     let events = h.journal(&s).await;
     assert_eq!(
         kinds(&events),
@@ -514,6 +529,7 @@ async fn a_claimant_leaving_as_the_run_ends_does_not_name_it() {
             "observer_attached",
             "started",
             "session_info",
+            "usage",
             "finished",
             "observer_detached",
         ]
@@ -550,7 +566,7 @@ fn every_event(_: &SessionEventPayload) -> bool {
     true
 }
 
-fn observer_attached(payload: &SessionEventPayload) -> bool {
+pub(super) fn observer_attached(payload: &SessionEventPayload) -> bool {
     matches!(
         payload,
         SessionEventPayload::Lifecycle(LifecycleEvent::ObserverAttached { .. })
@@ -643,7 +659,7 @@ async fn an_attach_dropped_while_recording_leaves_nothing_behind() {
 
 /// A harness whose runtime writes events through a journal store that holds
 /// the appends `gates` picks until `gate` is notified.
-fn harness_gating(
+pub(super) fn harness_gating(
     preparer: TestPreparer,
     retention: Duration,
     gate: &Arc<Notify>,
@@ -696,11 +712,186 @@ async fn a_stalled_attach_does_not_hold_up_a_start() {
 
     gate.notify_one();
     let claim = attach.await.unwrap();
-    assert_eq!(h.ended(run).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Finished);
     let events = h.journal(&s).await;
     assert_eq!(kinds(&events)[..2], ["observer_attached", "started"]);
     assert_eq!(events[0].run_id, None, "no run had started at the attach");
     drop(claim);
+}
+
+/// A run's wait before opening its stream covers the attaches counted before
+/// the wait began, not one counted after it that is still waiting its turn.
+/// That later attach still lands before `Started`, since it was counted
+/// before the stream opened.
+#[tokio::test]
+async fn a_run_does_not_wait_for_an_attach_counted_after_it() {
+    let gate = Arc::new(Notify::new());
+    let h = harness_gating(
+        TestPreparer::new(
+            &["a"],
+            vec![Prepared::Fake(vec![Step::Wait(Arc::new(Notify::new()))])],
+        ),
+        DEFAULT_RETENTION,
+        &gate,
+        observer_attached,
+    );
+    let s = session("s1");
+
+    let mut first = Box::pin(h.runtime.attach(&s, Attach::claiming()));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), first.as_mut())
+            .await
+            .is_err(),
+        "the first attach is waiting on its write"
+    );
+    let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
+    eventually("the run's agent is prepared", || {
+        !h.preparer.prepared.lock().unwrap().is_empty()
+    })
+    .await;
+    let mut second = Box::pin(h.runtime.attach(&s, Attach::collecting()));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), second.as_mut())
+            .await
+            .is_err(),
+        "the second attach waits its turn behind the first"
+    );
+
+    gate.notify_one();
+    let claim = tokio::time::timeout(PATIENCE, first)
+        .await
+        .expect("the first attach is written")
+        .unwrap();
+    h.context(run).await;
+
+    gate.notify_one();
+    let collecting = tokio::time::timeout(PATIENCE, second)
+        .await
+        .expect("the second attach is written")
+        .unwrap();
+    h.journaled(&s, "started").await;
+    assert_eq!(
+        kinds(&h.journal(&s).await)[..3],
+        ["observer_attached", "observer_attached", "started"]
+    );
+    drop(collecting);
+    drop(claim);
+}
+
+/// A run stopped after its agent was prepared, while it waits behind an
+/// attach being written, ends without a `Started` event and never opens its
+/// stream.
+#[tokio::test]
+async fn a_run_stopped_while_waiting_behind_an_attach_writes_no_started() {
+    let gate = Arc::new(Notify::new());
+    let never = Arc::new(Notify::new());
+    let h = harness_gating(
+        TestPreparer::new(&["a"], vec![Prepared::Fake(vec![Step::Wait(never)])]),
+        DEFAULT_RETENTION,
+        &gate,
+        observer_attached,
+    );
+    let s = session("s1");
+
+    let attach = h.runtime.attach(&s, Attach::collecting());
+    tokio::pin!(attach);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), attach.as_mut())
+            .await
+            .is_err(),
+        "the attach is waiting on its write"
+    );
+    let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
+    eventually("the run's agent is prepared", || {
+        !h.preparer.prepared.lock().unwrap().is_empty()
+    })
+    .await;
+    assert!(h.runtime.cancel(&run, CancelCause::External, None));
+
+    gate.notify_one();
+    let observer = attach.await.unwrap();
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Cancelled);
+    assert_eq!(
+        kinds(&h.journal(&s).await),
+        ["observer_attached", "cancelled"]
+    );
+    assert!(
+        h.preparer.attended.lock().unwrap().is_empty(),
+        "the stopped run never opened its stream"
+    );
+    drop(observer);
+}
+
+/// An observer that leaves while its run's stream is being opened has its
+/// detach journaled before the run's `Started`.
+#[tokio::test]
+async fn a_detach_while_the_stream_opens_comes_before_started() {
+    let detaching = Arc::new(Notify::new());
+    let opening = Arc::new(Notify::new());
+    let finish = Arc::new(Notify::new());
+    let h = harness_gating(
+        TestPreparer::new(
+            &["a"],
+            vec![Prepared::Fake(vec![Step::Wait(Arc::clone(&finish))])],
+        )
+        .opening_gated(Arc::clone(&opening)),
+        DEFAULT_RETENTION,
+        &detaching,
+        observer_detached,
+    );
+    let s = session("s1");
+
+    let observer = h.runtime.attach(&s, Attach::collecting()).await.unwrap();
+    let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
+    eventually("the run is opening its stream", || {
+        !h.preparer.attended.lock().unwrap().is_empty()
+    })
+    .await;
+    drop(observer);
+    opening.notify_one();
+    // Time enough for a run that does not wait for the detach to append
+    // `Started` ahead of it.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    detaching.notify_one();
+    finish.notify_one();
+
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Finished);
+    assert_eq!(
+        kinds(&h.journal(&s).await)[..3],
+        ["observer_attached", "observer_detached", "started"]
+    );
+}
+
+/// A run whose last claimant leaves while its stream is being opened ends
+/// without a `Started` event.
+#[tokio::test]
+async fn a_run_unclaimed_while_its_stream_opens_writes_no_started() {
+    let detaching = Arc::new(Notify::new());
+    let opening = Arc::new(Notify::new());
+    let never = Arc::new(Notify::new());
+    let h = harness_gating(
+        TestPreparer::new(&["a"], vec![Prepared::Fake(vec![Step::Wait(never)])])
+            .opening_gated(Arc::clone(&opening)),
+        DEFAULT_RETENTION,
+        &detaching,
+        observer_detached,
+    );
+    let s = session("s1");
+
+    let claim = h.runtime.attach(&s, Attach::claiming()).await.unwrap();
+    let run = h.runtime.start(on_session("s1", "q")).await.unwrap();
+    eventually("the run is opening its stream", || {
+        !h.preparer.attended.lock().unwrap().is_empty()
+    })
+    .await;
+    drop(claim);
+    opening.notify_one();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    detaching.notify_one();
+
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Cancelled);
+    let kinds = kinds(&h.journal(&s).await);
+    assert!(!kinds.contains(&"started"), "{kinds:?}");
 }
 
 /// An attach waiting on a stalled journal write does not hold up a drain,
@@ -804,7 +995,7 @@ async fn losing_the_claim_stops_the_run_before_the_detach_is_written() {
     drop(claim);
     assert_eq!(
         record.stopped(),
-        Some((RunCancelReason::Unclaimed, None)),
+        Some((CancelCause::Unclaimed, None)),
         "the run is stopped as the claim goes"
     );
     eventually("the run's stream ends", || !record.stoppable()).await;
@@ -814,10 +1005,18 @@ async fn losing_the_claim_stops_the_run_before_the_detach_is_written() {
     );
 
     journal_gate.notify_one();
-    assert_eq!(h.ended(run).await.status, RunStatus::Cancelled);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Cancelled);
     let events = h.journal(&s).await;
-    let tail: Vec<_> = kinds(&events).into_iter().rev().take(3).collect();
-    assert_eq!(tail, ["cancelled", "claims_exhausted", "observer_detached"]);
+    let tail: Vec<_> = kinds(&events).into_iter().rev().take(4).collect();
+    assert_eq!(
+        tail,
+        [
+            "cancelled",
+            "usage",
+            "claims_exhausted",
+            "observer_detached"
+        ]
+    );
 }
 
 /// A detach stalled on its write does not keep the session's journal alive
@@ -955,7 +1154,7 @@ async fn a_claim_given_up_and_retaken_journals_in_order() {
     );
 
     gate.notify_one();
-    assert_eq!(h.ended(run).await.status, RunStatus::Finished);
+    assert_eq!(h.ended(run).await.run.status, RunStatus::Finished);
     drop(second);
 }
 

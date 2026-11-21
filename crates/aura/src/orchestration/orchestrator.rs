@@ -66,6 +66,7 @@ use super::tools::RoutingToolSet;
 use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool, WriteArtifactTool};
 
 use super::config::OrchestrationConfig;
+use super::emitter::Emitter;
 use super::park::{
     ParkGuard, ParkedTaskRecord, ParkedTaskRecords, RecordedDecisions, ResumeContext,
     TaskContinuation,
@@ -317,10 +318,7 @@ fn extract_task_id(tool_call_id: &str) -> Option<usize> {
 /// Names the worker an event came from, so the payload does not have to carry
 /// attribution the envelope already holds.
 fn by_worker(worker_id: &str, payload: AgentEventPayload) -> AgentEvent {
-    AgentEvent::new(
-        aura_events::EmittingAgent::worker(worker_id, None, aura_events::COORDINATOR_AGENT_ID),
-        payload,
-    )
+    AgentEvent::new(aura_events::EmittingAgent::orchestrated(worker_id), payload)
 }
 
 fn by_coordinator(payload: AgentEventPayload) -> AgentEvent {
@@ -367,18 +365,15 @@ fn tool_event_to_orchestrator_event(event: crate::tool_call_observer::ToolEvent)
 
 fn outcome_of(success: bool, message: String) -> aura_events::agent::ToolOutcome {
     if success {
-        aura_events::agent::ToolOutcome::Success { result: message }
+        aura_events::agent::ToolOutcome::Success {
+            result: message,
+            format: aura_events::agent::ResultFormat::Text,
+        }
     } else {
         aura_events::agent::ToolOutcome::Failure { error: message }
     }
 }
 
-/// Forward a `ToolStart` event for a non-MCP tool the worker
-/// `ObserverWrapper` does not cover: skills, orchestration operations, and
-/// scratchpad tools when enabled (see [`scratchpad::should_forward_tool_event`]).
-/// Records the start instant so the completion can report a duration. No-op
-/// without an event channel. Used by both `stream_and_forward` (workers) and
-/// `stream_and_collect` (coordinator) so skill use surfaces in both roles.
 /// What a forwarded internal tool call needs from its start to report a
 /// completion.
 struct InternalToolStart {
@@ -387,8 +382,14 @@ struct InternalToolStart {
     worker_id: String,
 }
 
+/// Forward a `ToolStart` event for a non-MCP tool the worker
+/// `ObserverWrapper` does not cover: skills, orchestration operations, and
+/// scratchpad tools when enabled (see [`scratchpad::should_forward_tool_event`]).
+/// Records the start instant so the completion can report a duration. No-op
+/// without an emitter. Used by both `stream_and_forward` (workers) and
+/// `stream_and_collect` (coordinator) so skill use surfaces in both roles.
 async fn forward_internal_tool_started(
-    event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+    emitter: Option<&Emitter>,
     task_id: Option<usize>,
     worker_id: &str,
     tool_call_id: &str,
@@ -396,7 +397,7 @@ async fn forward_internal_tool_started(
     raw_arguments: &str,
     starts: &mut std::collections::HashMap<String, InternalToolStart>,
 ) {
-    let Some(tx) = event_tx else { return };
+    let Some(emitter) = emitter else { return };
     let tool_call_id = tool_call_id.to_string();
     starts.insert(
         tool_call_id.clone(),
@@ -409,8 +410,8 @@ async fn forward_internal_tool_started(
     let mut arguments =
         serde_json::from_str(raw_arguments).unwrap_or_else(|_| serde_json::json!({}));
     redact_internal_tool_arguments(tool_name, &mut arguments);
-    let _ = tx
-        .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+    emitter
+        .emit(by_worker(
             worker_id,
             AgentEventPayload::ToolStart {
                 task_id,
@@ -419,7 +420,7 @@ async fn forward_internal_tool_started(
                 arguments: Some(arguments),
                 progress_token: None,
             },
-        )))))
+        ))
         .await;
 }
 
@@ -444,7 +445,7 @@ fn redact_internal_tool_arguments(tool_name: &str, arguments: &mut serde_json::V
 /// tracked this call, so it is safe to invoke on every tool result: MCP results
 /// (tracked by `ObserverWrapper`, not here) are left untouched.
 async fn forward_internal_tool_completed(
-    event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+    emitter: Option<&Emitter>,
     task_id: Option<usize>,
     result: &crate::provider_agent::ToolResult,
     starts: &mut std::collections::HashMap<String, InternalToolStart>,
@@ -452,17 +453,18 @@ async fn forward_internal_tool_completed(
     let Some(start) = starts.remove(&result.id) else {
         return;
     };
-    let Some(tx) = event_tx else { return };
+    let Some(emitter) = emitter else { return };
     let outcome = match result.failure() {
         Some(error) => aura_events::agent::ToolOutcome::Failure {
             error: error.to_string(),
         },
         None => aura_events::agent::ToolOutcome::Success {
             result: result.result.clone(),
+            format: result.format(),
         },
     };
-    let _ = tx
-        .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+    emitter
+        .emit(by_worker(
             &start.worker_id,
             AgentEventPayload::ToolComplete {
                 task_id,
@@ -471,17 +473,17 @@ async fn forward_internal_tool_completed(
                 duration_ms: start.at.elapsed().as_millis() as u64,
                 outcome,
             },
-        )))))
+        ))
         .await;
 }
 
 /// Spawn a task that forwards tool call events to the SSE stream.
 ///
 /// Listens on the observer's broadcast channel and converts `ToolEvent`s
-/// to `AgentEventPayload`s, sending them through the event channel.
+/// to `AgentEventPayload`s, sending them through `emitter`.
 pub(super) fn spawn_tool_event_forwarder(
     observer: &ToolCallObserver,
-    event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+    emitter: Emitter,
     cancel_token: CancellationToken,
 ) {
     let mut tool_rx = observer.subscribe();
@@ -492,8 +494,7 @@ pub(super) fn spawn_tool_event_forwarder(
                 result = tool_rx.recv() => {
                     match result {
                         Ok(tool_event) => {
-                            let orch_event = tool_event_to_orchestrator_event(tool_event);
-                            let _ = event_tx.send(Ok(StreamItem::AgentEvent(Box::new(orch_event)))).await;
+                            emitter.emit(tool_event_to_orchestrator_event(tool_event)).await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("Tool observer lagged by {} events", n);
@@ -580,7 +581,7 @@ struct StreamCallParams<'a> {
     prompt: &'a str,
     history: Vec<rig::completion::Message>,
     phase: &'a str,
-    event_tx: Option<&'a tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+    emitter: Option<&'a Emitter>,
     context_agent: Option<&'a str>,
     /// Tokens of the call's whole input: prompt and history.
     input_tokens: Option<usize>,
@@ -1622,7 +1623,7 @@ impl Orchestrator {
         tool_result_cap: usize,
         scratchpad_budget: Option<&scratchpad::ContextBudget>,
         phase: &str,
-        event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+        emitter: Option<&Emitter>,
         stream_context: Option<StreamContext<'_>>,
         decision_ready: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
     ) -> Result<ForwardOutcome, Box<dyn std::error::Error + Send + Sync>> {
@@ -1685,25 +1686,25 @@ impl Orchestrator {
                     Ok(StreamItem::StreamAssistantItem(
                         StreamedAssistantContent::ReasoningDelta { delta, .. },
                     )) => {
-                        if let Some(tx) = event_tx {
+                        if let Some(emitter) = emitter {
                             if let Some(ref ctx) = stream_context {
-                                let _ = tx
-                                    .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                                emitter
+                                    .emit(by_worker(
                                         ctx.worker_id,
                                         AgentEventPayload::Reasoning {
                                             task_id: Some(ctx.task_id),
                                             content: delta,
                                         },
-                                    )))))
+                                    ))
                                     .await;
                             } else {
-                                let _ = tx
-                                    .send(Ok(StreamItem::StreamAssistantItem(
+                                emitter
+                                    .emit_item(StreamItem::StreamAssistantItem(
                                         StreamedAssistantContent::ReasoningDelta {
                                             delta,
                                             id: None,
                                         },
-                                    )))
+                                    ))
                                     .await;
                             }
                         }
@@ -1728,7 +1729,7 @@ impl Orchestrator {
                             None => (None, CONVERSATION_AGENT_ID),
                         };
                         forward_internal_tool_started(
-                            event_tx,
+                            emitter,
                             task_id,
                             worker_id,
                             &tc.id,
@@ -1773,7 +1774,7 @@ impl Orchestrator {
                         // in a dedicated arm) keeps the decision short-circuit intact
                         // for tools like submit_result.
                         forward_internal_tool_completed(
-                            event_tx,
+                            emitter,
                             stream_context.as_ref().map(|w| w.task_id),
                             tr,
                             &mut internal_tool_starts,
@@ -1836,7 +1837,7 @@ impl Orchestrator {
     ///
     /// Key behaviors:
     /// - Uses `agent.stream_chat()` which respects the agent's configured `max_depth`
-    /// - Forwards `ReasoningDelta`/`Reasoning` items through `event_tx`
+    /// - Forwards `ReasoningDelta`/`Reasoning` items through the emitter
     /// - No early-exit — runs the complete ReAct loop
     /// - `per_call_timeout_secs` bounds the stream open and the loop, one
     ///   instant for both; a cut loop returns [`ForwardOutcome::TimedOut`]
@@ -1856,7 +1857,7 @@ impl Orchestrator {
             prompt,
             history,
             phase,
-            event_tx,
+            emitter,
             ..
         } = params;
         let call_deadline = CallDeadline::after(self.config.per_call_timeout_secs());
@@ -1895,7 +1896,7 @@ impl Orchestrator {
             self.config.result_summary_length(),
             agent.scratchpad_budget(),
             phase,
-            event_tx,
+            emitter,
             stream_context,
             decision_ready,
         )
@@ -1910,7 +1911,7 @@ impl Orchestrator {
     /// Key behaviors:
     /// - Opens the stream depth-capped at the agent's resolved turn depth
     ///   (`[agent].turn_depth`; rig safety net, but early exit is the primary guard)
-    /// - Forwards `ReasoningDelta`/`Reasoning` items through `event_tx` when provided
+    /// - Forwards `ReasoningDelta`/`Reasoning` items through the emitter when provided
     /// - Short-circuits after first `ToolResult` when `decision_ready()` returns true
     /// - Falls back to normal completion for text-only responses
     ///
@@ -1934,7 +1935,7 @@ impl Orchestrator {
             prompt,
             history,
             phase,
-            event_tx,
+            emitter,
             context_agent,
             input_tokens,
         } = params;
@@ -1993,18 +1994,18 @@ impl Orchestrator {
                         Ok(StreamItem::StreamAssistantItem(
                             ref sa @ StreamedAssistantContent::ReasoningDelta { .. },
                         )) => {
-                            if let Some(tx) = event_tx {
-                                let _ = tx
-                                    .send(Ok(StreamItem::StreamAssistantItem(sa.clone())))
+                            if let Some(emitter) = emitter {
+                                emitter
+                                    .emit_item(StreamItem::StreamAssistantItem(sa.clone()))
                                     .await;
                             }
                         }
                         Ok(StreamItem::StreamAssistantItem(
                             ref sa @ StreamedAssistantContent::Reasoning(_),
                         )) => {
-                            if let Some(tx) = event_tx {
-                                let _ = tx
-                                    .send(Ok(StreamItem::StreamAssistantItem(sa.clone())))
+                            if let Some(emitter) = emitter {
+                                emitter
+                                    .emit_item(StreamItem::StreamAssistantItem(sa.clone()))
                                     .await;
                             }
                         }
@@ -2018,7 +2019,7 @@ impl Orchestrator {
                         ) =>
                         {
                             forward_internal_tool_started(
-                                event_tx,
+                                emitter,
                                 None,
                                 CONVERSATION_AGENT_ID,
                                 &tc.id,
@@ -2031,7 +2032,7 @@ impl Orchestrator {
                         // Tool result — check decision, short-circuit (fixes ReAct loop waste)
                         Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(ref tr))) => {
                             forward_internal_tool_completed(
-                                event_tx,
+                                emitter,
                                 None,
                                 tr,
                                 &mut internal_tool_starts,
@@ -2122,16 +2123,17 @@ impl Orchestrator {
             // the call's first inner turn: later inner turns add the tool
             // results the coordinator pulled in on the way to its decision
             // (skill bodies, prior-run listings), which is scratch too.
-            if let (Some(tx), Some(agent_id), Some(first)) = (event_tx, context_agent, tally.first)
+            if let (Some(emitter), Some(agent_id), Some(first)) =
+                (emitter, context_agent, tally.first)
                 && first.input_tokens > 0
             {
-                let _ = tx
-                    .send(Ok(StreamItem::ContextUsage {
+                emitter
+                    .emit_item(StreamItem::ContextUsage {
                         agent_id: agent_id.to_string(),
                         context_tokens: first.input_tokens,
                         response_tokens: first.output_tokens,
                         context_window: agent.context_window,
-                    }))
+                    })
                     .await;
             }
 
@@ -2243,7 +2245,7 @@ impl Orchestrator {
                         prompt: params.prompt,
                         history: params.history.clone(),
                         phase: params.phase,
-                        event_tx: params.event_tx,
+                        emitter: params.emitter,
                         context_agent: params.context_agent,
                         input_tokens: params.input_tokens,
                     },
@@ -2325,7 +2327,7 @@ impl Orchestrator {
         coordinator_state: &mut CoordinatorState,
         previous: Option<&IterationContext>,
         phase_index: usize,
-        event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+        emitter: Option<&Emitter>,
     ) -> Result<(PlanningResponse, String, String), StreamError> {
         let max_correction_attempts = self.config.max_plan_parse_retries;
 
@@ -2402,7 +2404,7 @@ impl Orchestrator {
                         prompt: &prompt,
                         history: full_history,
                         phase: "Planning",
-                        event_tx,
+                        emitter,
                         // Only a request's first planning call sees the
                         // persistent conversation — the chat history plus the
                         // planning prompt — so its occupancy is the
@@ -3880,7 +3882,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         &self,
         plan: &mut Plan,
         failure_history: &[FailedTaskRecord],
-        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+        emitter: &Emitter,
     ) -> Result<(u64, ParkedTaskRecords), StreamError> {
         use futures::StreamExt;
         use futures::stream::FuturesUnordered;
@@ -3896,7 +3898,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             let exhausted = self.exhausted_llms(plan, failure_history);
             let run_is_stopping = self.runs_on_any(None, &exhausted);
             if !run_is_stopping {
-                self.fail_tasks_on_exhausted_accounts(plan, &exhausted, event_tx)
+                self.fail_tasks_on_exhausted_accounts(plan, &exhausted, emitter)
                     .await;
             }
             let ready_tasks: Vec<(usize, String, Option<String>, Option<String>)> =
@@ -3943,17 +3945,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(task) = plan.get_task_mut(*task_id) {
                     task.start();
                 }
-                let _ = event_tx
-                    .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                emitter
+                    .emit(by_worker(
                         &worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
                         AgentEventPayload::TaskStarted {
                             task_id: *task_id,
                             description: task_desc.clone(),
                             orchestrator_id: self.orchestrator_id.clone(),
                         },
-                    )))))
+                    ))
                     .await;
             }
+
+            // Clone the handle before any worker future exists.
+            let wave_persistence = self.persistence.lock().await.clone();
 
             // Execute all ready tasks in parallel using FuturesUnordered
             let mut futures: FuturesUnordered<_> = ready_tasks
@@ -3967,7 +3972,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             worker_name: worker_name.as_deref(),
                         };
                         let result = self
-                            .execute_task(task_id, &params, Some(event_tx), None, None)
+                            .execute_task(task_id, &params, Some(emitter), None, None)
                             .await;
                         let duration_ms = start_time.elapsed().as_millis() as u64;
                         (task_id, result, duration_ms, worker_name, task_desc)
@@ -3984,6 +3989,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     Ok(TaskOutcome::Completed(exec_result)) => {
                         let final_result = self
                             .maybe_create_artifact(
+                                &wave_persistence,
                                 task_id,
                                 worker_name.as_deref(),
                                 exec_result.result,
@@ -4002,8 +4008,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             }
                             t.structured_output = exec_result.structured_output;
                         }
-                        let _ = event_tx
-                            .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                        emitter
+                            .emit(by_worker(
                                 &worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
                                 AgentEventPayload::TaskCompleted {
                                     task_id,
@@ -4012,7 +4018,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                     outcome: outcome_of(success, result_for_event),
                                     quota_exhausted: false,
                                 },
-                            )))))
+                            ))
                             .await;
                         if success {
                             tracing::info!("Task {} completed in {}ms", task_id, duration_ms);
@@ -4028,13 +4034,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     // like a result, but the task fails as a timeout.
                     Ok(TaskOutcome::TimedOut { message }) => {
                         let final_result = self
-                            .maybe_create_artifact(task_id, worker_name.as_deref(), message)
+                            .maybe_create_artifact(
+                                &wave_persistence,
+                                task_id,
+                                worker_name.as_deref(),
+                                message,
+                            )
                             .await;
                         if let Some(t) = plan.get_task_mut(task_id) {
                             t.fail(final_result.clone(), FailureCategory::AgentTimeout);
                         }
-                        let _ = event_tx
-                            .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                        emitter
+                            .emit(by_worker(
                                 &worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
                                 AgentEventPayload::TaskCompleted {
                                     task_id,
@@ -4043,7 +4054,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                     outcome: outcome_of(false, final_result),
                                     quota_exhausted: false,
                                 },
-                            )))))
+                            ))
                             .await;
                         tracing::warn!("Task {} timed out after {}ms", task_id, duration_ms);
                     }
@@ -4054,15 +4065,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     Ok(TaskOutcome::FailedWithOutput { error, output }) => {
                         let category = Self::categorize_failure_error(&error);
                         let output = self
-                            .maybe_create_artifact(task_id, worker_name.as_deref(), output)
+                            .maybe_create_artifact(
+                                &wave_persistence,
+                                task_id,
+                                worker_name.as_deref(),
+                                output,
+                            )
                             .await;
                         let message = with_kept_output(&error, &output);
                         if let Some(t) = plan.get_task_mut(task_id) {
                             t.fail(error.clone(), category);
                             t.kept_output = Some(output);
                         }
-                        let _ = event_tx
-                            .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                        emitter
+                            .emit(by_worker(
                                 &worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
                                 AgentEventPayload::TaskCompleted {
                                     task_id,
@@ -4072,7 +4088,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                     quota_exhausted: category
                                         == FailureCategory::ProviderQuotaExhausted,
                                 },
-                            )))))
+                            ))
                             .await;
                         tracing::warn!(
                             "Task {} failed after {}ms ({}), keeping an earlier attempt's output: {}",
@@ -4091,8 +4107,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         // completion event; one blocked event per parked call.
                         let worker_id = worker_name.clone().unwrap_or(self.orchestrator_id.clone());
                         for call in &pending {
-                            let _ = event_tx
-                                .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                            emitter
+                                .emit(by_worker(
                                     &worker_id,
                                     AgentEventPayload::TaskBlocked {
                                         task_id,
@@ -4101,7 +4117,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                         decision_id: call.decision_id.to_string(),
                                         tool_name: call.tool_name.clone().into(),
                                     },
-                                )))))
+                                ))
                                 .await;
                         }
                         if let Some(t) = plan.get_task_mut(task_id) {
@@ -4121,8 +4137,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         if let Some(t) = plan.get_task_mut(task_id) {
                             t.fail(err_str.clone(), category);
                         }
-                        let _ = event_tx
-                            .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+                        emitter
+                            .emit(by_worker(
                                 &worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
                                 AgentEventPayload::TaskCompleted {
                                     task_id,
@@ -4132,7 +4148,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                     quota_exhausted: category
                                         == FailureCategory::ProviderQuotaExhausted,
                                 },
-                            )))))
+                            ))
                             .await;
                         let worker_label = worker_name.as_deref().unwrap_or("generic");
                         let (task_preview, _) = safe_truncate(&task_desc, 100);
@@ -4175,9 +4191,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
     }
 
     /// If result exceeds artifact threshold, write full result to artifact file
-    /// and return a summary. Otherwise return the original result unchanged.
+    /// and return a summary. Otherwise, or with persistence disabled, return
+    /// the original result unchanged.
+    ///
+    /// Writes through `persistence`, a clone of the shared handle, and never
+    /// takes the shared mutex: the wave loop calls this while worker futures it
+    /// is not polling may hold or be queued for that mutex.
     async fn maybe_create_artifact(
         &self,
+        persistence: &ExecutionPersistence,
         task_id: usize,
         worker_name: Option<&str>,
         result: String,
@@ -4188,7 +4210,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
 
         let summary_len = self.config.result_summary_length();
-        let persistence = self.persistence.lock().await;
+        if !persistence.is_enabled() {
+            return result;
+        }
         let iteration = persistence.current_iteration();
 
         match persistence
@@ -4289,7 +4313,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         &self,
         task_id: usize,
         params: &TaskExecutionParams<'_>,
-        event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+        emitter: Option<&Emitter>,
         continuation: Option<&TaskContinuation>,
         resume: Option<&ResumeContext>,
     ) -> Result<TaskOutcome, StreamError> {
@@ -4303,7 +4327,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // so the live prompt-building and retry loop below do not apply.
         if let (Some(continuation), Some(resume)) = (continuation, resume) {
             return self
-                .resume_task(task_id, *worker_name, continuation, resume, event_tx)
+                .resume_task(task_id, *worker_name, continuation, resume, emitter)
                 .await;
         }
         if continuation.is_some() != resume.is_some() {
@@ -4435,7 +4459,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         prompt: &prompt,
                         history,
                         phase: "Worker task",
-                        event_tx,
+                        emitter,
                         context_agent: None,
                         input_tokens: None,
                     },
@@ -4503,12 +4527,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
 
             // Emit per-agent ScratchpadUsage event if this worker used scratchpad.
-            if let (Some(budget), Some(tx)) = (worker.scratchpad_budget(), event_tx) {
+            if let (Some(budget), Some(emitter)) = (worker.scratchpad_budget(), emitter) {
                 let agent_id = worker_name
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| self.orchestrator_id.clone());
                 if let Some(event) = crate::builder::scratchpad_usage_event(budget, &agent_id) {
-                    let _ = tx.send(Ok(event)).await;
+                    emitter.emit_item(event).await;
                 }
             }
 
@@ -4520,17 +4544,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 Ok(ForwardOutcome::TimedOut { last_turn, .. }) => *last_turn,
                 Err(_) => None,
             };
-            if let (Some(last_turn), Some(tx)) = (last_turn, event_tx) {
+            if let (Some(last_turn), Some(emitter)) = (last_turn, emitter) {
                 let agent_id = worker_name
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| self.orchestrator_id.clone());
-                let _ = tx
-                    .send(Ok(StreamItem::ContextUsage {
+                emitter
+                    .emit_item(StreamItem::ContextUsage {
                         agent_id,
                         context_tokens: last_turn.input_tokens,
                         response_tokens: last_turn.output_tokens,
                         context_window: worker.context_window,
-                    }))
+                    })
                     .await;
             }
 
@@ -4577,8 +4601,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     // The artifact below is named per task, so writing an
                     // earlier attempt's output would replace this attempt's.
                     last_raw_response.clear();
+                    let persistence = self.persistence.lock().await.clone();
                     let processed = self
-                        .maybe_create_artifact(task_id, *worker_name, worker_output)
+                        .maybe_create_artifact(&persistence, task_id, *worker_name, worker_output)
                         .await;
                     Err(format!("{DUPLICATE_LOOP_FAILURE}\n{processed}").into())
                 }
@@ -4729,7 +4754,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         worker_name: Option<&str>,
         continuation: &TaskContinuation,
         resume: &ResumeContext,
-        event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+        emitter: Option<&Emitter>,
     ) -> Result<TaskOutcome, StreamError> {
         let attempt = continuation.attempt;
         let Some(park) = self.worker_park(task_id, attempt) else {
@@ -4815,7 +4840,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             self.config.result_summary_length(),
             worker.scratchpad_budget(),
             "Worker resume",
-            event_tx,
+            emitter,
             worker_name.map(|name| StreamContext {
                 task_id,
                 worker_id: name,
@@ -5181,7 +5206,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         &self,
         plan: &mut Plan,
         exhausted: &[&LlmConfig],
-        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+        emitter: &Emitter,
     ) {
         let refused: Vec<(usize, Option<String>)> = plan
             .ready_tasks()
@@ -5197,7 +5222,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             if let Some(task) = plan.get_task_mut(task_id) {
                 task.fail(message.clone(), FailureCategory::ProviderQuotaExhausted);
             }
-            self.emit_quota_task_completed(task_id, worker.as_deref(), message, event_tx)
+            self.emit_quota_task_completed(task_id, worker.as_deref(), message, emitter)
                 .await;
         }
     }
@@ -5209,10 +5234,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
         task_id: usize,
         worker: Option<&str>,
         message: String,
-        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+        emitter: &Emitter,
     ) {
-        let _ = event_tx
-            .send(Ok(StreamItem::AgentEvent(Box::new(by_worker(
+        emitter
+            .emit(by_worker(
                 worker.unwrap_or(&self.orchestrator_id),
                 AgentEventPayload::TaskCompleted {
                     task_id,
@@ -5221,7 +5246,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     outcome: outcome_of(false, message),
                     quota_exhausted: true,
                 },
-            )))))
+            ))
             .await;
     }
 
@@ -5296,14 +5321,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
     }
 
-    /// Send an orchestrator event through the stream channel.
-    async fn emit_event(
-        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
-        event: AgentEventPayload,
-    ) {
-        let _ = event_tx
-            .send(Ok(StreamItem::AgentEvent(Box::new(by_coordinator(event)))))
-            .await;
+    /// Sends `event` as the coordinator's, on both the run's item stream and
+    /// its event channel.
+    async fn emit_event(emitter: &Emitter, event: AgentEventPayload) {
+        emitter.emit(by_coordinator(event)).await;
     }
 
     /// Emit a ReplanStarted event and build the iteration context for the next cycle.
@@ -5312,7 +5333,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// failure-driven). Callers handle path-specific pre-work (e.g. IterationComplete
     /// events, persistence writes) before calling this.
     async fn trigger_replan(
-        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+        emitter: &Emitter,
         iteration: usize,
         trigger: &str,
         plan: Plan,
@@ -5320,7 +5341,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         failure_history: &[FailedTaskRecord],
     ) -> (Option<IterationContext>, Plan) {
         Self::emit_event(
-            event_tx,
+            emitter,
             AgentEventPayload::ReplanStarted {
                 iteration: iteration + 1,
                 trigger: trigger.to_string(),
@@ -5364,7 +5385,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         &self,
         query: &str,
         chat_history: Vec<rig::completion::Message>,
-        event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+        emitter: &Emitter,
     ) -> Result<String, StreamError> {
         let span = tracing::Span::current();
         let (goal_preview, _) = safe_truncate(query, 200);
@@ -5414,11 +5435,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 &mut coordinator_state,
                 None,
                 0,
-                Some(&event_tx),
+                Some(emitter),
             )
             .await?;
         let initial_planning_ms = planning_start.elapsed().as_millis() as u64;
-        let usage_tx = event_tx.clone();
 
         let result = match response {
             PlanningResponse::Direct {
@@ -5428,7 +5448,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             } => {
                 span.record("orchestration.routing", "direct");
                 Self::emit_event(
-                    &event_tx,
+                    emitter,
                     AgentEventPayload::DirectAnswer {
                         response: response.clone(),
                         routing_rationale,
@@ -5446,7 +5466,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             } => {
                 span.record("orchestration.routing", "clarification");
                 Self::emit_event(
-                    &event_tx,
+                    emitter,
                     AgentEventPayload::ClarificationNeeded {
                         question: question.clone(),
                         options,
@@ -5463,7 +5483,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 let plan = response.into_plan().expect("StepsPlan always converts");
 
                 Self::emit_event(
-                    &event_tx,
+                    emitter,
                     AgentEventPayload::PlanCreated {
                         goal: plan.goal.clone(),
                         tasks: plan.tasks.iter().map(|t| t.description.clone()).collect(),
@@ -5479,7 +5499,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     plan,
                     chat_history,
                     &mut coordinator_state,
-                    event_tx,
+                    emitter,
                     orchestration_start,
                     initial_planning_ms,
                 )
@@ -5496,7 +5516,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 crate::builder::scratchpad_usage_event(budget, CONVERSATION_AGENT_ID)
             })
         {
-            let _ = usage_tx.send(Ok(event)).await;
+            emitter.emit_item(event).await;
         }
 
         match &result {
@@ -5523,7 +5543,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         initial_plan: Plan,
         chat_history: Vec<rig::completion::Message>,
         coordinator_state: &mut CoordinatorState,
-        event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+        emitter: &Emitter,
         orchestration_start: Instant,
         initial_planning_ms: u64,
     ) -> Result<String, StreamError> {
@@ -5547,7 +5567,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     &chat_history,
                     coordinator_state,
                     previous_context.as_ref(),
-                    &event_tx,
+                    emitter,
                     orchestration_start,
                     planning_ms,
                     &mut failure_history,
@@ -5593,7 +5613,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         chat_history: &[rig::completion::Message],
         coordinator_state: &mut CoordinatorState,
         previous_context: Option<&IterationContext>,
-        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+        emitter: &Emitter,
         orchestration_start: Instant,
         planning_ms: u64,
         failure_history: &mut Vec<FailedTaskRecord>,
@@ -5632,7 +5652,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // EXECUTE: Run workers on tasks (parallel when possible)
         // ----------------------------------------------------------------
         let (task_compute_ms, park_records) =
-            match self.execute(&mut plan, failure_history, event_tx).await {
+            match self.execute(&mut plan, failure_history, emitter).await {
                 Ok(result) => result,
                 Err(e) => {
                     self.write_run_manifest(&plan, iteration, None).await;
@@ -5644,7 +5664,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             &mut plan,
             coordinator_quota_error.is_some(),
             failure_history,
-            event_tx,
+            emitter,
         )
         .await;
         let new_failure_start = failure_history.len();
@@ -5704,7 +5724,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 task_compute_ms,
             );
             Self::emit_event(
-                event_tx,
+                emitter,
                 AgentEventPayload::IterationComplete {
                     iteration,
                     will_replan: false,
@@ -5744,7 +5764,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     failure_history.as_slice(),
                     &plan,
                     &park_records,
-                    event_tx,
+                    emitter,
                 )
                 .await;
             let tool_traces = self.load_tool_traces_for_plan(&plan).await;
@@ -5835,7 +5855,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         task_compute_ms,
                     );
                     Self::emit_event(
-                        event_tx,
+                        emitter,
                         AgentEventPayload::IterationComplete {
                             iteration,
                             will_replan: false,
@@ -5901,7 +5921,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             failure_history.clone(),
             tool_traces,
         );
-        Self::emit_event(event_tx, AgentEventPayload::Synthesizing { iteration }).await;
+        Self::emit_event(emitter, AgentEventPayload::Synthesizing { iteration }).await;
         let decision_start = Instant::now();
         let routing = self
             .plan_with_routing(
@@ -5910,7 +5930,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 coordinator_state,
                 Some(&post_execute_ctx),
                 1,
-                Some(event_tx),
+                Some(emitter),
             )
             .await;
 
@@ -5935,7 +5955,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 tracing::Span::current()
                     .record("orchestration.post_execute_decision", "respond_directly");
                 Self::emit_event(
-                    event_tx,
+                    emitter,
                     AgentEventPayload::DirectAnswer {
                         response: response.clone(),
                         routing_rationale,
@@ -5943,7 +5963,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 )
                 .await;
                 Self::emit_event(
-                    event_tx,
+                    emitter,
                     AgentEventPayload::IterationComplete {
                         iteration,
                         will_replan: false,
@@ -5983,7 +6003,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     "request_clarification",
                 );
                 Self::emit_event(
-                    event_tx,
+                    emitter,
                     AgentEventPayload::ClarificationNeeded {
                         question: question.clone(),
                         options,
@@ -5992,7 +6012,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 )
                 .await;
                 Self::emit_event(
-                    event_tx,
+                    emitter,
                     AgentEventPayload::IterationComplete {
                         iteration,
                         will_replan: false,
@@ -6042,7 +6062,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     );
                     let raw = Self::build_raw_task_results(&plan, detail);
                     Self::emit_event(
-                        event_tx,
+                        emitter,
                         AgentEventPayload::IterationComplete {
                             iteration,
                             will_replan: false,
@@ -6069,7 +6089,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 };
 
                 Self::emit_event(
-                    event_tx,
+                    emitter,
                     AgentEventPayload::PlanCreated {
                         goal: new_plan.goal.clone(),
                         tasks: new_plan
@@ -6084,7 +6104,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 )
                 .await;
                 Self::emit_event(
-                    event_tx,
+                    emitter,
                     AgentEventPayload::IterationComplete {
                         iteration,
                         will_replan: true,
@@ -6104,7 +6124,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
 
                 let (new_previous_context, _) = Self::trigger_replan(
-                    event_tx,
+                    emitter,
                     iteration,
                     "post_execute_create_plan",
                     plan,
@@ -6140,7 +6160,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 tracing::warn!("Post-execute coordinator call failed: {}", err_str);
                 let raw = Self::build_raw_task_results(&plan, &note);
                 Self::emit_event(
-                    event_tx,
+                    emitter,
                     AgentEventPayload::IterationComplete {
                         iteration,
                         will_replan: false,
@@ -6299,7 +6319,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         failure_history: &[FailedTaskRecord],
         plan: &Plan,
         park_records: &ParkedTaskRecords,
-        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+        emitter: &Emitter,
     ) -> Result<String, StreamError> {
         let Some(hitl) = self.agent_build_context.hitl.clone() else {
             return Err("run parked without a HITL policy configured".into());
@@ -6357,7 +6377,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     guard.mark_published();
                 }
                 Self::emit_event(
-                    event_tx,
+                    emitter,
                     AgentEventPayload::RunParked {
                         run_id: run_id.clone(),
                         decision_ids: commit
@@ -6406,7 +6426,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         plan: &mut Plan,
         coordinator_exhausted: bool,
         failure_history: &[FailedTaskRecord],
-        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+        emitter: &Emitter,
     ) {
         let exhausted = self.exhausted_llms(plan, failure_history);
         for task in &mut plan.tasks {
@@ -6430,7 +6450,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 crate::provider_error::QUOTA_EXHAUSTED_MESSAGE
             );
             task.fail(message.clone(), FailureCategory::ProviderQuotaExhausted);
-            self.emit_quota_task_completed(task.id, task.worker.as_deref(), message, event_tx)
+            self.emit_quota_task_completed(task.id, task.worker.as_deref(), message, emitter)
                 .await;
         }
     }
@@ -6756,13 +6776,27 @@ fn context_overflow_suggestion(phase: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Returns an emitter and the receiver of its item stream. The stream
+    /// holds up to `capacity` items, and nobody observes the run's event
+    /// channel.
+    fn unobserved_emitter(
+        capacity: usize,
+    ) -> (
+        Emitter,
+        tokio::sync::mpsc::Receiver<Result<StreamItem, StreamError>>,
+    ) {
+        let (items, received) = tokio::sync::mpsc::channel(capacity);
+        let run = RunContext::detached(aura_events::RunId::mint());
+        (Emitter::new(items, run), received)
+    }
+
     mod internal_tool_completions {
         use super::super::{InternalToolStart, forward_internal_tool_completed};
         use crate::provider_agent::{StreamItem, ToolResult, ToolResultKind};
         use aura_events::agent::{AgentEventPayload, ToolOutcome};
 
         async fn outcome_of(result: &str, kind: ToolResultKind) -> ToolOutcome {
-            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let (emitter, mut rx) = super::unobserved_emitter(4);
             let mut starts = std::collections::HashMap::from([(
                 "call_1".to_string(),
                 InternalToolStart {
@@ -6777,7 +6811,7 @@ mod tests {
                 result: result.into(),
                 kind,
             };
-            forward_internal_tool_completed(Some(&tx), Some(0), &result, &mut starts).await;
+            forward_internal_tool_completed(Some(&emitter), Some(0), &result, &mut starts).await;
             match rx.recv().await {
                 Some(Ok(StreamItem::AgentEvent(event))) => match event.payload {
                     AgentEventPayload::ToolComplete { outcome, .. } => outcome,
@@ -6804,7 +6838,7 @@ mod tests {
         async fn output_completes_as_a_success_with_its_text() {
             let outcome = outcome_of("Step 1\nStep 2", ToolResultKind::Text).await;
             assert!(
-                matches!(&outcome, ToolOutcome::Success { result } if result == "Step 1\nStep 2"),
+                matches!(&outcome, ToolOutcome::Success { result, .. } if result == "Step 1\nStep 2"),
                 "{outcome:?}"
             );
         }
@@ -9141,9 +9175,9 @@ mod tests {
         plan.get_task_mut(0).unwrap().complete("ok");
         mark_awaiting(&mut plan, 1, vec![parked_call("kubectl_apply")]);
 
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        let (emitter, mut event_rx) = unobserved_emitter(32);
         let (compute_ms, park_records) = orchestrator
-            .execute(&mut plan, &[], &event_tx)
+            .execute(&mut plan, &[], &emitter)
             .await
             .unwrap();
 
@@ -9526,7 +9560,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (orchestrator, store, registry, run_id) = park_orchestrator(dir.path()).await;
         let (plan, records, pending) = awaiting_plan_with_parked_calls(&registry, &run_id).await;
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        let (emitter, mut event_rx) = unobserved_emitter(32);
 
         let chat_history = vec![rig::completion::Message::user("deploy the service")];
         let message = orchestrator
@@ -9540,7 +9574,7 @@ mod tests {
                 &[],
                 &plan,
                 &records,
-                &event_tx,
+                &emitter,
             )
             .await
             .expect("the park commit succeeds");
@@ -9618,7 +9652,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        let (emitter, mut event_rx) = unobserved_emitter(32);
         let chat_history = vec![rig::completion::Message::user("deploy the service")];
         let before = chrono::Utc::now();
 
@@ -9633,7 +9667,7 @@ mod tests {
                 &[],
                 &plan,
                 &records,
-                &event_tx,
+                &emitter,
             )
             .await
             .expect("the park commit succeeds");
@@ -9691,7 +9725,7 @@ mod tests {
         let session_root = dir.path().join("park-sess");
         set_mode(&session_root, 0o555);
 
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        let (emitter, mut event_rx) = unobserved_emitter(32);
         let chat_history = vec![rig::completion::Message::user("deploy the service")];
         let result = crate::run_context::with_run(
             Arc::clone(&run),
@@ -9705,7 +9739,7 @@ mod tests {
                 &[],
                 &plan,
                 &records,
-                &event_tx,
+                &emitter,
             ),
         )
         .await;
@@ -9792,7 +9826,7 @@ mod tests {
         let session_root = dir.path().join("park-sess");
         set_mode(&session_root, 0o555);
 
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let (emitter, _event_rx) = unobserved_emitter(32);
         let chat_history = vec![rig::completion::Message::user("deploy the service")];
         let result = crate::run_context::with_run(
             Arc::clone(&run),
@@ -9806,7 +9840,7 @@ mod tests {
                 &[],
                 &plan,
                 &records,
-                &event_tx,
+                &emitter,
             ),
         )
         .await;
@@ -9870,7 +9904,7 @@ mod tests {
         let (run, mut events) = crate::run_context::RunContext::channel(this_run);
         crate::run_context::with_run(Arc::clone(&run), arm_guard(&orchestrator, &plan)).await;
 
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        let (emitter, mut event_rx) = unobserved_emitter(32);
         let chat_history = vec![rig::completion::Message::user("deploy the service")];
         let result = crate::run_context::with_run(
             Arc::clone(&run),
@@ -9884,7 +9918,7 @@ mod tests {
                 &[],
                 &plan,
                 &records,
-                &event_tx,
+                &emitter,
             ),
         )
         .await;
@@ -10165,10 +10199,10 @@ mod tests {
             task_context: &None,
             worker_name: Some("operations"),
         };
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let (emitter, _event_rx) = unobserved_emitter(32);
         let result = crate::run_context::with_run(
             Arc::clone(&run),
-            orchestrator.execute_task(0, &params, Some(&event_tx), None, None),
+            orchestrator.execute_task(0, &params, Some(&emitter), None, None),
         )
         .await;
 
@@ -10232,9 +10266,9 @@ mod tests {
                 .with_worker("operations")
                 .with_dependency(1),
         );
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(256);
+        let (emitter, _event_rx) = unobserved_emitter(256);
         orchestrator
-            .execute(&mut plan, &[], &event_tx)
+            .execute(&mut plan, &[], &emitter)
             .await
             .unwrap();
         let next_wave_built = test_rig::take_worker_override().is_none();
@@ -10347,9 +10381,9 @@ mod tests {
         plan.add_task(failed_on_quota(0, "billing"));
         plan.add_task(Task::new(1, "Search logs", "r").with_worker("operations"));
         plan.add_task(Task::new(2, "Summarize spend", "r").with_worker("billing"));
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
+        let (emitter, mut event_rx) = unobserved_emitter(256);
         orchestrator
-            .execute(&mut plan, &[], &event_tx)
+            .execute(&mut plan, &[], &emitter)
             .await
             .unwrap();
         let spare_override = test_rig::take_worker_override().is_some();
@@ -10391,9 +10425,9 @@ mod tests {
         let mut plan = Plan::new("Investigate");
         plan.add_task(Task::new(0, "Search logs", "r").with_worker("operations"));
         plan.add_task(Task::new(1, "Summarize spend", "r").with_worker("billing"));
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(256);
+        let (emitter, _event_rx) = unobserved_emitter(256);
         orchestrator
-            .execute(&mut plan, &history, &event_tx)
+            .execute(&mut plan, &history, &emitter)
             .await
             .unwrap();
         while test_rig::take_worker_override().is_some() {}
@@ -10423,9 +10457,9 @@ mod tests {
         let mut plan = Plan::new("Investigate");
         plan.add_task(failed_on_quota(0, "operations"));
         plan.add_task(Task::new(1, "Summarize spend", "r").with_worker("billing"));
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(256);
+        let (emitter, _event_rx) = unobserved_emitter(256);
         orchestrator
-            .execute(&mut plan, &[], &event_tx)
+            .execute(&mut plan, &[], &emitter)
             .await
             .unwrap();
         while test_rig::take_worker_override().is_some() {}
@@ -10481,10 +10515,10 @@ mod tests {
         let (run, _events) =
             crate::run_context::RunContext::channel(request_id.parse().expect("a run id"));
 
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+        let (emitter, mut event_rx) = unobserved_emitter(32);
         crate::run_context::with_run(
             Arc::clone(&run),
-            orchestrator.cancel_exhausted_awaiting_tasks(&mut plan, false, &[], &event_tx),
+            orchestrator.cancel_exhausted_awaiting_tasks(&mut plan, false, &[], &emitter),
         )
         .await;
         assert!(has_awaiting_task(&plan), "{:?}", plan.tasks);
@@ -10496,7 +10530,7 @@ mod tests {
         plan.get_task_mut(1).unwrap().worker = Some("billing".to_string());
         crate::run_context::with_run(
             Arc::clone(&run),
-            orchestrator.cancel_exhausted_awaiting_tasks(&mut plan, false, &[], &event_tx),
+            orchestrator.cancel_exhausted_awaiting_tasks(&mut plan, false, &[], &emitter),
         )
         .await;
         assert!(plan.tasks[1].is_quota_exhausted(), "{:?}", plan.tasks);
@@ -10540,7 +10574,7 @@ mod tests {
             routing_decision,
             chat_history_tokens: None,
         };
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(256);
+        let (emitter, _event_rx) = unobserved_emitter(256);
         let mut failure_history = Vec::new();
         let outcome = crate::run_context::with_run(
             Arc::clone(&run),
@@ -10551,7 +10585,7 @@ mod tests {
                 &[],
                 &mut coordinator_state,
                 None,
-                &event_tx,
+                &emitter,
                 Instant::now(),
                 0,
                 &mut failure_history,
@@ -10659,12 +10693,12 @@ mod tests {
             task_context: &None,
             worker_name: Some("operations"),
         };
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let (emitter, _event_rx) = unobserved_emitter(32);
         // The orchestrator's own body runs inside the run; these call it
         // directly, so the scope is established here instead.
         let result = crate::run_context::with_run(
             Arc::clone(&run),
-            orchestrator.execute_task(0, &params, Some(&event_tx), None, None),
+            orchestrator.execute_task(0, &params, Some(&emitter), None, None),
         )
         .await;
 
@@ -10704,12 +10738,12 @@ mod tests {
             task_context: &None,
             worker_name: Some("operations"),
         };
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let (emitter, _event_rx) = unobserved_emitter(32);
         // The orchestrator's own body runs inside the run; these call it
         // directly, so the scope is established here instead.
         let result = crate::run_context::with_run(
             Arc::clone(&run),
-            orchestrator.execute_task(0, &params, Some(&event_tx), None, None),
+            orchestrator.execute_task(0, &params, Some(&emitter), None, None),
         )
         .await;
 
@@ -10795,9 +10829,9 @@ mod tests {
 
         let mut plan = Plan::new("Inspect");
         plan.add_task(Task::new(0, "Inspect the pool", "r").with_worker("operations"));
-        let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
+        let (emitter, event_rx) = unobserved_emitter(256);
         orchestrator
-            .execute(&mut plan, &[], &event_tx)
+            .execute(&mut plan, &[], &emitter)
             .await
             .unwrap();
         let requests = model.requests().lock().unwrap().len();
@@ -10952,9 +10986,9 @@ mod tests {
 
         let mut plan = Plan::new("Inspect");
         plan.add_task(Task::new(0, "Inspect the pool", "r").with_worker("operations"));
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
+        let (emitter, mut event_rx) = unobserved_emitter(256);
         orchestrator
-            .execute(&mut plan, &[], &event_tx)
+            .execute(&mut plan, &[], &emitter)
             .await
             .unwrap();
         let mut completed = Vec::new();
@@ -10967,7 +11001,7 @@ mod tests {
                 } = event.payload
             {
                 let text = match outcome {
-                    aura_events::agent::ToolOutcome::Success { result } => result,
+                    aura_events::agent::ToolOutcome::Success { result, .. } => result,
                     aura_events::agent::ToolOutcome::Failure { error } => error,
                     aura_events::agent::ToolOutcome::Unknown => String::new(),
                 };
@@ -11163,7 +11197,7 @@ mod tests {
             routing_decision,
             chat_history_tokens: None,
         };
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(256);
+        let (emitter, _event_rx) = unobserved_emitter(256);
         let mut failure_history = Vec::new();
         let outcome = crate::run_context::with_run(
             Arc::clone(&run),
@@ -11174,7 +11208,7 @@ mod tests {
                 &[],
                 &mut coordinator_state,
                 None,
-                &event_tx,
+                &emitter,
                 Instant::now(),
                 0,
                 &mut failure_history,
@@ -11429,10 +11463,10 @@ mod tests {
             task_context: &None,
             worker_name: Some("operations"),
         };
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let (emitter, _event_rx) = unobserved_emitter(32);
         let result = crate::run_context::with_run(
             Arc::clone(&run),
-            orchestrator.execute_task(0, &params, Some(&event_tx), None, None),
+            orchestrator.execute_task(0, &params, Some(&emitter), None, None),
         )
         .await;
 
@@ -11490,9 +11524,9 @@ mod tests {
             task_context: &None,
             worker_name: Some("operations"),
         };
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(256);
+        let (emitter, _event_rx) = unobserved_emitter(256);
         let cancelled = tokio::time::timeout(Duration::from_secs(5), async {
-            let task = orchestrator.execute_task(0, &params, Some(&event_tx), None, None);
+            let task = orchestrator.execute_task(0, &params, Some(&emitter), None, None);
             tokio::pin!(task);
             loop {
                 tokio::select! {
@@ -11535,6 +11569,150 @@ mod tests {
         assert!(
             error.ends_with("- echo_tool: applied [truncated]"),
             "{error}"
+        );
+    }
+
+    // ====================================================================
+    // Both streams: what the orchestrator emits reaches the item stream
+    // and the run's channel.
+    // ====================================================================
+
+    /// The `type` tag an event's payload is serialized with.
+    fn payload_kind(payload: &AgentEventPayload) -> String {
+        serde_json::to_value(payload).expect("a payload serializes")["type"]
+            .as_str()
+            .expect("a payload is tagged with its kind")
+            .to_owned()
+    }
+
+    /// Runs one scripted worker task through `execute`, with the tool-event
+    /// forwarder started the way `factory.rs` starts it. Every event the run
+    /// produces appears once on the item stream and once on the run's
+    /// channel, and the two copies of each agent event are equal.
+    #[tokio::test]
+    async fn a_scripted_run_emits_each_event_to_both_streams_once() {
+        let _serial = WORKER_OVERRIDE_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let workers = std::collections::HashMap::from([(
+            "operations".to_string(),
+            crate::orchestration::WorkerConfig {
+                description: "Runs the scripted tool".to_string(),
+                preamble: "You inspect the pool.".to_string(),
+                mcp_filter: Some(vec![]),
+                vector_stores: vec![],
+                turn_depth: None,
+                llm: None,
+                scratchpad: None,
+                skills: None,
+            },
+        )]);
+        let orchestrator = Orchestrator::new(AgentBuildContext {
+            memory_dir: Some(dir.path().to_string_lossy().into_owned()),
+            orchestration: Some(OrchestrationConfig {
+                enabled: true,
+                workers,
+                ..Default::default()
+            }),
+            ..AgentBuildContext::default()
+        })
+        .await
+        .unwrap();
+        test_rig::install_worker_overrides(vec![WorkerOverride {
+            model: test_rig::ScriptedCompletionModel::new(vec![
+                ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
+                    "call_0",
+                    test_rig::ECHO_TOOL_NAME,
+                    serde_json::json!({"pool": "web"}),
+                )]),
+                ScriptedTurn::text("the pool is healthy"),
+            ]),
+            extra_tools: vec![Box::new(test_rig::RecordingTool::new(Arc::default()))],
+        }]);
+
+        let (run, mut channel) = RunContext::channel(aura_events::RunId::mint());
+        let (items, mut item_stream) = tokio::sync::mpsc::channel(256);
+        spawn_tool_event_forwarder(
+            &orchestrator.tool_call_observer,
+            Emitter::new(items.clone(), Arc::clone(&run)),
+            CancellationToken::new(),
+        );
+        let emitter = Emitter::new(items, Arc::clone(&run));
+        let mut plan = Plan::new("Inspect");
+        plan.add_task(Task::new(0, "Inspect the pool", "r").with_worker("operations"));
+        crate::run_context::with_run(
+            Arc::clone(&run),
+            orchestrator.execute(&mut plan, &[], &emitter),
+        )
+        .await
+        .unwrap();
+
+        // Dropping the orchestrator closes the observer, which stops the
+        // forwarder. The item stream ends once both emitters are dropped.
+        drop(emitter);
+        drop(orchestrator);
+        let mut sent = Vec::new();
+        while let Some(item) = tokio::time::timeout(Duration::from_secs(5), item_stream.recv())
+            .await
+            .expect("the item stream ends once both emitters are gone")
+        {
+            sent.push(item.expect("the run sends no errors"));
+        }
+        let received: Vec<AgentEvent> = std::iter::from_fn(|| channel.try_recv().ok()).collect();
+
+        let mut sent_kinds: Vec<(String, String)> = sent
+            .iter()
+            .filter_map(|item| match item {
+                StreamItem::AgentEvent(event) => {
+                    Some((payload_kind(&event.payload), event.agent.agent_id.clone()))
+                }
+                StreamItem::ContextUsage { agent_id, .. } => {
+                    Some(("context_usage".to_owned(), agent_id.clone()))
+                }
+                StreamItem::ScratchpadUsage { agent_id, .. } => {
+                    Some(("scratchpad_usage".to_owned(), agent_id.clone()))
+                }
+                StreamItem::McpStatus(_) => Some(("mcp_status".to_owned(), String::new())),
+                _ => None,
+            })
+            .collect();
+        let mut received_kinds: Vec<(String, String)> = received
+            .iter()
+            .map(|event| (payload_kind(&event.payload), event.agent.agent_id.clone()))
+            .collect();
+        sent_kinds.sort();
+        received_kinds.sort();
+        let expected: Vec<(String, String)> = [
+            "context_usage",
+            "task_completed",
+            "task_started",
+            "tool_complete",
+            "tool_start",
+        ]
+        .into_iter()
+        .map(|kind| (kind.to_owned(), "operations".to_owned()))
+        .collect();
+        assert_eq!(sent_kinds, expected, "the item stream: {sent:?}");
+        assert_eq!(received_kinds, expected, "the run's channel: {received:?}");
+
+        let as_json =
+            |event: &AgentEvent| serde_json::to_string(event).expect("an event serializes");
+        let mut sent_events: Vec<String> = sent
+            .iter()
+            .filter_map(|item| match item {
+                StreamItem::AgentEvent(event) => Some(as_json(event)),
+                _ => None,
+            })
+            .collect();
+        let mut received_events: Vec<String> = received
+            .iter()
+            .filter(|event| !matches!(event.payload, AgentEventPayload::ContextUsage { .. }))
+            .map(as_json)
+            .collect();
+        sent_events.sort();
+        received_events.sort();
+        assert_eq!(
+            sent_events, received_events,
+            "an agent event's two copies are the same event"
         );
     }
 
@@ -11675,7 +11853,7 @@ mod tests {
         let (registry, _store) = file_store_registry(&dir.path().join("approvals"));
         let (orchestrator, _run_id) =
             file_backed_park_orchestrator(&registry, dir.path(), "park-ends-run").await;
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+        let (emitter, _event_rx) = unobserved_emitter(64);
 
         let (park_model, _invocations) = gated_worker_override(vec![
             ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
@@ -11689,7 +11867,7 @@ mod tests {
         let mut plan = Plan::new("Deploy");
         plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
         orchestrator
-            .execute(&mut plan, &[], &event_tx)
+            .execute(&mut plan, &[], &emitter)
             .await
             .unwrap();
 
@@ -11725,7 +11903,7 @@ mod tests {
         let (registry, store) = file_store_registry(&dir.path().join("approvals"));
         let (orchestrator, run_id) =
             file_backed_park_orchestrator(&registry, dir.path(), "loop-sess").await;
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+        let (emitter, _event_rx) = unobserved_emitter(64);
 
         let (park_model, park_invocations) =
             gated_worker_override(vec![ScriptedTurn::tool_calls(vec![ScriptedToolCall::new(
@@ -11738,7 +11916,7 @@ mod tests {
         let mut plan = Plan::new("Deploy");
         plan.add_task(Task::new(0, "Gated apply", "r").with_worker("operations"));
         let (_compute_ms, park_records) = orchestrator
-            .execute(&mut plan, &[], &event_tx)
+            .execute(&mut plan, &[], &emitter)
             .await
             .unwrap();
         let TaskState::AwaitingApproval { pending } = &plan.tasks[0].state else {
@@ -11760,7 +11938,7 @@ mod tests {
                 &[],
                 &plan,
                 &park_records,
-                &event_tx,
+                &emitter,
             )
             .await
             .expect("the park commit succeeds");
@@ -11826,12 +12004,12 @@ mod tests {
             task_context: &None,
             worker_name: Some("operations"),
         };
-        let (event_tx2, _event_rx2) = tokio::sync::mpsc::channel(64);
+        let (emitter2, _event_rx2) = unobserved_emitter(64);
         let outcome = orchestrator2
             .execute_task(
                 0,
                 &params,
-                Some(&event_tx2),
+                Some(&emitter2),
                 Some(&continuation),
                 Some(&resume_ctx),
             )
@@ -12196,6 +12374,83 @@ mod coordinator_artifact_tests {
 
     fn big_artifact() -> String {
         (0..20_000).map(|i| format!("log line {i}\n")).collect()
+    }
+
+    /// With no `memory_dir` there is no artifact to hold the rest of a long
+    /// result, so none of it is cut.
+    #[tokio::test]
+    async fn a_long_result_stays_whole_without_a_memory_dir() {
+        let orchestrator = Orchestrator::new(AgentBuildContext::default())
+            .await
+            .unwrap();
+        let result = big_artifact();
+
+        let persistence = orchestrator.persistence.lock().await.clone();
+        let kept = orchestrator
+            .maybe_create_artifact(&persistence, 0, Some("files"), result.clone())
+            .await;
+
+        assert_eq!(kept, result);
+    }
+
+    #[tokio::test]
+    async fn a_long_result_is_cut_once_an_artifact_holds_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let orchestrator = orchestrator(temp.path(), None, None).await;
+        let result = big_artifact();
+
+        let persistence = orchestrator.persistence.lock().await.clone();
+        let kept = orchestrator
+            .maybe_create_artifact(&persistence, 0, Some("files"), result.clone())
+            .await;
+
+        assert!(kept.len() < result.len());
+        assert!(
+            kept.ends_with("saved to artifact: task-0-files-iter-1-result.txt]"),
+            "{}",
+            &kept[kept.len() - 80..]
+        );
+    }
+
+    /// The wave loop writes a finished task's artifact while other worker
+    /// futures sit unpolled. One of them pending on a file write with the
+    /// shared mutex held must not stall that write (mezmo/aura#896).
+    #[tokio::test]
+    async fn a_result_artifact_is_written_while_a_worker_holds_the_persistence_lock() {
+        use futures::StreamExt;
+        use futures::stream::FuturesUnordered;
+
+        let temp = tempfile::tempdir().unwrap();
+        let orchestrator = orchestrator(temp.path(), None, None).await;
+        let snapshot = orchestrator.persistence.lock().await.clone();
+
+        type Worker<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = &'static str> + 'a>>;
+        let mut workers: FuturesUnordered<Worker<'_>> = FuturesUnordered::new();
+        workers.push(Box::pin(async {
+            orchestrator
+                .record_worker_execution(0, "task", 1, 1, Ok("output"), None, "prompt")
+                .await;
+            "holder"
+        }));
+        workers.push(Box::pin(async { "finished" }));
+
+        // Polls the holder first, which locks the mutex and pends on its
+        // first file write, then the task that finishes.
+        assert_eq!(workers.next().await, Some("finished"));
+        assert!(
+            orchestrator.persistence.try_lock().is_err(),
+            "the holder must still own the persistence lock"
+        );
+
+        let kept = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            orchestrator.maybe_create_artifact(&snapshot, 1, Some("files"), big_artifact()),
+        )
+        .await
+        .expect("the artifact write waited on the persistence lock");
+        assert!(kept.contains("saved to artifact:"), "{kept}");
+
+        assert_eq!(workers.next().await, Some("holder"));
     }
 
     /// The coordinator's artifact tools with their run bound, as

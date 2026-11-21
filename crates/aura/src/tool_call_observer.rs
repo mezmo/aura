@@ -100,6 +100,7 @@ impl ToolEvent {
             tool_initiator_id: tool_initiator_id.into(),
             result: aura_events::agent::ToolOutcome::Success {
                 result: result.into(),
+                format: aura_events::agent::ResultFormat::Text,
             },
             duration_ms,
         }

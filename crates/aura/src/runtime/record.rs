@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
-use aura_events::run::{Liveness, RunCancelReason};
+use aura_events::run::{CancelCause, Liveness};
 use aura_events::{RunId, SessionId, TokenCount, TokenUsage};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
@@ -210,13 +210,30 @@ pub(crate) struct RunRecord {
     ending: watch::Sender<Ending>,
     /// The run's context.
     context: Mutex<Option<Arc<RunContext>>>,
+    /// How many of the run's stream items have shown activity.
+    activity: watch::Sender<u64>,
+}
+
+/// Follows one run's activity.
+pub struct RunActivity(watch::Receiver<u64>);
+
+impl RunActivity {
+    /// Resolves once the run has shown activity since the last wait, or, on
+    /// the first wait, since the run began. Activity that comes while nothing
+    /// waits is reported once, by the next wait. Never resolves once the
+    /// runtime has let go of the run.
+    pub async fn next(&mut self) {
+        if self.0.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 /// Whether and why a run was stopped.
 #[derive(Default)]
 struct Stops {
-    /// The reason and message the run was stopped with.
-    reason: Option<(RunCancelReason, Option<String>)>,
+    /// The cause and reason the run was stopped with.
+    stopped_with: Option<(CancelCause, Option<String>)>,
     /// Whether the run can no longer be stopped.
     closed: bool,
 }
@@ -246,7 +263,7 @@ enum Ending {
 impl RunRecord {
     pub(super) fn new(facts: RunFacts) -> Self {
         Self {
-            id: facts.run_id,
+            id: facts.run.run_id,
             cancel: CancellationToken::new(),
             stops: Mutex::new(Stops::default()),
             usage: OnceLock::new(),
@@ -254,7 +271,22 @@ impl RunRecord {
             task: Mutex::new(None),
             ending: watch::Sender::new(Ending::Unclaimed),
             context: Mutex::new(None),
+            activity: watch::Sender::new(0),
         }
+    }
+
+    /// Records that the run showed activity.
+    pub(super) fn note_activity(&self) {
+        self.activity
+            .send_modify(|count| *count = count.wrapping_add(1));
+    }
+
+    pub(super) fn activity(&self) -> RunActivity {
+        let mut activity = self.activity.subscribe();
+        if *activity.borrow() > 0 {
+            activity.mark_changed();
+        }
+        RunActivity(activity)
     }
 
     fn context_slot(&self) -> MutexGuard<'_, Option<Arc<RunContext>>> {
@@ -285,17 +317,17 @@ impl RunRecord {
     }
 
     pub(super) fn liveness(&self) -> Liveness {
-        self.facts.borrow().liveness
+        self.facts.borrow().run.liveness
     }
 
     /// The run's facts. A live run's usage is read from its counters now,
     /// since the stored facts only get usage once the run ends.
     pub(super) fn facts(&self) -> RunFacts {
         let mut facts = self.facts.borrow().clone();
-        if !facts.status.is_terminal()
+        if !facts.run.status.is_terminal()
             && let Some(usage) = self.usage.get()
         {
-            facts.usage = token_usage(usage);
+            facts.run.usage = token_usage(usage);
         }
         facts
     }
@@ -316,20 +348,26 @@ impl RunRecord {
         let _ = self.usage.set(usage);
     }
 
+    /// The run's usage counters. `None` until the agent starts streaming the
+    /// run.
+    pub(super) fn counters(&self) -> Option<&UsageState> {
+        self.usage.get()
+    }
+
     fn stops(&self) -> MutexGuard<'_, Stops> {
         self.stops.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Stops the run for `reason` and returns whether it did. The first
-    /// reason given is the one the run ends with, and a later stop does not
+    /// Stops the run for `cause` and returns whether it did. The first
+    /// cause given is the one the run ends with, and a later stop does not
     /// change it. Returns `false` once the run's stream has ended, because
     /// by then the run's ending is already decided.
-    pub(super) fn stop(&self, reason: RunCancelReason, message: Option<String>) -> bool {
+    pub(super) fn stop(&self, cause: CancelCause, reason: Option<String>) -> bool {
         let mut stops = self.stops();
         if stops.closed {
             return false;
         }
-        stops.reason.get_or_insert((reason, message));
+        stops.stopped_with.get_or_insert((cause, reason));
         self.cancel.cancel();
         true
     }
@@ -344,9 +382,9 @@ impl RunRecord {
         self.stops().closed = true;
     }
 
-    /// The reason and message the run was stopped with, if it was stopped.
-    pub(super) fn stopped(&self) -> Option<(RunCancelReason, Option<String>)> {
-        self.stops().reason.clone()
+    /// The cause and reason the run was stopped with, if it was stopped.
+    pub(super) fn stopped(&self) -> Option<(CancelCause, Option<String>)> {
+        self.stops().stopped_with.clone()
     }
 
     fn task(&self) -> MutexGuard<'_, Option<JoinHandle<()>>> {

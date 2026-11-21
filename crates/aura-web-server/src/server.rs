@@ -7,14 +7,12 @@ use crate::a2a::{
 use crate::handlers;
 use crate::session_store::{SessionStore, build_session_store};
 use crate::streaming::ToolResultMode;
-use crate::types::{ActiveRequestTracker, AppState, ErrorDetail, ErrorResponse};
+use crate::types::{ActiveRequestTracker, AppState};
 use aura::instance_id::instance_id as compute_instance_id;
 use aura_config::load_config;
-use axum::Json;
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::{
     Router, middleware,
     routing::{get, post},
@@ -92,6 +90,18 @@ pub struct ServerArgs {
         value_parser = clap::builder::BoolishValueParser::new(),
     )]
     pub aura_emit_reasoning: bool,
+
+    /// Serve chat completions from the agent runtime. When off, each request
+    /// builds and runs its own agent.
+    /// Accepts the canonical boolean vocabulary (1/0, true/false, yes/no, on/off, t/f, y/n).
+    #[arg(
+        long,
+        env = "AURA_RUNTIME_CHAT_COMPLETIONS",
+        default_value = "false",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
+    pub runtime_chat_completions: bool,
 
     /// Dev-only: surface the raw upstream provider error to clients on failure.
     /// Leave OFF for public-facing deployments — provider error bodies can echo
@@ -245,16 +255,7 @@ async fn shutdown_guard(
     next: Next,
 ) -> Response {
     if state.shutdown_token.is_cancelled() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: ErrorDetail {
-                    message: "Server is shutting down".to_string(),
-                    error_type: "service_unavailable".to_string(),
-                },
-            }),
-        )
-            .into_response();
+        return handlers::shutting_down_response();
     }
     next.run(request).await
 }
@@ -459,6 +460,14 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         )));
     }
     info!("Session store backend: {}", session_store.backend());
+    info!(
+        "Chat completions path: {}",
+        if args.runtime_chat_completions {
+            "runtime (AURA_RUNTIME_CHAT_COMPLETIONS=true)"
+        } else {
+            "request-bound"
+        }
+    );
 
     // HITL webhook HMAC (AURA_HITL_WEBHOOK_SECRET*): fail startup loud on a
     // misconfiguration instead of silently serving unsigned, unverified
@@ -514,11 +523,22 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         }
     }
 
+    let pending_approvals =
+        aura::hitl::PendingApprovals::with_backend(session_store.approvals(), session_store.bus());
+    let runtime = crate::types::build_runtime(
+        &configs_arc,
+        args.default_agent.clone(),
+        &pending_approvals,
+        ingress_hmac.clone(),
+        &session_store,
+    );
     let app_state = Arc::new(AppState {
+        runtime,
         configs: configs_arc,
         tool_result_mode: args.tool_result_mode,
         tool_result_max_length: args.tool_result_max_length,
         streaming_buffer_size: args.streaming_buffer_size,
+        runtime_chat_completions: args.runtime_chat_completions,
         aura_custom_events: args.aura_custom_events,
         aura_emit_reasoning: args.aura_emit_reasoning,
         debug_provider_errors: args.debug_provider_errors,
@@ -531,10 +551,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         default_agent: args.default_agent.clone(),
         additional_tools: Arc::new(Vec::new),
         slack_api: slack_api.clone(),
-        pending_approvals: aura::hitl::PendingApprovals::with_backend(
-            session_store.approvals(),
-            session_store.bus(),
-        ),
+        pending_approvals,
         hitl_webhook_hmac: ingress_hmac.clone(),
         session_store: session_store.clone(),
     });
@@ -624,6 +641,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         let shutdown_token = shutdown_token.clone();
         let stream_shutdown_token = stream_shutdown_token.clone();
         let active_requests = active_requests.clone();
+        let runtime = Arc::clone(&app_state.runtime);
         async move {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
@@ -634,27 +652,29 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
                 }
             }
 
-            // Phase 1: reject new requests (middleware returns 503)
+            // Phase 1: reject new requests (middleware returns 503) and let
+            // the runtime's runs and the tracked requests end on their own.
             let mut clean_shutdown = false;
             shutdown_token.cancel();
             info!("Allowing {shutdown_timeout:?} for in-flight requests to complete");
-            if timeout(shutdown_timeout, active_requests.wait_for_drain())
-                .await
-                .is_ok()
-            {
+            let finished =
+                futures_util::future::join(runtime.idle(), active_requests.wait_for_drain());
+            if timeout(shutdown_timeout, finished).await.is_ok() {
                 clean_shutdown = true;
             }
 
-            // Phase 2: terminate remaining streams ([DONE] → MCP cleanup)
+            // Phase 2: terminate the remaining streams ([DONE] → MCP cleanup).
+            // Tracked requests stop through the stream shutdown token, and
+            // the runtime's runs through its drain.
             if !clean_shutdown {
                 info!("Grace period expired, terminating remaining streams");
                 stream_shutdown_token.cancel();
-                if timeout(Duration::from_secs(5), active_requests.wait_for_drain())
-                    .await
-                    .is_ok()
-                {
-                    clean_shutdown = true;
-                }
+                let grace = Duration::from_secs(5);
+                let ((), drained) = tokio::join!(
+                    runtime.drain(grace),
+                    timeout(grace, active_requests.wait_for_drain()),
+                );
+                clean_shutdown = drained.is_ok();
             }
 
             // Phase 3: hard-stop any request task that ignored the

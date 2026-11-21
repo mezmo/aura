@@ -9,6 +9,7 @@ pub mod approver_headers;
 pub mod bedrock_embedding;
 pub mod builder;
 pub mod config;
+pub mod conversation;
 pub mod env_flags;
 pub mod error;
 pub mod fallback_tool_parser;
@@ -43,8 +44,8 @@ pub mod stream_events;
 pub mod streaming;
 pub mod streaming_request_hook;
 pub(crate) mod string_utils;
-#[cfg(all(test, feature = "otel"))]
-pub(crate) mod test_span_capture;
+#[cfg(all(feature = "otel", any(test, feature = "test-support")))]
+pub mod test_span_capture;
 pub mod tool_call_observer;
 pub mod tool_error_detection;
 pub mod tool_middleware;
@@ -60,6 +61,7 @@ pub use builder::{
     build_streaming_agent, build_streaming_agent_with_tools, no_run_tools,
 };
 pub use config::{AgentBuildContext, RunId, SessionId, ToolContextFactory};
+pub use conversation::{Conversation, LANES_PER_CONVERSATION, Lane, LaneNumber, RunSession};
 // Pure config types are owned by `aura-config` and re-exported here for
 // ergonomic consumption (`aura::LlmConfig`, etc.).
 pub use aura_config::{
@@ -90,7 +92,8 @@ pub use rig::tool::{Tool as RigTool, ToolDyn};
 pub use rig_builder::{RigBuilder, resolve_mcp_headers_in};
 pub use run_context::{BoundRun, RunContext, RunInProgress, RunLease};
 pub use runtime::{
-    AgentRuntime, AgentState, BlockReason, RigBuilderPreparer, RuntimeStores, StartError, StartRun,
+    AgentRuntime, AgentState, BlockReason, RigBuilderPreparer, RunTarget, RuntimeStores,
+    StartError, StartRun,
 };
 pub use scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
 pub use streaming::StreamingAgent;
@@ -115,7 +118,9 @@ pub use stream_events::{
     AuraStreamEvent, CorrelationContext, CorrelationContextExt, EmittingAgent, WorkerPhase,
     format_named_sse,
 };
-pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};
+pub use streaming_request_hook::{
+    BilledUsage, CacheSplit, ResponseContent, StreamingRequestHook, UsageState,
+};
 pub use tool_call_observer::{ToolCallObserver, ToolEvent};
 pub use tool_middleware::{
     CallFailure, MiddlewareStack, MiddlewareTool, Next, ToolMiddleware, ToolReply, ToolRequest,

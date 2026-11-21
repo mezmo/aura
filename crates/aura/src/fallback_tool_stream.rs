@@ -30,13 +30,16 @@
 //! - Pythonic: `[tool_name(arg="value")]`
 //! - Qwen XML: `<function=name><parameter=arg>value</parameter></function>`
 
-use crate::fallback_tool_parser::parse_fallback_tool_calls;
+use crate::fallback_tool_parser::{ParsedToolCall, parse_fallback_tool_calls};
 use crate::mcp::McpManager;
 use crate::provider_agent::{
     StreamError, StreamItem, StreamedAssistantContent, StreamedUserContent, ToolCall, ToolResult,
     ToolResultKind,
 };
+use crate::streaming_request_hook::{emit_from_stream, requested_arguments};
 use crate::string_utils::truncate_for_log;
+use aura_events::agent::{AgentEvent, AgentEventPayload};
+use aura_events::{ToolCallId, ToolName};
 use futures::stream::{BoxStream, StreamExt};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -64,6 +67,8 @@ pub struct FallbackToolExecutor {
     /// server normal registration would have picked. See
     /// `McpManager::resolve_winning_tools`.
     mcp_filter: Option<Vec<aura_config::GlobPattern>>,
+    /// The id of the stream this executor wraps.
+    stream_id: Option<String>,
 }
 
 impl FallbackToolExecutor {
@@ -92,7 +97,16 @@ impl FallbackToolExecutor {
             mcp_manager,
             available_tools,
             mcp_filter,
+            stream_id: None,
         }
+    }
+
+    /// Wraps the stream with id `stream_id`, so each call it runs is
+    /// announced to the run when that stream is the run's own. See
+    /// [`announce`].
+    pub(crate) fn for_stream(mut self, stream_id: &str) -> Self {
+        self.stream_id = Some(stream_id.to_owned());
+        self
     }
 
     /// Wrap a stream with fallback tool execution capability.
@@ -174,6 +188,9 @@ impl FallbackToolExecutor {
                                         arguments: parsed_call.arguments.clone(),
                                     })
                                 ));
+                                if let Some(stream_id) = &executor_clone.stream_id {
+                                    announce(stream_id, &tool_call_id, &parsed_call).await;
+                                }
 
                                 let tool_result = executor_clone.mcp_manager
                                     .execute_fallback_tool(
@@ -280,6 +297,26 @@ impl StreamState {
     }
 }
 
+/// Sends the call's `ToolRequested` event to the run, as the streaming hook
+/// does for a native call. A fallback call never goes through rig's tool
+/// loop, so the hook never sees it. The caller sends the event after the
+/// call's item, which is the order rig gives a native call and its event.
+/// Like the hook's, the event reaches the run only from the run's own
+/// stream.
+async fn announce(stream_id: &str, id: &str, call: &ParsedToolCall) {
+    let (arguments, unparsed_arguments) = requested_arguments(call.arguments.clone());
+    emit_from_stream(
+        stream_id,
+        AgentEvent::single_agent(AgentEventPayload::ToolRequested {
+            tool_call_id: ToolCallId::new(id),
+            tool_name: ToolName::new(&call.name),
+            arguments,
+            unparsed_arguments,
+        }),
+    )
+    .await;
+}
+
 /// What a fallback call's output holds. The output is the MCP tool's own
 /// text, not rig's encoding, so JSON other than a string stays JSON.
 fn output_kind(output: &str) -> ToolResultKind {
@@ -323,6 +360,113 @@ mod tests {
 
         assert_eq!(results.len(), 1, "{results:?}");
         assert_eq!(results[0].kind, ToolResultKind::Error, "{:?}", results[0]);
+    }
+
+    /// A model's text naming the `lookup` tool, then the end of its turn.
+    fn calls_lookup() -> BoxStream<'static, Result<StreamItem, StreamError>> {
+        futures::stream::iter([
+            Ok(StreamItem::StreamAssistantItem(
+                StreamedAssistantContent::Text(
+                    r#"{"name": "lookup", "parameters": {"q": "x"}}"#.to_string(),
+                ),
+            )),
+            Ok(StreamItem::FinalMarker),
+        ])
+        .boxed()
+    }
+
+    fn executor() -> FallbackToolExecutor {
+        FallbackToolExecutor::new(
+            Arc::new(McpManager::new()),
+            vec!["lookup".to_string()],
+            None,
+        )
+    }
+
+    /// The run's own stream announces a fallback call with `ToolRequested`,
+    /// after the call's item and before its result, as the streaming hook
+    /// does for a native call.
+    #[tokio::test]
+    async fn the_run_s_own_stream_announces_a_call_after_its_item() {
+        use crate::run_context::{RunContext, named_run_id, scope_stream};
+
+        let run_id = named_run_id("req_fallback");
+        let (run, mut events) = RunContext::channel(run_id);
+        let mut stream = scope_stream(
+            run,
+            executor()
+                .for_stream(&run_id.to_string())
+                .wrap_stream(calls_lookup()),
+        );
+
+        let call = loop {
+            match stream.next().await.expect("the stream yields the call") {
+                Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(call))) => {
+                    break call;
+                }
+                _ => continue,
+            }
+        };
+        assert!(
+            events.try_recv().is_err(),
+            "nothing is announced before the call's item"
+        );
+
+        let result = stream.next().await.expect("the stream yields the result");
+        assert!(
+            matches!(
+                result,
+                Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(
+                    _
+                )))
+            ),
+            "{result:?}"
+        );
+        let announced = events.try_recv().expect("the call is announced");
+        let AgentEventPayload::ToolRequested {
+            tool_call_id,
+            tool_name,
+            arguments,
+            unparsed_arguments,
+        } = announced.payload
+        else {
+            panic!("expected ToolRequested, got {:?}", announced.payload);
+        };
+        assert_eq!(tool_call_id.as_str(), call.id);
+        assert_eq!(tool_name.as_str(), "lookup");
+        assert_eq!(arguments, serde_json::json!({"q": "x"}));
+        assert_eq!(unparsed_arguments, None);
+        assert!(announced.agent.is_single_agent());
+        assert!(events.try_recv().is_err(), "one call, one announcement");
+    }
+
+    /// A stream other than the run's own, such as an orchestration worker's,
+    /// announces nothing to the run, as the streaming hook sends nothing
+    /// from it.
+    #[tokio::test]
+    async fn another_stream_of_the_run_announces_nothing() {
+        use crate::run_context::{RunContext, named_run_id, scope_stream};
+
+        let (run, mut events) = RunContext::channel(named_run_id("req_fallback"));
+        let items: Vec<_> = scope_stream(
+            run,
+            executor()
+                .for_stream("worker_attempt_1")
+                .wrap_stream(calls_lookup()),
+        )
+        .collect()
+        .await;
+
+        assert!(
+            items.iter().any(|item| matches!(
+                item,
+                Ok(StreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::ToolCall(_)
+                ))
+            )),
+            "the call still runs: {items:?}"
+        );
+        assert!(events.try_recv().is_err(), "nothing reaches the run");
     }
 
     #[test]

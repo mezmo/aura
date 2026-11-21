@@ -5,7 +5,10 @@
 //! once. The runtime finds or creates the session, then prepares the agent
 //! and streams the run on a task of its own. Everything the run emits goes to
 //! the session's journal, between the run's `Started` event and its ending.
-//! A session runs one run at a time.
+//! A session runs one run at a time. A conversation, which is a chat id and
+//! the agent answering it, has up to
+//! [`LANES_PER_CONVERSATION`](crate::conversation::LANES_PER_CONVERSATION)
+//! sessions called lanes, so it can run several at once.
 //!
 //! Callers get snapshots: a run's [`RunFacts`], a session's [`AgentState`],
 //! or a listing read through the [`RunStore`]. The one live handle is the
@@ -13,7 +16,9 @@
 //! a session's events. The agent, the run's event channel, and its task are
 //! never handed out.
 
+mod lanes;
 mod observe;
+mod otel;
 mod prepare;
 mod record;
 mod recorder;
@@ -31,26 +36,32 @@ use std::time::Duration;
 
 use aura_config::Config;
 use aura_events::run::{
-    LifecycleEvent, Liveness, LivenessPolicy, Observer, ObserverId, RunCancelReason,
+    CancelCause, LifecycleEvent, Liveness, LivenessPolicy, Observer, ObserverId,
     SessionEventPayload,
 };
 use aura_events::{RunId, SessionId};
 use tokio_util::sync::CancellationToken;
 
+use crate::conversation::Conversation;
 use crate::hitl::PendingApprovals;
 use crate::journal::{Cursor, SessionJournal};
 use crate::session_store::{
-    InMemoryJournalStore, InMemoryRunStore, InMemorySkillInvocationStore, JournalStore, RunFacts,
-    RunFilter, RunStatus, RunStore, SessionStoreError, SkillInvocationStore,
+    InMemoryJournalStore, InMemoryRunStore, InMemorySkillInvocationStore, JournalStore, RunDetails,
+    RunFacts, RunFilter, RunStatus, RunStore, SessionStoreError, SkillInvocationStore,
 };
 
+pub use crate::conversation::RunSession;
 pub use observe::{Attach, AttachError, ObserverCounts, Subscription};
+pub use otel::record_ending;
+#[cfg(feature = "test-support")]
+pub use prepare::AgentForRun;
 pub use prepare::RigBuilderPreparer;
-pub use start::{StartError, StartRun};
+pub use record::RunActivity;
+pub use start::{Admitted, BusyLane, Caller, RunTarget, StartError, StartRun};
 pub use state::{AgentState, BlockReason};
 
 use prepare::AgentPreparer;
-use record::{Abandon, ObserverWrite, RunRecord, SessionRecord};
+use record::{Abandon, ObserverWrite, RunRecord, SessionRecord, SessionState};
 
 /// How long [`AgentRuntime::new`] keeps a run after it ends.
 pub const DEFAULT_RETENTION: Duration = Duration::from_secs(60);
@@ -87,6 +98,8 @@ struct Shared {
     pending_approvals: PendingApprovals,
     sessions: Mutex<HashMap<SessionId, Arc<SessionRecord>>>,
     runs: RwLock<HashMap<RunId, Arc<RunRecord>>>,
+    /// How many sessions have a live run.
+    live_runs: tokio::sync::watch::Sender<usize>,
     /// Guards finding or adding a session and claiming it for a run.
     admission: Mutex<()>,
     /// How long an ended run stays held.
@@ -131,6 +144,7 @@ impl AgentRuntime {
                 pending_approvals,
                 sessions: Mutex::new(HashMap::new()),
                 runs: RwLock::new(HashMap::new()),
+                live_runs: tokio::sync::watch::Sender::new(0),
                 admission: Mutex::new(()),
                 retention,
                 draining: AtomicBool::new(false),
@@ -140,17 +154,120 @@ impl AgentRuntime {
         }
     }
 
+    /// A runtime that gets each run's agent from `agents` instead of building
+    /// it from `configs`. It is for tests that drive the runtime with a
+    /// scripted agent.
+    ///
+    /// `agents` is given the resolved config and the run's id. It returns the
+    /// agent for the run and the agent its events are attributed to, or the
+    /// error that preparing the agent would have failed with. Agent names
+    /// resolve as they do in [`RigBuilderPreparer`]. Approvals are kept in
+    /// memory, and ended runs are held for [`DEFAULT_RETENTION`].
+    #[cfg(feature = "test-support")]
+    pub fn over_agents<F>(
+        configs: Arc<Vec<Config>>,
+        default_agent: Option<String>,
+        stores: RuntimeStores,
+        agents: F,
+    ) -> Self
+    where
+        F: Fn(&Config, RunId) -> Result<AgentForRun, crate::error::BuilderError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let preparer = prepare::AgentFactoryPreparer::new(configs, default_agent, Box::new(agents));
+        Self::with_preparer(
+            Arc::new(preparer),
+            stores,
+            PendingApprovals::new(),
+            DEFAULT_RETENTION,
+        )
+    }
+
     /// Starts a run and returns its id as soon as the run is recorded, in
     /// [`RunStatus::Preparing`]. The run's task writes the run to the run
     /// store, prepares the agent, and streams the run; `Started` follows on
     /// the session's journal once it is streaming.
     ///
-    /// A start that names no session gets a new one. A start that names no
-    /// agent runs the default agent. A session runs one run at a time, so a
-    /// start on a session with a live run is refused with that run's id; the
-    /// agent may change from one run to the next. Once [`drain`](Self::drain)
-    /// has begun, every start is refused.
+    /// A start that names no agent runs the default agent. A fresh start
+    /// gets a new session. A session runs one run at a time, so a start on a
+    /// named session with a live run is refused with that run's id; the
+    /// agent may change from one run to the next. A start on a conversation
+    /// takes one of its lanes, picked by `Shared::admit_lane`. Once
+    /// [`drain`](Self::drain) has begun, every start is refused.
     pub async fn start(&self, start: StartRun) -> Result<RunId, StartError> {
+        let launched = self.launch(start, |_, _| Ok(())).await?;
+        Ok(launched.record.id)
+    }
+
+    /// Starts a run as [`start`](Self::start) does, attaches an observer as
+    /// `how` says to the session the run is on, and returns the run's id,
+    /// its session, and the observer's subscription.
+    ///
+    /// The observer is added in the same hold of `admission` that picks the
+    /// session, so no other start or claim can get in between. A claim on a
+    /// named session that already has a claimant is refused with that
+    /// claimant's id. The observer's attach event comes before the run's
+    /// `Started` on the session's stream.
+    ///
+    /// If the attach event cannot be written, or the caller stops waiting for
+    /// it, the start fails and `Registered`'s `Drop` stops its run.
+    pub async fn start_attached(
+        &self,
+        start: StartRun,
+        how: Attach,
+    ) -> Result<Admitted, StartError> {
+        let observer = Observer {
+            id: new_observer_id(),
+            kind: how.kind,
+            presence: how.presence,
+        };
+        self.shared.start_recorder();
+        let Launched {
+            record,
+            session,
+            run_session,
+            joined: write,
+        } = self
+            .launch(start, |state, session| {
+                state
+                    .observers
+                    .attach(observer.clone())
+                    .map_err(|by| StartError::AlreadyClaimed { by })?;
+                Ok(session.begin_observer_write())
+            })
+            .await?;
+        let run = record.id;
+        let registered = Registered {
+            shared: Arc::clone(&self.shared),
+            record: session,
+            write,
+            observer: observer.id.clone(),
+            run: Some(AttachedRun::StartedWith(record)),
+            recorded: false,
+        };
+        let subscription = registered.write_attach(observer, how.from).await?;
+        Ok(Admitted {
+            run,
+            session: run_session,
+            subscription,
+        })
+    }
+
+    /// Admits `start` on the session its target resolves to, records the run
+    /// as `Preparing`, and spawns its task, all under one hold of
+    /// `admission`.
+    ///
+    /// `join` runs with the session's state locked, after the check for a
+    /// live run and before the run is recorded, so anything it adds to the
+    /// session is there before the run. If `join` returns an error, the start
+    /// is refused with it.
+    async fn launch<T>(
+        &self,
+        start: StartRun,
+        join: impl FnOnce(&mut SessionState, &SessionRecord) -> Result<T, StartError>,
+    ) -> Result<Launched<T>, StartError> {
         let config = self.shared.preparer.config(start.agent.as_deref())?;
         if !honours(&config, start.liveness) {
             return Err(StartError::PolicyUnsupported {
@@ -158,36 +275,57 @@ impl AgentRuntime {
                 agent: config.agent_id().to_owned(),
             });
         }
-        let session_id = start.session.clone().unwrap_or_else(new_session_id);
 
         // `admission` is held from here until the run's task is spawned, so
         // two starts on one session cannot both find it idle. Nothing below
         // awaits before the spawn. So a caller that drops this future cannot
         // leave the session holding a run that no task will finish.
-        let (_admitted, session) = self.shared.admit(&session_id).await?;
+        let (_admitted, session, run_session) = match &start.target {
+            RunTarget::Fresh => {
+                let id = new_session_id();
+                let (admitted, session) = self.shared.admit(&id).await?;
+                (admitted, session, RunSession::Plain(id))
+            }
+            // The id is admitted as it is, even when it is a lane's session
+            // id such as `c1:a:0`. The run then runs on that lane's session,
+            // but its facts record a plain session, with no lane.
+            RunTarget::Session(id) => {
+                let (admitted, session) = self.shared.admit(id).await?;
+                (admitted, session, RunSession::Plain(id.clone()))
+            }
+            RunTarget::Conversation { chat } => {
+                let conversation = Conversation::new(chat.clone(), config.agent_id());
+                let (admitted, session, lane) = self.shared.admit_lane(&conversation).await?;
+                (admitted, session, RunSession::Lane(lane))
+            }
+        };
         let run_id = RunId::mint();
-        let record = {
+        let (record, joined) = {
             let mut state = session.lock();
             if let Some(live) = &state.live {
                 return Err(StartError::RunInProgress(live.id));
             }
+            let joined = join(&mut state, &session)?;
             let record = Arc::new(RunRecord::new(RunFacts {
-                run_id,
-                session_id: session_id.clone(),
-                agent: config.agent_id().to_owned(),
-                status: RunStatus::Preparing,
-                liveness: start.liveness,
-                started_at: aura_events::Timestamp::now(),
-                ended_at: None,
-                usage: aura_events::TokenUsage::default(),
-                first_seq: None,
-                latest_seq: None,
-                pending_approvals: Vec::new(),
-                checkpoint: None,
-                continues: start.continues,
+                session: run_session.clone(),
+                run: RunDetails {
+                    run_id,
+                    agent: config.agent_id().to_owned(),
+                    status: RunStatus::Preparing,
+                    liveness: start.liveness,
+                    started_at: aura_events::Timestamp::now(),
+                    ended_at: None,
+                    usage: aura_events::TokenUsage::default(),
+                    first_event: None,
+                    latest_event: None,
+                    pending_approvals: Vec::new(),
+                    checkpoint: None,
+                    continues: start.continues,
+                },
             }));
             state.live = Some(Arc::clone(&record));
-            record
+            self.shared.live_runs.send_modify(|live| *live += 1);
+            (record, joined)
         };
         self.shared
             .runs
@@ -195,30 +333,43 @@ impl AgentRuntime {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(run_id, Arc::clone(&record));
 
+        // The task prepares the agent under the caller's span.
         let task = tokio::spawn(task::run(
             Arc::clone(&self.shared),
-            session,
+            Arc::clone(&session),
             Arc::clone(&record),
             config,
             start,
+            tracing::Span::current(),
         ));
         record.hold_task(task);
-        Ok(run_id)
+        Ok(Launched {
+            record,
+            session,
+            run_session,
+            joined,
+        })
     }
 
     /// Stops the run and returns whether it was stopped. Returns `false` for
     /// a run that has ended or that this process does not hold. The run's
-    /// task writes the `Cancelled` ending, with `reason` and `message`.
-    pub fn cancel(&self, run: &RunId, reason: RunCancelReason, message: Option<String>) -> bool {
+    /// task writes the `Cancelled` ending, with `cause` and `reason`.
+    pub fn cancel(&self, run: &RunId, cause: CancelCause, reason: Option<String>) -> bool {
         self.shared
             .run(run)
-            .is_some_and(|record| record.stop(reason, message))
+            .is_some_and(|record| record.stop(cause, reason))
+    }
+
+    /// Follows the activity of `run`, or `None` for a run this process does
+    /// not hold.
+    pub fn activity(&self, run: &RunId) -> Option<RunActivity> {
+        self.shared.run(run).map(|record| record.activity())
     }
 
     /// Shuts the runtime down, in four steps:
     ///
     /// 1. Refuses every later start with [`StartError::ShuttingDown`].
-    /// 2. Stops every live run for [`RunCancelReason::Shutdown`], and waits
+    /// 2. Stops every live run for [`CancelCause::Shutdown`], and waits
     ///    up to `grace` for them to end.
     /// 3. Abandons any run still going: aborts its task and writes its
     ///    `Cancelled` ending for it. Writing those endings, and waiting for
@@ -245,7 +396,7 @@ impl AgentRuntime {
                 .collect()
         };
         for record in &live {
-            record.stop(RunCancelReason::Shutdown, None);
+            record.stop(CancelCause::Shutdown, None);
         }
         if tokio::time::timeout(grace, all_settled(&live))
             .await
@@ -273,7 +424,7 @@ impl AgentRuntime {
                 if let Some(task) = task {
                     let _ = task.await;
                 }
-                let session_id = record.facts().session_id;
+                let session_id = record.facts().session_id();
                 let session = self.shared.lock_sessions().get(&session_id).cloned();
                 if let Some(session) = session {
                     task::end_abandoned(&self.shared, &session, &record).await;
@@ -302,6 +453,18 @@ impl AgentRuntime {
         self.shared.lock_sessions().clear();
     }
 
+    /// Resolves once no run is live on this runtime, meaning no session has
+    /// a run preparing or streaming, or once a drain has let every run go. A
+    /// run stops being live when its ending frees its session. That happens
+    /// before the run store has the run's final facts.
+    pub async fn idle(&self) {
+        let mut live = self.shared.live_runs.subscribe();
+        tokio::select! {
+            _ = live.wait_for(|live| *live == 0) => {}
+            () = self.shared.shut_down.cancelled() => {}
+        }
+    }
+
     /// Attaches an observer to `session` and returns its `Subscription`: the
     /// session's event stream, read from the cursor the observer asked for.
     /// A session this process does not hold is opened first.
@@ -328,42 +491,8 @@ impl AgentRuntime {
             presence: how.presence,
         };
         self.shared.start_recorder();
-        let mut registered = self.shared.register(session, &observer).await?;
-        let record = Arc::clone(&registered.record);
-        // A live cursor is pinned to the journal's newest number, so the
-        // subscription can pick up from the same place on a reopened journal.
-        let from = match how.from {
-            Cursor::Live => record.journal.latest().map_or(Cursor::Start, Cursor::After),
-            from => from,
-        };
-        let events = record.journal.subscribe(from);
-        let attached = LifecycleEvent::ObserverAttached {
-            observer: observer.clone(),
-        };
-        // Behind every observer write counted before it, so a claim given up
-        // just before shows on the stream as given up first.
-        let write = async {
-            registered.write.turn().await;
-            record
-                .journal
-                .append(registered.run_id, SessionEventPayload::Lifecycle(attached))
-                .await
-        };
-        // An attach still writing when a drain has let everything go gives
-        // up, so it does not keep the session's journal alive past shutdown.
-        tokio::select! {
-            appended = write => appended?,
-            () = self.shared.shut_down.cancelled() => return Err(AttachError::ShuttingDown),
-        };
-        registered.recorded = true;
-        drop(registered);
-        Ok(Subscription::new(
-            observer,
-            events,
-            from,
-            &record,
-            Arc::downgrade(&self.shared),
-        ))
+        let registered = self.shared.register(session, &observer).await?;
+        Ok(registered.write_attach(observer, how.from).await?)
     }
 
     /// How many observers `session` has, or `None` for a session this
@@ -393,11 +522,11 @@ impl AgentRuntime {
         let session = self.shared.lock_sessions().get(session).cloned()?;
         let state = session.lock();
         if let Some(live) = &state.live {
-            let RunFacts {
+            let RunDetails {
                 status,
                 pending_approvals,
                 ..
-            } = live.facts();
+            } = live.facts().run;
             return Some(match status {
                 RunStatus::Preparing => AgentState::Preparing,
                 _ if !pending_approvals.is_empty() => AgentState::Blocked {
@@ -510,10 +639,10 @@ impl Shared {
     async fn admit(
         &self,
         id: &SessionId,
-    ) -> Result<(MutexGuard<'_, ()>, Arc<SessionRecord>), AdmitError> {
+    ) -> Result<(MutexGuard<'_, ()>, Arc<SessionRecord>), Refused> {
         let admitted = self.lock_admission();
         if self.draining.load(Ordering::Acquire) {
-            return Err(AdmitError::ShuttingDown);
+            return Err(Refused::ShuttingDown);
         }
         if let Some(session) = self.usable_session(id) {
             return Ok((admitted, session));
@@ -524,7 +653,7 @@ impl Shared {
 
         let admitted = self.lock_admission();
         if self.draining.load(Ordering::Acquire) {
-            return Err(AdmitError::ShuttingDown);
+            return Err(Refused::ShuttingDown);
         }
         if let Some(session) = self.usable_session(id) {
             return Ok((admitted, session));
@@ -558,34 +687,43 @@ impl Shared {
     }
 }
 
-/// Why [`Shared::admit`] refused.
-enum AdmitError {
+/// Why admitting a session, or writing an observer's attach, failed.
+enum Refused {
     ShuttingDown,
     Store(SessionStoreError),
 }
 
-impl From<SessionStoreError> for AdmitError {
+impl From<SessionStoreError> for Refused {
     fn from(error: SessionStoreError) -> Self {
         Self::Store(error)
     }
 }
 
-impl From<AdmitError> for StartError {
-    fn from(refused: AdmitError) -> Self {
+impl From<Refused> for StartError {
+    fn from(refused: Refused) -> Self {
         match refused {
-            AdmitError::ShuttingDown => Self::ShuttingDown,
-            AdmitError::Store(error) => Self::Store(error),
+            Refused::ShuttingDown => Self::ShuttingDown,
+            Refused::Store(error) => Self::Store(error),
         }
     }
 }
 
-impl From<AdmitError> for AttachError {
-    fn from(refused: AdmitError) -> Self {
+impl From<Refused> for AttachError {
+    fn from(refused: Refused) -> Self {
         match refused {
-            AdmitError::ShuttingDown => Self::ShuttingDown,
-            AdmitError::Store(error) => Self::Store(error),
+            Refused::ShuttingDown => Self::ShuttingDown,
+            Refused::Store(error) => Self::Store(error),
         }
     }
+}
+
+/// A run [`AgentRuntime::launch`] admitted, with its task spawned.
+struct Launched<T> {
+    record: Arc<RunRecord>,
+    session: Arc<SessionRecord>,
+    run_session: RunSession,
+    /// What the start's `join` returned.
+    joined: T,
 }
 
 /// An observer whose attach is not yet on the session's stream.
@@ -594,10 +732,67 @@ struct Registered {
     record: Arc<SessionRecord>,
     write: ObserverWrite,
     observer: ObserverId,
-    /// The live run the attach names.
-    run_id: Option<RunId>,
+    /// The run that goes with the observer's attach.
+    run: Option<AttachedRun>,
     /// Whether the attach reached the session's stream.
     recorded: bool,
+}
+
+/// The run that goes with an observer's attach.
+enum AttachedRun {
+    /// The session's live run.
+    Live(RunId),
+    /// The run started together with the observer.
+    StartedWith(Arc<RunRecord>),
+}
+
+impl Registered {
+    /// Subscribes to the session's stream from `from`, appends the
+    /// observer's attach event when its turn comes, and returns the
+    /// subscription.
+    async fn write_attach(
+        mut self,
+        observer: Observer,
+        from: Cursor,
+    ) -> Result<Subscription, Refused> {
+        let record = Arc::clone(&self.record);
+        // A live cursor is pinned to the journal's newest number, so the
+        // subscription can pick up from the same place on a reopened journal.
+        let from = match from {
+            Cursor::Live => record.journal.latest().map_or(Cursor::Start, Cursor::After),
+            from => from,
+        };
+        let events = record.journal.subscribe(from);
+        let attached = LifecycleEvent::ObserverAttached {
+            observer: observer.clone(),
+        };
+        // A run started together with the observer did not exist when the
+        // observer was added, so the attach has no run id, the same as an
+        // attach made before `start`.
+        let run_id = match &self.run {
+            Some(AttachedRun::Live(id)) => Some(*id),
+            Some(AttachedRun::StartedWith(_)) | None => None,
+        };
+        // Behind every observer write counted before it, so a claim given up
+        // just before shows on the stream as given up first.
+        let write = async {
+            self.write.turn().await;
+            record
+                .journal
+                .append(run_id, SessionEventPayload::Lifecycle(attached))
+                .await
+        };
+        // An attach still writing when a drain has let everything go gives
+        // up, so it does not keep the session's journal alive past shutdown.
+        tokio::select! {
+            appended = write => appended.map_err(Refused::Store)?,
+            () = self.shared.shut_down.cancelled() => return Err(Refused::ShuttingDown),
+        };
+        self.recorded = true;
+        let shared = Arc::downgrade(&self.shared);
+        drop(self);
+        Ok(Subscription::new(observer, events, from, &record, shared))
+    }
 }
 
 impl Shared {
@@ -606,8 +801,7 @@ impl Shared {
     /// observer off again unless its attach reaches the stream. Holds
     /// `admission` only while it does this, so an attach and a start cannot
     /// both open the session, and a stalled append afterwards holds up only
-    /// this session. Until the guard is dropped, the session is not let go,
-    /// and its runs append neither `Started` nor an ending.
+    /// this session. Until the guard is dropped, the session is not let go.
     async fn register(
         self: &Arc<Self>,
         id: &SessionId,
@@ -635,19 +829,30 @@ impl Shared {
             record,
             write,
             observer: observer.id.clone(),
-            run_id,
+            run: run_id.map(AttachedRun::Live),
             recorded: false,
         })
     }
 }
 
 impl Drop for Registered {
-    /// Finishes the attach's observer write. An attach that never reached
-    /// the stream also takes its observer off again, without recording or
-    /// reacting to it, and lets the session go if it then holds nothing.
+    /// Finishes the attach's observer write. If the attach event never
+    /// reached the stream, it also takes the observer off the session without
+    /// writing a detach, stops the run started together with it, and lets the
+    /// session go if it then holds nothing.
     fn drop(&mut self) {
         if !self.recorded {
             drop(self.shared.unregister(&self.record.id, &self.observer));
+            // The run is stopped as `External` whatever its liveness policy,
+            // since nobody would read it and the caller never got its id. It
+            // is stopped before the write is finished, because the run's task
+            // checks for a stop once that write is done.
+            if let Some(AttachedRun::StartedWith(run)) = &self.run {
+                run.stop(
+                    CancelCause::External,
+                    Some("the start failed before its observer was attached".to_owned()),
+                );
+            }
         }
         // Finished before the hand-off, so the let-go finds no write of this
         // attach still pending.

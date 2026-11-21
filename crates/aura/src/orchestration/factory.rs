@@ -15,6 +15,7 @@ use crate::config::{AgentBuildContext, RunId};
 use crate::provider_agent::{StreamError, StreamItem};
 use crate::streaming::StreamingAgent;
 
+use super::emitter::Emitter;
 use super::orchestrator::{
     Orchestrator, STREAM_CHUNK_SIZE, spawn_timeout_watcher, spawn_tool_event_forwarder,
 };
@@ -132,6 +133,7 @@ impl OrchestratorFactory {
                 orchestrator.usage_state = usage_state.clone();
                 orchestrator.outer_budget = outer_budget;
                 orchestrator.run_tools = run_tools;
+                let emitter = Emitter::new(event_tx.clone(), std::sync::Arc::clone(&run));
 
                 // Surface per-server connection status so degraded/unavailable
                 // MCP servers are visible in orchestration mode too (workers
@@ -147,31 +149,36 @@ impl OrchestratorFactory {
                         .await;
                     let snapshot = mcp_manager.server_status_snapshot();
                     if !snapshot.is_empty() {
-                        let _ = event_tx.send(Ok(StreamItem::McpStatus(snapshot))).await;
+                        emitter.emit_item(StreamItem::McpStatus(snapshot)).await;
                     }
                 }
 
                 // Forward tool call events from workers to SSE stream
                 spawn_tool_event_forwarder(
                     &orchestrator.tool_call_observer,
-                    event_tx.clone(),
+                    emitter.clone(),
                     cancel_token_clone.clone(),
                 );
 
                 tokio::select! {
-                    result = orchestrator.run_orchestration(&query, chat_history, event_tx.clone()) => {
+                    result = orchestrator.run_orchestration(&query, chat_history, &emitter) => {
                         match result {
                             Ok(final_result) => {
                                 for chunk in final_result.chars().collect::<Vec<_>>().chunks(STREAM_CHUNK_SIZE) {
                                     let text: String = chunk.iter().collect();
-                                    let _ = event_tx.send(Ok(StreamItem::StreamAssistantItem(
-                                        crate::provider_agent::StreamedAssistantContent::Text(text)
-                                    ))).await;
+                                    emitter
+                                        .emit_item(StreamItem::StreamAssistantItem(
+                                            crate::provider_agent::StreamedAssistantContent::Text(text),
+                                        ))
+                                        .await;
                                 }
 
-                                let _ = event_tx.send(Ok(StreamItem::Final(
-                                    final_response(final_result, &usage_state)
-                                ))).await;
+                                emitter
+                                    .emit_item(StreamItem::Final(final_response(
+                                        final_result,
+                                        &usage_state,
+                                    )))
+                                    .await;
                             }
                             Err(e) => {
                                 let _ = event_tx.send(Err(e)).await;
@@ -268,18 +275,10 @@ impl StreamingAgent for OrchestratorFactory {
                 cancel: cancel_token.clone(),
                 finished,
             },
-            std::sync::Arc::clone(&run),
+            run,
             usage_state.clone(),
             timeout,
         );
-
-        // The answer an orchestrated run produces is the coordinator's, so it
-        // is attributed there rather than to any worker that fed it.
-        let stream = Box::pin(crate::streaming::tee_content(
-            run,
-            aura_events::EmittingAgent::coordinator(),
-            stream,
-        ));
 
         crate::streaming::AgentRun::new(stream, cancel_token, usage_state)
             .observed_by(run_events)

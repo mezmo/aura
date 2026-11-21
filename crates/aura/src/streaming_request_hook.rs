@@ -111,7 +111,7 @@ fn queue_owner(stream_id: &str) -> Option<Arc<crate::run_context::RunContext>> {
 }
 
 /// Sends a tool event raised by this stream to the run [`queue_owner`] gives it.
-async fn emit_from_stream(stream_id: &str, event: AgentEvent) {
+pub(crate) async fn emit_from_stream(stream_id: &str, event: AgentEvent) {
     if let Some(run) = queue_owner(stream_id) {
         let _ = run.emit(event).await;
     }
@@ -307,6 +307,78 @@ impl UsageState {
                 );
                 let mut pending = poisoned.into_inner();
                 std::mem::take(&mut *pending)
+            }
+        }
+    }
+}
+
+/// A provider's prompt-cache split: the tokens read from the cache and the
+/// tokens written to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheSplit {
+    pub read: aura_events::TokenCount,
+    pub creation: aura_events::TokenCount,
+}
+
+/// The tokens a provider billed for a whole run, and its prompt-cache
+/// split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BilledUsage {
+    pub usage: aura_events::TokenUsage,
+    pub cache: Option<CacheSplit>,
+}
+
+/// Turns a tool call's argument text into the `arguments` and
+/// `unparsed_arguments` fields of `ToolRequested`. Text that parses as JSON
+/// becomes the value, with no unparsed text. Text that does not parse
+/// becomes an empty object, and the text is returned alongside it so a reader
+/// can still show the call as the provider sent it.
+pub(crate) fn requested_arguments(text: String) -> (serde_json::Value, Option<String>) {
+    match serde_json::from_str(&text) {
+        Ok(arguments) => (arguments, None),
+        Err(_) => (serde_json::json!({}), Some(text)),
+    }
+}
+
+/// Works out what a run billed from the two places that report usage.
+///
+/// The final response carries rig's usage summed over every turn, including
+/// turns that only called tools. The hook counts only the turns that
+/// produced text. So when the final response reports any prompt tokens, its
+/// usage and its cache split are used. When there is no final response, or
+/// it reports zero prompt tokens, the hook's running totals and cache split
+/// are used. In both cases the total is the prompt tokens plus the completion
+/// tokens.
+pub fn resolve_billed_usage(
+    final_response: Option<&crate::provider_agent::FinalResponseInfo>,
+    usage_state: &UsageState,
+) -> BilledUsage {
+    use aura_events::TokenCount;
+
+    let usage = |prompt: u64, completion: u64| TokenUsage {
+        prompt_tokens: TokenCount::new(prompt),
+        completion_tokens: TokenCount::new(completion),
+        total_tokens: TokenCount::new(prompt + completion),
+    };
+    let split = |(read, creation): (u64, u64)| CacheSplit {
+        read: TokenCount::new(read),
+        creation: TokenCount::new(creation),
+    };
+    match final_response {
+        Some(response) if response.usage.input_tokens > 0 => BilledUsage {
+            usage: usage(response.usage.input_tokens, response.usage.output_tokens),
+            cache: response.cache_usage.map(|cache| {
+                split((
+                    cache.cache_read_input_tokens,
+                    cache.cache_creation_input_tokens,
+                ))
+            }),
+        },
+        _ => {
+            let (prompt, completion, _) = usage_state.get_final_usage();
+            BilledUsage {
+                usage: usage(prompt, completion),
+                cache: usage_state.get_cache_usage().map(split),
             }
         }
     }
@@ -575,9 +647,7 @@ where
             self.hooks.on_tool_call(&tool_name).await;
 
             if publish_event {
-                // Parse args as JSON (fallback to empty object if invalid)
-                let arguments: serde_json::Value =
-                    serde_json::from_str(&args_str).unwrap_or(serde_json::json!({}));
+                let (arguments, unparsed_arguments) = requested_arguments(args_str);
 
                 // Rig 0.28+ passes correct tool_call_id; register for event correlation
                 if let Some(id) = &tool_call_id {
@@ -591,6 +661,7 @@ where
                             tool_call_id: id,
                             tool_name: ToolName::new(&tool_name),
                             arguments,
+                            unparsed_arguments,
                         }),
                     )
                     .await;
@@ -771,6 +842,7 @@ mod tests {
                 tool_call_id: ToolCallId::new(id),
                 tool_name: ToolName::new("lookup"),
                 arguments: serde_json::json!({}),
+                unparsed_arguments: None,
             })
         }
 
@@ -1280,5 +1352,119 @@ mod tests {
             110,
             "tool completion unchanged after the final response turn"
         );
+    }
+
+    #[test]
+    fn arguments_that_parse_carry_no_text() {
+        let (arguments, unparsed) = requested_arguments(r#"{"path":"/mock"}"#.to_owned());
+        assert_eq!(arguments, serde_json::json!({ "path": "/mock" }));
+        assert_eq!(unparsed, None);
+    }
+
+    /// A provider can cut arguments short. The event still gets an object,
+    /// and the text the provider sent is kept alongside it.
+    #[test]
+    fn arguments_that_do_not_parse_keep_their_text() {
+        let (arguments, unparsed) = requested_arguments(r#"{"path":"/mo"#.to_owned());
+        assert_eq!(arguments, serde_json::json!({}));
+        assert_eq!(unparsed.as_deref(), Some(r#"{"path":"/mo"#));
+    }
+
+    mod billed_usage {
+        use super::super::{BilledUsage, CacheSplit, UsageState, resolve_billed_usage};
+        use crate::provider_agent::FinalResponseInfo;
+        use aura_events::{TokenCount, TokenUsage};
+
+        fn response(input: u64, output: u64, cache: Option<(u64, u64)>) -> FinalResponseInfo {
+            FinalResponseInfo {
+                content: "the answer".to_owned(),
+                usage: rig::completion::Usage {
+                    input_tokens: input,
+                    output_tokens: output,
+                    total_tokens: input + output,
+                },
+                cache_usage: cache.map(|(read, creation)| rig::completion::CacheUsage {
+                    cache_read_input_tokens: read,
+                    cache_creation_input_tokens: creation,
+                }),
+            }
+        }
+
+        fn billed(prompt: u64, completion: u64, cache: Option<(u64, u64)>) -> BilledUsage {
+            BilledUsage {
+                usage: TokenUsage {
+                    prompt_tokens: TokenCount::new(prompt),
+                    completion_tokens: TokenCount::new(completion),
+                    total_tokens: TokenCount::new(prompt + completion),
+                },
+                cache: cache.map(|(read, creation)| CacheSplit {
+                    read: TokenCount::new(read),
+                    creation: TokenCount::new(creation),
+                }),
+            }
+        }
+
+        /// The hook never sees a tool turn that has no text, so its total is
+        /// too low. The final response's usage counts every turn, so it wins,
+        /// and its cache split is used with it.
+        #[test]
+        fn the_final_response_wins_over_the_hooks_under_count() {
+            let usage_state = UsageState::new();
+            usage_state.store_usage(7_000, 200, 7_200, false);
+            usage_state.store_cache_usage(3_000, 500);
+
+            assert_eq!(
+                resolve_billed_usage(
+                    Some(&response(12_000, 250, Some((9_000, 2_000)))),
+                    &usage_state
+                ),
+                billed(12_000, 250, Some((9_000, 2_000)))
+            );
+        }
+
+        /// When the final response reports no prompt tokens, the hook's totals
+        /// and its cache split are used.
+        #[test]
+        fn a_response_reporting_zero_leaves_the_hooks_totals() {
+            let usage_state = UsageState::new();
+            usage_state.accumulate_usage(5_000, 200);
+            usage_state.accumulate_usage(8_000, 400);
+            usage_state.store_cache_usage(4_000, 1_000);
+
+            assert_eq!(
+                resolve_billed_usage(Some(&response(0, 0, None)), &usage_state),
+                billed(13_000, 600, Some((4_000, 1_000)))
+            );
+        }
+
+        /// A run that ended before its final response has only what the
+        /// hook recorded.
+        #[test]
+        fn no_final_response_leaves_the_hooks_totals() {
+            let usage_state = UsageState::new();
+            usage_state.store_usage(1_500, 100, 1_600, false);
+
+            assert_eq!(
+                resolve_billed_usage(None, &usage_state),
+                billed(1_500, 100, None)
+            );
+        }
+
+        /// The cache split always comes from the same source as the totals, so
+        /// the cached tokens are always part of the prompt tokens reported with
+        /// them. Here the final response wins and reports no split, so the
+        /// result has none, even though the hook recorded one.
+        #[test]
+        fn the_cache_split_comes_from_the_totals_source() {
+            let usage_state = UsageState::new();
+            usage_state.store_usage(4_000, 150, 4_150, false);
+            usage_state.store_cache_usage(3_000, 500);
+
+            assert_eq!(
+                resolve_billed_usage(Some(&response(12_000, 250, None)), &usage_state).cache,
+                None,
+                "the response's own split, even when it reports none"
+            );
+        }
     }
 }

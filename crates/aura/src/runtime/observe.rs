@@ -18,8 +18,8 @@ use std::task::{Context, Poll};
 
 use aura_events::SessionId;
 use aura_events::run::{
-    DetachCause, LifecycleEvent, LivenessPolicy, Observer, ObserverId, ObserverKind,
-    RunCancelReason, SessionEventPayload,
+    CancelCause, DetachCause, LifecycleEvent, LivenessPolicy, Observer, ObserverId, ObserverKind,
+    SessionEventPayload,
 };
 use futures::Stream;
 use serde::Serialize;
@@ -133,6 +133,10 @@ impl ObserverSet {
             return self.claimant.take().map(|holder| (holder, true));
         }
         self.collecting.remove(id).map(|observer| (observer, false))
+    }
+
+    pub(super) fn claimant(&self) -> Option<&ObserverId> {
+        self.claimant.as_ref().map(|holder| &holder.id)
     }
 
     pub(super) fn attendance(&self) -> Attendance {
@@ -317,7 +321,7 @@ impl Detached {
         if let Some(live) = &self.live
             && live.liveness().policy == LivenessPolicy::Cancel
         {
-            live.stop(RunCancelReason::Unclaimed, None);
+            live.stop(CancelCause::Unclaimed, None);
         }
     }
 }

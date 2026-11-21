@@ -482,11 +482,11 @@ impl RunStore for InMemoryRunStore {
     /// map's first entries are the oldest.
     async fn put(&self, facts: &RunFacts) -> Result<(), SessionStoreError> {
         let mut runs = self.lock();
-        runs.insert(facts.run_id, facts.clone());
+        runs.insert(facts.run.run_id, facts.clone());
         if runs.len() > self.max_runs {
             let evict = runs
                 .iter()
-                .find(|(_, facts)| facts.status.is_terminal())
+                .find(|(_, facts)| facts.run.status.is_terminal())
                 .or_else(|| runs.iter().next())
                 .map(|(id, _)| *id);
             if let Some(evict) = evict {
@@ -607,10 +607,11 @@ mod tests {
 
     use super::*;
     use crate::config::SessionId;
+    use crate::conversation::RunSession;
     use crate::hitl::{
         AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, PROTOCOL_VERSION,
     };
-    use crate::session_store::RunStatus;
+    use crate::session_store::{RunDetails, RunStatus};
 
     fn parked(request_id: &str) -> ParkedApproval {
         let now = chrono::Utc::now();
@@ -1333,19 +1334,21 @@ mod tests {
 
     fn facts(n: u128, session: &str, status: RunStatus) -> RunFacts {
         RunFacts {
-            run_id: run_id(n),
-            session_id: SessionId::new(session).unwrap(),
-            agent: "agent".to_owned(),
-            status,
-            liveness: aura_events::run::Liveness::default(),
-            started_at: aura_events::Timestamp::from_unix_millis(n as u64),
-            ended_at: None,
-            usage: aura_events::TokenUsage::default(),
-            first_seq: None,
-            latest_seq: None,
-            pending_approvals: Vec::new(),
-            checkpoint: None,
-            continues: None,
+            session: RunSession::Plain(SessionId::new(session).unwrap()),
+            run: RunDetails {
+                run_id: run_id(n),
+                agent: "agent".to_owned(),
+                status,
+                liveness: aura_events::run::Liveness::default(),
+                started_at: aura_events::Timestamp::from_unix_millis(n as u64),
+                ended_at: None,
+                usage: aura_events::TokenUsage::default(),
+                first_event: None,
+                latest_event: None,
+                pending_approvals: Vec::new(),
+                checkpoint: None,
+                continues: None,
+            },
         }
     }
 
@@ -1355,7 +1358,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .map(|facts| facts.run_id.as_uuid().as_u128())
+            .map(|facts| facts.run.run_id.as_uuid().as_u128())
             .collect()
     }
 
@@ -1396,7 +1399,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.get(&run_id(1)).await.unwrap().unwrap().status,
+            store.get(&run_id(1)).await.unwrap().unwrap().run.status,
             Finished
         );
     }
@@ -1432,12 +1435,54 @@ mod tests {
         assert_eq!(listed(&store, finished_in_a).await, vec![3]);
     }
 
+    /// Listing by conversation returns the runs on any of its lanes. It
+    /// leaves out runs of another agent or another chat, and a run on the
+    /// chat id used as a plain session.
+    #[tokio::test]
+    async fn run_store_lists_a_conversations_runs_across_its_lanes() {
+        use crate::conversation::{Conversation, Lane, LaneNumber};
+        use RunStatus::*;
+
+        let math = Conversation::new(SessionId::new("chat-1").unwrap(), "math");
+        let on = |n, conversation: &Conversation, lane| RunFacts {
+            session: RunSession::Lane(Lane::new(
+                conversation.clone(),
+                LaneNumber::new(lane).unwrap(),
+            )),
+            ..facts(n, "unused", Finished)
+        };
+        let store = InMemoryRunStore::new();
+        for run in [
+            on(4, &math, 1),
+            on(1, &math, 0),
+            facts(2, "chat-1", Finished),
+            on(
+                3,
+                &Conversation::new(SessionId::new("chat-1").unwrap(), "weather"),
+                0,
+            ),
+            on(
+                5,
+                &Conversation::new(SessionId::new("chat-2").unwrap(), "math"),
+                0,
+            ),
+        ] {
+            store.put(&run).await.unwrap();
+        }
+
+        let by_math = RunFilter {
+            conversation: Some(math),
+            ..RunFilter::default()
+        };
+        assert_eq!(listed(&store, by_math).await, vec![1, 4]);
+    }
+
     #[tokio::test]
     async fn run_store_lists_by_whether_a_run_waits_on_an_approval() {
         use RunStatus::*;
         let store = InMemoryRunStore::new();
         let mut waiting = facts(2, "sess-a", Running);
-        waiting.pending_approvals = vec![DecisionId::generate()];
+        waiting.run.pending_approvals = vec![DecisionId::generate()];
         store.put(&facts(1, "sess-a", Running)).await.unwrap();
         store.put(&waiting).await.unwrap();
 

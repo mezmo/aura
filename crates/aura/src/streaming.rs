@@ -37,7 +37,9 @@
 //! }
 //! ```
 
-use crate::provider_agent::{StreamError, StreamItem, StreamedAssistantContent};
+use crate::provider_agent::{
+    StreamError, StreamItem, StreamedAssistantContent, StreamedUserContent,
+};
 use crate::run_context::{Attendance, RunContext};
 use crate::streaming_request_hook::UsageState;
 use async_trait::async_trait;
@@ -257,65 +259,186 @@ impl AgentRun {
     }
 }
 
-/// Copies a run's content onto its event stream as the items pass, so an
-/// observer of the run sees what an agent is saying and not only what it is
-/// doing.
+/// Wraps an item stream and copies some of its items onto the run's event
+/// channel as they pass. These are the events the session's journal needs
+/// that nothing else sends. They let an observer of the run see what the
+/// agent says, not only what it does. The copies are:
 ///
-/// The `StreamItem` stream stays the content path every consumer reads; this
-/// puts the same content where a consumer built on the run's events can reach
-/// it, without changing what the existing ones see. The run is passed rather
-/// than read from scope because this wraps the stream from outside it.
+/// - text as `TextDelta`, reasoning deltas as `Reasoning`, and the final
+///   response as `Completed`, all attributed to `agent`;
+/// - each tool result as a `ToolComplete` attributed to `agent`, with the
+///   name of the call it answers and the time since that call's item passed;
+/// - a single agent's closing `ScratchpadUsage`, attributed to the agent id
+///   in the item.
 ///
-/// `agent` is whose content this stream carries. An orchestrated run's answer
-/// is the coordinator's, not that of any worker that fed it.
-pub fn tee_content<S>(
+/// No other item is copied. A tool call already reaches the channel as the
+/// streaming hook's `ToolRequested`. The orchestrator's emitter sends its own
+/// events, readings and content to the channel itself. Every item still
+/// reaches the stream's reader, unchanged and in the same order.
+///
+/// A tool result is a failure exactly when [`ToolResult::failure`] says so.
+/// Either way the full text is copied, and each reader decides what to do
+/// with it: truncate it, render it raw, or look for the passthrough marker
+/// in it. A result whose call never passed is not copied, because there is
+/// no call name to give it.
+///
+/// [`ToolResult::failure`]: crate::provider_agent::ToolResult::failure
+pub fn tee_run_events<S>(
     run: std::sync::Arc<RunContext>,
     agent: aura_events::EmittingAgent,
     inner: S,
-) -> impl futures::Stream<Item = Result<StreamItem, StreamError>>
+) -> BoxStream<'static, Result<StreamItem, StreamError>>
 where
-    S: futures::Stream<Item = Result<StreamItem, StreamError>>,
+    S: futures::Stream<Item = Result<StreamItem, StreamError>> + Send + 'static,
 {
-    async_stream::stream! {
+    Box::pin(async_stream::stream! {
+        let mut ledger = ToolCallLedger::default();
         for await item in inner {
             if let Ok(item) = &item
-                && let Some(payload) = content_of(item)
+                && let Some(event) = ledger.copy_of(item, &agent)
             {
-                run.emit(aura_events::agent::AgentEvent::new(agent.clone(), payload))
-                    .await;
+                run.emit(event).await;
             }
             yield item;
         }
-    }
+    })
 }
 
-/// The content an item carries, or `None` for an item that carries none. Tool
-/// lifecycle and progress reach the run from their producers instead, so an
-/// item that only marks them has nothing to copy.
-fn content_of(item: &StreamItem) -> Option<aura_events::agent::AgentEventPayload> {
-    use aura_events::agent::AgentEventPayload as Payload;
+/// A tool call whose result has not passed through the stream yet.
+#[derive(Debug)]
+struct PendingToolCall {
+    id: aura_events::ToolCallId,
+    name: aura_events::ToolName,
+    /// When the call's item passed through the stream.
+    since: std::time::Instant,
+}
 
-    match item {
-        StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(content)) => {
-            Some(Payload::TextDelta {
-                content: content.clone(),
-            })
-        }
-        StreamItem::StreamAssistantItem(StreamedAssistantContent::ReasoningDelta {
-            delta, ..
-        }) => Some(Payload::Reasoning {
-            content: delta.clone(),
-            task_id: None,
-        }),
-        StreamItem::Final(final_response) => Some(Payload::Completed {
-            content: final_response.content.clone(),
-            usage: aura_events::TokenUsage {
-                prompt_tokens: aura_events::TokenCount::new(final_response.usage.input_tokens),
-                completion_tokens: aura_events::TokenCount::new(final_response.usage.output_tokens),
-                total_tokens: aura_events::TokenCount::new(final_response.usage.total_tokens),
+/// The run's tool calls that are still waiting for their results, in the
+/// order the calls were made.
+#[derive(Debug, Default)]
+struct ToolCallLedger {
+    pending: Vec<PendingToolCall>,
+}
+
+impl ToolCallLedger {
+    /// The event to copy onto the run's channel for `item`, if any. The event
+    /// is attributed to `agent` unless the item names its own agent. A tool
+    /// call copies nothing, but it is recorded here so that its result can
+    /// take the call's name and duration.
+    fn copy_of(
+        &mut self,
+        item: &StreamItem,
+        agent: &aura_events::EmittingAgent,
+    ) -> Option<aura_events::agent::AgentEvent> {
+        use aura_events::agent::{AgentEvent, AgentEventPayload as Payload};
+
+        let payload = match item {
+            StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(content)) => {
+                Payload::TextDelta {
+                    content: content.clone(),
+                }
+            }
+            StreamItem::StreamAssistantItem(StreamedAssistantContent::ReasoningDelta {
+                delta,
+                ..
+            }) => Payload::Reasoning {
+                content: delta.clone(),
+                task_id: None,
             },
-        }),
-        _ => None,
+            StreamItem::Final(response) => Payload::Completed {
+                content: response.content.clone(),
+                usage: aura_events::TokenUsage {
+                    prompt_tokens: aura_events::TokenCount::new(response.usage.input_tokens),
+                    completion_tokens: aura_events::TokenCount::new(response.usage.output_tokens),
+                    total_tokens: aura_events::TokenCount::new(response.usage.total_tokens),
+                },
+            },
+            StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(call)) => {
+                self.pending.push(PendingToolCall {
+                    id: aura_events::ToolCallId::new(&call.id),
+                    name: aura_events::ToolName::new(&call.name),
+                    since: std::time::Instant::now(),
+                });
+                return None;
+            }
+            StreamItem::StreamUserItem(StreamedUserContent::ToolResult(result)) => {
+                self.complete(result)?
+            }
+            StreamItem::ScratchpadUsage {
+                agent_id,
+                tokens_intercepted,
+                tokens_extracted,
+            } => {
+                return Some(AgentEvent::new(
+                    aura_events::EmittingAgent {
+                        agent_id: agent_id.clone(),
+                        agent_name: None,
+                        parent_agent_id: None,
+                    },
+                    Payload::ScratchpadUsage {
+                        tokens_intercepted: aura_events::TokenCount::new(
+                            *tokens_intercepted as u64,
+                        ),
+                        tokens_extracted: aura_events::TokenCount::new(*tokens_extracted as u64),
+                    },
+                ));
+            }
+            StreamItem::StreamAssistantItem(
+                StreamedAssistantContent::ToolCallDelta { .. }
+                | StreamedAssistantContent::Reasoning(_),
+            )
+            | StreamItem::FinalMarker
+            | StreamItem::TurnUsage(..)
+            | StreamItem::AgentEvent(_)
+            | StreamItem::ContextUsage { .. }
+            | StreamItem::McpStatus(_) => return None,
+        };
+        Some(AgentEvent::new(agent.clone(), payload))
+    }
+
+    /// Builds the `ToolComplete` for `result` and removes its call from the
+    /// ledger. The call is matched on the result's `id` first, then on its
+    /// `call_id`.
+    fn complete(
+        &mut self,
+        result: &crate::provider_agent::ToolResult,
+    ) -> Option<aura_events::agent::AgentEventPayload> {
+        use aura_events::agent::{AgentEventPayload, ToolOutcome};
+
+        let position = self
+            .pending
+            .iter()
+            .position(|call| call.id.as_str() == result.id)
+            .or_else(|| {
+                let call_id = result.call_id.as_deref()?;
+                self.pending
+                    .iter()
+                    .position(|call| call.id.as_str() == call_id)
+            });
+        let Some(position) = position else {
+            tracing::debug!(
+                tool_call_id = %result.id,
+                "a tool result whose call never passed is not copied"
+            );
+            return None;
+        };
+        let call = self.pending.remove(position);
+        let outcome = match result.failure() {
+            Some(_) => ToolOutcome::Failure {
+                error: result.result.clone(),
+            },
+            None => ToolOutcome::Success {
+                result: result.result.clone(),
+                format: result.format(),
+            },
+        };
+        Some(AgentEventPayload::ToolComplete {
+            tool_call_id: call.id,
+            tool_name: call.name,
+            duration_ms: u64::try_from(call.since.elapsed().as_millis()).unwrap_or(u64::MAX),
+            outcome,
+            task_id: None,
+        })
     }
 }
 
@@ -616,18 +739,32 @@ mod tests {
         assert!(run_token.is_cancelled());
     }
 
-    mod content {
+    mod copy {
         use super::*;
-        use crate::provider_agent::FinalResponseInfo;
-        use aura_events::agent::AgentEventPayload as Payload;
+        use crate::passthrough_tool::PASSTHROUGH_MARKER;
+        use crate::provider_agent::{FinalResponseInfo, ToolCall, ToolResult, ToolResultKind};
+        use aura_events::EmittingAgent;
+        use aura_events::agent::ToolOutcome;
+        use aura_events::agent::{AgentEvent, AgentEventPayload as Payload, ResultFormat};
 
-        fn say(content: &str) -> Result<StreamItem, StreamError> {
+        type Item = Result<StreamItem, StreamError>;
+
+        fn say(content: &str) -> Item {
             Ok(StreamItem::StreamAssistantItem(
                 StreamedAssistantContent::Text(content.to_string()),
             ))
         }
 
-        fn finish(content: &str) -> Result<StreamItem, StreamError> {
+        fn think(delta: &str) -> Item {
+            Ok(StreamItem::StreamAssistantItem(
+                StreamedAssistantContent::ReasoningDelta {
+                    id: None,
+                    delta: delta.to_string(),
+                },
+            ))
+        }
+
+        fn finish(content: &str) -> Item {
             Ok(StreamItem::Final(FinalResponseInfo {
                 content: content.to_string(),
                 usage: rig::completion::Usage {
@@ -639,107 +776,381 @@ mod tests {
             }))
         }
 
-        async fn teed(items: Vec<Result<StreamItem, StreamError>>) -> (usize, Vec<Payload>) {
-            let (_, passed, seen) =
-                teed_as(aura_events::EmittingAgent::single_agent(), items).await;
-            (passed, seen)
+        fn call(id: &str, name: &str) -> Item {
+            Ok(StreamItem::StreamAssistantItem(
+                StreamedAssistantContent::ToolCall(ToolCall {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    arguments: "{}".to_string(),
+                }),
+            ))
         }
 
-        async fn teed_as(
-            agent: aura_events::EmittingAgent,
-            items: Vec<Result<StreamItem, StreamError>>,
-        ) -> (Vec<aura_events::EmittingAgent>, usize, Vec<Payload>) {
+        fn result(id: &str, text: &str, kind: ToolResultKind) -> Item {
+            answered(id, None, text, kind)
+        }
+
+        fn answered(id: &str, call_id: Option<&str>, text: &str, kind: ToolResultKind) -> Item {
+            Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(
+                ToolResult {
+                    id: id.to_string(),
+                    call_id: call_id.map(str::to_string),
+                    result: text.to_string(),
+                    kind,
+                },
+            )))
+        }
+
+        /// Runs `items` through the copy as a single agent's run. Returns how
+        /// many items passed and the events that reached the run's channel.
+        async fn copied(items: Vec<Item>) -> (usize, Vec<AgentEvent>) {
+            copied_as(EmittingAgent::single_agent(), futures::stream::iter(items)).await
+        }
+
+        async fn copied_as(
+            agent: EmittingAgent,
+            items: impl futures::Stream<Item = Item> + Send + 'static,
+        ) -> (usize, Vec<AgentEvent>) {
             let (run, mut events) =
-                RunContext::channel(crate::run_context::named_run_id("run_tee"));
-            let passed = tee_content(run, agent, futures::stream::iter(items))
+                RunContext::channel(crate::run_context::named_run_id("run_copy"));
+            let passed = tee_run_events(run, agent, items)
                 .collect::<Vec<_>>()
                 .await
                 .len();
-
-            let mut agents = Vec::new();
-            let mut payloads = Vec::new();
-            while let Ok(event) = events.try_recv() {
-                agents.push(event.agent);
-                payloads.push(event.payload);
-            }
-            (agents, passed, payloads)
+            let seen = std::iter::from_fn(|| events.try_recv().ok()).collect();
+            (passed, seen)
         }
 
-        /// The items still reach the consumer that reads them today; the copy is
-        /// additional, not a diversion.
+        fn payloads(events: Vec<AgentEvent>) -> Vec<Payload> {
+            events.into_iter().map(|event| event.payload).collect()
+        }
+
+        /// The name, duration and outcome of the only event on the channel,
+        /// which must be a `ToolComplete`.
+        fn completion(events: Vec<AgentEvent>) -> (String, u64, ToolOutcome) {
+            let [
+                AgentEvent {
+                    payload:
+                        Payload::ToolComplete {
+                            tool_name,
+                            duration_ms,
+                            outcome,
+                            task_id: None,
+                            ..
+                        },
+                    ..
+                },
+            ] = events.as_slice()
+            else {
+                panic!("expected one ToolComplete, got {events:?}");
+            };
+            (tool_name.to_string(), *duration_ms, outcome.clone())
+        }
+
+        /// Every item still reaches the stream's reader. The copy adds events
+        /// and takes no items away.
         #[tokio::test]
         async fn every_item_still_passes_through() {
-            let (passed, _) = teed(vec![say("a"), say("b"), finish("ab")]).await;
-            assert_eq!(passed, 3);
+            let (passed, _) = copied(vec![
+                say("a"),
+                call("call_1", "list_files"),
+                result("call_1", "a.txt", ToolResultKind::Text),
+                Ok(StreamItem::FinalMarker),
+                finish("a"),
+            ])
+            .await;
+            assert_eq!(passed, 5);
         }
 
         #[tokio::test]
-        async fn text_reaches_the_run_in_order() {
-            let (_, seen) = teed(vec![say("Hello "), say("world")]).await;
+        async fn content_reaches_the_run_in_order_as_the_agents() {
+            let (_, events) = copied(vec![think("Hmm."), say("Hello "), say("world")]).await;
 
-            let deltas: Vec<_> = seen
-                .iter()
-                .filter_map(|payload| match payload {
-                    Payload::TextDelta { content } => Some(content.as_str()),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(deltas, vec!["Hello ", "world"]);
+            for event in &events {
+                assert_eq!(event.agent, EmittingAgent::single_agent());
+            }
+            assert!(
+                matches!(
+                    payloads(events).as_slice(),
+                    [
+                        Payload::Reasoning { content: reasoning, task_id: None },
+                        Payload::TextDelta { content: first },
+                        Payload::TextDelta { content: second },
+                    ] if reasoning == "Hmm." && first == "Hello " && second == "world"
+                ),
+                "the deltas arrive in order"
+            );
         }
 
-        /// The final item carries the whole answer and its billed usage, which is
-        /// what an observer needs to close out a run it only watched.
+        /// The final item carries the whole answer and its billed usage, which
+        /// is what an observer needs to close out a run it only watched.
         #[tokio::test]
         async fn the_final_item_reaches_the_run_as_a_completed_run() {
-            let (_, seen) = teed(vec![say("hi"), finish("hi there")]).await;
+            let (_, events) = copied(vec![say("hi"), finish("hi there")]).await;
 
-            let completed = seen
-                .iter()
+            let completed = payloads(events)
+                .into_iter()
                 .find_map(|payload| match payload {
                     Payload::Completed { content, usage } => {
-                        Some((content.as_str(), usage.total_tokens.get()))
+                        Some((content, usage.total_tokens.get()))
                     }
                     _ => None,
                 })
                 .expect("a completed run");
-            assert_eq!(completed, ("hi there", 15));
+            assert_eq!(completed, ("hi there".to_string(), 15));
         }
 
-        /// An orchestrated run's answer is the coordinator's. A worker feeds it,
-        /// so attributing the content to whoever produced the item would name the
-        /// wrong agent to an observer deciding who said what.
+        /// A tool result produces a `ToolComplete` for its call. The event
+        /// takes the call's name, and its duration is the time since the
+        /// call's item passed.
         #[tokio::test]
-        async fn orchestrated_content_is_the_coordinators() {
-            let (agents, _, seen) = teed_as(
-                aura_events::EmittingAgent::coordinator(),
-                vec![say("the answer"), finish("the answer")],
-            )
+        async fn a_result_completes_its_call_with_the_calls_name_and_time() {
+            let items = async_stream::stream! {
+                yield call("call_1", "list_files");
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                yield result("call_1", "a.txt b.txt", ToolResultKind::Text);
+            };
+            let (_, events) = copied_as(EmittingAgent::single_agent(), items).await;
+
+            assert_eq!(events[0].agent, EmittingAgent::single_agent());
+            let (name, duration_ms, outcome) = completion(events);
+            assert_eq!(name, "list_files");
+            assert!(duration_ms >= 20, "measured {duration_ms} ms");
+            assert!(
+                matches!(
+                    &outcome,
+                    ToolOutcome::Success { result, format: ResultFormat::Text } if result == "a.txt b.txt"
+                ),
+                "{outcome:?}"
+            );
+        }
+
+        /// A failure keeps its full text, including rig's prefixes. The reader
+        /// decides how much of it to show.
+        #[tokio::test]
+        async fn an_error_completes_as_a_failure_with_its_whole_text() {
+            let error = "Toolset error: ToolCallError: connection refused";
+            let (_, events) = copied(vec![
+                call("call_1", "read_file"),
+                result("call_1", error, ToolResultKind::Error),
+            ])
             .await;
 
+            let (_, _, outcome) = completion(events);
             assert!(
-                !seen.is_empty(),
-                "the coordinator's content reaches the run"
+                matches!(&outcome, ToolOutcome::Failure { error: text } if text == error),
+                "{outcome:?}"
             );
-            for agent in &agents {
-                assert_eq!(
-                    agent,
-                    &aura_events::EmittingAgent::coordinator(),
-                    "every copied item is attributed to the coordinator"
-                );
-            }
         }
 
-        /// A run nobody observes has dropped its receiver, so the copy fails and
-        /// the items must still pass.
+        /// A result of kind `Error` is a failure, whatever its text says.
+        #[tokio::test]
+        async fn an_error_without_a_known_prefix_is_still_a_failure() {
+            let (_, events) = copied(vec![
+                call("call_1", "read_file"),
+                result("call_1", "boom", ToolResultKind::Error),
+            ])
+            .await;
+
+            let (_, _, outcome) = completion(events);
+            assert!(
+                matches!(&outcome, ToolOutcome::Failure { error } if error == "boom"),
+                "{outcome:?}"
+            );
+        }
+
+        /// Output that starts with the MCP error prefix is a failure. Output
+        /// that only looks like an error, such as `Tool execution failed:`, is
+        /// a success.
+        #[tokio::test]
+        async fn output_is_a_failure_only_when_it_reports_one() {
+            let (_, events) = copied(vec![
+                call("call_1", "fetch"),
+                result(
+                    "call_1",
+                    "Tool returned an error: 401 Unauthorized",
+                    ToolResultKind::Text,
+                ),
+            ])
+            .await;
+            let (_, _, outcome) = completion(events);
+            assert!(
+                matches!(&outcome, ToolOutcome::Failure { error } if error == "Tool returned an error: 401 Unauthorized"),
+                "{outcome:?}"
+            );
+
+            let (_, events) = copied(vec![
+                call("call_1", "tail"),
+                result(
+                    "call_1",
+                    "Tool execution failed: disk full on node-3",
+                    ToolResultKind::Text,
+                ),
+            ])
+            .await;
+            let (_, _, outcome) = completion(events);
+            assert!(
+                matches!(outcome, ToolOutcome::Success { .. }),
+                "{outcome:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn json_output_says_it_is_json() {
+            let (_, events) = copied(vec![
+                call("call_1", "stat"),
+                result("call_1", r#"{"files":11}"#, ToolResultKind::Json),
+            ])
+            .await;
+
+            let (_, _, outcome) = completion(events);
+            assert!(
+                matches!(
+                    &outcome,
+                    ToolOutcome::Success { result, format: ResultFormat::Json } if result == r#"{"files":11}"#
+                ),
+                "{outcome:?}"
+            );
+        }
+
+        /// A reader spots a client tool's yield by the passthrough marker in
+        /// its result, so the copy must keep the marker.
+        #[tokio::test]
+        async fn the_passthrough_marker_survives_the_copy() {
+            let marked = format!("\"{PASSTHROUGH_MARKER}\"");
+            let (_, events) = copied(vec![
+                call("call_1", "get_weather"),
+                result("call_1", &marked, ToolResultKind::Text),
+            ])
+            .await;
+
+            let (_, _, outcome) = completion(events);
+            assert!(
+                matches!(&outcome, ToolOutcome::Success { result, .. } if result.contains(PASSTHROUGH_MARKER)),
+                "{outcome:?}"
+            );
+        }
+
+        /// Each result is matched to its own call, whatever order the results
+        /// come back in. A result that matches only on its `call_id` still
+        /// finds its call.
+        #[tokio::test]
+        async fn each_result_completes_the_call_it_answers() {
+            let (_, events) = copied(vec![
+                call("call_1", "list_files"),
+                call("call_2", "read_file"),
+                result("call_2", "contents", ToolResultKind::Text),
+                answered("rig_1", Some("call_1"), "a.txt", ToolResultKind::Text),
+            ])
+            .await;
+
+            let names: Vec<_> = payloads(events)
+                .into_iter()
+                .map(|payload| match payload {
+                    Payload::ToolComplete {
+                        tool_call_id,
+                        tool_name,
+                        ..
+                    } => (tool_call_id.to_string(), tool_name.to_string()),
+                    other => panic!("expected ToolComplete, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                names,
+                vec![
+                    ("call_2".to_string(), "read_file".to_string()),
+                    ("call_1".to_string(), "list_files".to_string()),
+                ]
+            );
+        }
+
+        /// A result whose call never passed has no call name, so it is left
+        /// out of the copy instead of being given a made-up name.
+        #[tokio::test]
+        async fn a_result_without_its_call_is_not_copied() {
+            let (passed, events) =
+                copied(vec![result("call_9", "orphan", ToolResultKind::Text)]).await;
+            assert_eq!(passed, 1);
+            assert!(events.is_empty(), "{events:?}");
+        }
+
+        /// A single agent's closing scratchpad reading is attributed to the
+        /// agent id in the item.
+        #[tokio::test]
+        async fn a_scratchpad_reading_names_the_agent_it_names() {
+            let (_, events) = copied(vec![Ok(StreamItem::ScratchpadUsage {
+                agent_id: "main".to_string(),
+                tokens_intercepted: 1_200,
+                tokens_extracted: 300,
+            })])
+            .await;
+
+            let [event] = events.as_slice() else {
+                panic!("expected one reading, got {events:?}");
+            };
+            assert_eq!(event.agent, EmittingAgent::single_agent());
+            assert!(matches!(
+                &event.payload,
+                Payload::ScratchpadUsage { tokens_intercepted, tokens_extracted }
+                    if tokens_intercepted.get() == 1_200 && tokens_extracted.get() == 300
+            ));
+        }
+
+        /// Agent events, context readings and MCP status are not copied,
+        /// because the orchestrator's emitter puts those on the channel
+        /// itself. The final marker, turn usage, tool-call deltas and a whole
+        /// reasoning block have nothing to copy.
+        #[tokio::test]
+        async fn items_with_nothing_to_copy_stay_off_the_channel() {
+            let (passed, events) = copied(vec![
+                Ok(StreamItem::AgentEvent(Box::new(AgentEvent::new(
+                    EmittingAgent::coordinator(),
+                    Payload::Synthesizing { iteration: 1 },
+                )))),
+                Ok(StreamItem::ContextUsage {
+                    agent_id: "main".to_string(),
+                    context_tokens: 100,
+                    response_tokens: 5,
+                    context_window: None,
+                }),
+                Ok(StreamItem::McpStatus(Vec::new())),
+                Ok(StreamItem::FinalMarker),
+                Ok(StreamItem::TurnUsage(
+                    rig::completion::Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        total_tokens: 2,
+                    },
+                    None,
+                )),
+                Ok(StreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::ToolCallDelta {
+                        id: "call_1".to_string(),
+                        name: None,
+                        delta: Some("{".to_string()),
+                    },
+                )),
+                Ok(StreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::Reasoning("whole".to_string()),
+                )),
+            ])
+            .await;
+
+            assert_eq!(passed, 7);
+            assert!(events.is_empty(), "{events:?}");
+        }
+
+        /// When nobody observes the run, its channel's receiver is gone and
+        /// every copy fails. The items must still pass through.
         #[tokio::test]
         async fn an_unobserved_run_still_streams_its_items() {
             let (run, events) =
                 RunContext::channel(crate::run_context::named_run_id("run_unobserved"));
             drop(events);
 
-            let passed = tee_content(
+            let passed = tee_run_events(
                 run,
-                aura_events::EmittingAgent::single_agent(),
+                EmittingAgent::single_agent(),
                 futures::stream::iter(vec![say("a"), finish("a")]),
             )
             .collect::<Vec<_>>()

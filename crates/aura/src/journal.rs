@@ -752,11 +752,11 @@ mod tests {
         assert!(!next, "nothing reads the run's channel any more");
     }
 
-    /// `tee_content` copies what the agent says onto the run's channel for a
-    /// consumer built on the run's events. The drain is that consumer, so a
-    /// late observer reads the words and not only the tool calls.
+    /// `tee_run_events` copies what the agent says onto the run's channel.
+    /// The drain reads that channel into the journal, so a late observer
+    /// reads the agent's words and not only its tool calls.
     #[tokio::test]
-    async fn the_drain_records_what_tee_content_copies() {
+    async fn the_drain_records_what_the_copy_puts_on_the_channel() {
         use crate::provider_agent::{FinalResponseInfo, StreamItem, StreamedAssistantContent};
 
         let journal = journal().await;
@@ -782,7 +782,7 @@ mod tests {
         ];
         // Consuming the teed stream drops the run with it, which closes the
         // channel the drain reads.
-        let passed = crate::streaming::tee_content(
+        let passed = crate::streaming::tee_run_events(
             context,
             aura_events::EmittingAgent::single_agent(),
             futures::stream::iter(items),
