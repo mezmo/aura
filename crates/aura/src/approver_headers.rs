@@ -3,8 +3,8 @@
 //! When a HITL-gated tool call is approved over the webhook route, the
 //! approval HTTP response may carry identity headers. This module holds the
 //! types that carry those headers from capture (gate scope, webhook route
-//! only) to application (exactly one outbound MCP request, via the rmcp
-//! request-extension side-channel).
+//! only) to application (one approved invocation, including its polling
+//! samples, via the rmcp request-extension side-channel).
 
 use aura_config::ToolHeaderMappings;
 use reqwest::header::{HeaderMap, HeaderName};

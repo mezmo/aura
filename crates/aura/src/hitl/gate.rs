@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use super::decision::{AgentScope, ApprovalOrigin, ApprovalOutcome, DecisionId};
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
-use super::registry::{ParkedApproval, PendingApprovals};
+use super::registry::{ParkedApproval, PendingApprovals, PollingTarget};
 use super::route::{ApprovalError, DecisionRoute, GateDecision};
 use crate::orchestration::{
     BlockedCell, CallKey, ParkGuard, PendingCall, RecordedDecisions, run_owner_id,
@@ -164,6 +164,8 @@ impl HitlApprovalWrapper {
         matched: &str,
         args: &Value,
         ctx: &ToolCallContext,
+        polling_target: Option<&PollingTarget>,
+        item: ApprovalItem,
     ) -> Result<PreCallOutcome, ToolError> {
         // Park is worker-only: the scope carries the run and task identity.
         let AgentScope::Worker { run_id, .. } = &self.scope else {
@@ -199,12 +201,7 @@ impl HitlApprovalWrapper {
                 matched_pattern: matched.to_string(),
                 agent_name: self.agent_name.clone(),
             },
-            items: vec![ApprovalItem {
-                tool_name: ctx.tool_name.clone(),
-                tool_namespace: ctx.tool_namespace.clone(),
-                arguments: args.clone(),
-                tool_call_intent: ctx.tool_call_intent.clone(),
-            }],
+            items: vec![item],
         };
 
         // The store's own register, not the registry's park-anyway one: a
@@ -213,6 +210,7 @@ impl HitlApprovalWrapper {
             request,
             registered_at: now,
             expires_at,
+            polling_target: polling_target.cloned(),
         };
         if let Err(err) = park.registry.register_durable(parked.clone()).await {
             tracing::warn!(
@@ -265,17 +263,28 @@ impl HitlApprovalWrapper {
     }
 }
 
-#[async_trait]
-impl ToolWrapper for HitlApprovalWrapper {
-    async fn pre_call(
+impl HitlApprovalWrapper {
+    pub(crate) async fn pre_call_polling(
         &self,
         args: &Value,
         ctx: &ToolCallContext,
+        target: &PollingTarget,
+        item: ApprovalItem,
     ) -> Result<PreCallOutcome, ToolError> {
-        let Some(matched) = self.matched_pattern(&ctx.tool_name, ctx.tool_namespace.as_deref())
-        else {
-            return Ok(PreCallOutcome::Proceed { overrides: None });
-        };
+        let matched = self
+            .matched_pattern(&target.tool_name, Some(&target.namespace))
+            .or_else(|| self.matched_pattern(&ctx.tool_name, ctx.tool_namespace.as_deref()));
+        self.authorize(args, ctx, matched, Some(target), item).await
+    }
+
+    async fn authorize(
+        &self,
+        args: &Value,
+        ctx: &ToolCallContext,
+        matched: Option<&str>,
+        polling_target: Option<&PollingTarget>,
+        item: ApprovalItem,
+    ) -> Result<PreCallOutcome, ToolError> {
         // Recorded-decisions consult: a resumed worker's gated call may
         // already carry a stored decision. A hit maps through the same
         // mapping the live route uses (so an approval proceeds and a denial
@@ -292,7 +301,10 @@ impl ToolWrapper for HitlApprovalWrapper {
                     "resume mismatch: no task id".to_string().into(),
                 ));
             };
-            match recorded.take(&CallKey::new(task_id, &ctx.tool_name, args)) {
+            match recorded
+                .take_bound(&CallKey::new(task_id, &ctx.tool_name, args), polling_target)
+                .map_err(|error| ToolError::ToolCallError(error.into()))?
+            {
                 Some(decision) => {
                     return approval_result_to_pre_call(Ok(GateDecision::without_overrides(
                         ApprovalOutcome::Decided(decision),
@@ -312,8 +324,13 @@ impl ToolWrapper for HitlApprovalWrapper {
                 None => {}
             }
         }
+        let Some(matched) = matched else {
+            return Ok(PreCallOutcome::Proceed { overrides: None });
+        };
         if let Some(park) = &self.park {
-            return self.park_pre_call(park, matched, args, ctx).await;
+            return self
+                .park_pre_call(park, matched, args, ctx, polling_target, item)
+                .await;
         }
         let run = self.run();
         let request = ApprovalRequest {
@@ -326,12 +343,7 @@ impl ToolWrapper for HitlApprovalWrapper {
                 matched_pattern: matched.to_string(),
                 agent_name: self.agent_name.clone(),
             },
-            items: vec![ApprovalItem {
-                tool_name: ctx.tool_name.clone(),
-                tool_namespace: ctx.tool_namespace.clone(),
-                arguments: args.clone(),
-                tool_call_intent: ctx.tool_call_intent.clone(),
-            }],
+            items: vec![item],
         };
         let cancel = run
             .as_ref()
@@ -349,6 +361,28 @@ impl ToolWrapper for HitlApprovalWrapper {
             None => self.route.decide_for_gate(request, &cancel).await,
         };
         approval_result_to_pre_call(decision)
+    }
+}
+
+#[async_trait]
+impl ToolWrapper for HitlApprovalWrapper {
+    async fn pre_call(
+        &self,
+        args: &Value,
+        ctx: &ToolCallContext,
+    ) -> Result<PreCallOutcome, ToolError> {
+        let matched = self.matched_pattern(&ctx.tool_name, ctx.tool_namespace.as_deref());
+        if matched.is_none() {
+            return Ok(PreCallOutcome::Proceed { overrides: None });
+        }
+        let item = ApprovalItem {
+            tool_name: ctx.tool_name.clone(),
+            tool_namespace: ctx.tool_namespace.clone(),
+            arguments: args.clone(),
+            tool_call_intent: ctx.tool_call_intent.clone(),
+            polling: None,
+        };
+        self.authorize(args, ctx, matched, None, item).await
     }
 }
 
