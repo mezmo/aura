@@ -1,5 +1,6 @@
 use crate::error::ConfigError;
 use crate::globpattern::GlobPattern;
+use crate::header_map::{HeaderMap, HeaderMapError};
 use crate::lenient_bool;
 use crate::lenient_int;
 use crate::orchestration::OrchestrationConfig;
@@ -738,11 +739,11 @@ pub enum McpServerConfig {
     HttpStreamable {
         url: String,
         #[serde(default)]
-        headers: HashMap<String, String>,
+        headers: HeaderMap,
         #[serde(default)]
         description: Option<String>,
         #[serde(default)]
-        headers_from_request: HashMap<String, String>,
+        headers_from_request: HeaderMap,
         /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
         #[serde(default)]
         scratchpad: ScratchpadRules,
@@ -754,11 +755,11 @@ pub enum McpServerConfig {
     Sse {
         url: String,
         #[serde(default)]
-        headers: HashMap<String, String>,
+        headers: HeaderMap,
         #[serde(default)]
         description: Option<String>,
         #[serde(default)]
-        headers_from_request: HashMap<String, String>,
+        headers_from_request: HeaderMap,
         /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
         #[serde(default)]
         scratchpad: ScratchpadRules,
@@ -1219,8 +1220,8 @@ mod tests {
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 300,
-                headers: HashMap::new(),
-                headers_from_request: HashMap::new(),
+                headers: HeaderMap::new(),
+                headers_from_request: HeaderMap::new(),
                 tool_headers_from_response: ToolHeaderMappings::default(),
             },
         };
@@ -1252,8 +1253,8 @@ mod tests {
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 30,
-                headers: HashMap::new(),
-                headers_from_request: HashMap::new(),
+                headers: HeaderMap::new(),
+                headers_from_request: HeaderMap::new(),
                 tool_headers_from_response: ToolHeaderMappings::default(),
             },
         };
@@ -1268,8 +1269,8 @@ mod tests {
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 60,
-                headers: HashMap::new(),
-                headers_from_request: HashMap::new(),
+                headers: HeaderMap::new(),
+                headers_from_request: HeaderMap::new(),
                 tool_headers_from_response: ToolHeaderMappings::default(),
             },
         };
@@ -1286,8 +1287,8 @@ mod tests {
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 120,
-                headers: HashMap::new(),
-                headers_from_request: HashMap::new(),
+                headers: HeaderMap::new(),
+                headers_from_request: HeaderMap::new(),
                 tool_headers_from_response: ToolHeaderMappings::default(),
             },
         };
@@ -1534,7 +1535,7 @@ tool_headers_from_response = { "Content-Type" = "x-anything" }
         .collect();
         let err = ToolHeaderMappings::try_from(raw).unwrap_err().to_string();
         assert!(
-            err.contains("duplicate tool header override"),
+            err.contains("differ only by case"),
             "unexpected error: {err}"
         );
     }
@@ -1588,10 +1589,10 @@ pub enum DecisionRouteConfig {
         timeout_secs: u64,
         /// Static webhook headers.
         #[serde(default)]
-        headers: HashMap<String, String>,
+        headers: HeaderMap,
         /// Outbound header name → inbound request header name mapping.
         #[serde(default)]
-        headers_from_request: HashMap<String, String>,
+        headers_from_request: HeaderMap,
         /// Outbound MCP header name → webhook approval-response header name.
         #[serde(default, skip_serializing_if = "ToolHeaderMappings::is_empty")]
         tool_headers_from_response: ToolHeaderMappings,
@@ -1611,12 +1612,14 @@ pub const RESERVED_TOOL_HEADER_NAMES: [&str; 6] = [
 
 /// Validated `tool_headers_from_response` mapping: outbound MCP header
 /// name → webhook approval-response header name, both sides lowercased.
-/// Syntactically invalid header names, duplicates after lowercasing, and
-/// reserved transport-owned names (see [`RESERVED_TOOL_HEADER_NAMES`])
-/// are rejected at construction, so downstream code never holds an
-/// unvalidated map.
+/// The outbound names form a [`HeaderMap`], so they are valid and unique
+/// ignoring case. Syntactically invalid header names on either side and
+/// reserved transport-owned names (see [`RESERVED_TOOL_HEADER_NAMES`]) are
+/// rejected at construction, so downstream code never holds an unvalidated
+/// map.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct ToolHeaderMappings(HashMap<String, String>);
+#[serde(transparent)]
+pub struct ToolHeaderMappings(HeaderMap);
 
 impl ToolHeaderMappings {
     /// True when no mapping is configured.
@@ -1639,38 +1642,43 @@ impl ToolHeaderMappings {
     }
 }
 
-impl TryFrom<HashMap<String, String>> for ToolHeaderMappings {
+impl TryFrom<HeaderMap> for ToolHeaderMappings {
     type Error = ConfigError;
 
-    /// The one validation site: lowercase-normalize outbound names, reject
-    /// syntactically invalid header names on either side, reject duplicates
-    /// after normalization, reject reserved transport-owned names.
+    /// Lowercase the response header names, reject syntactically invalid
+    /// ones, and reject reserved transport-owned outbound names. The
+    /// outbound names are already valid and unique as [`HeaderMap`] keys.
     /// Implemented (not a typed hole) because deserialization is reachable
     /// through deployable config, where a hole would panic.
-    fn try_from(raw: HashMap<String, String>) -> Result<Self, Self::Error> {
-        let mut normalized: HashMap<String, String> = HashMap::with_capacity(raw.len());
-        for (name, response_name) in raw {
-            let lowered = name.to_lowercase();
+    fn try_from(mut map: HeaderMap) -> Result<Self, Self::Error> {
+        if let Some(name) = map
+            .keys()
+            .find(|name| RESERVED_TOOL_HEADER_NAMES.contains(&name.as_str()))
+        {
+            return Err(ConfigError::ReservedToolHeaderOverride { name: name.clone() });
+        }
+        for response_name in map.values_mut() {
+            let lowered = response_name.to_lowercase();
             if http::header::HeaderName::from_bytes(lowered.as_bytes()).is_err() {
                 return Err(ConfigError::InvalidToolHeaderName { name: lowered });
             }
-            let response_lowered = response_name.to_lowercase();
-            if http::header::HeaderName::from_bytes(response_lowered.as_bytes()).is_err() {
-                return Err(ConfigError::InvalidToolHeaderName {
-                    name: response_lowered,
-                });
-            }
-            if RESERVED_TOOL_HEADER_NAMES.contains(&lowered.as_str()) {
-                return Err(ConfigError::ReservedToolHeaderOverride { name: lowered });
-            }
-            if normalized
-                .insert(lowered.clone(), response_lowered)
-                .is_some()
-            {
-                return Err(ConfigError::DuplicateToolHeaderOverride { name: lowered });
-            }
+            *response_name = lowered;
         }
-        Ok(Self(normalized))
+        Ok(Self(map))
+    }
+}
+
+impl TryFrom<HashMap<String, String>> for ToolHeaderMappings {
+    type Error = ConfigError;
+
+    fn try_from(raw: HashMap<String, String>) -> Result<Self, Self::Error> {
+        let map = HeaderMap::try_from(raw).map_err(|err| match err {
+            HeaderMapError::InvalidName { name } => ConfigError::InvalidToolHeaderName {
+                name: name.to_lowercase(),
+            },
+            collision @ HeaderMapError::CaseCollision { .. } => collision.into(),
+        })?;
+        Self::try_from(map)
     }
 }
 
@@ -1679,8 +1687,8 @@ impl<'de> Deserialize<'de> for ToolHeaderMappings {
     where
         D: serde::Deserializer<'de>,
     {
-        let raw = HashMap::<String, String>::deserialize(deserializer)?;
-        Self::try_from(raw).map_err(serde::de::Error::custom)
+        let map = HeaderMap::deserialize(deserializer)?;
+        Self::try_from(map).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1758,10 +1766,10 @@ pub struct CatalogWebhookConfig {
     pub timeout_secs: u64,
     /// Static headers with environment variable interpolation.
     #[serde(default)]
-    pub headers: HashMap<String, String>,
+    pub headers: HeaderMap,
     /// Outbound header name → inbound request header name mapping.
     #[serde(default)]
-    pub headers_from_request: HashMap<String, String>,
+    pub headers_from_request: HeaderMap,
     /// Optional HMAC signing configuration.
     #[serde(default)]
     pub hmac: Option<CatalogHmacConfig>,

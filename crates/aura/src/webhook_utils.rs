@@ -10,15 +10,16 @@
 
 use std::collections::HashMap;
 
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderValue};
 use tracing::{info, warn};
 
 use crate::hitl::{ConfigError, PrimarySecret, Tolerance, WebhookHmac};
 
 /// Resolve operator-configured webhook headers into a validated [`HeaderMap`]:
 /// `static_headers` overlaid with `headers_from_request` values pulled from the
-/// inbound client request. Invalid header names or values are skipped with a
-/// warning that names the offending key (never the value).
+/// inbound client request. Header names are valid by construction of
+/// [`aura_config::HeaderMap`]; invalid values are skipped with a warning that
+/// names the offending key (never the value).
 ///
 /// Opt-in only: nothing is forwarded unless the operator configures it.
 /// Classification is deliberately absent from this surface — see
@@ -29,17 +30,14 @@ use crate::hitl::{ConfigError, PrimarySecret, Tolerance, WebhookHmac};
 /// category in the "Skipping invalid ___ header" warning (e.g. `"webhook"`,
 /// `"catalog webhook"`).
 pub fn resolve_headers(
-    static_headers: &HashMap<String, String>,
-    headers_from_request: &HashMap<String, String>,
+    static_headers: &aura_config::HeaderMap,
+    headers_from_request: &aura_config::HeaderMap,
     req_headers: Option<&HashMap<String, String>>,
 ) -> HeaderMap {
     let empty = HashMap::new();
     let req_headers = req_headers.unwrap_or(&empty);
 
-    let mut resolved: HashMap<String, String> = static_headers
-        .iter()
-        .map(|(k, v)| (k.to_lowercase(), v.clone()))
-        .collect();
+    let mut resolved = static_headers.clone();
     let resolved_count = crate::rig_builder::apply_request_header_mappings(
         &mut resolved,
         headers_from_request,
@@ -50,16 +48,13 @@ pub fn resolve_headers(
     }
 
     let mut header_map = HeaderMap::new();
-    for (key, value) in &resolved {
-        match (
-            HeaderName::from_bytes(key.as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            (Ok(name), Ok(val)) => {
+    for (name, value) in resolved.header_names() {
+        match HeaderValue::from_str(value) {
+            Ok(val) => {
                 header_map.insert(name, val);
             }
-            _ => {
-                warn!("Skipping invalid header '{}' (failed to convert)", key);
+            Err(_) => {
+                warn!("Skipping invalid header '{}' (failed to convert)", name);
             }
         }
     }

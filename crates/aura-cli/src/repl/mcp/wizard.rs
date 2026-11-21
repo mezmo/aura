@@ -11,7 +11,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use aura_config::config::McpServerConfig;
-use aura_config::{GlobPattern, ScratchpadRules, ScratchpadToolEntry};
+use aura_config::{GlobPattern, HeaderMap, ScratchpadRules, ScratchpadToolEntry};
+use reqwest::header::HeaderName;
 
 use super::catalog::{CATALOG, CatalogEntry, Template};
 use crate::backend::Backend;
@@ -336,8 +337,8 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
 /// check can't resolve placeholders through the normal loader.
 fn inline_secrets(server: &McpServerConfig, secrets: &[(String, String)]) -> McpServerConfig {
     let mut server = server.clone();
-    let inline = |values: &mut HashMap<String, String>| {
-        for value in values.values_mut() {
+    let inline = |values: &mut dyn Iterator<Item = &mut String>| {
+        for value in values {
             for (var, secret) in secrets {
                 *value = value.replace(&format!("{{{{ env.{var} }}}}"), secret);
             }
@@ -345,9 +346,9 @@ fn inline_secrets(server: &McpServerConfig, secrets: &[(String, String)]) -> Mcp
     };
     match &mut server {
         McpServerConfig::HttpStreamable { headers, .. } | McpServerConfig::Sse { headers, .. } => {
-            inline(headers);
+            inline(&mut headers.values_mut());
         }
-        McpServerConfig::Stdio { env, .. } => inline(env),
+        McpServerConfig::Stdio { env, .. } => inline(&mut env.values_mut()),
     }
     server
 }
@@ -756,7 +757,7 @@ fn collect_catalog(
 
     let (server, secrets) = match &entry.template {
         Template::Http { url, headers } => {
-            let mut header_map = HashMap::new();
+            let mut header_map = HeaderMap::new();
             let mut secrets = Vec::new();
             for template in *headers {
                 let source = collect_credential(ctx, template.env_var, template.secret_prompt)?;
@@ -766,7 +767,9 @@ fn collect_catalog(
                     &format!("{{{{ env.{} }}}}", template.env_var),
                     &format!("{{{{ env.{} }}}}", source.env_var()),
                 );
-                header_map.insert(template.header.to_string(), value);
+                let header = HeaderName::from_bytes(template.header.as_bytes())
+                    .expect("catalog header names are valid");
+                header_map.insert(header, value);
                 secrets.push(source);
             }
             (
@@ -837,10 +840,10 @@ fn collect_custom(ctx: &mut CommandContext, config_path: &Path) -> Option<Collec
             }
             println!("Enter an http:// or https:// URL.");
         };
-        let mut headers = HashMap::new();
+        let mut headers = HeaderMap::new();
         let mut secrets = Vec::new();
         if confirm(ctx, "Does the server need an auth header? [y/N] ")
-            && let Some(header) = ask_with_default(ctx, "Header name", "Authorization")
+            && let Some((header, header_name)) = ask_header_name(ctx)
         {
             println!("How is the `{header}` value formed?");
             println!("  1. Bearer <secret>");
@@ -876,7 +879,7 @@ fn collect_custom(ctx: &mut CommandContext, config_path: &Path) -> Option<Collec
             };
             let source = collect_credential(ctx, &derive_env_var(&name, &header), &secret_prompt)?;
             headers.insert(
-                header,
+                header_name,
                 format!("{prefix}{{{{ env.{} }}}}", source.env_var()),
             );
             secrets.push(source);
@@ -888,7 +891,7 @@ fn collect_custom(ctx: &mut CommandContext, config_path: &Path) -> Option<Collec
                 url,
                 headers,
                 description: None,
-                headers_from_request: HashMap::new(),
+                headers_from_request: aura_config::HeaderMap::new(),
                 scratchpad: ScratchpadRules::default(),
                 user_agent: None,
             }
@@ -904,16 +907,12 @@ fn collect_custom(ctx: &mut CommandContext, config_path: &Path) -> Option<Collec
     })
 }
 
-fn http_streamable(
-    url: String,
-    headers: HashMap<String, String>,
-    description: &str,
-) -> McpServerConfig {
+fn http_streamable(url: String, headers: HeaderMap, description: &str) -> McpServerConfig {
     McpServerConfig::HttpStreamable {
         url,
         headers,
         description: (!description.is_empty()).then(|| description.to_string()),
-        headers_from_request: HashMap::new(),
+        headers_from_request: aura_config::HeaderMap::new(),
         scratchpad: ScratchpadRules::default(),
         user_agent: None,
     }
@@ -1060,6 +1059,18 @@ fn ask(ctx: &mut CommandContext, prompt: &str) -> Option<String> {
         .map(|line| line.trim().to_string())
 }
 
+/// Ask for a header name until the answer is a valid one. Returns the name as
+/// typed, for prompts, and parsed, for the header table.
+fn ask_header_name(ctx: &mut CommandContext) -> Option<(String, HeaderName)> {
+    loop {
+        let answer = ask_with_default(ctx, "Header name", "Authorization")?;
+        match HeaderName::from_bytes(answer.as_bytes()) {
+            Ok(name) => return Some((answer, name)),
+            Err(_) => println!("`{answer}` is not a valid header name."),
+        }
+    }
+}
+
 fn ask_with_default(ctx: &mut CommandContext, prompt: &str, default: &str) -> Option<String> {
     let answer = ask(ctx, &format!("{prompt} [{default}]: "))?;
     Some(if answer.is_empty() {
@@ -1177,10 +1188,13 @@ mod tests {
         for entry in CATALOG {
             let (server, _secrets) = match &entry.template {
                 Template::Http { url, headers } => {
-                    let header_map = headers
-                        .iter()
-                        .map(|t| (t.header.to_string(), t.value_template.to_string()))
-                        .collect();
+                    let header_map = HeaderMap::try_from(
+                        headers
+                            .iter()
+                            .map(|t| (t.header.to_string(), t.value_template.to_string()))
+                            .collect::<HashMap<_, _>>(),
+                    )
+                    .expect("catalog header names are valid");
                     (
                         http_streamable(url.to_string(), header_map, entry.description),
                         (),
@@ -1291,10 +1305,11 @@ mod tests {
     fn inlines_secrets_for_verification_without_touching_original() {
         let server = http_streamable(
             "https://mcp.mezmo.com/mcp".to_string(),
-            HashMap::from([(
+            HeaderMap::try_from(HashMap::from([(
                 "Authorization".to_string(),
                 "Bearer {{ env.MEZMO_API_KEY }}".to_string(),
-            )]),
+            )]))
+            .unwrap(),
             "",
         );
         let inlined = inline_secrets(
@@ -1305,7 +1320,7 @@ mod tests {
             panic!("transport changed");
         };
         assert_eq!(
-            headers.get("Authorization").map(String::as_str),
+            headers.get("authorization").map(String::as_str),
             Some("Bearer sk-live-123")
         );
         // The original (destined for the config file) keeps the placeholder.
@@ -1313,7 +1328,7 @@ mod tests {
             panic!("transport changed");
         };
         assert_eq!(
-            headers.get("Authorization").map(String::as_str),
+            headers.get("authorization").map(String::as_str),
             Some("Bearer {{ env.MEZMO_API_KEY }}")
         );
     }
@@ -1415,7 +1430,7 @@ mod tests {
     fn scratchpad_wildcard_entry_renders_into_server_config() {
         let mut server = http_streamable(
             "https://mcp.example.com/mcp".to_string(),
-            HashMap::new(),
+            HeaderMap::new(),
             "",
         );
         server
