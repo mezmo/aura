@@ -2213,6 +2213,7 @@ mod tests {
             orchestration: None,
             hitl: None,
             governance: None,
+            a2a: None,
             agent: aura_config::AgentConfig {
                 name: "test-agent".to_string(),
                 ..aura_config::AgentConfig::default()
