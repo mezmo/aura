@@ -372,7 +372,7 @@ impl Shared {
         detached.write.turn().await;
         let journal = self.lock_sessions().get(&detached.session.id).map_or_else(
             || Arc::clone(&detached.session.journal),
-            |held| Arc::clone(&held.journal),
+            |open_session| Arc::clone(&open_session.journal),
         );
         let live = detached.live.as_ref();
         let run_id = live.map(|live| live.id);
@@ -448,14 +448,14 @@ mod tests {
             }
         );
 
-        let (gone, held_claim) = set.detach(&ObserverId::new("k1").unwrap()).unwrap();
+        let (gone, was_claimant) = set.detach(&ObserverId::new("k1").unwrap()).unwrap();
         assert_eq!(gone.id, ObserverId::new("k1").unwrap());
-        assert!(held_claim);
+        assert!(was_claimant);
         assert!(!set.attendance().claimed);
         assert_eq!(set.detach(&ObserverId::new("k1").unwrap()), None);
 
-        let (_, held_claim) = set.detach(&ObserverId::new("c2").unwrap()).unwrap();
-        assert!(!held_claim);
+        let (_, was_claimant) = set.detach(&ObserverId::new("c2").unwrap()).unwrap();
+        assert!(!was_claimant);
         assert!(!set.attendance().present);
         assert!(!set.is_empty());
     }

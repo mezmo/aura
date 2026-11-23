@@ -200,17 +200,17 @@ impl Inner {
         let mut lines = self.read_lines(&path)?;
 
         let dedup_key = record.invocation.dedup_key();
-        let mut held = 0usize;
+        let mut count_of_records = 0usize;
         for line in &lines {
             if let Ok(existing) = SkillInvocationRecord::decode(line) {
-                held += 1;
+                count_of_records += 1;
                 if existing.invocation.dedup_key() == dedup_key {
                     // First write wins; the rewrite refreshes the file's mtime.
                     return publish(&path, rejoin(&lines).as_bytes());
                 }
             }
         }
-        if held >= MAX_SKILL_RECORDS_PER_LOG {
+        if count_of_records >= MAX_SKILL_RECORDS_PER_LOG {
             tracing::warn!(
                 session_id = log.session_id.as_str(),
                 agent_id = log.agent_id,

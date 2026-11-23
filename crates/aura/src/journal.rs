@@ -249,7 +249,7 @@ impl SessionJournal {
             let mut fill_to = joined_at;
             // A live event that arrived past a stretch the broadcast dropped,
             // delivered once the stretch has been read from the store.
-            let mut held: Option<Arc<SessionEvent>> = None;
+            let mut early_event: Option<Arc<SessionEvent>> = None;
 
             loop {
                 if let Some(to) = fill_to.take() {
@@ -284,15 +284,15 @@ impl SessionJournal {
                         }
                         from = expected;
                     }
-                    // What the store lacked up to `to` is missed. A held event
-                    // says so as it is delivered; without one, say it now
+                    // What the store lacked up to `to` is missed. An early
+                    // event says so as it is delivered; without one, say it now
                     // rather than at the next live event, which may never come.
-                    if held.is_none() && expected <= to {
+                    if early_event.is_none() && expected <= to {
                         yield JournalItem::Gap { resumed_at: to.next() };
                         expected = to.next();
                     }
                 }
-                if let Some(event) = held.take() {
+                if let Some(event) = early_event.take() {
                     if let Some(gap) = advance(&mut expected, event.seq) {
                         yield gap;
                     }
@@ -309,7 +309,7 @@ impl SessionJournal {
                             SequenceNumber::try_from(event.seq.get() - 1)
                                 .expect("a number past the expected one is past the first"),
                         );
-                        held = Some(event);
+                        early_event = Some(event);
                     }
                     Ok(event) => {
                         expected = event.seq.next();

@@ -611,7 +611,7 @@ impl Shared {
         let mut sessions = self.lock_sessions();
         if sessions
             .get(&session.id)
-            .is_some_and(|held| Arc::ptr_eq(held, session))
+            .is_some_and(|open_session| Arc::ptr_eq(open_session, session))
         {
             sessions.remove(&session.id);
         }
@@ -681,9 +681,9 @@ impl Shared {
     /// a live run is returned anyway, so the start is refused for that run
     /// instead of replacing the session.
     fn usable_session(&self, id: &SessionId) -> Option<Arc<SessionRecord>> {
-        let held = self.lock_sessions().get(id).cloned()?;
-        let usable = !held.journal.is_fenced() || held.lock().live.is_some();
-        usable.then_some(held)
+        let session = self.lock_sessions().get(id).cloned()?;
+        let usable = !session.journal.is_fenced() || session.lock().live.is_some();
+        usable.then_some(session)
     }
 }
 
