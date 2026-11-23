@@ -307,7 +307,7 @@ async fn session_ended_sent_after_started_when_enabled() {
 /// While `Unknown` (no consent), `cli_session_ended` is held and never
 /// sent — mirrors the guard `run_repl` applies at the call site.
 #[tokio::test]
-async fn session_ended_held_while_unknown() {
+async fn session_ended_is_not_sent_while_consent_is_unknown() {
     let f = fixture(TelemetryState::Unknown).await;
     f.handle.capture(CliSessionEnded {
         exit_reason: ExitReason::Eof,

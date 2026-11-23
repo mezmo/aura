@@ -1256,11 +1256,11 @@ async fn a_detach_waits_behind_an_attach_counted_before_it() {
     let s = session("s1");
 
     let claim = h.runtime.attach(&s, Attach::claiming()).await.unwrap();
-    let held = h.runtime.attach(&s, Attach::collecting()).await.unwrap();
+    let collector = h.runtime.attach(&s, Attach::collecting()).await.unwrap();
     let pending = h
         .runtime
         .shared
-        .unregister(&s, &held.observer().id)
+        .unregister(&s, &collector.observer().id)
         .expect("the observer is attached");
     let mut joining = Box::pin(h.runtime.attach(&s, Attach::collecting()));
     assert!(
@@ -1305,5 +1305,5 @@ async fn a_detach_waits_behind_an_attach_counted_before_it() {
         ]
     );
     drop(joined);
-    drop(held);
+    drop(collector);
 }

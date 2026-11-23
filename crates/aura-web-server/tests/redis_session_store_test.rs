@@ -1677,12 +1677,15 @@ async fn corrupt_skill_record_is_skipped_from_list() {
         .await
         .unwrap();
     // The planted entry shares the store's hash, so the skip below is real.
-    let held: usize = redis::cmd("HLEN")
+    let count_of_entries: usize = redis::cmd("HLEN")
         .arg(&key)
         .query_async(&mut raw)
         .await
         .unwrap();
-    assert_eq!(held, 2, "the store's record and the planted entry");
+    assert_eq!(
+        count_of_entries, 2,
+        "the store's record and the planted entry"
+    );
 
     let listed = skills.list(&log).await.unwrap();
     assert_eq!(listed.len(), 1);

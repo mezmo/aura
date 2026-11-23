@@ -1792,7 +1792,7 @@ async fn drain_waits_for_a_run_already_writing_its_ending() {
 /// arrives after the end still reads it, and is let go after; its session
 /// goes with it, and a later start on the session continues its sequence.
 #[tokio::test(start_paused = true)]
-async fn an_ended_run_is_held_for_the_retention_window() {
+async fn an_ended_run_is_kept_for_the_retention_window() {
     use futures::StreamExt;
 
     let retention = Duration::from_secs(60);
@@ -2925,7 +2925,7 @@ mod spans {
             ..StartRun::new("q")
         };
 
-        let held = h
+        let busy_run = h
             .runtime
             .start(on_chat(tracing::Span::none()))
             .await
@@ -2939,7 +2939,7 @@ mod spans {
         assert_eq!(attribute("session.id").as_deref(), Some("c1"));
         assert_eq!(attribute("session.lane").as_deref(), Some("1"));
         gate.notify_one();
-        h.ended(held).await;
+        h.ended(busy_run).await;
     }
 
     /// A run given `Span::none()` is untraced. The runtime opens no span of

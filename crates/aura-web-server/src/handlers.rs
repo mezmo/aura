@@ -4046,11 +4046,11 @@ source = '{}'
         #[tokio::test]
         async fn a_second_request_on_a_busy_chat_streams_a_full_body() {
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
-            let held = Arc::clone(&gate);
+            let gate_for_first_run = Arc::clone(&gate);
             let runs = AtomicUsize::new(0);
             let mut state = runtime_state(vec![config("solo")], move |_, run| {
                 match runs.fetch_add(1, Ordering::SeqCst) {
-                    0 => gated(&held, run, "answer 1"),
+                    0 => gated(&gate_for_first_run, run, "answer 1"),
                     _ => gated(&Arc::new(tokio::sync::Semaphore::new(1)), run, "answer 2"),
                 }
             });
@@ -4529,9 +4529,9 @@ source = '{}'
         #[tokio::test]
         async fn a_non_streaming_client_that_leaves_does_not_stop_the_run() {
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
-            let held = Arc::clone(&gate);
+            let gate_for_run = Arc::clone(&gate);
             let state = state_over(vec![config("solo")], move |_, run| {
-                gated(&held, run, "late answer")
+                gated(&gate_for_run, run, "late answer")
             });
 
             let mut request = Box::pin(send(&state, chat(None, false)));

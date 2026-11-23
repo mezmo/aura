@@ -237,7 +237,7 @@ async fn a_start_on_a_conversation_with_every_lane_busy_is_refused() {
         ],
     ));
 
-    let held = h
+    let first = h
         .runtime
         .start_attached(on_chat("c1", "q"), Attach::claiming())
         .await
@@ -249,14 +249,14 @@ async fn a_start_on_a_conversation_with_every_lane_busy_is_refused() {
         .unwrap();
     let third = h.runtime.start(on_chat("c1", "q")).await.unwrap();
     let fourth = h.runtime.start(on_chat("c1", "q")).await.unwrap();
-    assert_eq!(h.lane_of(held.run), 0);
+    assert_eq!(h.lane_of(first.run), 0);
     assert_eq!(h.lane_of(third), 2);
     assert_eq!(h.lane_of(fourth), 3);
 
     let expected = [
         BusyLane::RunningAndClaimed {
-            run: held.run,
-            by: held.subscription.observer().id.clone(),
+            run: first.run,
+            by: first.subscription.observer().id.clone(),
         },
         BusyLane::Claimed {
             by: claim.observer().id.clone(),
@@ -283,8 +283,8 @@ async fn a_start_on_a_conversation_with_every_lane_busy_is_refused() {
                      lane 0 running `{}`, claimed by observer `{}`; \
                      lane 1 claimed by observer `{}`; \
                      lane 2 running `{third}`; lane 3 running `{fourth}`",
-                    held.run,
-                    held.subscription.observer().id,
+                    first.run,
+                    first.subscription.observer().id,
                     claim.observer().id,
                 )
             );

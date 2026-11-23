@@ -733,7 +733,7 @@ mod telemetry_command_tests {
     }
 
     #[test]
-    fn recent_lists_held_events() {
+    fn recent_lists_unsent_events() {
         let t = build(TelemetryState::Unknown);
         t.handle.capture(ChatRequestStarted {});
         let out = format_telemetry_recent(&t.handle, 10);

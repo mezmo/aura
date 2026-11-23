@@ -653,7 +653,7 @@ mod tests {
     /// The guard moves to the stream, so the run outlives the handle for as
     /// long as someone is reading it.
     #[tokio::test]
-    async fn the_run_survives_the_handle_while_its_stream_is_held() {
+    async fn the_run_survives_the_handle_while_its_stream_is_read() {
         let (run, cancel) = empty_run();
         let mut events = run.into_events();
 

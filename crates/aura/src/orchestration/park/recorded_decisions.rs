@@ -237,7 +237,7 @@ mod tests {
         assert!(recorded.is_strict(1));
 
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let _held = guard;
+            let _guard = guard;
             panic!("simulated continuation fault");
         }));
         assert!(result.is_err(), "the panic must be caught");
