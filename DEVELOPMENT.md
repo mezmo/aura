@@ -228,6 +228,7 @@ Operational metrics (`crates/aura/src/metrics.rs`, `crates/aura-web-server/src/m
 - Prometheus names are the dotted names with dots as underscores, `_seconds` for `s` units and `_total` on counters: `gen_ai.client.inference.usage.input_tokens` scrapes as `gen_ai_client_inference_usage_input_tokens_total`.
 - Every recording site goes through the functions in `aura::metrics`, which own the attribute vocabulary; labels are config-bounded (agent, provider, model, MCP server key, tool name, ingress, outcome) and never a session, request, run or user id.
 - Local check: `cargo run --bin aura -- webserver`, send one chat completion, then `curl -s localhost:8080/metrics`.
+- Prometheus and Grafana locally: `docker compose -f compose/metrics/metrics.yml up -d` scrapes a host-run server (bind `HOST=0.0.0.0`) or the compose stack and provisions `deployment/grafana/aura-overview.json`, the starter dashboard the Helm chart's scrape wiring (`metrics.*` values) is meant to feed. `deployment/grafana/check-metric-names.sh` checks every metric the dashboard queries against the instruments `aura::metrics` declares.
 
 Orchestrator components and loop:
 

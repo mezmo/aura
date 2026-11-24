@@ -1,0 +1,62 @@
+# compose/metrics/metrics.yml
+# Prometheus + Grafana for looking at aura's /metrics locally.
+#
+# Prometheus scrapes two targets: an aura started on this host (port
+# AURA_HOST_PORT, default 8080) and the aura-web-server service of
+# compose/base.yml. Whichever is not running shows as a down target, nothing
+# else. Grafana provisions the Prometheus datasource and
+# deployment/grafana/aura-overview.json as its home dashboard, with anonymous
+# admin access, so there is no login.
+#
+# Against a host-run server (it must bind 0.0.0.0, the default 127.0.0.1 is
+# unreachable from the Prometheus container):
+#   HOST=0.0.0.0 AURA_METRICS_OTLP=false cargo run --bin aura -- webserver
+#   docker compose -f compose/metrics/metrics.yml up -d
+#   open http://localhost:3000
+# Against the compose stack:
+#   docker compose -f compose/base.yml -f compose/dev.yml -f compose/metrics/metrics.yml up -d
+# A host server on another port (read when the prometheus service is created):
+#   AURA_HOST_PORT=18210 docker compose -f compose/metrics/metrics.yml up -d --force-recreate
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2d
+    configs:
+      - source: prometheus_config
+        target: /etc/prometheus/prometheus.yml
+        mode: 0444
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+
+  grafana:
+    image: grafana/grafana:12.2.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/aura-overview.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../deployment/grafana:/var/lib/grafana/dashboards:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
+
+configs:
+  prometheus_config:
+    content: |
+      global:
+        scrape_interval: 5s
+      scrape_configs:
+        - job_name: aura-host
+          static_configs:
+            - targets: ["host.docker.internal:${AURA_HOST_PORT:-8080}"]
+        - job_name: aura-compose
+          static_configs:
+            - targets: ["aura-web-server:8080"]
