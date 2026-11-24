@@ -58,12 +58,31 @@ pub async fn record_request(request: Request, next: Next) -> Response {
     if let Some(route) = route {
         aura::metrics::record_http_request(
             &route,
-            method.as_str(),
+            method_label(&method),
             response.status().as_u16(),
             started.elapsed(),
         );
     }
     response
+}
+
+/// `http.request.method` for the metrics: one of the methods the HTTP
+/// semconv names, or `_OTHER` for any other token a caller sends, so a
+/// caller-chosen method cannot create a series.
+fn method_label(method: &axum::http::Method) -> &'static str {
+    use axum::http::Method;
+    match *method {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::DELETE => "DELETE",
+        Method::HEAD => "HEAD",
+        Method::OPTIONS => "OPTIONS",
+        Method::PATCH => "PATCH",
+        Method::CONNECT => "CONNECT",
+        Method::TRACE => "TRACE",
+        _ => "_OTHER",
+    }
 }
 
 /// Serve `router` on `addr` until `exit` is cancelled. Binding happens
@@ -102,6 +121,34 @@ mod tests {
     async fn body_text(response: Response) -> String {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_method_outside_the_known_set_is_labelled_other() {
+        aura::metrics::init(false).unwrap();
+        let app = router::<()>().layer(axum::middleware::from_fn(record_request));
+        let request = Request::builder()
+            .method(axum::http::Method::from_bytes(b"PURGE").unwrap())
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let text = body_text(
+            app.oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            text.contains(r#"http_request_method="_OTHER""#),
+            "no _OTHER series in:\n{text}"
+        );
+        assert!(
+            !text.contains("PURGE"),
+            "caller-chosen method leaked into:\n{text}"
+        );
     }
 
     #[tokio::test]

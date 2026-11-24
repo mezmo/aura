@@ -2147,13 +2147,6 @@ impl Orchestrator {
         format!("Current time: {timestamp}\n\n{base}")
     }
 
-    /// Stream a planning call with transient-provider retry and backoff.
-    ///
-    /// Clears the routing decision before each call so the decision-ready
-    /// early-exit cannot observe a decision set by a failed stream. Transient
-    /// provider errors are resent the same prompt after an exponential backoff
-    /// governed by `[orchestration.retry]`; the conversation is never touched
-    /// here because the resent prompt is identical to the failed one. Each
     /// One worker task's outcome and wall-clock, in the metrics. A task
     /// without a specialised worker is labelled `generic`.
     fn record_task_metric(&self, worker_name: Option<&str>, outcome: &str, duration_ms: u64) {
@@ -2177,6 +2170,13 @@ impl Orchestrator {
         crate::metrics::record_routing_decision(&self.agent_build_context.agent.name, decision);
     }
 
+    /// Stream a planning call with transient-provider retry and backoff.
+    ///
+    /// Clears the routing decision before each call so the decision-ready
+    /// early-exit cannot observe a decision set by a failed stream. Transient
+    /// provider errors are resent the same prompt after an exponential backoff
+    /// governed by `[orchestration.retry]`; the conversation is never touched
+    /// here because the resent prompt is identical to the failed one. Each
     /// attempt gets a fresh `per_call_timeout_secs` budget; when that timeout
     /// is nonzero, one coordinator planning call is bounded by
     /// `(max_retries + 1) × per_call_timeout_secs` plus the cumulative

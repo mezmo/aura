@@ -59,7 +59,6 @@ pub struct RunMeasure<'a> {
     pub ingress: Ingress,
     pub role: AgentRole,
     pub orchestration: bool,
-    /// `None` for a run that finished normally.
     pub error_type: Option<&'a str>,
     pub duration: Duration,
     pub inference_calls: Option<u64>,
@@ -581,6 +580,8 @@ mod imp {
             .add(delta, &[kv(AURA_INGRESS, ingress.as_str())]);
     }
 
+    /// A run that finished normally carries no `error.type`; a failed one
+    /// carries the handler's classification of its ending.
     pub fn record_run(run: RunMeasure<'_>) {
         let Some(i) = instruments() else { return };
         let mode = if run.orchestration {
