@@ -2449,19 +2449,63 @@ mod tests {
         }
     }
 
+    thread_local! {
+        static THREAD_WARN_LOG: std::cell::RefCell<Option<Vec<u8>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// A writer into the calling thread's `THREAD_WARN_LOG` buffer.
+    struct ThreadWarnLog;
+
+    impl std::io::Write for ThreadWarnLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            THREAD_WARN_LOG.with_borrow_mut(|log| {
+                if let Some(log) = log {
+                    log.extend_from_slice(bytes);
+                }
+            });
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Capture what `body` logs at WARN and above on this thread, as text.
+    ///
+    /// Tracing caches a callsite's interest on its first hit, from the
+    /// subscriber of the thread that hits it. A thread-local subscriber
+    /// misses an event whose callsite another thread with no subscriber hit
+    /// first, so this captures through a global subscriber that writes each
+    /// line to the emitting thread's buffer and drops lines from threads
+    /// that are not capturing.
+    fn capture_thread_warn_log<R>(body: impl FnOnce() -> R) -> (R, String) {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(|| ThreadWarnLog)
+                    .with_max_level(tracing::Level::WARN)
+                    .with_ansi(false)
+                    .finish(),
+            )
+            .expect("no other global subscriber in the aura lib tests");
+            // A callsite first hit between the subscriber's registration and
+            // its install as the global default is cached as disabled.
+            tracing::callsite::rebuild_interest_cache();
+        });
+
+        THREAD_WARN_LOG.set(Some(Vec::new()));
+        let output = body();
+        let log = THREAD_WARN_LOG.take().unwrap_or_default();
+        (output, String::from_utf8_lossy(&log).into_owned())
+    }
+
     #[test]
     fn webhook_headers_invalid_value_skipped_with_warning_and_no_leak() {
         // A header VALUE with forbidden control characters must be skipped,
         // a warning must be emitted, and the value must NOT appear in the
         // captured log (the header name may).
-        use std::sync::Arc;
-
-        let buf = Arc::new(CapturedLog(std::sync::Mutex::new(Vec::new())));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
 
         // A valid header name paired with a value containing CR/LF (forbidden
         // in field values per RFC 7230) alongside a valid entry that must
@@ -2471,10 +2515,21 @@ mod tests {
             make_req_headers(&[("x-bad", "unique-secret\r\ninvalid"), ("x-valid", "ok")]);
         let headers_from_request = std::collections::HashMap::new();
 
-        let header_map = tracing::subscriber::with_default(subscriber, || {
+        let (header_map, log) = capture_thread_warn_log(|| {
+            // Another thread with no subscriber reaches the same warning
+            // first, as a concurrent test such as
+            // `webhook_headers_invalid_skipped` can.
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    crate::webhook_utils::resolve_headers(
+                        &static_headers,
+                        &headers_from_request,
+                        None,
+                    )
+                });
+            });
             crate::webhook_utils::resolve_headers(&static_headers, &headers_from_request, None)
         });
-        let log = String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string();
 
         // (a) the invalid entry is skipped; the valid one remains.
         assert_eq!(header_map.get("x-valid").unwrap(), "ok");
