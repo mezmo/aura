@@ -103,6 +103,19 @@ pub struct ServerArgs {
     )]
     pub runtime_chat_completions: bool,
 
+    /// Serve the runtime's own routes, which list and read sessions and
+    /// runs, stream their events, and cancel a run (`/v1/sessions`,
+    /// `/v1/runs`). When off, those routes do not exist.
+    /// Accepts the canonical boolean vocabulary (1/0, true/false, yes/no, on/off, t/f, y/n).
+    #[arg(
+        long,
+        env = "AURA_RUNTIME_API",
+        default_value = "false",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
+    pub runtime_api: bool,
+
     /// Dev-only: surface the raw upstream provider error to clients on failure.
     /// Leave OFF for public-facing deployments — provider error bodies can echo
     /// request content. When off, clients get a generic message; the raw error
@@ -246,6 +259,27 @@ fn advertised_base_url(server_url: Option<&str>, host: &str, port: u16) -> Strin
         other => other,
     };
     format!("http://{host}:{port}")
+}
+
+/// The server's own routes, before any layer. The runtime's routes
+/// (`runtime_api::routes`) are among them only when `runtime_api` is on, so
+/// with it off a request for one of them is a 404. They are merged here and
+/// not after the layers, so every layer the caller adds covers them too.
+fn routes(runtime_api: bool) -> Router<Arc<AppState>> {
+    let routes = Router::new()
+        .route("/health", get(handlers::health))
+        .route("/aura/info", get(handlers::info))
+        .route("/v1/models", get(handlers::list_models))
+        .route("/v1/chat/completions", post(handlers::chat_completions))
+        .route(
+            "/v1/approvals/{decision_id}",
+            post(handlers::resolve_approval),
+        );
+    if runtime_api {
+        routes.merge(crate::runtime_api::routes())
+    } else {
+        routes
+    }
 }
 
 /// Middleware that rejects new requests with 503 when shutdown_token is cancelled.
@@ -468,6 +502,14 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             "request-bound"
         }
     );
+    info!(
+        "Runtime API routes: {}",
+        if args.runtime_api {
+            "on (AURA_RUNTIME_API=true)"
+        } else {
+            "off"
+        }
+    );
 
     // HITL webhook HMAC (AURA_HITL_WEBHOOK_SECRET*): fail startup loud on a
     // misconfiguration instead of silently serving unsigned, unverified
@@ -575,15 +617,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         args.host, args.port
     );
 
-    let app = Router::new()
-        .route("/health", get(handlers::health))
-        .route("/aura/info", get(handlers::info))
-        .route("/v1/models", get(handlers::list_models))
-        .route("/v1/chat/completions", post(handlers::chat_completions))
-        .route(
-            "/v1/approvals/{decision_id}",
-            post(handlers::resolve_approval),
-        )
+    let app = routes(args.runtime_api)
         .layer(axum::extract::Extension(handlers::IngressHmac(
             ingress_hmac,
         )))
@@ -739,6 +773,131 @@ mod timeout_warning_tests {
         assert!(server_inactivity_vs_orchestration_warning(30).is_some());
         assert!(server_inactivity_vs_orchestration_warning(1).is_some());
         assert!(server_inactivity_vs_orchestration_warning(0).is_none());
+    }
+}
+
+/// The server's routes, built with the runtime's routes and without them.
+#[cfg(test)]
+mod router_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use aura::runtime::{AgentForRun, AgentRuntime, RunTarget, RuntimeStores, StartRun};
+    use aura::session_store::RunFilter;
+    use aura_events::{EmittingAgent, RunId, SessionId};
+    use aura_test_utils::mock_agent::{MockAgent, Step, items};
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use axum::response::Response;
+    use tower::ServiceExt;
+
+    use crate::types::AppState;
+
+    /// A state with one run on the session `s1`, which has ended, so each
+    /// runtime route has a session or a run to answer for.
+    async fn state_with_an_ended_run() -> (Arc<AppState>, RunId) {
+        let config = aura_config::Config {
+            agent: aura_config::AgentConfig {
+                name: "solo".to_owned(),
+                ..aura_config::AgentConfig::default()
+            },
+            ..aura_config::Config::default()
+        };
+        let mut state = AppState::for_tests(vec![config]);
+        state.runtime = Arc::new(AgentRuntime::over_agents(
+            Arc::clone(&state.configs),
+            None,
+            RuntimeStores::in_memory(),
+            |_, run| {
+                let agent = MockAgent::scripted(vec![Step::item(items::text("answer"))])
+                    .for_run(run)
+                    .with_run_context();
+                Ok(AgentForRun {
+                    agent: Arc::new(agent),
+                    attribution: EmittingAgent::single_agent(),
+                })
+            },
+        ));
+        let state = Arc::new(state);
+        let run = state
+            .runtime
+            .start(StartRun {
+                target: RunTarget::Session(SessionId::new("s1").expect("a session id")),
+                ..StartRun::new("q")
+            })
+            .await
+            .expect("the run starts");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let runs = state
+                    .runtime
+                    .list(&RunFilter::default())
+                    .await
+                    .expect("the run store lists runs");
+                if runs
+                    .iter()
+                    .any(|facts| facts.run.run_id == run && facts.run.status.is_terminal())
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the run ends in time");
+        (state, run)
+    }
+
+    /// One request to each of the seven runtime routes, for `s1` or `run`.
+    fn runtime_requests(run: RunId) -> [(Method, String); 7] {
+        [
+            (Method::GET, "/v1/sessions".to_owned()),
+            (Method::GET, "/v1/sessions/s1".to_owned()),
+            (Method::GET, "/v1/sessions/s1/events".to_owned()),
+            (Method::GET, "/v1/runs".to_owned()),
+            (Method::GET, format!("/v1/runs/{run}")),
+            (Method::GET, format!("/v1/runs/{run}/events")),
+            (Method::POST, format!("/v1/runs/{run}/cancel")),
+        ]
+    }
+
+    async fn send(state: &Arc<AppState>, runtime_api: bool, method: Method, uri: &str) -> Response {
+        super::routes(runtime_api)
+            .with_state(Arc::clone(state))
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("a request"),
+            )
+            .await
+            .expect("the router answers")
+    }
+
+    /// With the flag off the routes do not exist, so each answers axum's
+    /// own 404, with no body, and not the error envelope a missing session
+    /// or run gets.
+    #[tokio::test]
+    async fn with_the_flag_off_each_runtime_route_is_an_empty_404() {
+        let (state, run) = state_with_an_ended_run().await;
+        for (method, uri) in runtime_requests(run) {
+            let response = send(&state, false, method.clone(), &uri).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("the body reads");
+            assert!(body.is_empty(), "{method} {uri}: {body:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn with_the_flag_on_each_runtime_route_answers() {
+        let (state, run) = state_with_an_ended_run().await;
+        for (method, uri) in runtime_requests(run) {
+            let response = send(&state, true, method.clone(), &uri).await;
+            assert_ne!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        }
     }
 }
 

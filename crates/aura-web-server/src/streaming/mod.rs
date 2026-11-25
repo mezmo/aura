@@ -46,6 +46,7 @@ pub use handlers::{
 pub use otel::StreamOtelContext;
 
 // The runtime-backed chat path
+pub(crate) use body::{HEARTBEAT_FRAME, heartbeat, tick};
 pub use body::{HEARTBEAT_INTERVAL, Timeouts, collect_body, sse_body};
 pub use projection::{Ending, Projected, Pulse, SseProjector};
 

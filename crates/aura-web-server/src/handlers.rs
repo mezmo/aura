@@ -2082,7 +2082,7 @@ fn unauthorized_response() -> Response {
     )
 }
 
-fn error_response(
+pub(crate) fn error_response(
     status: StatusCode,
     message: impl Into<String>,
     error_type: impl Into<String>,
