@@ -1,7 +1,7 @@
 //! In-memory (single-process) implementations of the session-store
 //! capabilities: the default backend, with all state scoped to the process.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -15,8 +15,8 @@ use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError, Ti
 
 use super::{
     ApprovalStore, EventBus, JournalEntry, JournalStore, MAX_SKILL_RECORDS_PER_LOG, RunFacts,
-    RunFilter, RunStore, SessionStoreError, SkillInvocationRecord, SkillInvocationStore,
-    SkillLogKey, Subscription,
+    RunFilter, RunStore, SessionFilter, SessionRuns, SessionStoreError, SkillInvocationRecord,
+    SkillInvocationStore, SkillLogKey, Subscription,
 };
 
 /// Buffered payloads per topic before slow subscribers start lagging.
@@ -439,12 +439,67 @@ impl JournalStore for InMemoryJournalStore {
 }
 
 /// A [`RunStore`] in this process: each run's facts in a map ordered by run
-/// id.
+/// id, with each session's run ids beside it.
 pub struct InMemoryRunStore {
     // `std::sync::Mutex`: every operation is a synchronous map op; nothing
     // awaits while holding the lock.
-    runs: Mutex<BTreeMap<RunId, RunFacts>>,
+    runs: Mutex<StoredRuns>,
     max_runs: usize,
+}
+
+/// The runs an [`InMemoryRunStore`] keeps.
+#[derive(Default)]
+struct StoredRuns {
+    /// Each run's facts, by run id.
+    by_id: BTreeMap<RunId, RunFacts>,
+    /// The ids of each session's runs, by session id.
+    by_session: BTreeMap<SessionId, BTreeSet<RunId>>,
+}
+
+impl StoredRuns {
+    /// Keeps `facts` in place of any facts of the same run. A run keeps the
+    /// session it started on, so its id is filed under that session once.
+    fn insert(&mut self, facts: &RunFacts) {
+        let id = facts.run.run_id;
+        self.by_id.insert(id, facts.clone());
+        self.by_session
+            .entry(facts.session_id())
+            .or_default()
+            .insert(id);
+    }
+
+    /// Lets the run go, and its session's entry once that holds no run.
+    fn remove(&mut self, id: &RunId) {
+        let Some(facts) = self.by_id.remove(id) else {
+            return;
+        };
+        let session = facts.session_id();
+        if let Some(ids) = self.by_session.get_mut(&session) {
+            ids.remove(id);
+            if ids.is_empty() {
+                self.by_session.remove(&session);
+            }
+        }
+    }
+
+    /// The session whose runs are `ids`, read as [`SessionRuns::push`]
+    /// would read them pushed in the order they started: its newest run,
+    /// and the newest run before it that has ended. Only those two are
+    /// copied.
+    fn session_runs(&self, ids: &BTreeSet<RunId>) -> Option<SessionRuns> {
+        let mut newest_first = ids.iter().rev().filter_map(|id| self.by_id.get(id));
+        let newest = newest_first.next()?;
+        Some(
+            match newest_first.find(|facts| facts.run.status.is_terminal()) {
+                Some(previous_ended) => {
+                    let mut runs = SessionRuns::new(previous_ended.clone());
+                    runs.push(newest.clone());
+                    runs
+                }
+                None => SessionRuns::new(newest.clone()),
+            },
+        )
+    }
 }
 
 impl Default for InMemoryRunStore {
@@ -465,12 +520,12 @@ impl InMemoryRunStore {
     #[must_use]
     pub fn with_bounds(max_runs: usize) -> Self {
         Self {
-            runs: Mutex::new(BTreeMap::new()),
+            runs: Mutex::new(StoredRuns::default()),
             max_runs: max_runs.max(1),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<RunId, RunFacts>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, StoredRuns> {
         self.runs.lock().expect("run store lock poisoned")
     }
 }
@@ -482,12 +537,13 @@ impl RunStore for InMemoryRunStore {
     /// map's first entries are the oldest.
     async fn put(&self, facts: &RunFacts) -> Result<(), SessionStoreError> {
         let mut runs = self.lock();
-        runs.insert(facts.run.run_id, facts.clone());
-        if runs.len() > self.max_runs {
+        runs.insert(facts);
+        if runs.by_id.len() > self.max_runs {
             let evict = runs
+                .by_id
                 .iter()
                 .find(|(_, facts)| facts.run.status.is_terminal())
-                .or_else(|| runs.iter().next())
+                .or_else(|| runs.by_id.iter().next())
                 .map(|(id, _)| *id);
             if let Some(evict) = evict {
                 runs.remove(&evict);
@@ -497,7 +553,7 @@ impl RunStore for InMemoryRunStore {
     }
 
     async fn get(&self, run: &RunId) -> Result<Option<RunFacts>, SessionStoreError> {
-        Ok(self.lock().get(run).cloned())
+        Ok(self.lock().by_id.get(run).cloned())
     }
 
     async fn list(&self, filter: &RunFilter) -> Result<Vec<RunFacts>, SessionStoreError> {
@@ -506,11 +562,41 @@ impl RunStore for InMemoryRunStore {
         let start = filter.after.map_or(Bound::Unbounded, Bound::Excluded);
         Ok(self
             .lock()
+            .by_id
             .range((start, Bound::Unbounded))
             .map(|(_, facts)| facts)
             .filter(|facts| filter.matches(facts))
             .take(filter.limit)
             .cloned()
+            .collect())
+    }
+
+    async fn newest_per_session(
+        &self,
+        filter: &SessionFilter,
+    ) -> Result<Vec<SessionRuns>, SessionStoreError> {
+        use std::ops::Bound;
+
+        // Sessions in id order, past `after`, or only the filter's session:
+        // a read of one session touches only that session's runs, and a
+        // page stops at its limit.
+        let start = match (&filter.session, &filter.after) {
+            (Some(session), _) => Bound::Included(session),
+            (None, Some(after)) => Bound::Excluded(after),
+            (None, None) => Bound::Unbounded,
+        };
+        let end = filter
+            .session
+            .as_ref()
+            .map_or(Bound::Unbounded, Bound::Included);
+        let runs = self.lock();
+        Ok(runs
+            .by_session
+            .range::<SessionId, _>((start, end))
+            .filter(|(id, _)| filter.after.as_ref().is_none_or(|after| *id > after))
+            .filter_map(|(_, ids)| runs.session_runs(ids))
+            .filter(|session| filter.matches(session))
+            .take(filter.limit)
             .collect())
     }
 
@@ -611,7 +697,7 @@ mod tests {
     use crate::hitl::{
         AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, PROTOCOL_VERSION,
     };
-    use crate::session_store::{RunDetails, RunStatus};
+    use crate::session_store::{RunDetails, RunStatus, RunStatuses};
 
     fn parked(request_id: &str) -> ParkedApproval {
         let now = chrono::Utc::now();
@@ -1375,7 +1461,8 @@ mod tests {
             store.get(&run_id(1)).await.unwrap(),
             Some(facts(1, "sess-1", Running))
         );
-        assert_eq!(store.lock().len(), 1);
+        assert_eq!(store.lock().by_id.len(), 1);
+        assert_eq!(store.lock().by_session.len(), 1);
     }
 
     #[tokio::test]
@@ -1545,6 +1632,32 @@ mod tests {
         assert_eq!(listed(&store, RunFilter::default()).await, vec![2, 3]);
     }
 
+    /// A session all of whose runs the store let go is no longer listed,
+    /// and one that keeps some is listed by the runs it keeps.
+    #[tokio::test]
+    async fn newest_per_session_follows_the_runs_the_store_lets_go() {
+        use RunStatus::*;
+        let store = InMemoryRunStore::with_bounds(2);
+        store.put(&facts(1, "s1", Finished)).await.unwrap();
+        store.put(&facts(2, "s2", Finished)).await.unwrap();
+        store.put(&facts(3, "s2", Running)).await.unwrap();
+        assert_eq!(
+            newest(&store, SessionFilter::default()).await,
+            vec![(facts(3, "s2", Running), Some(run_id(2)))]
+        );
+
+        store.put(&facts(4, "s3", Running)).await.unwrap();
+
+        assert_eq!(
+            newest(&store, SessionFilter::default()).await,
+            vec![
+                (facts(3, "s2", Running), None),
+                (facts(4, "s3", Running), None),
+            ]
+        );
+        assert_eq!(store.lock().by_session.len(), 2);
+    }
+
     #[tokio::test]
     async fn run_store_bound_of_zero_keeps_one() {
         use RunStatus::*;
@@ -1553,5 +1666,235 @@ mod tests {
         store.put(&facts(2, "sess-a", Finished)).await.unwrap();
 
         assert_eq!(listed(&store, RunFilter::default()).await, vec![2]);
+    }
+
+    /// Run `n` on lane `lane` of the conversation between `chat` and the
+    /// agent `agent`.
+    fn on_lane(n: u128, chat: &str, lane: u8, status: RunStatus) -> RunFacts {
+        use crate::conversation::{Conversation, Lane, LaneNumber};
+
+        RunFacts {
+            session: RunSession::Lane(Lane::new(
+                Conversation::new(SessionId::new(chat).unwrap(), "agent"),
+                LaneNumber::new(lane).unwrap(),
+            )),
+            ..facts(n, "unused", status)
+        }
+    }
+
+    async fn store_holding(runs: &[RunFacts]) -> InMemoryRunStore {
+        let store = InMemoryRunStore::new();
+        for run in runs {
+            store.put(run).await.unwrap();
+        }
+        store
+    }
+
+    /// Each row the store lists, as its newest run and its previous ended
+    /// run.
+    async fn newest(
+        store: &InMemoryRunStore,
+        filter: SessionFilter,
+    ) -> Vec<(RunFacts, Option<RunId>)> {
+        store
+            .newest_per_session(&filter)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(SessionRuns::into_parts)
+            .collect()
+    }
+
+    /// Runs are grouped by session id. A lane is a session of its own, and a
+    /// plain session named for the chat is apart from the chat's lanes.
+    #[tokio::test]
+    async fn newest_per_session_groups_runs_by_session_with_each_lane_apart() {
+        use RunStatus::*;
+        let store = store_holding(&[
+            facts(1, "c1", Finished),
+            on_lane(2, "c1", 0, Finished),
+            on_lane(3, "c1", 1, Running),
+            on_lane(4, "c1", 0, Running),
+            facts(5, "b", Finished),
+        ])
+        .await;
+
+        assert_eq!(
+            newest(&store, SessionFilter::default()).await,
+            vec![
+                (facts(5, "b", Finished), None),
+                (facts(1, "c1", Finished), None),
+                (on_lane(4, "c1", 0, Running), Some(run_id(2))),
+                (on_lane(3, "c1", 1, Running), None),
+            ]
+        );
+    }
+
+    /// The newest run is the one with the greatest run id, whatever order the
+    /// runs were put in. The previous ended run is the newest of the older
+    /// runs that has ended, which is not always the run just before it.
+    #[tokio::test]
+    async fn newest_per_session_takes_the_newest_run_and_the_newest_ended_run_before_it() {
+        use RunStatus::*;
+        let store = store_holding(&[
+            facts(4, "s1", Preparing),
+            facts(2, "s1", Cancelled),
+            facts(7, "s3", Finished),
+            facts(1, "s1", Finished),
+            facts(6, "s2", Failed),
+            facts(3, "s1", Running),
+            facts(5, "s2", Parked),
+        ])
+        .await;
+
+        assert_eq!(
+            newest(&store, SessionFilter::default()).await,
+            vec![
+                (facts(4, "s1", Preparing), Some(run_id(2))),
+                (facts(6, "s2", Failed), Some(run_id(5))),
+                (facts(7, "s3", Finished), None),
+            ]
+        );
+    }
+
+    /// Each session here has an older run that matches the filter and a
+    /// newest run that does not, or the other way round. Only the newest run
+    /// counts.
+    #[tokio::test]
+    async fn newest_per_session_filters_on_the_newest_run_only() {
+        use RunStatus::*;
+        let mut by_old = facts(3, "s-agent", Finished);
+        by_old.run.agent = "old".to_owned();
+        let mut waited = facts(5, "s-approval", Finished);
+        waited.run.pending_approvals = vec![DecisionId::generate()];
+        let status_newest = facts(2, "s-status", Running);
+        let agent_newest = facts(4, "s-agent", Finished);
+        let approval_newest = facts(6, "s-approval", Finished);
+        // A start on a lane's session id runs on that session as a plain
+        // session, so one session id can have a lane run and a plain run.
+        let lane_newest = facts(8, "c1:agent:0", Finished);
+        let store = store_holding(&[
+            facts(1, "s-status", Finished),
+            status_newest.clone(),
+            by_old,
+            agent_newest.clone(),
+            waited,
+            approval_newest.clone(),
+            on_lane(7, "c1", 0, Finished),
+            lane_newest.clone(),
+        ])
+        .await;
+        let previous = |n| Some(run_id(n));
+
+        assert_eq!(
+            newest(
+                &store,
+                SessionFilter {
+                    statuses: Some(RunStatuses::just(Finished)),
+                    ..SessionFilter::default()
+                }
+            )
+            .await,
+            vec![
+                (lane_newest.clone(), previous(7)),
+                (agent_newest.clone(), previous(3)),
+                (approval_newest.clone(), previous(5)),
+            ]
+        );
+        assert_eq!(
+            newest(
+                &store,
+                SessionFilter {
+                    agent: Some("old".to_owned()),
+                    ..SessionFilter::default()
+                }
+            )
+            .await,
+            vec![]
+        );
+        assert_eq!(
+            newest(
+                &store,
+                SessionFilter {
+                    pending_approval: Some(true),
+                    ..SessionFilter::default()
+                }
+            )
+            .await,
+            vec![]
+        );
+        assert_eq!(
+            newest(
+                &store,
+                SessionFilter {
+                    chat: Some(SessionId::new("c1").unwrap()),
+                    ..SessionFilter::default()
+                }
+            )
+            .await,
+            vec![]
+        );
+        assert_eq!(
+            newest(
+                &store,
+                SessionFilter {
+                    session: Some(SessionId::new("s-status").unwrap()),
+                    ..SessionFilter::default()
+                }
+            )
+            .await,
+            vec![(status_newest, previous(1))]
+        );
+    }
+
+    /// Rows come in session-id order whatever order the runs started in.
+    /// `after` starts the listing after an id, whether or not the store holds
+    /// that id, and `limit` counts the rows the filter selects.
+    #[tokio::test]
+    async fn newest_per_session_pages_in_session_id_order() {
+        use RunStatus::*;
+        let store = store_holding(&[
+            facts(1, "s3", Finished),
+            facts(2, "s1", Finished),
+            facts(3, "s5", Finished),
+            facts(4, "s2", Finished),
+            facts(5, "s4", Finished),
+            facts(6, "s2a", Running),
+        ])
+        .await;
+        let page = |after: Option<&str>, limit| SessionFilter {
+            statuses: Some(RunStatuses::just(Finished)),
+            limit,
+            after: after.map(|after| SessionId::new(after).unwrap()),
+            ..SessionFilter::default()
+        };
+
+        assert_eq!(
+            newest(&store, page(None, 2)).await,
+            vec![
+                (facts(2, "s1", Finished), None),
+                (facts(4, "s2", Finished), None),
+            ]
+        );
+        assert_eq!(
+            newest(&store, page(Some("s2"), 2)).await,
+            vec![
+                (facts(1, "s3", Finished), None),
+                (facts(5, "s4", Finished), None),
+            ]
+        );
+        assert_eq!(
+            newest(&store, page(Some("s2b"), 2)).await,
+            vec![
+                (facts(1, "s3", Finished), None),
+                (facts(5, "s4", Finished), None),
+            ]
+        );
+        assert_eq!(
+            newest(&store, page(Some("s4"), 2)).await,
+            vec![(facts(3, "s5", Finished), None)]
+        );
+        assert_eq!(newest(&store, page(Some("s5"), 2)).await, vec![]);
+        assert_eq!(newest(&store, page(None, 0)).await, vec![]);
     }
 }

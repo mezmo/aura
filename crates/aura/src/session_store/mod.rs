@@ -43,7 +43,10 @@ pub use memory::{
     InMemorySkillInvocationStore,
 };
 pub use record::{DecisionRecord, InvalidRecord, OriginRecord, ParkedApprovalRecord, ScopeRecord};
-pub use run_record::{DEFAULT_RUN_LIST_LIMIT, RunDetails, RunFacts, RunFilter, RunStatus};
+pub use run_record::{
+    DEFAULT_RUN_LIST_LIMIT, DEFAULT_SESSION_LIST_LIMIT, RunDetails, RunFacts, RunFilter, RunStatus,
+    RunStatuses, SessionFilter, SessionRuns,
+};
 pub use skill_record::{
     SKILL_INVOCATION_RECORD_VERSION, SkillInvocation, SkillInvocationRecord, SkillRecordDecodeError,
 };
@@ -265,6 +268,25 @@ pub trait RunStore: Send + Sync {
     /// When [`RunFilter::after`] is set, only runs after that id are listed,
     /// so the last id of one page gets the next page.
     async fn list(&self, filter: &RunFilter) -> Result<Vec<RunFacts>, SessionStoreError>;
+
+    /// Lists sessions, one row for each session id, each with its newest
+    /// run.
+    ///
+    /// Runs are grouped by [`RunFacts::session_id`]. Each lane of a
+    /// conversation has a session id of its own, so a conversation with
+    /// runs on two lanes is two rows, not one.
+    ///
+    /// The filter is applied to each session's newest run only. A session
+    /// whose newest run does not match is left out, even when one of its
+    /// older runs would have matched.
+    ///
+    /// The first matching rows come back in session-id order, at most
+    /// [`SessionFilter::limit`] of them. To page, pass the last row's session
+    /// id as [`SessionFilter::after`], and the listing starts after that id.
+    async fn newest_per_session(
+        &self,
+        filter: &SessionFilter,
+    ) -> Result<Vec<SessionRuns>, SessionStoreError>;
 
     /// Stores the facts of a run that has ended. `terminal` is the run's last
     /// journal event, already appended and numbered.
