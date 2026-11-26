@@ -7,12 +7,6 @@ NEXTEST_BIN = $(CARGO_BIN_DIR)/cargo-nextest
 NEXTEST_VERSION ?= 0.9.133
 GRCOV_VERSION ?= v0.10.7
 GRCOV_BIN = $(CARGO_BIN_DIR)/grcov
-HAKARI_VERSION ?= 0.9.39
-HAKARI_SHA256_LINUX_AMD64 ?= 699a3193a9bd1a8d914b970d3f50f3385f24fbd8b1294d0c0ff31fbe7c2c9f48
-HAKARI_SHA256_LINUX_ARM64 ?= c92f6c556e84f00da1ea0a26217eea5be3d701f1ee9d24a04066a46b65886fbc
-HAKARI_SHA256_DARWIN ?= c1f84026b805cc7fb31c271e8b0720abadb8d9416d126c76d6fc50a2a147d7f9
-HAKARI_BIN = $(CARGO_BIN_DIR)/cargo-hakari-$(HAKARI_VERSION)-$(if $(filter true,$(ENABLE_DOCKER)),docker,native)
-HAKARI = $(if $(filter true,$(AURA_AUTO_DOWNLOAD)),$(HAKARI_BIN),cargo hakari)
 PATH := $(CARGO_BIN_DIR):$(PATH)
 AURA_RELEASE :=
 
@@ -121,17 +115,17 @@ update-lockfile: $(DOCKER_ENV) ## Regenerate Cargo.lock after version changes
 # hakari reads the dependency graph and never compiles, so it strips the
 # sccache wrapper for the same reason as update-lockfile.
 .PHONY:hakari
-hakari: $(DOCKER_ENV) $(HAKARI_BIN) ## Regenerate crates/workspace-hack after a dependency or feature change
-	$(RUN) env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER $(HAKARI) generate
-	$(RUN) env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER $(HAKARI) manage-deps --yes
+hakari: $(DOCKER_ENV) ## Regenerate crates/workspace-hack after a dependency or feature change
+	$(RUN) env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo hakari generate
+	$(RUN) env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo hakari manage-deps --yes
 
 .PHONY:lint-hakari
-lint-hakari: $(DOCKER_ENV) $(HAKARI_BIN) ## Fail when crates/workspace-hack is out of date
+lint-hakari: $(DOCKER_ENV) ## Fail when crates/workspace-hack is out of date
 	@# hakari's own metadata call would rewrite a stale Cargo.lock, so the
 	@# lock is checked first.
 	$(RUN) env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo metadata --locked --format-version 1 > /dev/null
-	$(RUN) env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER $(HAKARI) generate --diff
-	$(RUN) env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER $(HAKARI) manage-deps --dry-run
+	$(RUN) env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo hakari generate --diff
+	$(RUN) env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo hakari manage-deps --dry-run
 
 .PHONY:clean-rust
 clean-rust: ## Clean up rust build artifacts
@@ -152,7 +146,7 @@ clean-profile: ## Clean artifacts left over from profiling
 
 .PHONY:clean-bin
 clean-bin: $(DOCKER_ENV) ## Cleanup the binaries added by aura
-	$(RUN_NO_ENV) rm -f $(NEXTEST_BIN) $(GRCOV_BIN) $(CARGO_BIN_DIR)/cargo-hakari-*
+	$(RUN_NO_ENV) rm -f $(NEXTEST_BIN) $(GRCOV_BIN)
 
 .PHONY:fmt-rust
 fmt-rust:: $(REPORT_DIR)                 ## Format code with rustfmt
@@ -383,11 +377,3 @@ $(GRCOV_BIN): | $(CARGO_BIN_DIR)
 	curl -LsSf "https://github.com/mozilla/grcov/releases/download/$(GRCOV_VERSION)/grcov-$$target.tar.bz2" | tar xjf - -C $(CARGO_BIN_DIR); \
 	chmod +x "$@"; \
 	touch "$@"
-
-# The install runs where the binary will run, through $(RUN_NO_ENV), and the
-# file name separates native from container binaries.
-$(HAKARI_BIN): | $(CARGO_BIN_DIR)
-	@if [ "$(AURA_AUTO_DOWNLOAD)" = "true" ]; then \
-		$(RUN_NO_ENV) sh scripts/install-cargo-hakari.sh $(HAKARI_VERSION) $@ \
-			$(HAKARI_SHA256_LINUX_AMD64) $(HAKARI_SHA256_LINUX_ARM64) $(HAKARI_SHA256_DARWIN); \
-	fi
