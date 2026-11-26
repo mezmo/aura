@@ -164,6 +164,12 @@ pipeline {
           }
         } // end rustfmt
 
+        stage("Workspace Hack Check") {
+          steps {
+            sh "make lint-hakari"
+          }
+        } // end workspace-hack
+
         stage("Docker Lint") {
           steps {
             withChecks('hadolint') {

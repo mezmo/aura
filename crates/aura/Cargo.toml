@@ -72,6 +72,7 @@ strum = { workspace = true }
 tiktoken-rs = "0.9.1"
 # Exact local Gemini tokenizer (embeds the Gemma 3 SentencePiece model)
 gemini-tokenizer = "0.2.0"
+workspace-hack.workspace = true
 
 [features]
 default = ["otel"]

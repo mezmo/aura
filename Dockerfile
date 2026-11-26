@@ -70,8 +70,9 @@ COPY crates/aura-telemetry/Cargo.toml crates/aura-telemetry/Cargo.toml
 COPY crates/aura-telemetry-derive/Cargo.toml crates/aura-telemetry-derive/Cargo.toml
 COPY crates/aura-test-utils/Cargo.toml crates/aura-test-utils/Cargo.toml
 COPY crates/aura-web-server/Cargo.toml crates/aura-web-server/Cargo.toml
+COPY crates/workspace-hack/Cargo.toml crates/workspace-hack/build.rs crates/workspace-hack/
 # cargo chef needs a target file for every workspace manifest.
-RUN for crate in aura aura-cli aura-config aura-events aura-telemetry aura-telemetry-derive aura-test-utils aura-web-server; do \
+RUN for crate in aura aura-cli aura-config aura-events aura-telemetry aura-telemetry-derive aura-test-utils aura-web-server workspace-hack; do \
       mkdir -p "crates/$crate/src" && \
       printf 'pub fn _chef_stub() {}\n' > "crates/$crate/src/lib.rs"; \
     done && \

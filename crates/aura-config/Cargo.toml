@@ -33,6 +33,7 @@ tempfile = "3"
 
 # Grammar for GlobPattern config validation
 peg = "0.8.6"
+workspace-hack.workspace = true
 
 [features]
 test_util = []
