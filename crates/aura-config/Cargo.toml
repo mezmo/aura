@@ -17,6 +17,7 @@ clap = { workspace = true }
 # Error handling
 thiserror = { workspace = true }
 http = { workspace = true }
+url = "2"
 
 # Logging
 tracing = { workspace = true }

@@ -19,6 +19,8 @@ aws-sdk-bedrockagentruntime = { workspace = true }
 aws-smithy-types = { workspace = true }
 
 rmcp = { workspace = true }
+# A2A wire types for the remote-agent (sender) client
+a2a = { workspace = true }
 base64 = "0.22"
 bytes = "1"
 futures = "0.3"

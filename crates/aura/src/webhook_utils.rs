@@ -36,11 +36,8 @@ pub fn resolve_headers(
     let empty = HashMap::new();
     let req_headers = req_headers.unwrap_or(&empty);
 
-    let mut resolved: HashMap<String, String> = static_headers
-        .iter()
-        .map(|(k, v)| (k.to_lowercase(), v.clone()))
-        .collect();
-    let resolved_count = crate::rig_builder::apply_request_header_mappings(
+    let mut resolved = static_headers.clone();
+    let resolved_count = crate::rig_builder::overlay_request_headers(
         &mut resolved,
         headers_from_request,
         req_headers,
