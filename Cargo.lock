@@ -258,6 +258,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -298,6 +299,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width 0.2.2",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -318,6 +320,7 @@ dependencies = [
  "toml 0.8.23",
  "toml_edit 0.22.27",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -347,6 +350,7 @@ dependencies = [
  "trybuild",
  "uuid",
  "wiremock",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -370,6 +374,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -418,6 +423,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wiremock",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6051,6 +6057,66 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "workspace-hack"
+version = "0.2.20"
+dependencies = [
+ "aho-corasick",
+ "bitflags",
+ "bstr",
+ "bytes",
+ "cc",
+ "chrono",
+ "clap",
+ "clap_builder",
+ "either",
+ "errno",
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+ "getrandom 0.2.17",
+ "getrandom 0.4.2",
+ "hyper 1.9.0",
+ "hyper-rustls 0.27.9",
+ "hyper-util",
+ "libc",
+ "log",
+ "memchr",
+ "mime_guess",
+ "mio",
+ "num-integer",
+ "num-traits",
+ "peg-runtime",
+ "percent-encoding",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "regex-automata",
+ "regex-syntax",
+ "reqwest",
+ "rustix",
+ "rustls 0.23.40",
+ "rustls-webpki 0.103.13",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "slab",
+ "smallvec",
+ "syn 2.0.117",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-stream",
+ "tokio-util",
+ "toml_datetime 0.6.11",
+ "tower 0.5.3",
+ "tower-http",
+ "tracing",
+ "tracing-core",
 ]
 
 [[package]]

@@ -1,0 +1,26 @@
+hakari-package = "workspace-hack"
+
+# Version 4 needs cargo-hakari 0.9.22 or newer.
+dep-format-version = "4"
+
+resolver = "2"
+
+# Keep in step with the release targets in `.makefiles/rust.mk`.
+platforms = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+# Check, release and cross builds compile host and target units separately,
+# so copying target features onto the host would build both sides twice.
+unify-target-host = "unify-if-both"
+
+workspace-hack-line-style = "workspace-dotted"
+
+# aura-events depends only on serde, serde_json and uuid by default. A proc
+# macro's dependencies build on the host, so a workspace-hack dependency on
+# aura-telemetry-derive would compile the whole hack for the host.
+[final-excludes]
+workspace-members = ["aura-events", "aura-telemetry-derive"]

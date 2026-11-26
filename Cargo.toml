@@ -8,6 +8,7 @@ members = [
     "crates/aura-web-server",
     "crates/aura-test-utils",
     "crates/aura-cli",
+    "crates/workspace-hack",
 ]
 default-members = [
     "crates/aura",
@@ -37,6 +38,7 @@ repository = "https://github.com/mezmo/aura"
 strip = "symbols"
 
 [workspace.dependencies]
+workspace-hack = { path = "crates/workspace-hack" }
 rig-core = { git = "https://github.com/mezmo/rig.git", rev = "097d08d6188c76debabedddd2ac65ca5bffd2863", default-features = false, features = ["rmcp", "reqwest-rustls"] }
 # The fork's vendored copy (versioned "0.3.10" but carrying prompt-caching
 # support beyond the crates.io release of that number), building against the

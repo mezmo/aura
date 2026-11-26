@@ -20,6 +20,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 # Resolves the user home dir on every platform (USERPROFILE on Windows,
 # HOME on Unix) so the install-id co-locates with the CLI's ~/.aura.
 dirs = "6"
+workspace-hack.workspace = true
 
 [dev-dependencies]
 tempfile = "3.10"

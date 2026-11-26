@@ -13,3 +13,4 @@ serde_json = { workspace = true }
 async-trait = "0.1"
 futures = "0.3"
 tokio-util = "0.7"
+workspace-hack.workspace = true
