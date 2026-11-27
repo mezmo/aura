@@ -32,6 +32,11 @@ authors = ["Mezmo <support@mezmo.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/mezmo/aura"
 
+[profile.dev]
+# Backtraces keep file and line. Inspecting locals in a debugger needs
+# `debug = true`.
+debug = "line-tables-only"
+
 [profile.release]
 # Stripping is the only size optimization worth its build cost; see #668 for
 # the lto / codegen-units measurements.
