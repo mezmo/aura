@@ -55,6 +55,8 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry-prometheus = { workspace = true, optional = true }
+prometheus = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
 chrono = { version = "0.4", features = ["serde"] }
 
@@ -76,7 +78,7 @@ workspace-hack.workspace = true
 
 [features]
 default = ["otel"]
-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "dep:tonic"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "dep:tonic", "dep:opentelemetry-prometheus", "dep:prometheus"]
 # Test seams for other crates' tests: `AgentRuntime::over_agents`, a runtime
 # over agents the test supplies, and the public `test_span_capture` (with
 # `otel`). Enable it only from `[dev-dependencies]`.

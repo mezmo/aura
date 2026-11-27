@@ -952,7 +952,13 @@ mod tests {
                 .unwrap(),
         );
         let counter = TiktokenCounter::default_counter();
-        let budget = ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            Arc::new(counter),
+        );
         let scratchpad = ScratchpadMiddleware::new(
             HashMap::from([("big_tool".to_string(), 10_usize)]),
             storage,

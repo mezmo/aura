@@ -54,6 +54,7 @@ mod factory;
 mod frame_validation_tests;
 mod observer_wrapper;
 mod orchestrator;
+pub(crate) use orchestrator::{is_context_overflow_error, is_max_depth_error};
 mod overview;
 mod park;
 mod persistence;

@@ -134,6 +134,9 @@ pub(crate) fn scratchpad_usage_event(
 pub struct PreparedAgent {
     pub(crate) inner: ProviderAgent,
     pub(crate) model: String,
+    /// How the agent's metrics name it: `[agent].name`, or the worker's name
+    /// under orchestration, beside the config's.
+    pub(crate) agent_labels: crate::metrics::AgentLabels,
     pub(crate) max_depth: usize,
     pub(crate) mcp_manager: Option<Arc<crate::mcp::McpManager>>,
     /// Whether Ollama text-to-tool parsing is on.
@@ -189,6 +192,91 @@ pub struct Agent {
     events: Mutex<Option<mpsc::Receiver<AgentEvent>>>,
     /// The run's one stream through [`StreamingAgent::stream`].
     stream_claim: crate::streaming::StreamClaim,
+}
+
+/// `error.type` of a failed LLM turn, from the stream error's shape: the
+/// cases the orchestrator already tells apart, a cancellation, and the rest.
+fn inference_error_type(error: &(dyn std::error::Error + Send + Sync)) -> &'static str {
+    if crate::orchestration::is_context_overflow_error(error) {
+        "context_overflow"
+    } else if crate::orchestration::is_max_depth_error(error) {
+        "max_depth"
+    } else if error.to_string().to_ascii_lowercase().contains("cancel") {
+        "cancelled"
+    } else {
+        "stream_error"
+    }
+}
+
+/// Record every LLM turn of `stream` in the inference metrics under `labels`
+/// and, when `usage` is the run's, count it there. A turn is one `TurnUsage`
+/// item, which the provider stream yields for tool-call turns and text turns
+/// alike, after the turn's tool calls: rig runs each tool inside the provider
+/// stream, between the `ToolCall` item and its `ToolResult`, and yields the
+/// turn's usage once the provider's response is complete. A turn's duration
+/// therefore runs from the stream's creation, or from the previous turn's
+/// usage item, to its own usage item, less the time between each tool call
+/// and its result, so it spans the provider call and the streaming of its
+/// response and leaves the tool execution out. An `Err` item is the turn
+/// that failed: it is recorded with an `error.type` and no tokens, since the
+/// provider reported none.
+fn meter_turns(
+    labels: crate::metrics::InferenceLabels,
+    stream: Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
+    usage: Option<crate::UsageState>,
+) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
+    use crate::provider_agent::{StreamedAssistantContent, StreamedUserContent};
+    use tokio::time::{Duration, Instant};
+
+    let mut turn_started = Instant::now();
+    let mut tool_started: Option<Instant> = None;
+    let mut tool_time = Duration::ZERO;
+    Box::pin(stream.map(move |item| {
+        match &item {
+            Ok(StreamItem::TurnUsage(turn, cache)) => {
+                let duration = turn_started.elapsed().saturating_sub(tool_time);
+                crate::metrics::record_inference(&labels, None, duration);
+                crate::metrics::record_token_usage(
+                    &labels,
+                    crate::metrics::TokenMeasure {
+                        input: turn.input_tokens,
+                        output: turn.output_tokens,
+                        cache_read: cache.map(|c| c.cache_read_input_tokens).unwrap_or(0),
+                        cache_write: cache.map(|c| c.cache_creation_input_tokens).unwrap_or(0),
+                    },
+                );
+                if let Some(usage) = &usage {
+                    usage.count_turn();
+                }
+                turn_started = Instant::now();
+                tool_started = None;
+                tool_time = Duration::ZERO;
+            }
+            Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(_))) => {
+                tool_started = Some(Instant::now());
+            }
+            Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(_))) => {
+                if let Some(started) = tool_started.take() {
+                    tool_time += started.elapsed();
+                }
+            }
+            Err(error) => {
+                if let Some(started) = tool_started.take() {
+                    tool_time += started.elapsed();
+                }
+                let duration = turn_started.elapsed().saturating_sub(tool_time);
+                crate::metrics::record_inference(
+                    &labels,
+                    Some(inference_error_type(error.as_ref())),
+                    duration,
+                );
+                turn_started = Instant::now();
+                tool_time = Duration::ZERO;
+            }
+            _ => {}
+        }
+        item
+    }))
 }
 
 /// A run reads its prepared agent's fields and calls its methods directly, so
@@ -304,6 +392,7 @@ impl PreparedAgent {
         ) + mcp_tool_tokens;
 
         let build = scratchpad::build_scratchpad(scratchpad::ScratchpadBuildInputs {
+            agent: build_context.agent_labels(),
             sp_cfg: &sp_cfg,
             storage_dir: std::path::Path::new(&memory_dir),
             read_root: None,
@@ -357,9 +446,9 @@ impl PreparedAgent {
         // Initialize MCP manager first (shared across all providers)
         let mcp_manager = if let Some(mcp_config) = &build_context.mcp {
             tracing::info!("Initializing MCP tools using dynamic adaptors");
-            Some(Arc::new(
-                McpManager::initialize_from_config(mcp_config).await?,
-            ))
+            let manager = McpManager::initialize_from_config(mcp_config).await?;
+            manager.record_connection_metrics(&build_context.agent.name);
+            Some(Arc::new(manager))
         } else {
             None
         };
@@ -386,13 +475,16 @@ impl PreparedAgent {
             let scope = crate::hitl::AgentScope::Single {
                 session_id: build_context_owned.session_id.clone(),
             };
-            let wrapper = Arc::new(crate::hitl::HitlApprovalWrapper::new(
-                hitl.patterns.clone(),
-                hitl.route.clone(),
-                scope.clone(),
-                build_context_owned.agent.name.clone(),
-                build_context_owned.instance_id.clone(),
-            ));
+            let wrapper = Arc::new(
+                crate::hitl::HitlApprovalWrapper::new(
+                    hitl.patterns.clone(),
+                    hitl.route.clone(),
+                    scope.clone(),
+                    build_context_owned.agent.name.clone(),
+                    build_context_owned.instance_id.clone(),
+                )
+                .metered_as(build_context_owned.agent_labels()),
+            );
             hitl_gate = Some(Arc::clone(&wrapper));
             let gate_layer: Arc<dyn crate::tool_middleware::ToolMiddleware> =
                 Arc::new(WrapperLayer(wrapper));
@@ -583,7 +675,7 @@ impl PreparedAgent {
                 }
 
                 // Add tools using the BuilderState helper
-                let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = BuilderState::new(&build_context.agent_labels(), agent_builder);
                 let builder_state = if let Some(ref tools) = client_tools {
                     Self::add_passthrough_tools(builder_state, tools)
                 } else {
@@ -649,7 +741,7 @@ impl PreparedAgent {
                     agent_builder = agent_builder.additional_params(params.clone());
                 }
 
-                let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = BuilderState::new(&build_context.agent_labels(), agent_builder);
                 let builder_state = if let Some(ref tools) = client_tools {
                     Self::add_passthrough_tools(builder_state, tools)
                 } else {
@@ -731,7 +823,7 @@ impl PreparedAgent {
                     agent_builder = agent_builder.additional_params(params.clone());
                 }
 
-                let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = BuilderState::new(&build_context.agent_labels(), agent_builder);
                 let builder_state = if let Some(ref tools) = client_tools {
                     Self::add_passthrough_tools(builder_state, tools)
                 } else {
@@ -787,7 +879,7 @@ impl PreparedAgent {
                     agent_builder = agent_builder.additional_params(params.clone());
                 }
 
-                let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = BuilderState::new(&build_context.agent_labels(), agent_builder);
                 let builder_state = if let Some(ref tools) = client_tools {
                     Self::add_passthrough_tools(builder_state, tools)
                 } else {
@@ -842,7 +934,7 @@ impl PreparedAgent {
                     agent_builder = agent_builder.additional_params(params.clone());
                 }
 
-                let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = BuilderState::new(&build_context.agent_labels(), agent_builder);
                 let builder_state = if let Some(ref tools) = client_tools {
                     Self::add_passthrough_tools(builder_state, tools)
                 } else {
@@ -902,7 +994,7 @@ impl PreparedAgent {
                     agent_builder = agent_builder.additional_params(params.clone());
                 }
 
-                let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = BuilderState::new(&build_context.agent_labels(), agent_builder);
                 let builder_state = if let Some(ref tools) = client_tools {
                     Self::add_passthrough_tools(builder_state, tools)
                 } else {
@@ -930,6 +1022,7 @@ impl PreparedAgent {
         Ok(PreparedAgent {
             inner: provider_agent,
             model: model_name,
+            agent_labels: build_context.agent_labels(),
             max_depth,
             mcp_manager,
             fallback_tool_parsing,
@@ -953,6 +1046,28 @@ impl PreparedAgent {
     /// The request headers forwarded when this agent was prepared.
     pub fn forwarded_headers(&self) -> &ForwardedHeaders {
         &self.forwarded_headers
+    }
+
+    /// How this agent's LLM turns are labelled in the inference metrics.
+    pub fn inference_labels(&self) -> crate::metrics::InferenceLabels {
+        crate::metrics::InferenceLabels::new(
+            &self.agent_labels,
+            self.inner.provider_name(),
+            &self.model,
+        )
+    }
+
+    /// Record every LLM turn of `stream` in the inference metrics under this
+    /// agent's labels and, when `usage` is the run's, count it there. See
+    /// [`meter_turns`] for what a turn is and what its duration covers.
+    pub(crate) fn meter_turn_usage(
+        &self,
+        stream: Pin<
+            Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>,
+        >,
+        usage: Option<crate::UsageState>,
+    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
+        meter_turns(self.inference_labels(), stream, usage)
     }
 
     /// Begin the run `run_id` of this agent, for a request whose headers are
@@ -1195,6 +1310,7 @@ impl PreparedAgent {
                     tracing::info!("  Adding dynamic {} tool: {}", label, tool_name);
 
                     let tool_adaptor = crate::mcp::McpToolAdaptor::new(
+                        &build_context.agent_labels(),
                         mcp_tool.clone(),
                         Arc::clone(&client_arc),
                         transport_kind,
@@ -1747,8 +1863,10 @@ impl Agent {
             .stream_prompt(query, self.prepared.max_depth)
             .await;
         self.hold_run(
-            self.prepared
-                .maybe_wrap_with_fallback(self.count_turns(stream), None),
+            self.prepared.maybe_wrap_with_fallback(
+                self.count_turns(self.meter_turn_usage(stream, None)),
+                None,
+            ),
         )
     }
 
@@ -1764,8 +1882,10 @@ impl Agent {
             .stream_chat(query, chat_history, self.prepared.max_depth)
             .await;
         self.hold_run(
-            self.prepared
-                .maybe_wrap_with_fallback(self.count_turns(stream), None),
+            self.prepared.maybe_wrap_with_fallback(
+                self.count_turns(self.meter_turn_usage(stream, None)),
+                None,
+            ),
         )
     }
 
@@ -1788,8 +1908,10 @@ impl Agent {
             .stream_chat(query, chat_history, max_depth)
             .await;
         self.hold_run(
-            self.prepared
-                .maybe_wrap_with_fallback(self.count_turns(stream), None),
+            self.prepared.maybe_wrap_with_fallback(
+                self.count_turns(self.meter_turn_usage(stream, None)),
+                None,
+            ),
         )
     }
 
@@ -1884,7 +2006,8 @@ impl Agent {
         request_id: &str,
     ) -> crate::streaming::AgentRun {
         self.seed_scratchpad_request_input(query, &[]);
-        self.prepared
+        let run = self
+            .prepared
             .inner
             .stream_prompt_with_timeout(
                 query,
@@ -1894,15 +2017,16 @@ impl Agent {
                 self.scratchpad_budget().cloned(),
                 self.prepared.client_tool_names.clone(),
             )
-            .await
-            .map_stream(|stream| {
-                self.hold_run(
-                    self.append_scratchpad_usage(
-                        self.prepared
-                            .maybe_wrap_with_fallback(self.count_turns(stream), Some(request_id)),
-                    ),
-                )
-            })
+            .await;
+        let usage = run.usage().clone();
+        run.map_stream(|stream| {
+            self.hold_run(
+                self.append_scratchpad_usage(self.prepared.maybe_wrap_with_fallback(
+                    self.count_turns(self.meter_turn_usage(stream, Some(usage))),
+                    Some(request_id),
+                )),
+            )
+        })
     }
 
     /// Stream a chat query with timeout and cancellation support.
@@ -1924,7 +2048,8 @@ impl Agent {
         request_id: &str,
     ) -> crate::streaming::AgentRun {
         self.seed_scratchpad_request_input(query, &chat_history);
-        self.prepared
+        let run = self
+            .prepared
             .inner
             .stream_chat_with_timeout(
                 query,
@@ -1935,15 +2060,16 @@ impl Agent {
                 self.scratchpad_budget().cloned(),
                 self.prepared.client_tool_names.clone(),
             )
-            .await
-            .map_stream(|stream| {
-                self.hold_run(
-                    self.append_scratchpad_usage(
-                        self.prepared
-                            .maybe_wrap_with_fallback(self.count_turns(stream), Some(request_id)),
-                    ),
-                )
-            })
+            .await;
+        let usage = run.usage().clone();
+        run.map_stream(|stream| {
+            self.hold_run(
+                self.append_scratchpad_usage(self.prepared.maybe_wrap_with_fallback(
+                    self.count_turns(self.meter_turn_usage(stream, Some(usage))),
+                    Some(request_id),
+                )),
+            )
+        })
     }
 
     /// Seed the scratchpad budget's running estimate with the user query +
@@ -2397,6 +2523,7 @@ pub(crate) mod test_support {
         PreparedAgent {
             inner,
             model: "scripted".to_owned(),
+            agent_labels: crate::metrics::AgentLabels::main("scripted"),
             max_depth: 1,
             mcp_manager: None,
             fallback_tool_parsing: false,
@@ -2429,7 +2556,13 @@ pub(crate) mod test_support {
     /// A scratchpad budget of 128k tokens with a fifth of it reserved.
     pub(crate) fn budget() -> scratchpad::ContextBudget {
         let counter = Arc::new(TiktokenCounter::default_counter());
-        scratchpad::ContextBudget::new(128_000, 0.20, 0, counter)
+        scratchpad::ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            counter,
+        )
     }
 }
 
@@ -2553,7 +2686,10 @@ mod tests {
                 ..Default::default()
             };
             let manager = Some(Arc::new(manager_serving_all_transports(server).await));
-            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
+            let state = BuilderState::new(
+                &crate::metrics::AgentLabels::main("test"),
+                rig::agent::AgentBuilder::new(UnpromptedModel),
+            );
             PreparedAgent::add_all_tools(
                 state,
                 &build_context,
@@ -2701,7 +2837,10 @@ mod tests {
         ) -> rig::agent::Agent<UnpromptedModel> {
             let config = gated_build_context(pattern, run);
             let manager = Some(Arc::new(manager_serving(server, namespace, tool).await));
-            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
+            let state = BuilderState::new(
+                &crate::metrics::AgentLabels::main("test"),
+                rig::agent::AgentBuilder::new(UnpromptedModel),
+            );
             PreparedAgent::add_all_tools(state, &config, &manager, &Arc::default(), Vec::new())
                 .await
                 .expect("composition succeeds")
@@ -2751,7 +2890,10 @@ mod tests {
             let manager = Some(Arc::new(
                 manager_serving(&server, "github", "list_repos").await,
             ));
-            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
+            let state = BuilderState::new(
+                &crate::metrics::AgentLabels::main("test"),
+                rig::agent::AgentBuilder::new(UnpromptedModel),
+            );
             let agent = PreparedAgent::add_all_tools(
                 state,
                 &build_context,
@@ -2899,7 +3041,10 @@ mod tests {
             build_context.add_outer_tool_layer(Arc::clone(&gate_layer));
             build_context.hitl_gate_layer = Some(gate_layer);
 
-            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
+            let state = BuilderState::new(
+                &build_context.agent_labels(),
+                rig::agent::AgentBuilder::new(UnpromptedModel),
+            );
             PreparedAgent::add_all_tools(
                 state,
                 &build_context,
@@ -3068,7 +3213,10 @@ timeout_secs = 60
                 mcp_filter: Some(vec!["github:*".into()]),
                 ..Default::default()
             };
-            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
+            let state = BuilderState::new(
+                &crate::metrics::AgentLabels::main("test"),
+                rig::agent::AgentBuilder::new(UnpromptedModel),
+            );
             let agent = PreparedAgent::add_all_tools(
                 state,
                 &build_context,
@@ -3126,7 +3274,10 @@ timeout_secs = 60
         /// identifies the winner.
         async fn compose_over(manager: McpManager) -> rig::agent::Agent<UnpromptedModel> {
             let build_context = AgentBuildContext::default();
-            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
+            let state = BuilderState::new(
+                &crate::metrics::AgentLabels::main("test"),
+                rig::agent::AgentBuilder::new(UnpromptedModel),
+            );
             PreparedAgent::add_all_tools(
                 state,
                 &build_context,
@@ -3361,7 +3512,13 @@ timeout_secs = 60
                 .unwrap(),
         );
         let counter = TiktokenCounter::default_counter();
-        let sp_budget = scratchpad::ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
+        let sp_budget = scratchpad::ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            Arc::new(counter),
+        );
         let scratchpad = ScratchpadMiddleware::new(
             HashMap::from([("big_tool".to_string(), 10_usize)]),
             storage,
@@ -3532,6 +3689,123 @@ timeout_secs = 60
             );
         }
 
+        /// One streamed run lands in the metrics: its LLM turn's duration
+        /// and tokens under the agent's own labels.
+        #[cfg(feature = "otel")]
+        #[tokio::test]
+        async fn a_streamed_run_records_its_inference_metrics() {
+            crate::metrics::init(false).unwrap();
+            let (prepared, _requests) = prepared_scripted(vec![ScriptedTurn::text("done")]);
+            let agent = prepared.begin_run(RunId::mint(), None, None).unwrap();
+            let id = agent.run_id().to_string();
+            let run = StreamingAgent::stream(
+                &agent,
+                "q",
+                Vec::new(),
+                crate::streaming::RunOptions::default(),
+                &id,
+            )
+            .await;
+            let usage = run.usage().clone();
+            let items: Vec<_> = run.into_events().collect().await;
+            assert!(items.iter().all(Result::is_ok), "{items:?}");
+            assert_eq!((usage.llm_turns(), usage.tool_calls()), (1, 0));
+
+            let text = crate::metrics::render_prometheus().unwrap();
+            let labels = r#"aura_agent="scripted",gen_ai_agent_name="scripted",gen_ai_operation_name="chat",gen_ai_provider_name="scripted",gen_ai_request_model="scripted""#;
+            assert!(
+                text.contains(&format!(
+                    "gen_ai_client_inference_duration_seconds_count{{{labels}}}"
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "gen_ai_client_inference_usage_input_tokens_total{{{labels},gen_ai_token_modality=\"text\"}}"
+                )),
+                "{text}"
+            );
+        }
+
+        /// A tool-call turn is timed as the provider's part of it: rig runs
+        /// the tool inside the provider stream before yielding the turn's
+        /// usage, and that time is left out. A failed turn is timed the same
+        /// way.
+        #[cfg(feature = "otel")]
+        #[tokio::test(start_paused = true)]
+        async fn a_tool_turn_is_timed_without_its_inline_tool_run() {
+            use crate::provider_agent::{
+                StreamedAssistantContent, StreamedUserContent, ToolCall, ToolResult,
+            };
+            use tokio::time::{Duration, sleep};
+
+            crate::metrics::init(false).unwrap();
+            let tool_call =
+                StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(ToolCall {
+                    id: "c1".into(),
+                    name: "t".into(),
+                    arguments: "{}".into(),
+                }));
+            let tool_result =
+                StreamItem::StreamUserItem(StreamedUserContent::ToolResult(ToolResult {
+                    id: "c1".into(),
+                    call_id: None,
+                    result: "ok".into(),
+                    kind: crate::provider_agent::ToolResultKind::Text,
+                }));
+            // Each item arrives `delay` after the previous one.
+            let script: Vec<(Duration, Result<StreamItem, StreamError>)> = vec![
+                (Duration::from_millis(500), Ok(tool_call.clone())),
+                (Duration::from_secs(30), Ok(tool_result.clone())),
+                (
+                    Duration::from_millis(250),
+                    Ok(StreamItem::TurnUsage(Usage::new(), None)),
+                ),
+                (
+                    Duration::from_secs(2),
+                    Ok(StreamItem::TurnUsage(Usage::new(), None)),
+                ),
+                (Duration::from_millis(100), Ok(tool_call)),
+                (Duration::from_secs(10), Err("the provider hung up".into())),
+            ];
+            let stream = futures::stream::iter(script).then(|(delay, item)| async move {
+                sleep(delay).await;
+                item
+            });
+            let labels = crate::metrics::InferenceLabels::new(
+                &crate::metrics::AgentLabels::main("timed"),
+                "scripted",
+                "scripted",
+            );
+            let items: Vec<_> = meter_turns(labels, Box::pin(stream), None).collect().await;
+            assert_eq!(items.len(), 6);
+
+            let text = crate::metrics::render_prometheus().unwrap();
+            // Labels in exposition order: aura_agent sorts before error_type.
+            let config = r#"aura_agent="timed","#;
+            let labels = r#"gen_ai_agent_name="timed",gen_ai_operation_name="chat",gen_ai_provider_name="scripted",gen_ai_request_model="scripted""#;
+            // 0.5 + 30 + 0.25 less the 30 s tool run, then 2 s of text.
+            assert!(
+                text.contains(&format!(
+                    "gen_ai_client_inference_duration_seconds_sum{{{config}{labels}}} 2.75"
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "gen_ai_client_inference_duration_seconds_count{{{config}{labels}}} 2"
+                )),
+                "{text}"
+            );
+            // 0.1 s before the tool call; the 10 s the tool ran do not count.
+            assert!(
+                text.contains(&format!(
+                    "gen_ai_client_inference_duration_seconds_sum{{{config}error_type=\"stream_error\",{labels}}} 0.1"
+                )),
+                "{text}"
+            );
+        }
+
         /// The orchestrator re-streams one coordinator `Agent` through
         /// `stream_chat_with_depth` on a transient retry. The claim guards only
         /// the trait method, so that path still streams twice.
@@ -3630,9 +3904,10 @@ timeout_secs = 60
             let manager = Some(Arc::new(
                 super::namespace_gating::manager_serving(&server, "github", "list_repos").await,
             ));
-            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(
-                ScriptedCompletionModel::new(Vec::new()),
-            ));
+            let state = BuilderState::new(
+                &crate::metrics::AgentLabels::main("test"),
+                rig::agent::AgentBuilder::new(ScriptedCompletionModel::new(Vec::new())),
+            );
             let inner = PreparedAgent::add_all_tools(
                 state,
                 &build_context,
@@ -3852,5 +4127,26 @@ timeout_secs = 60
                 .begin_run(crate::run_context::named_run_id("req_b"), None, None)
                 .expect("the slot frees with the stream");
         }
+    }
+}
+
+#[cfg(test)]
+mod inference_error_type_tests {
+    use super::inference_error_type;
+
+    fn err(msg: &str) -> Box<dyn std::error::Error + Send + Sync> {
+        msg.to_string().into()
+    }
+
+    #[test]
+    fn names_the_known_failure_shapes_and_falls_back() {
+        assert_eq!(
+            inference_error_type(err("Request cancelled by client").as_ref()),
+            "cancelled"
+        );
+        assert_eq!(
+            inference_error_type(err("connection reset").as_ref()),
+            "stream_error"
+        );
     }
 }

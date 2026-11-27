@@ -650,8 +650,13 @@ mod tests {
     fn tool_state_reaches_the_slot_from_the_bound_run() {
         use crate::scratchpad::TiktokenCounter;
 
-        let budget =
-            ContextBudget::new(1_000, 0.0, 0, Arc::new(TiktokenCounter::default_counter()));
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            1_000,
+            0.0,
+            0,
+            Arc::new(TiktokenCounter::default_counter()),
+        );
         let nudge = TurnNudgeState::new(true, None, 2).unwrap();
         let slot = BoundRun::default();
         slot.bind(RunContext::detached_with(

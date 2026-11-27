@@ -154,6 +154,10 @@ pub struct UsageState {
     last_output_tokens: Arc<AtomicU64>,
     /// Tool IDs completed since the last usage event (for aura.tool_usage correlation)
     pending_tool_ids: Arc<Mutex<Vec<ToolCallId>>>,
+    /// LLM turns recorded.
+    llm_turns: Arc<AtomicU64>,
+    /// Tool calls the model issued.
+    tool_calls: Arc<AtomicU64>,
 }
 
 impl UsageState {
@@ -250,6 +254,26 @@ impl UsageState {
         }
     }
 
+    /// LLM turns recorded so far: one per `TurnUsage` item of the run's
+    /// stream (`PreparedAgent::meter_turn_usage`) or per `accumulate_usage`
+    /// call, whichever path feeds this state.
+    pub fn llm_turns(&self) -> u64 {
+        self.llm_turns.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_turn(&self) {
+        self.llm_turns.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Tool calls the model issued so far, as the hook saw them.
+    pub fn tool_calls(&self) -> u64 {
+        self.tool_calls.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn count_tool_call(&self) {
+        self.tool_calls.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Accumulate billed usage across independent LLM calls (orchestration path).
     ///
     /// Adds to the billed counters like [`store_usage`](Self::store_usage) but
@@ -259,6 +283,7 @@ impl UsageState {
     /// emitted from each agent's final response instead.
     pub fn accumulate_usage(&self, prompt: u64, completion: u64) {
         self.initialized.store(true, Ordering::Release);
+        self.llm_turns.fetch_add(1, Ordering::AcqRel);
         self.billed_prompt_tokens
             .fetch_add(prompt, Ordering::AcqRel);
         self.accumulated_completion_tokens
@@ -638,6 +663,11 @@ where
         // makes the matching skip so push/pop stay symmetric. Cancellation
         // is still checked.
         let publish_event = Self::should_publish_tool_event(&tool_name);
+        // The tool count follows the event surface: a suppressed scratchpad
+        // read is context management, not a tool call the model made.
+        if publish_event {
+            self.usage_state.count_tool_call();
+        }
         async move {
             // Stash the call id so the park arm can record it on the cell entry.
             if let Some(cell) = park_cell_for(&request_id) {
@@ -1210,7 +1240,13 @@ mod tests {
     fn test_with_scratchpad_budget_stores_budget() {
         use crate::scratchpad::TiktokenCounter;
         let counter = Arc::new(TiktokenCounter::default_counter());
-        let budget = ContextBudget::new(128_000, 0.20, 0, counter);
+        let budget = ContextBudget::new(
+            &crate::metrics::AgentLabels::main("test"),
+            128_000,
+            0.20,
+            0,
+            counter,
+        );
         let (hook, _, _) = StreamingRequestHook::with_scratchpad_budget(
             crate::streaming::RunOptions::bounded(Some(Duration::from_secs(60))),
             "req_with_budget",
@@ -1466,5 +1502,27 @@ mod tests {
                 "the response's own split, even when it reports none"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod usage_counter_tests {
+    use super::UsageState;
+
+    #[test]
+    fn every_usage_path_counts_a_turn_and_tool_calls_count_separately() {
+        let usage = UsageState::new();
+        assert_eq!((usage.llm_turns(), usage.tool_calls()), (0, 0));
+        usage.store_usage(10, 5, 15, false);
+        assert_eq!(
+            usage.llm_turns(),
+            0,
+            "the final-turn snapshot is not a turn count"
+        );
+        usage.count_turn();
+        usage.count_turn();
+        usage.accumulate_usage(30, 5);
+        usage.count_tool_call();
+        assert_eq!((usage.llm_turns(), usage.tool_calls()), (3, 1));
     }
 }

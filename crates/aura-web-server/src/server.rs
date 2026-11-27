@@ -5,6 +5,7 @@ use crate::a2a::{
     legacy_jsonrpc_router,
 };
 use crate::handlers;
+use crate::metrics;
 use crate::session_store::{SessionStore, build_session_store};
 use crate::streaming::ToolResultMode;
 use crate::types::{ActiveRequestTracker, AppState};
@@ -145,6 +146,27 @@ pub struct ServerArgs {
     /// latency.
     #[arg(long, env = "STREAM_INACTIVITY_TIMEOUT_SECS", default_value = "0")]
     pub stream_inactivity_timeout_secs: u64,
+
+    /// Serve `/metrics` (and `/health`) on this address instead of the API
+    /// port, for deployments where the API port is public. Example:
+    /// `0.0.0.0:9464`. When unset, `/metrics` is served on the API port.
+    #[arg(long, env = "AURA_METRICS_LISTEN")]
+    pub metrics_listen: Option<std::net::SocketAddr>,
+
+    /// Push metrics over OTLP as well, when an OTLP endpoint is configured
+    /// (`OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`,
+    /// as the OTLP spec resolves them). Set false when that endpoint takes
+    /// traces only (Phoenix, for one), which otherwise fails an export every
+    /// interval. `/metrics` is served either way.
+    /// Accepts the canonical boolean vocabulary (1/0, true/false, yes/no, on/off, t/f, y/n).
+    #[arg(
+        long,
+        env = "AURA_METRICS_OTLP",
+        default_value = "true",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
+    pub metrics_otlp: bool,
 
     /// Graceful shutdown timeout in seconds.
     /// On SIGTERM/SIGINT, new requests are rejected immediately (503), but in-flight
@@ -350,6 +372,7 @@ fn hitl_route_vs_server_window_warning(
 /// Serve until SIGINT/SIGTERM, then drain in-flight streams and flush spans.
 pub async fn serve(args: ServerArgs) -> std::io::Result<()> {
     let result = run(args).await;
+    aura::metrics::shutdown().await;
     aura::logging::shutdown_tracer().await;
     result
 }
@@ -363,6 +386,16 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
 
     // Initialize logging using shared module
     aura::logging::init_logging(args.debug, args.verbose, "aura_web_server");
+    // Before any agent is built: instruments bind to the provider that is
+    // global when they are first used, and MCP connection status is
+    // recorded as agents come up.
+    match aura::metrics::init(args.metrics_otlp) {
+        Ok(()) => {}
+        Err(aura::metrics::MetricsError::Disabled) => {
+            warn!("built without the `otel` feature: /metrics is not served")
+        }
+        Err(e) => warn!("metrics disabled: {e}"),
+    }
 
     info!("Starting Aura Web Server v{}", env!("CARGO_PKG_VERSION"));
     info!("Loading configuration from: {}", args.config);
@@ -387,6 +420,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             id, provider, model, iid
         );
         warn_timeout_relationships(id, config, &args);
+        aura::metrics::declare_config(config);
     }
 
     // Tool-name collisions are a config fault the request path can only warn
@@ -400,6 +434,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         let id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
         match aura::McpManager::initialize_from_config(mcp_config).await {
             Ok(manager) => {
+                manager.record_connection_metrics(&config.agent.name);
                 for line in manager.collision_report() {
                     warn!("agent '{}': {}", id, line);
                 }
@@ -631,6 +666,24 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         app
     };
 
+    // Scrape routes are merged after the shutdown guard's layer so a
+    // draining server stays scrapable; `--metrics-listen` moves them to
+    // their own port and off the API port entirely.
+    let exit_token = CancellationToken::new();
+    let app = if aura::metrics::is_available() {
+        match args.metrics_listen {
+            None => app.merge(metrics::router()),
+            Some(addr) => {
+                metrics::listener(addr, app_state.clone(), exit_token.clone()).await?;
+                app
+            }
+        }
+    } else {
+        app
+    };
+    // Last, so every mounted route (A2A included) reports its duration.
+    let app = app.layer(middleware::from_fn(metrics::record_request));
+
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", args.host, args.port)).await?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -693,6 +746,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
             }
 
             info!(clean_shutdown, unaborted_tasks, "shutdown complete");
+            exit_token.cancel();
             let _ = shutdown_tx.send(());
         }
     });
@@ -755,6 +809,27 @@ mod parse_args_tests {
         );
         assert_eq!(args.config, "agents.toml");
         assert_eq!(args.port, 9999);
+    }
+
+    #[test]
+    fn metrics_flags_default_to_the_api_port_and_otlp_push() {
+        let args = parse_args(["aura"], "aura", "aura webserver");
+        assert!(args.metrics_listen.is_none());
+        assert!(args.metrics_otlp);
+
+        let args = parse_args(
+            [
+                "aura",
+                "--metrics-listen",
+                "0.0.0.0:9464",
+                "--metrics-otlp",
+                "off",
+            ],
+            "aura",
+            "aura webserver",
+        );
+        assert_eq!(args.metrics_listen.map(|a| a.port()), Some(9464));
+        assert!(!args.metrics_otlp);
     }
 
     #[test]

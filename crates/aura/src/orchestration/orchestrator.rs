@@ -836,9 +836,9 @@ impl Orchestrator {
         // Initialize MCP manager (shared across coordinator and all workers via Arc)
         let mcp_manager = if let Some(ref mcp_config) = agent_build_context.mcp {
             tracing::info!("Orchestrator: initializing MCP connections");
-            Some(Arc::new(
-                McpManager::initialize_from_config(mcp_config).await?,
-            ))
+            let manager = McpManager::initialize_from_config(mcp_config).await?;
+            manager.record_connection_metrics(&agent_build_context.agent.name);
+            Some(Arc::new(manager))
         } else {
             None
         };
@@ -913,16 +913,19 @@ impl Orchestrator {
 
     /// The tools a worker executes itself beside its MCP tools: `wait_for`
     /// when an MCP manager exists, plus fresh instances of the run's own
-    /// tools. Called once per worker built.
-    fn worker_own_tools(&self) -> Vec<Box<dyn rig::tool::ToolDyn>> {
+    /// tools. Called once per worker built, with that worker's labels.
+    fn worker_own_tools(
+        &self,
+        worker: &crate::metrics::AgentLabels,
+    ) -> Vec<Box<dyn rig::tool::ToolDyn>> {
         let mut tools: Vec<Box<dyn rig::tool::ToolDyn>> = self
             .mcp_manager
             .as_ref()
             .map(|mcp| {
-                vec![
-                    Box::new(super::tools::wait_for::WaitForTool::new(Arc::clone(mcp)))
-                        as Box<dyn rig::tool::ToolDyn>,
-                ]
+                vec![Box::new(super::tools::wait_for::WaitForTool::new(
+                    worker,
+                    Arc::clone(mcp),
+                )) as Box<dyn rig::tool::ToolDyn>]
             })
             .unwrap_or_default();
         tools.extend((self.run_tools)());
@@ -1116,6 +1119,7 @@ impl Orchestrator {
                 };
 
                 let build = scratchpad::build_scratchpad(scratchpad::ScratchpadBuildInputs {
+                    agent: worker_build_context.agent_labels(),
                     sp_cfg,
                     storage_dir: &iter_dir,
                     read_root: Some(&read_root),
@@ -1144,6 +1148,7 @@ impl Orchestrator {
             let initial_used = self.worker_fixed_overhead(worker_cfg, &*token_counter);
             scratchpad_budget = Some(
                 scratchpad::ContextBudget::new(
+                    &worker_build_context.agent_labels(),
                     window as usize,
                     scratchpad::ScratchpadConfig::default().context_safety_margin,
                     initial_used,
@@ -1245,7 +1250,8 @@ impl Orchestrator {
                 scope.clone(),
                 worker_build_context.agent.name.clone(),
                 worker_build_context.instance_id.clone(),
-            );
+            )
+            .metered_as(worker_build_context.agent_labels());
             // The park arm needs the store-bearing route; webhook deployments
             // keep the live decision path.
             if let (
@@ -1407,6 +1413,7 @@ impl Orchestrator {
             hitl_approval_tool: None,
             inner: provider_agent,
             model: model_name,
+            agent_labels: worker_build_context.agent_labels(),
             max_depth: resolved_depth,
             mcp_manager: self.mcp_manager.clone(),
             fallback_tool_parsing: false,
@@ -2138,6 +2145,29 @@ impl Orchestrator {
         let base =
             ctx.build_continuation_prompt(max_iterations, show_tool_chain, content_max_length);
         format!("Current time: {timestamp}\n\n{base}")
+    }
+
+    /// One worker task's outcome and wall-clock, in the metrics. A task
+    /// without a specialised worker is labelled `generic`.
+    fn record_task_metric(&self, worker_name: Option<&str>, outcome: &str, duration_ms: u64) {
+        crate::metrics::record_task(
+            &self.agent_build_context.agent.name,
+            worker_name.unwrap_or("generic"),
+            outcome,
+            std::time::Duration::from_millis(duration_ms),
+        );
+    }
+
+    /// One routing decision, in the metrics. A post-execute call that fails
+    /// before it routes records its own decision where it is handled.
+    fn record_routing_metric(&self, response: &PlanningResponse) {
+        use crate::metrics::decision;
+        let decision = match response {
+            PlanningResponse::Direct { .. } => decision::DIRECT_ANSWER,
+            PlanningResponse::Clarification { .. } => decision::CLARIFICATION,
+            PlanningResponse::StepsPlan { .. } => decision::ORCHESTRATED,
+        };
+        crate::metrics::record_routing_decision(&self.agent_build_context.agent.name, decision);
     }
 
     /// Stream a planning call with transient-provider retry and backoff.
@@ -2887,6 +2917,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Shared helper that eliminates per-provider duplication in `create_coordinator`.
     #[allow(clippy::too_many_arguments)]
     fn build_agent_with_tools<M: rig::completion::CompletionModel + Send + Sync>(
+        agent: &crate::metrics::AgentLabels,
         completion_model: M,
         preamble: &str,
         temperature: Option<f64>,
@@ -2909,7 +2940,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         if let Some(max) = max_tokens {
             builder = builder.max_tokens(max);
         }
-        let mut state = BuilderState::Initial(builder);
+        let mut state = BuilderState::new(agent, builder);
         if let Some(list_tools) = tools.list_tools {
             state = state.add_tool(list_tools);
         }
@@ -2996,6 +3027,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .filter(|sp| sp.enabled && sp.coordinator);
         let Some(sp_cfg) = sp_cfg else {
             let budget = scratchpad::ContextBudget::new(
+                &self.agent_build_context.agent_labels(),
                 window as usize,
                 scratchpad::ScratchpadConfig::default().context_safety_margin,
                 0,
@@ -3020,6 +3052,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             (run_dir, read_root)
         };
         let build = scratchpad::build_scratchpad(scratchpad::ScratchpadBuildInputs {
+            agent: self.agent_build_context.agent_labels(),
             sp_cfg,
             storage_dir: &run_dir,
             read_root: Some(&read_root),
@@ -3232,6 +3265,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let prepared = Arc::new(PreparedAgent {
             inner: provider_agent,
             model: model_name,
+            agent_labels: self.agent_build_context.agent_labels(),
             max_depth,
             mcp_manager: None, // Coordinator doesn't have MCP tools
             fallback_tool_parsing: false,
@@ -3308,6 +3342,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     });
                 }
                 Ok(ProviderAgent::OpenAI(Self::build_agent_with_tools(
+                    &self.agent_build_context.agent_labels(),
                     cm,
                     preamble,
                     temperature,
@@ -3338,6 +3373,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     cm = cm.with_prompt_caching();
                 }
                 Ok(ProviderAgent::Anthropic(Self::build_agent_with_tools(
+                    &self.agent_build_context.agent_labels(),
                     cm,
                     preamble,
                     temperature,
@@ -3376,6 +3412,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     cm = cm.with_prompt_caching();
                 }
                 Ok(ProviderAgent::Bedrock(Self::build_agent_with_tools(
+                    &self.agent_build_context.agent_labels(),
                     cm,
                     preamble,
                     temperature,
@@ -3402,6 +3439,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .map_err(|e| format!("Failed to build Gemini coordinator: {}", e))?
                     .completion_model(model);
                 Ok(ProviderAgent::Gemini(Self::build_agent_with_tools(
+                    &self.agent_build_context.agent_labels(),
                     cm,
                     preamble,
                     temperature,
@@ -3423,6 +3461,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .map_err(|e| format!("Failed to build Ollama coordinator: {}", e))?
                     .completion_model(model);
                 Ok(ProviderAgent::Ollama(Self::build_agent_with_tools(
+                    &self.agent_build_context.agent_labels(),
                     cm,
                     preamble,
                     temperature,
@@ -3449,6 +3488,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .map_err(|e| format!("Failed to build OpenRouter coordinator: {}", e))?
                     .completion_model(model);
                 Ok(ProviderAgent::OpenRouter(Self::build_agent_with_tools(
+                    &self.agent_build_context.agent_labels(),
                     cm,
                     preamble,
                     temperature,
@@ -3479,7 +3519,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let shared_mcp: Option<Arc<McpManager>> = self.mcp_manager.clone();
 
         // Box<dyn ToolDyn> is not Clone, so each provider arm constructs its own instance.
-        let wait_for_tools = || self.worker_own_tools();
+        let wait_for_tools = || self.worker_own_tools(&worker_build_context.agent_labels());
 
         // Test-only model injection (park/reify rig): a queued override builds
         // this worker from a scripted model. The override's extra tools go
@@ -3499,7 +3539,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             builder = builder.name(&worker_build_context.agent.name);
             builder = builder.provider_name(llm_provider).model_name(llm_model);
             builder = builder.preamble(preamble);
-            let mut state = BuilderState::Initial(builder);
+            let mut state = BuilderState::new(&worker_build_context.agent_labels(), builder);
             for tool in worker_override.extra_tools {
                 let shim = DynToolAsTool::new(tool);
                 match (
@@ -3578,7 +3618,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(max) = worker_build_context.llm.max_tokens() {
                     builder = builder.max_tokens(max);
                 }
-                let state = BuilderState::Initial(builder);
+                let state = BuilderState::new(&worker_build_context.agent_labels(), builder);
                 let state = PreparedAgent::add_all_tools(
                     state,
                     worker_build_context,
@@ -3622,7 +3662,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(params) = additional_params {
                     builder = builder.additional_params(params.clone());
                 }
-                let state = BuilderState::Initial(builder);
+                let state = BuilderState::new(&worker_build_context.agent_labels(), builder);
                 let state = PreparedAgent::add_all_tools(
                     state,
                     worker_build_context,
@@ -3674,7 +3714,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(params) = additional_params {
                     builder = builder.additional_params(params.clone());
                 }
-                let state = BuilderState::Initial(builder);
+                let state = BuilderState::new(&worker_build_context.agent_labels(), builder);
                 let state = PreparedAgent::add_all_tools(
                     state,
                     worker_build_context,
@@ -3711,7 +3751,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(params) = additional_params {
                     builder = builder.additional_params(params.clone());
                 }
-                let state = BuilderState::Initial(builder);
+                let state = BuilderState::new(&worker_build_context.agent_labels(), builder);
                 let state = PreparedAgent::add_all_tools(
                     state,
                     worker_build_context,
@@ -3747,7 +3787,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
 
-                let state = BuilderState::Initial(builder);
+                let state = BuilderState::new(&worker_build_context.agent_labels(), builder);
                 let state = PreparedAgent::add_all_tools(
                     state,
                     worker_build_context,
@@ -3787,7 +3827,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(params) = additional_params {
                     builder = builder.additional_params(params.clone());
                 }
-                let state = BuilderState::Initial(builder);
+                let state = BuilderState::new(&worker_build_context.agent_labels(), builder);
                 let state = PreparedAgent::add_all_tools(
                     state,
                     worker_build_context,
@@ -3920,6 +3960,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             .await;
                         let result_for_event = final_result.clone();
                         let success = exec_result.structured_output.is_some();
+                        self.record_task_metric(
+                            worker_name.as_deref(),
+                            if success { "completed" } else { "soft_failure" },
+                            duration_ms,
+                        );
                         if let Some(t) = plan.get_task_mut(task_id) {
                             if success {
                                 t.complete(final_result);
@@ -3955,6 +4000,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     // The partial output goes through the artifact flow
                     // like a result, but the task fails as a timeout.
                     Ok(TaskOutcome::TimedOut { message }) => {
+                        self.record_task_metric(
+                            worker_name.as_deref(),
+                            "agent_timeout",
+                            duration_ms,
+                        );
                         let final_result = self
                             .maybe_create_artifact(
                                 &wave_persistence,
@@ -4024,6 +4074,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     }) => {
                         // The task awaits human decisions: no artifact, no
                         // completion event; one blocked event per parked call.
+                        self.record_task_metric(worker_name.as_deref(), "blocked", duration_ms);
                         let worker_id = worker_name.clone().unwrap_or(self.orchestrator_id.clone());
                         for call in &pending {
                             emitter
@@ -4053,6 +4104,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     Err(e) => {
                         let err_str = e.to_string();
                         let category = Self::categorize_failure_error(&err_str);
+                        self.record_task_metric(worker_name.as_deref(), "failed", duration_ms);
                         if let Some(t) = plan.get_task_mut(task_id) {
                             t.fail(err_str.clone(), category);
                         }
@@ -4738,7 +4790,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let srd = submit_result_decision.clone();
         let park_registration =
             crate::streaming_request_hook::ParkCellRegistration::new(&park.key, park.cell.clone());
-        let stream = worker
+        let run = worker
             .inner
             .stream_chat_message_with_timeout(
                 current_prompt,
@@ -4749,7 +4801,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 worker.scratchpad_budget().cloned(),
                 worker.client_tool_names.clone(),
             )
-            .await
+            .await;
+        let worker_usage = run.usage().clone();
+        let stream = run
+            .map_stream(|stream| worker.meter_turn_usage(stream, Some(worker_usage)))
             .into_events();
         let stream_result = Self::drive_forward_loop(
             stream,
@@ -5210,6 +5265,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             )
             .await?;
         let initial_planning_ms = planning_start.elapsed().as_millis() as u64;
+        self.record_routing_metric(&response);
 
         let result = match response {
             PlanningResponse::Direct {
@@ -5345,7 +5401,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 )
                 .await?
             {
-                IterationOutcome::FinalResult(s) => break s,
+                IterationOutcome::FinalResult(s) => {
+                    crate::metrics::record_planning_cycles(
+                        &self.agent_build_context.agent.name,
+                        iteration as u64,
+                    );
+                    break s;
+                }
                 IterationOutcome::Continue {
                     new_plan,
                     previous_context: pc,
@@ -5651,6 +5713,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
             )
             .await;
 
+        if let Ok((response, _, _)) = &routing {
+            self.record_routing_metric(response);
+        }
         let decision_elapsed = decision_start.elapsed();
         let decision_latency = decision_elapsed.as_secs_f64();
         // The continuation decision call doubles as the planning step for the
@@ -5874,18 +5939,29 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .record("orchestration.post_execute_decision", "coordinator_error");
                 let err_str = e.to_string();
                 let category = Self::categorize_failure_error(&err_str);
-                let note = match category {
-                    FailureCategory::AgentTimeout => {
-                        format!("Post-execute coordinator call timed out: {}", err_str)
-                    }
-                    FailureCategory::DepthExhausted => {
+                let (decision, note) = match category {
+                    FailureCategory::AgentTimeout => (
+                        crate::metrics::decision::COORDINATOR_TIMEOUT,
+                        format!("Post-execute coordinator call timed out: {}", err_str),
+                    ),
+                    FailureCategory::DepthExhausted => (
+                        crate::metrics::decision::COORDINATOR_TURN_BUDGET_EXHAUSTED,
                         format!(
                             "Post-execute coordinator exhausted its turn budget without routing: {}",
                             err_str
-                        )
-                    }
-                    _ => format!("Post-execute coordinator call failed: {}", err_str),
+                        ),
+                    ),
+                    _ => (
+                        crate::metrics::decision::COORDINATOR_ERROR,
+                        format!("Post-execute coordinator call failed: {}", err_str),
+                    ),
                 };
+                // The run ends `ok` with the raw task results, so this routing
+                // decision is what the metrics keep of the failed call.
+                crate::metrics::record_routing_decision(
+                    &self.agent_build_context.agent.name,
+                    decision,
+                );
                 tracing::warn!("{}", note);
                 let raw = Self::build_raw_task_results(&plan, &note);
                 Self::emit_event(
@@ -6416,7 +6492,7 @@ fn park_verdict_lines(plan: &Plan) -> Vec<String> {
 }
 
 /// Check if an error indicates a MaxDepthError from rig's ReAct loop.
-fn is_max_depth_error(error: &(dyn std::error::Error + Send + Sync)) -> bool {
+pub(crate) fn is_max_depth_error(error: &(dyn std::error::Error + Send + Sync)) -> bool {
     let msg = error.to_string();
     msg.contains("MaxDepthError") || msg.contains("reached limit")
 }
@@ -6425,7 +6501,7 @@ fn is_max_depth_error(error: &(dyn std::error::Error + Send + Sync)) -> bool {
 ///
 /// True when the error indicates context window overflow. Delegates to
 /// `categorize_failure_error` so classification stays in one place.
-fn is_context_overflow_error(error: &dyn std::error::Error) -> bool {
+pub(crate) fn is_context_overflow_error(error: &dyn std::error::Error) -> bool {
     matches!(
         Orchestrator::categorize_failure_error(&error.to_string()),
         FailureCategory::ContextOverflow
@@ -8627,7 +8703,11 @@ mod tests {
         let mut orchestrator = Orchestrator::new(AgentBuildContext::default())
             .await
             .unwrap();
-        assert!(orchestrator.worker_own_tools().is_empty());
+        assert!(
+            orchestrator
+                .worker_own_tools(&crate::metrics::AgentLabels::main("worker"))
+                .is_empty()
+        );
 
         let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = Arc::clone(&built);
@@ -8635,8 +8715,8 @@ mod tests {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             vec![Box::new(Marker) as Box<dyn rig::tool::ToolDyn>]
         });
-        let first = orchestrator.worker_own_tools();
-        let second = orchestrator.worker_own_tools();
+        let first = orchestrator.worker_own_tools(&crate::metrics::AgentLabels::main("worker"));
+        let second = orchestrator.worker_own_tools(&crate::metrics::AgentLabels::main("worker"));
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].name(), Marker::NAME);
         assert_eq!(second[0].name(), Marker::NAME);

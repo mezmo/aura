@@ -104,10 +104,11 @@ fn record_tool_call_result(span: &tracing::Span, result: &Result<String, anyhow:
 ///
 /// The client's namespace — the MCP server config key it fronts — is recorded
 /// as a separate `tool.namespace` span attribute, never folded into
-/// `tool_name`, which is always the bare name sent to the model.
+/// `tool_name`, which is always the bare name sent to the model. `agent` is
+/// the agent the call is made for, as the MCP metric labels it.
 #[tracing::instrument(
     name = "mcp.tool_call",
-    skip(client, args, approver_overrides),
+    skip(client, agent, args, approver_overrides),
     fields(
         tool.name = %tool_name,
         tool.namespace = %client.namespace(),
@@ -116,6 +117,7 @@ fn record_tool_call_result(span: &tracing::Span, result: &Result<String, anyhow:
 )]
 pub async fn execute_mcp_tool(
     client: &McpClient,
+    agent: &crate::metrics::AgentLabels,
     tool_name: &str,
     args: Value,
     approver_overrides: Option<crate::approver_headers::ApproverHeaders>,
@@ -149,9 +151,17 @@ pub async fn execute_mcp_tool(
         _ => HashMap::new(),
     };
 
+    let started = std::time::Instant::now();
     let result = client
         .call_tool(tool_name, args_map, approver_overrides)
         .await;
+    crate::metrics::record_mcp_operation(
+        agent,
+        client.namespace().as_ref(),
+        tool_name,
+        mcp_error_type(&result),
+        started.elapsed(),
+    );
 
     // OTel: record result attributes
     record_tool_call_result(&span, &result);
@@ -180,6 +190,23 @@ pub async fn execute_mcp_tool(
                 }
             }
         }
+    }
+}
+
+/// `error.type` of one MCP call for the metrics: a result that reports an
+/// error counts as a failed call (`isError` responses come back as text),
+/// a cancelled call is told apart from a transport failure the same way
+/// the agent-facing error is.
+fn mcp_error_type<E: std::fmt::Display>(result: &Result<String, E>) -> Option<&'static str> {
+    match result {
+        Ok(response) => {
+            crate::tool_error_detection::is_reported_error(response).then_some("tool_error")
+        }
+        Err(e) => Some(if bound_transport_error(&e.to_string()).is_none() {
+            "cancelled"
+        } else {
+            "transport_error"
+        }),
     }
 }
 
@@ -225,6 +252,18 @@ pub(crate) fn preview_response(response: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_error_type_tells_apart_answered_errors_cancellations_and_transport_failures() {
+        let ok: Result<String, String> = Ok("{\"items\": []}".to_string());
+        assert_eq!(mcp_error_type(&ok), None);
+        let answered: Result<String, String> = Ok("Tool returned an error: forbidden".to_string());
+        assert_eq!(mcp_error_type(&answered), Some("tool_error"));
+        let cancelled: Result<String, String> = Err("Request cancelled by client".to_string());
+        assert_eq!(mcp_error_type(&cancelled), Some("cancelled"));
+        let transport: Result<String, String> = Err("connection reset".to_string());
+        assert_eq!(mcp_error_type(&transport), Some("transport_error"));
+    }
 
     #[test]
     fn test_preview_response_short() {
@@ -373,9 +412,15 @@ mod tests {
                     .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test"))),
             );
 
-            execute_mcp_tool(client, "gated", json!({}), overrides)
-                .await
-                .expect("the call succeeds");
+            execute_mcp_tool(
+                client,
+                &crate::metrics::AgentLabels::main("test-agent"),
+                "gated",
+                json!({}),
+                overrides,
+            )
+            .await
+            .expect("the call succeeds");
 
             assert!(
                 captured.contains("mcp.tool_call"),

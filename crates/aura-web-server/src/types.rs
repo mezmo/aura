@@ -1,3 +1,4 @@
+use aura::metrics::Ingress;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -85,17 +86,20 @@ impl ActiveRequestTracker {
 /// produces exactly one decrement.
 pub struct ActiveRequestGuard {
     tracker: Arc<ActiveRequestTracker>,
+    ingress: Ingress,
 }
 
 impl ActiveRequestGuard {
-    pub fn new(tracker: Arc<ActiveRequestTracker>) -> Self {
+    pub fn new(tracker: Arc<ActiveRequestTracker>, ingress: Ingress) -> Self {
         tracker.increment();
-        Self { tracker }
+        aura::metrics::runs_active_add(ingress, 1);
+        Self { tracker, ingress }
     }
 }
 
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
+        aura::metrics::runs_active_add(self.ingress, -1);
         self.tracker.decrement();
     }
 }

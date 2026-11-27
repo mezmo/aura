@@ -50,6 +50,8 @@ pub use aura_events::{RunId, SessionId};
 pub struct AgentBuildContext {
     pub llm: LlmConfig,
     pub agent: AgentSettings,
+    /// The loaded config's `[agent].name`.
+    pub config_agent: String,
     pub vector_stores: Vec<VectorStoreConfig>,
     pub mcp: Option<McpConfig>,
     pub tools: Option<ToolsConfig>,
@@ -136,6 +138,7 @@ impl Clone for AgentBuildContext {
         Self {
             llm: self.llm.clone(),
             agent: self.agent.clone(),
+            config_agent: self.config_agent.clone(),
             vector_stores: self.vector_stores.clone(),
             mcp: self.mcp.clone(),
             tools: self.tools.clone(),
@@ -226,6 +229,12 @@ impl std::fmt::Debug for AgentBuildContext {
 }
 
 impl AgentBuildContext {
+    /// How this agent's metrics name it: the loaded config and the agent
+    /// itself, which is the worker's name when this context builds a worker.
+    pub fn agent_labels(&self) -> crate::metrics::AgentLabels {
+        crate::metrics::AgentLabels::new(&self.config_agent, &self.agent.name)
+    }
+
     /// The stack MCP tools run through: the placed layers outside the
     /// caller's `tool_wrapper`, so the wrapper sees the raw tool output and
     /// every layer still runs when both are set.

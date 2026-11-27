@@ -16,6 +16,7 @@ use super::events::{
 use super::search::{self, SlackSearchTool};
 use super::socket_mode;
 use crate::types::{ActiveRequestGuard, AppState};
+use aura::metrics::{AgentRole, Ingress, RunMeasure};
 
 /// Capacity of the socket-to-dispatcher channel.
 const EVENT_QUEUE: usize = 64;
@@ -247,7 +248,7 @@ fn queue_answer(ingress: &Arc<SlackIngress>, inbound: Inbound, earlier: Option<V
     );
     let ingress = Arc::clone(ingress);
     let tracker = Arc::clone(&ingress.state.active_requests);
-    let active = ActiveRequestGuard::new(Arc::clone(&tracker));
+    let active = ActiveRequestGuard::new(Arc::clone(&tracker), Ingress::Slack);
     let task = async move {
         let _active = active;
         let slot = tokio::select! {
@@ -370,6 +371,8 @@ impl SlackIngress {
         })
         .expect("the id starts with \"slack:\", so it is not blank");
         let (config, tools) = run_setup(&self.config, &self.api, inbound);
+        let agent_name = config.agent.name.clone();
+        let orchestration = config.orchestration_enabled();
         debug!(
             request_id,
             search = inbound.action_token.is_some(),
@@ -383,6 +386,7 @@ impl SlackIngress {
 
         let timeout = (self.state.streaming_timeout_secs > 0)
             .then(|| Duration::from_secs(self.state.streaming_timeout_secs));
+        let started = std::time::Instant::now();
         let run = agent
             .stream(
                 &inbound.text,
@@ -392,6 +396,7 @@ impl SlackIngress {
                 request_id,
             )
             .await;
+        let usage = run.usage().clone();
 
         // The run's own deadline only fires between hook points, so the
         // consumer bounds the wall clock too and, on timeout or shutdown,
@@ -401,6 +406,16 @@ impl SlackIngress {
             () = self.state.stream_shutdown_token.cancelled() => Err(RunError::Cancelled),
             outcome = bounded(timeout, final_content(run.into_events())) => outcome,
         };
+        aura::metrics::record_run(RunMeasure {
+            agent: &agent_name,
+            ingress: Ingress::Slack,
+            role: AgentRole::Main,
+            orchestration,
+            error_type: outcome.as_ref().err().map(RunError::metric_error_type),
+            duration: started.elapsed(),
+            inference_calls: Some(usage.llm_turns()),
+            tool_calls: (!orchestration).then(|| usage.tool_calls()),
+        });
         match &outcome {
             Err(RunError::TimedOut) => {
                 agent
@@ -521,6 +536,21 @@ enum RunError {
     TimedOut,
     #[error("run cancelled by server shutdown")]
     Cancelled,
+}
+
+impl RunError {
+    /// `error.type` for the run metric. Build failures never reach the
+    /// metric, since the run is recorded only once it has streamed.
+    fn metric_error_type(&self) -> &'static str {
+        match self {
+            RunError::Slack(_) => "slack_error",
+            RunError::Build(_) => "build_error",
+            RunError::Stream(_) => "stream_error",
+            RunError::NoFinal => "no_final",
+            RunError::TimedOut => "timeout",
+            RunError::Cancelled => "shutdown",
+        }
+    }
 }
 
 /// Map earlier messages, oldest first, onto chat history: each message

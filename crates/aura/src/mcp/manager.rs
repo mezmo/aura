@@ -62,6 +62,23 @@ impl McpManager {
         }
     }
 
+    /// Record every server's connection state and tool count for `agent`
+    /// in the metrics. The gauges hold the newest attempt: every request
+    /// connects again as its agent is built (`PreparedAgent::prepare` for a
+    /// single agent, `Orchestrator::new` under orchestration), so a server
+    /// that drops shows as disconnected from the next request on, not only
+    /// at startup.
+    pub fn record_connection_metrics(&self, agent: &str) {
+        for (server, info) in &self.server_info {
+            crate::metrics::set_mcp_server_status(
+                agent,
+                server,
+                matches!(info.status, ConnectionStatus::Connected),
+                info.tools_count as u64,
+            );
+        }
+    }
+
     /// Initialize MCP connections and discover tools from all configured servers
     pub async fn initialize_from_config(
         mcp_config: &crate::config::McpConfig,
