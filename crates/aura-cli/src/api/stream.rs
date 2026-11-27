@@ -542,7 +542,9 @@ mod tests {
         tools_requested: Vec<(String, String, BTreeMap<String, serde_json::Value>)>,
         tools_started: Vec<(String, String)>,
         tools_completed: Vec<(String, String, Option<String>)>,
+        tool_durations: Vec<Duration>,
         usages: Vec<(u64, u64)>,
+        cache_usages: Vec<Option<(u64, u64)>>,
         tool_usages: Vec<(u64, u64)>,
         context_usages: Vec<(u64, u64, Option<u64>, String)>,
         reasoning: Vec<(String, String)>,
@@ -574,9 +576,10 @@ mod tests {
             &mut self,
             tool_id: &str,
             tool_name: &str,
-            _duration: Duration,
+            duration: Duration,
             result: Option<&str>,
         ) {
+            self.tool_durations.push(duration);
             self.tools_completed.push((
                 tool_id.to_string(),
                 tool_name.to_string(),
@@ -587,9 +590,10 @@ mod tests {
             &mut self,
             prompt_tokens: u64,
             completion_tokens: u64,
-            _cache_usage: Option<(u64, u64)>,
+            cache_usage: Option<(u64, u64)>,
         ) {
             self.usages.push((prompt_tokens, completion_tokens));
+            self.cache_usages.push(cache_usage);
         }
         fn on_context_usage(
             &mut self,
@@ -643,6 +647,103 @@ mod tests {
         let mut caps = Captures::default();
         let result = process_sse_events(event_stream, no_cancel(), &mut caps).await;
         (result, caps)
+    }
+
+    /// The payload structs name the producer's fields as plain strings, and a
+    /// payload that fails to parse is dropped. Build each event the way the
+    /// server does and render it to SSE text, so renaming a field on
+    /// `AuraStreamEvent` fails here instead of silently losing a callback.
+    #[tokio::test]
+    async fn events_built_by_aura_events_reach_every_callback() {
+        use aura_events::{AuraStreamEvent, CorrelationContext, EmittingAgent};
+
+        let worker = || EmittingAgent::worker("log_worker", None, "coordinator");
+        let correlation = || CorrelationContext::new("s1", None);
+        let events = [
+            AuraStreamEvent::tool_requested(
+                "call_1",
+                "Shell",
+                serde_json::json!({ "command": "ls" }),
+                worker(),
+                correlation(),
+            ),
+            AuraStreamEvent::tool_start("call_1", "Shell", None, worker(), correlation()),
+            AuraStreamEvent::tool_complete_success(
+                "call_1",
+                "Shell",
+                1500,
+                "output",
+                worker(),
+                correlation(),
+            ),
+            AuraStreamEvent::tool_complete_failure(
+                "call_2",
+                "Shell",
+                250,
+                "denied",
+                worker(),
+                correlation(),
+            ),
+            AuraStreamEvent::tool_usage(
+                vec!["call_1".to_string()],
+                10,
+                5,
+                15,
+                worker(),
+                correlation(),
+            ),
+            AuraStreamEvent::usage(100, 50, 150, Some((30, 20)), correlation()),
+            AuraStreamEvent::context_usage(4000, 120, Some(128_000), worker(), correlation()),
+        ];
+
+        // Decode the text with the same SSE parser `process_stream` uses.
+        let sse_stream = stream::iter(
+            events
+                .iter()
+                .map(|event| Ok::<_, std::io::Error>(event.format_sse())),
+        )
+        .eventsource();
+        let mut caps = Captures::default();
+        process_sse_events(sse_stream, no_cancel(), &mut caps)
+            .await
+            .unwrap();
+
+        let args: BTreeMap<String, serde_json::Value> =
+            BTreeMap::from([("command".to_string(), serde_json::json!("ls"))]);
+        assert_eq!(
+            caps.tools_requested,
+            vec![("call_1".to_string(), "Shell".to_string(), args)]
+        );
+        assert_eq!(
+            caps.tools_started,
+            vec![("call_1".to_string(), "Shell".to_string())]
+        );
+        assert_eq!(
+            caps.tools_completed,
+            vec![
+                (
+                    "call_1".to_string(),
+                    "Shell".to_string(),
+                    Some("output".to_string())
+                ),
+                (
+                    "call_2".to_string(),
+                    "Shell".to_string(),
+                    Some("Error: denied".to_string())
+                ),
+            ]
+        );
+        assert_eq!(
+            caps.tool_durations,
+            vec![Duration::from_millis(1500), Duration::from_millis(250)]
+        );
+        assert_eq!(caps.tool_usages, vec![(10, 5)]);
+        assert_eq!(caps.usages, vec![(100, 50)]);
+        assert_eq!(caps.cache_usages, vec![Some((30, 20))]);
+        assert_eq!(
+            caps.context_usages,
+            vec![(4000, 120, Some(128_000), "log_worker".to_string())]
+        );
     }
 
     // -----------------------------------------------------------------------
