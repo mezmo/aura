@@ -1112,6 +1112,7 @@ mod scripts {
                                 result: "Listed eleven files".to_owned(),
                                 format: ResultFormat::Text,
                             },
+                            quota_exhausted: false,
                         })),
                         emitted(by_coordinator(AgentEventPayload::IterationComplete {
                             iteration: 1,

@@ -517,6 +517,17 @@ impl Task {
         };
     }
 
+    /// Whether this task failed on a provider account out of credit or quota.
+    pub fn is_quota_exhausted(&self) -> bool {
+        matches!(
+            self.state,
+            TaskState::Failed {
+                category: FailureCategory::ProviderQuotaExhausted,
+                ..
+            }
+        )
+    }
+
     /// Mark this task as failed with an error and structured category.
     pub fn fail(&mut self, error: impl Into<String>, category: FailureCategory) {
         self.state = TaskState::Failed {
@@ -566,6 +577,8 @@ pub enum FailureCategory {
     ProviderAuthError,
     /// LLM model not found or invalid model identifier (404).
     ProviderNotFound,
+    /// The provider account is out of credit or quota.
+    ProviderQuotaExhausted,
     /// Upstream dependency task failed.
     DependencyFailed,
     /// Worker completed but reported unable to produce a result.
@@ -573,6 +586,17 @@ pub enum FailureCategory {
     /// Unclassified worker failure.
     #[default]
     AgentError,
+}
+
+/// A failed task's error as prompts and results show it. A quota failure's
+/// error is the provider's body and request id, which stay in the saved plan
+/// and logs, so it reads as the plain message.
+pub(crate) fn failure_text(error: &str, category: FailureCategory) -> &str {
+    if category == FailureCategory::ProviderQuotaExhausted {
+        crate::provider_error::QUOTA_EXHAUSTED_MESSAGE
+    } else {
+        error
+    }
 }
 
 /// One gated tool call parked for a human decision.
@@ -1048,6 +1072,19 @@ impl IterationContext {
                                 )
                             }
                         }
+                        // The provider's body and request id stay out of a
+                        // prompt the coordinator could quote from. The worker
+                        // is named so the next plan can avoid its account.
+                        (cat @ FailureCategory::ProviderQuotaExhausted, _) => {
+                            format!(
+                                "- Task {}: {} → failed [{}] on worker {}: {}",
+                                t.id,
+                                t.description,
+                                cat,
+                                t.worker.as_deref().unwrap_or("generic"),
+                                crate::provider_error::QUOTA_EXHAUSTED_MESSAGE
+                            )
+                        }
                         (cat, _) => {
                             let (truncated_error, was_truncated) =
                                 crate::string_utils::safe_truncate(error, content_max_length);
@@ -1142,8 +1179,10 @@ impl IterationContext {
                     .as_deref()
                     .map(|w| format!(" (worker: {w})"))
                     .unwrap_or_default();
-                let (truncated_error, was_truncated) =
-                    crate::string_utils::safe_truncate(&record.error, content_max_length);
+                let (truncated_error, was_truncated) = crate::string_utils::safe_truncate(
+                    failure_text(&record.error, record.category),
+                    content_max_length,
+                );
                 let suffix = if was_truncated { " [truncated]" } else { "" };
                 fh.push_str(&format!(
                     "\n- Iteration {}: \"{}\"{} — [{}] {}{}",
@@ -1247,6 +1286,23 @@ fn extract_artifact_footer(result: &str) -> Option<&str> {
 /// The heading above a task's kept output.
 pub(super) const KEPT_OUTPUT_HEADING: &str =
     "Output from an earlier attempt, which did not call submit_result:";
+
+/// A failed task's `TaskCompleted` text: its `error`, then `output` under
+/// [`KEPT_OUTPUT_HEADING`].
+pub fn with_kept_output(error: &str, output: &str) -> String {
+    format!("{error}\n{KEPT_OUTPUT_HEADING}\n{output}")
+}
+
+/// A `TaskCompleted` text split into its error and, if it carries one, the
+/// kept output with its heading. The split is at the first heading, so the
+/// worker's output can quote the heading without moving it.
+pub fn split_kept_output(text: &str) -> (&str, Option<&str>) {
+    let marker = format!("\n{KEPT_OUTPUT_HEADING}\n");
+    match text.find(&marker) {
+        Some(at) => (&text[..at], Some(&text[at + 1..])),
+        None => (text, None),
+    }
+}
 
 /// `output` cut to `max_length`, with its artifact footer kept so the filename
 /// survives the cut.
@@ -1957,6 +2013,33 @@ mod tests {
         // No failure section on the success path
         assert!(!prompt.contains("FAILURE SUMMARY:"));
         assert!(!prompt.contains("AREAS NEEDING ATTENTION:"));
+    }
+
+    #[test]
+    fn test_continuation_prompt_names_the_exhausted_worker_without_the_provider_body() {
+        let body = r#"Your credit balance is too low","request_id":"req_011secret"#;
+        let mut plan = Plan::new("Debug the issue");
+        let mut task = Task::new(0, "Gather logs", "Collect logs").with_worker("operations");
+        task.fail(body, FailureCategory::ProviderQuotaExhausted);
+        plan.add_task(task);
+        let failures = vec![FailedTaskRecord {
+            description: "Gather logs".to_string(),
+            error: body.to_string(),
+            iteration: 1,
+            worker: Some("operations".to_string()),
+            category: FailureCategory::ProviderQuotaExhausted,
+            kept_output: None,
+        }];
+
+        let ctx = IterationContext::new(1, plan, None, failures, HashMap::new());
+        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+
+        assert!(prompt.contains("on worker operations"), "{prompt}");
+        assert!(
+            prompt.contains(crate::provider_error::QUOTA_EXHAUSTED_MESSAGE),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("req_011secret"), "{prompt}");
     }
 
     #[test]
@@ -2963,6 +3046,10 @@ mod tests {
             (FailureCategory::LoopDetected, "loop_detected"),
             (FailureCategory::ProviderOverloaded, "provider_overloaded"),
             (FailureCategory::ProviderAuthError, "provider_auth_error"),
+            (
+                FailureCategory::ProviderQuotaExhausted,
+                "provider_quota_exhausted",
+            ),
             (FailureCategory::DependencyFailed, "dependency_failed"),
             (FailureCategory::SoftFailure, "soft_failure"),
             (FailureCategory::AgentError, "agent_error"),
