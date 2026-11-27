@@ -5,6 +5,9 @@
 //! in web services or other applications that need to build agents
 //! programmatically.
 
+// Counts the cargo-hakari workspace hack as used (cargo::unused_dependencies).
+use workspace_hack as _;
+
 pub mod approver_headers;
 pub mod bedrock_embedding;
 pub mod builder;

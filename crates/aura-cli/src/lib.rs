@@ -1,3 +1,6 @@
+// Counts the cargo-hakari workspace hack as used (cargo::unused_dependencies).
+use workspace_hack as _;
+
 pub mod agent_config;
 pub mod api;
 pub mod aura_dir;

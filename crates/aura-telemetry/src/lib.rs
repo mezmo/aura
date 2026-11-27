@@ -18,6 +18,9 @@
 //! - [`install_id`] — anonymous install UUID persisted on disk; sets
 //!   PostHog `distinct_id` and never appears in event property maps.
 
+// Counts the cargo-hakari workspace hack as used (cargo::unused_dependencies).
+use workspace_hack as _;
+
 // Let `#[derive(Event)]` resolve `aura_telemetry::...` paths even when
 // the macro is used inside this crate's own modules (e.g. `events.rs`).
 extern crate self as aura_telemetry;

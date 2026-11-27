@@ -201,7 +201,7 @@ impl ConditionalEventHandler for StreamUpHandler {
         } else {
             // Track how deep into history the user has gone (capped at actual count).
             let count = HISTORY_COUNT.load(Ordering::Relaxed);
-            let _ = HISTORY_DEPTH.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
+            let _ = HISTORY_DEPTH.try_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
                 if d < count { Some(d + 1) } else { None }
             });
             None // default rustyline behavior (history)
@@ -262,7 +262,7 @@ impl ConditionalEventHandler for PageUpHandler {
         } else {
             // Jump back 10 entries in input history (capped at count)
             let count = HISTORY_COUNT.load(Ordering::Relaxed);
-            let _ = HISTORY_DEPTH.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
+            let _ = HISTORY_DEPTH.try_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
                 let new = (d + 10).min(count);
                 if new != d { Some(new) } else { None }
             });

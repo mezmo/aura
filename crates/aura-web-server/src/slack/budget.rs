@@ -17,7 +17,7 @@ impl Budget {
     /// still finds it spent once its siblings have.
     pub fn take(&self) -> bool {
         self.0
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 left.checked_sub(1)
             })
             .is_ok()

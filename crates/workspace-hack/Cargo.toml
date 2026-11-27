@@ -165,3 +165,6 @@ mio = { version = "1", features = ["net", "os-ext"] }
 rustix = { version = "1", features = ["fs", "stdio", "termios"] }
 
 ### END HAKARI SECTION
+
+[lints.cargo]
+unused_dependencies = "allow"

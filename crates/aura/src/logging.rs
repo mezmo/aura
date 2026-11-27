@@ -540,13 +540,9 @@ pub fn init_logging(debug: bool, verbose: bool, binary_name: &str) {
                 // Block execute_tool spans from rig::agent::prompt_request to prevent duplicate logs
                 // Our aura::mcp::dynamic provides tool execution logs with proper truncation
                 // This also blocks events within the execute_tool span (like "executed tool X with args Y")
-                if metadata.target().starts_with("rig::agent::prompt_request")
+                !(metadata.target().starts_with("rig::agent::prompt_request")
                     && metadata.is_span()
-                    && metadata.name() == "execute_tool"
-                {
-                    return false;
-                }
-                true
+                    && metadata.name() == "execute_tool")
             }))
             .with_filter(console_filter);
 
