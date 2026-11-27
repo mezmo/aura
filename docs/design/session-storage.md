@@ -617,7 +617,7 @@ phases 2 and 3 are independent and can land in either order; phase 4 needs both.
 - **Trait conformance suite:** one async test battery run against _both_ the in-memory and
   Redis backends — register/resolve, at-most-once resolve, expiry, `cancel_request`, task
   create/get/list/history-by-context. The Redis side ships as
-  `crates/aura-web-server/tests/redis_session_store_test.rs` behind the
+  `crates/aura-web-server/tests/integration/redis_session_store_test.rs` behind the
   `integration-session-store` feature, pointed at an ephemeral Valkey via
   `AURA_TEST_REDIS_URL` (`make test-integration-session-store-local`).
 - **Cross-pod simulation:** two `AppState` instances sharing one backend; park an approval

@@ -8,13 +8,13 @@
 //!
 //! ```sh
 //! docker run --rm -d -p 6379:6379 valkey/valkey:8
-//! cargo test -p aura-web-server --features integration-session-store --test redis_session_store_test
+//! cargo test -p aura-web-server --features integration-session-store --test integration redis_session_store_test::
 //! ```
 //!
 //! Each test namespaces its keys under a unique prefix with a short TTL, so
 //! tests neither collide nor leave state behind.
 
-mod common;
+use crate::common;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;

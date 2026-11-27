@@ -285,7 +285,7 @@ test-integration-session-store-local: $(REPORT_DIR) ## Start an ephemeral Valkey
 	@echo "✅ Valkey is ready; running session-store integration tests..."
 	@trap 'docker stop $(VALKEY_TEST_NAME) >/dev/null 2>&1; exit 130' INT TERM; \
 	AURA_TEST_REDIS_URL=redis://127.0.0.1:$(VALKEY_TEST_PORT) \
-	cargo test --package aura-web-server --features integration-session-store --test redis_session_store_test --no-fail-fast; \
+	cargo test --package aura-web-server --features integration-session-store --test integration --no-fail-fast redis_session_store_test::; \
 	test_exit=$$?; \
 	docker stop $(VALKEY_TEST_NAME) >/dev/null 2>&1 || true; \
 	exit $$test_exit
@@ -311,7 +311,7 @@ test-integration-hitl-local: $(REPORT_DIR) ## Start mock-mcp, run HITL header-fo
 	if [ "$$mcp_status" != "healthy" ]; then echo "❌ Timeout waiting for mock-mcp"; docker compose -f compose/base.yml -f compose/dev.yml down; exit 1; fi
 	@echo "Running HITL header-forwarding integration tests..."
 	@trap 'docker compose -f compose/base.yml -f compose/dev.yml down; exit 130' INT TERM; \
-	cargo test --package aura-web-server --features integration-hitl-header-forwarding --test hitl_header_forwarding_tests --no-fail-fast -- --test-threads=1; \
+	cargo test --package aura-web-server --features integration-hitl-header-forwarding --test integration --no-fail-fast hitl_header_forwarding_tests:: -- --test-threads=1; \
 	test_exit=$$?; \
 	docker compose -f compose/base.yml -f compose/dev.yml down; \
 	exit $$test_exit

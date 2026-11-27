@@ -1,6 +1,6 @@
 # SSE and span parity: coverage manifest
 
-`tests/sse_parity.rs` serves one chat completion through both chat paths
+`tests/integration/sse_parity.rs` serves one chat completion through both chat paths
 and compares what they produce.
 
 The request-bound path (`execute_completion` reading the agent's item
@@ -242,5 +242,5 @@ the bytes.
 No test in the file is ignored, so the following returns nothing:
 
 ```
-grep -n '#\[ignore' crates/aura-web-server/tests/sse_parity.rs
+grep -n '#\[ignore' crates/aura-web-server/tests/integration/sse_parity.rs
 ```

@@ -9,7 +9,7 @@
 //! the per-log cap, skew tolerance, and mtime-based expiry — follow. No Docker: every test gets its
 //! own tempdir.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::time::Duration;
