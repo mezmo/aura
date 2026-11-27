@@ -213,9 +213,6 @@ pub struct CompletionMessage {
     pub content: Option<String>,
 }
 
-// AuraToolEvent and AuraUsageEvent removed — replaced by shared types from
-// the aura-events crate (AuraStreamEvent enum with Serialize + Deserialize).
-
 /// Details of a single Shell call executed within an Update group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellCallDetail {
@@ -525,74 +522,6 @@ mod tests {
     #[test]
     fn snake_to_pascal_already_pascal() {
         assert_eq!(snake_to_pascal_case("AlreadyPascal"), "AlreadyPascal");
-    }
-
-    // -----------------------------------------------------------------------
-    // AuraStreamEvent deserialization (shared types from aura-events crate)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn aura_stream_event_usage_roundtrip() {
-        use aura_events::AuraStreamEvent;
-        let data =
-            r#"{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150,"session_id":"s1"}"#;
-        match serde_json::from_str::<AuraStreamEvent>(data).unwrap() {
-            AuraStreamEvent::Usage {
-                prompt_tokens,
-                completion_tokens,
-                ..
-            } => {
-                assert_eq!(prompt_tokens, 100);
-                assert_eq!(completion_tokens, 50);
-            }
-            other => panic!("expected Usage, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn aura_stream_event_tool_requested_roundtrip() {
-        use aura_events::AuraStreamEvent;
-        let data = r#"{"tool_id":"call_1","tool_name":"Shell","arguments":{"command":"ls"},"agent_id":"main","session_id":"s1"}"#;
-        match serde_json::from_str::<AuraStreamEvent>(data).unwrap() {
-            AuraStreamEvent::ToolRequested {
-                tool_id,
-                tool_name,
-                arguments,
-                ..
-            } => {
-                assert_eq!(tool_id, "call_1");
-                assert_eq!(tool_name, "Shell");
-                assert_eq!(arguments["command"], "ls");
-            }
-            other => panic!("expected ToolRequested, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn aura_stream_event_tool_complete_roundtrip() {
-        use aura_events::AuraStreamEvent;
-        let data = r#"{"tool_id":"call_1","tool_name":"Shell","duration_ms":1500,"success":true,"result":"output","agent_id":"main","session_id":"s1"}"#;
-        match serde_json::from_str::<AuraStreamEvent>(data).unwrap() {
-            AuraStreamEvent::ToolComplete {
-                tool_name,
-                duration_ms,
-                result,
-                success,
-                ..
-            } => {
-                assert_eq!(tool_name, "Shell");
-                assert_eq!(duration_ms, 1500);
-                assert!(success);
-                assert_eq!(result.as_deref(), Some("output"));
-            }
-            other => panic!("expected ToolComplete, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn aura_stream_event_invalid_json() {
-        use aura_events::AuraStreamEvent;
-        assert!(serde_json::from_str::<AuraStreamEvent>("not json").is_err());
     }
 
     // -----------------------------------------------------------------------
