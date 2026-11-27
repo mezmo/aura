@@ -6,6 +6,7 @@ How to build, test, and navigate the AURA codebase. For the contribution process
 
 - **Rust (nightly)**: the repo's `rust-toolchain.toml` installs the right toolchain automatically on first build.
 - **Docker and Docker Compose**: required for integration tests and containerized builds.
+- **cargo-hakari**: `make hakari` and `make lint` run it, at the version CI pins (see [Workspace hack](#workspace-hack)).
 - **Node.js 22+** (optional): used by CI tooling such as commit linting and release generation.
 
 ## Building from Source
@@ -92,7 +93,7 @@ Make targets are composed from modular includes under `.makefiles/` (rust, docke
 
 ### Workspace hack
 
-`crates/workspace-hack` depends on every third-party crate that two workspace members would otherwise build with different features, with the union of those features. Every member except `aura-events` and the `aura-telemetry-derive` proc macro depends on it. So `cargo build -p aura`, `cargo test --workspace` and `cargo clippy` all resolve one feature set per dependency, and switching between them doesn't rebuild the dependency graph. [cargo-hakari](https://docs.rs/cargo-hakari) generates it from `.config/hakari.toml`. Make downloads the pinned version (`HAKARI_VERSION` in `.makefiles/rust.mk`) into `.bin/` and checks its SHA-256:
+`crates/workspace-hack` depends on every third-party crate that two workspace members would otherwise build with different features, with the union of those features. Every member except `aura-events` and the `aura-telemetry-derive` proc macro depends on it. So `cargo build -p aura`, `cargo test --workspace` and `cargo clippy` all resolve one feature set per dependency, and switching between them doesn't rebuild the dependency graph. [cargo-hakari](https://docs.rs/cargo-hakari) generates it from `.config/hakari.toml`. Make runs `cargo hakari`, so install the version CI runs, `CARGO_HAKARI_VERSION` in the `Dockerfile`, with `cargo binstall cargo-hakari@<version>` or `cargo install cargo-hakari@<version> --locked`. Another version can write a different hack than the one CI checks:
 
 ```bash
 make hakari        # after adding, removing or changing a dependency
