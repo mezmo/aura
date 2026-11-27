@@ -1,5 +1,8 @@
 //! Shared test utilities for aura integration tests.
 
+// Counts the cargo-hakari workspace hack as used (cargo::unused_dependencies).
+use workspace_hack as _;
+
 pub mod mock_agent;
 pub mod sse;
 

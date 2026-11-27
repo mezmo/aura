@@ -27,7 +27,7 @@ ARG CLOUDSMITH_SHA256_AMD64=e3729f8fc58e44ae9f7f50af197ab9d99b4b70551b7cbe83cf42
 ARG CLOUDSMITH_SHA256_ARM64=50c3fd0d7486eb9577bd713240c04f3d9d75a9da424ea944a51b105e13e15901
 
 ### 000 Chef
-FROM lukemathwalker/cargo-chef:latest-rust-1.95@sha256:00c3c07c51d092325df88f0df2d626cd4302e12933f179ba154509cc314d6c2a AS chef
+FROM lukemathwalker/cargo-chef:latest-rust-1.100@sha256:edbf6876f6a78e921b94e65001cc494214bfb790f374c8bd7bc05de62f69258b AS chef
 
 ### 001 Core
 # sentencepiece-sys builds its C++ library from source.

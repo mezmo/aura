@@ -1,3 +1,6 @@
+// Counts the cargo-hakari workspace hack as used (cargo::unused_dependencies).
+use workspace_hack as _;
+
 pub mod config;
 pub mod env;
 pub mod error;

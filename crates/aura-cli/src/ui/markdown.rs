@@ -19,13 +19,13 @@ fn skin_from_theme(t: &Theme) -> MadSkin {
 
     // Headings (h1-h3) share the Heading role.
     let heading = t.heading;
-    for level in 0..3 {
-        skin.headers[level].set_fg(heading.fg);
+    for header in skin.headers.iter_mut().take(3) {
+        header.set_fg(heading.fg);
         if heading.bold {
-            skin.headers[level].add_attr(Attribute::Bold);
+            header.add_attr(Attribute::Bold);
         }
         if heading.italic {
-            skin.headers[level].add_attr(Attribute::Italic);
+            header.add_attr(Attribute::Italic);
         }
     }
 
