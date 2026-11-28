@@ -3568,6 +3568,11 @@ impl StreamHandler for ReplStreamHandler {
                 crate::ui::prompt::increment_orch_scrollback();
             }
 
+            if let Some(polling) = &pending.polling {
+                println!("  {}", polling.to_string().themed(AuraStyle::Warning),);
+                crate::ui::prompt::increment_orch_scrollback();
+            }
+
             // Read y/n
             eprint!("  {} ", "Approve? [y]es / [n]o".themed(AuraStyle::Warning),);
             let _ = io::stderr().flush();

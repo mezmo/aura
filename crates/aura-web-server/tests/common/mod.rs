@@ -21,6 +21,7 @@ use aura::session_store::{ApprovalStore, ParkedApprovalRecord};
 pub fn make_parked(request_id: &str, ttl: Duration) -> ParkedApproval {
     let now = chrono::Utc::now();
     ParkedApproval {
+        polling_target: None,
         request: ApprovalRequest {
             version: PROTOCOL_VERSION,
             instance_id: "test-instance".to_string(),
@@ -36,6 +37,7 @@ pub fn make_parked(request_id: &str, ttl: Duration) -> ParkedApproval {
                 tool_namespace: None,
                 arguments: serde_json::json!({"pod": "web-1"}),
                 tool_call_intent: Some("restarting to pick up the config change".to_string()),
+                polling: None,
             }],
         },
         registered_at: now,

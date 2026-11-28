@@ -35,6 +35,39 @@ pub struct ParkedApprovalRecord {
     pub items: Vec<ApprovalItem>,
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub polling_target: Option<PollingTargetRecord>,
+}
+
+/// Storage form of a polling target and its original invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollingTargetRecord {
+    pub server_id: String,
+    pub namespace: String,
+    pub tool_name: String,
+    pub invocation_arguments: serde_json::Value,
+}
+
+impl From<&crate::hitl::PollingTarget> for PollingTargetRecord {
+    fn from(target: &crate::hitl::PollingTarget) -> Self {
+        Self {
+            server_id: target.server_id.clone(),
+            namespace: target.namespace.clone(),
+            tool_name: target.tool_name.clone(),
+            invocation_arguments: target.invocation_arguments.clone(),
+        }
+    }
+}
+
+impl From<PollingTargetRecord> for crate::hitl::PollingTarget {
+    fn from(record: PollingTargetRecord) -> Self {
+        Self {
+            server_id: record.server_id,
+            namespace: record.namespace,
+            tool_name: record.tool_name,
+            invocation_arguments: record.invocation_arguments,
+        }
+    }
 }
 
 /// Storage form of [`AgentScope`].
@@ -126,6 +159,7 @@ impl From<&ParkedApproval> for ParkedApprovalRecord {
             items: request.items.clone(),
             registered_at: parked.registered_at,
             expires_at: parked.expires_at,
+            polling_target: parked.polling_target.as_ref().map(Into::into),
         }
     }
 }
@@ -146,6 +180,7 @@ impl TryFrom<ParkedApprovalRecord> for ParkedApproval {
             },
             registered_at: record.registered_at,
             expires_at: record.expires_at,
+            polling_target: record.polling_target.map(Into::into),
         })
     }
 }
@@ -247,6 +282,7 @@ mod tests {
     fn parked(scope: AgentScope, origin: ApprovalOrigin) -> ParkedApproval {
         let now = chrono::Utc::now();
         ParkedApproval {
+            polling_target: None,
             request: ApprovalRequest {
                 version: PROTOCOL_VERSION,
                 instance_id: "test-instance".to_string(),
@@ -259,6 +295,7 @@ mod tests {
                     tool_namespace: None,
                     arguments: serde_json::json!({"arg": 1}),
                     tool_call_intent: None,
+                    polling: None,
                 }],
             },
             registered_at: now,
@@ -288,6 +325,24 @@ mod tests {
                 agent_name: "test-agent".to_string(),
             },
         ));
+    }
+
+    #[test]
+    fn polling_target_and_raw_invocation_survive_storage() {
+        let mut approval = parked(
+            AgentScope::Single { session_id: None },
+            ApprovalOrigin::ConfigGate {
+                matched_pattern: "*".to_owned(),
+                agent_name: "worker".to_owned(),
+            },
+        );
+        approval.polling_target = Some(crate::hitl::PollingTarget {
+            server_id: "server-id".to_owned(),
+            namespace: "test".to_owned(),
+            tool_name: "query".to_owned(),
+            invocation_arguments: serde_json::json!({"probe": {"tool": "query", "args": {}}}),
+        });
+        assert_round_trip(approval);
     }
 
     #[test]
@@ -363,5 +418,43 @@ mod tests {
         };
         let err = AgentScope::try_from(scope).unwrap_err();
         assert!(err.reason.contains("not-a-uuid"));
+    }
+
+    #[test]
+    fn polling_target_projection_preserves_json_and_round_trips_scope() {
+        let mut approval = parked(
+            AgentScope::Single { session_id: None },
+            ApprovalOrigin::ConfigGate {
+                matched_pattern: "*".to_owned(),
+                agent_name: "test".to_owned(),
+            },
+        );
+        let target_json = serde_json::json!({
+            "server_id": "server", "namespace": "test", "tool_name": "probe_tool",
+            "invocation_arguments": {"probe": {"tool": "probe_tool", "args": {}}, "until": {"matches": "ok"}}
+        });
+        let record: PollingTargetRecord = serde_json::from_value(target_json.clone()).unwrap();
+        approval.polling_target = Some(record.into());
+        approval.request.items[0].polling = Some(crate::hitl::PollingScope {
+            every_secs: 2,
+            for_up_to_secs: 120,
+        });
+        let json = serde_json::to_value(ParkedApprovalRecord::from(&approval)).unwrap();
+        assert_eq!(json["polling_target"], target_json);
+        let decoded: ParkedApprovalRecord = serde_json::from_value(json).unwrap();
+        let restored = ParkedApproval::try_from(decoded).unwrap();
+        assert_eq!(restored.polling_target, approval.polling_target);
+        assert_eq!(restored.request.items, approval.request.items);
+
+        let mut legacy = serde_json::to_value(ParkedApprovalRecord::from(&approval)).unwrap();
+        legacy.as_object_mut().unwrap().remove("polling_target");
+        legacy["items"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("polling");
+        let decoded: ParkedApprovalRecord = serde_json::from_value(legacy).unwrap();
+        let restored = ParkedApproval::try_from(decoded).unwrap();
+        assert!(restored.polling_target.is_none());
+        assert!(restored.request.items[0].polling.is_none());
     }
 }

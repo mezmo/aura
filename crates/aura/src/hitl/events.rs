@@ -139,20 +139,7 @@ impl<'a> From<&'a ApprovalRequest> for ApprovalRequestWire<'a> {
 /// prompt the client renders.
 impl From<&ParkedApproval> for ApprovalPending {
     fn from(parked: &ParkedApproval) -> Self {
-        let first_item = parked.request.items.first();
-        Self {
-            decision_id: parked.request.decision_id.to_string(),
-            tool_name: first_item
-                .map(|item| item.tool_name.clone())
-                .unwrap_or_default(),
-            tool_namespace: first_item.and_then(|item| item.tool_namespace.clone()),
-            arguments: first_item
-                .map(|item| item.arguments.clone())
-                .unwrap_or(serde_json::Value::Null),
-            origin: origin_to_wire(&parked.request.origin),
-            scope: scope_to_wire(&parked.request.scope),
-            expires_at: parked.expires_at.to_rfc3339(),
-        }
+        pending(&parked.request, &parked.expires_at)
     }
 }
 
@@ -173,6 +160,12 @@ pub fn pending(
         arguments: first_item
             .map(|item| item.arguments.clone())
             .unwrap_or(serde_json::Value::Null),
+        polling: first_item
+            .and_then(|item| item.polling.as_ref())
+            .map(|scope| aura_events::ApprovalPolling {
+                every_secs: scope.every_secs,
+                for_up_to_secs: scope.for_up_to_secs,
+            }),
         origin: origin_to_wire(&request.origin),
         scope: scope_to_wire(&request.scope),
         expires_at: expires_at.to_rfc3339(),
@@ -319,6 +312,51 @@ mod tests {
         assert_eq!(json["outcome"]["kind"], "cancelled");
         assert_eq!(json["outcome"]["reason"], "sender_dropped");
         assert_eq!(json["duration_ms"], 42);
+    }
+
+    #[test]
+    fn polling_scope_survives_live_and_parked_pending_projections() {
+        let now = chrono::Utc::now();
+        let mut parked = ParkedApproval {
+            request: ApprovalRequest {
+                version: super::super::PROTOCOL_VERSION,
+                instance_id: "test".to_owned(),
+                decision_id: DecisionId::generate(),
+                request_id: "test".to_owned(),
+                scope: AgentScope::Single { session_id: None },
+                origin: super::super::ApprovalOrigin::ConfigGate {
+                    matched_pattern: "*".to_owned(),
+                    agent_name: "test".to_owned(),
+                },
+                items: vec![super::super::ApprovalItem {
+                    tool_name: "probe_tool".to_owned(),
+                    tool_namespace: Some("test".to_owned()),
+                    arguments: serde_json::json!({}),
+                    tool_call_intent: None,
+                    polling: Some(super::super::PollingScope {
+                        every_secs: 2,
+                        for_up_to_secs: 120,
+                    }),
+                }],
+            },
+            registered_at: now,
+            expires_at: now,
+            polling_target: None,
+        };
+        let live = serde_json::to_value(pending(&parked.request, &now)).unwrap();
+        let restored = serde_json::to_value(ApprovalPending::from(&parked)).unwrap();
+        assert_eq!(live, restored);
+        assert_eq!(
+            live["polling"],
+            serde_json::json!({"every_secs": 2, "for_up_to_secs": 120})
+        );
+        parked.request.items[0].polling = None;
+        assert!(
+            serde_json::to_value(pending(&parked.request, &now))
+                .unwrap()
+                .get("polling")
+                .is_none()
+        );
     }
 
     #[test]

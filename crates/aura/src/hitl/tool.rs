@@ -294,6 +294,7 @@ impl Tool for RequestApprovalTool {
                 tool_namespace: None,
                 arguments: serde_json::to_value(&args).unwrap_or_default(),
                 tool_call_intent,
+                polling: None,
             }],
         };
         let cancel = run
