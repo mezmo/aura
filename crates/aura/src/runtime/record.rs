@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use aura_events::run::{CancelCause, Liveness};
-use aura_events::{RunId, SessionId, TokenCount, TokenUsage};
+use aura_events::{RunId, SequenceNumber, SessionId, TokenCount, TokenUsage};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -200,6 +200,9 @@ impl SessionRecord {
 /// One run the runtime holds.
 pub(crate) struct RunRecord {
     pub(super) id: RunId,
+    /// The sequence number of the newest event in the session's stream when
+    /// the run was accepted.
+    preceding_event: Option<SequenceNumber>,
     /// The token that stops the run.
     pub(super) cancel: CancellationToken,
     stops: Mutex<Stops>,
@@ -261,9 +264,10 @@ enum Ending {
 }
 
 impl RunRecord {
-    pub(super) fn new(facts: RunFacts) -> Self {
+    pub(super) fn new(facts: RunFacts, preceding_event: Option<SequenceNumber>) -> Self {
         Self {
             id: facts.run.run_id,
+            preceding_event,
             cancel: CancellationToken::new(),
             stops: Mutex::new(Stops::default()),
             usage: OnceLock::new(),
@@ -273,6 +277,10 @@ impl RunRecord {
             context: Mutex::new(None),
             activity: watch::Sender::new(0),
         }
+    }
+
+    pub(super) fn preceding_event(&self) -> Option<SequenceNumber> {
+        self.preceding_event
     }
 
     /// Records that the run showed activity.
@@ -335,6 +343,16 @@ impl RunRecord {
     /// Changes the run's facts and wakes whoever watches them.
     pub(super) fn update(&self, change: impl FnOnce(&mut RunFacts)) {
         self.facts.send_modify(change);
+    }
+
+    /// Resolves once the run's facts show it ended.
+    pub(super) async fn ended(&self) {
+        // The record owns the sender, so the wait cannot fail while it runs.
+        let _ = self
+            .facts
+            .subscribe()
+            .wait_for(|facts| facts.run.status.is_terminal())
+            .await;
     }
 
     /// A receiver that sees every change to the run's facts.

@@ -22,7 +22,7 @@ use super::projection::{Projected, Pulse, SseProjector};
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 /// The SSE comment a heartbeat sends.
-const HEARTBEAT_FRAME: &[u8] = b": heartbeat\n\n";
+pub(crate) const HEARTBEAT_FRAME: &[u8] = b": heartbeat\n\n";
 
 /// The timeout windows a streaming body enforces on its run, and how often
 /// it sends a heartbeat.
@@ -244,7 +244,7 @@ async fn expiry(window: &mut Option<(Duration, Pin<Box<Sleep>>)>) -> Duration {
 /// Builds the interval heartbeats go out on. Returns `None` when there is no
 /// period or the period is zero, since `tokio::time::interval` panics on a
 /// zero period.
-fn heartbeat(period: Option<Duration>) -> Option<Interval> {
+pub(crate) fn heartbeat(period: Option<Duration>) -> Option<Interval> {
     period.filter(|period| !period.is_zero()).map(|period| {
         let mut heartbeat = tokio::time::interval(period);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -254,7 +254,7 @@ fn heartbeat(period: Option<Duration>) -> Option<Interval> {
 
 /// Waits for the heartbeat's next tick. With no heartbeat, it never
 /// resolves.
-async fn tick(heartbeat: &mut Option<Interval>) {
+pub(crate) async fn tick(heartbeat: &mut Option<Interval>) {
     match heartbeat {
         Some(heartbeat) => {
             heartbeat.tick().await;

@@ -33,11 +33,12 @@ use crate::provider_agent::{
     ProviderAgent, StreamError, StreamItem, StreamedUserContent, ToolResult, ToolResultKind,
 };
 use crate::run_context::{Attendance, RunContext};
-use crate::session_store::{JournalEntry, SkillLogKey};
+use crate::session_store::{JournalEntry, SessionFilter, SessionRuns, SkillLogKey};
 use crate::streaming::{AgentRun, RunOptions, StreamingAgent};
 use crate::streaming_request_hook::UsageState;
 use aura_events::McpServerStatus;
 
+mod introspect;
 mod lanes;
 mod observe;
 
@@ -491,6 +492,13 @@ impl RunStore for GatedRunStore {
         self.inner.list(filter).await
     }
 
+    async fn newest_per_session(
+        &self,
+        filter: &SessionFilter,
+    ) -> Result<Vec<SessionRuns>, SessionStoreError> {
+        self.inner.newest_per_session(filter).await
+    }
+
     /// Waits for the gate before finishing, so a test can hold a run in its
     /// ending.
     async fn finish(
@@ -521,6 +529,13 @@ impl RunStore for PanickingRunStore {
 
     async fn list(&self, filter: &RunFilter) -> Result<Vec<RunFacts>, SessionStoreError> {
         self.inner.list(filter).await
+    }
+
+    async fn newest_per_session(
+        &self,
+        filter: &SessionFilter,
+    ) -> Result<Vec<SessionRuns>, SessionStoreError> {
+        self.inner.newest_per_session(filter).await
     }
 
     /// Panics instead of finishing the run.
@@ -2032,7 +2047,7 @@ fn preparing(run_id: RunId) -> RunFacts {
 /// stops are refused, so the run keeps the ending it reached.
 #[test]
 fn a_stop_after_the_stream_ended_is_refused() {
-    let record = RunRecord::new(preparing(RunId::mint()));
+    let record = RunRecord::new(preparing(RunId::mint()), None);
     assert!(record.stop(CancelCause::External, Some("first".to_owned())));
     assert!(
         record.stop(CancelCause::Shutdown, None),
@@ -2044,7 +2059,7 @@ fn a_stop_after_the_stream_ended_is_refused() {
     );
     assert!(record.cancel.is_cancelled());
 
-    let record = RunRecord::new(preparing(RunId::mint()));
+    let record = RunRecord::new(preparing(RunId::mint()), None);
     record.close_to_stops();
     assert!(!record.stop(CancelCause::External, None));
     assert_eq!(record.stopped(), None);

@@ -22,6 +22,7 @@ mod otel;
 mod prepare;
 mod record;
 mod recorder;
+mod snapshot;
 mod start;
 mod state;
 mod task;
@@ -29,7 +30,7 @@ mod task;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
@@ -39,15 +40,16 @@ use aura_events::run::{
     CancelCause, LifecycleEvent, Liveness, LivenessPolicy, Observer, ObserverId,
     SessionEventPayload,
 };
-use aura_events::{RunId, SessionId};
+use aura_events::{RunId, SequenceNumber, SessionId};
 use tokio_util::sync::CancellationToken;
 
 use crate::conversation::Conversation;
 use crate::hitl::PendingApprovals;
 use crate::journal::{Cursor, SessionJournal};
 use crate::session_store::{
-    InMemoryJournalStore, InMemoryRunStore, InMemorySkillInvocationStore, JournalStore, RunDetails,
-    RunFacts, RunFilter, RunStatus, RunStore, SessionStoreError, SkillInvocationStore,
+    InMemoryJournalStore, InMemoryRunStore, InMemorySkillInvocationStore, JournalEntry,
+    JournalStore, RunDetails, RunFacts, RunFilter, RunStatus, RunStatuses, RunStore, SessionFilter,
+    SessionRuns, SessionStoreError, SkillInvocationStore,
 };
 
 pub use crate::conversation::RunSession;
@@ -57,8 +59,12 @@ pub use otel::record_ending;
 pub use prepare::AgentForRun;
 pub use prepare::RigBuilderPreparer;
 pub use record::RunActivity;
+pub use snapshot::{
+    EventRange, PageLimit, RunPage, RunQuery, RunSnapshot, SessionPage, SessionQuery,
+    SessionSnapshot, StopOutcome,
+};
 pub use start::{Admitted, BusyLane, Caller, RunTarget, StartError, StartRun};
-pub use state::{AgentState, BlockReason};
+pub use state::{AgentState, AgentStateKind, BlockReason};
 
 use prepare::AgentPreparer;
 use record::{Abandon, ObserverWrite, RunRecord, SessionRecord, SessionState};
@@ -306,23 +312,29 @@ impl AgentRuntime {
                 return Err(StartError::RunInProgress(live.id));
             }
             let joined = join(&mut state, &session)?;
-            let record = Arc::new(RunRecord::new(RunFacts {
-                session: run_session.clone(),
-                run: RunDetails {
-                    run_id,
-                    agent: config.agent_id().to_owned(),
-                    status: RunStatus::Preparing,
-                    liveness: start.liveness,
-                    started_at: aura_events::Timestamp::now(),
-                    ended_at: None,
-                    usage: aura_events::TokenUsage::default(),
-                    first_event: None,
-                    latest_event: None,
-                    pending_approvals: Vec::new(),
-                    checkpoint: None,
-                    continues: start.continues,
+            // Read before the run's task is spawned, so every event the run
+            // appends has a later number.
+            let preceding_event = session.journal.latest();
+            let record = Arc::new(RunRecord::new(
+                RunFacts {
+                    session: run_session.clone(),
+                    run: RunDetails {
+                        run_id,
+                        agent: config.agent_id().to_owned(),
+                        status: RunStatus::Preparing,
+                        liveness: start.liveness,
+                        started_at: aura_events::Timestamp::now(),
+                        ended_at: None,
+                        usage: aura_events::TokenUsage::default(),
+                        first_event: None,
+                        latest_event: None,
+                        pending_approvals: Vec::new(),
+                        checkpoint: None,
+                        continues: start.continues,
+                    },
                 },
-            }));
+                preceding_event,
+            ));
             state.live = Some(Arc::clone(&record));
             self.shared.live_runs.send_modify(|live| *live += 1);
             (record, joined)
@@ -513,6 +525,7 @@ impl AgentRuntime {
     /// Where the session stands, or `None` for a session this process does
     /// not hold. The first case that applies wins:
     ///
+    /// - a live run that was stopped: `Stopping`
     /// - a live run whose agent is being prepared: `Preparing`
     /// - a live run waiting on approvals: `Blocked`
     /// - any other live run: `Running`
@@ -528,6 +541,7 @@ impl AgentRuntime {
                 ..
             } = live.facts().run;
             return Some(match status {
+                _ if live.stopped().is_some() => AgentState::Stopping,
                 RunStatus::Preparing => AgentState::Preparing,
                 _ if !pending_approvals.is_empty() => AgentState::Blocked {
                     on: BlockReason::Approval {
@@ -547,6 +561,514 @@ impl AgentRuntime {
     pub async fn list(&self, filter: &RunFilter) -> Result<Vec<RunFacts>, SessionStoreError> {
         self.shared.run_store.list(filter).await
     }
+
+    /// One page of the sessions `query` selects, in session-id order: those
+    /// the run store has a run of, and those the runtime holds a run of. A
+    /// session is listed for as long as either keeps one of its runs, so a
+    /// session the runtime has let go is still listed, and so is one whose
+    /// rows the store let go while the runtime holds its run. A session that
+    /// never had a run is not.
+    ///
+    /// The query's agent, chat and state are read off each session's newest
+    /// run. For a session the runtime holds, that is the runtime's newest
+    /// run, as [`session`](Self::session) reads it, and the store supplies
+    /// the runs before it. When the store's rows for the page have no row
+    /// for such a session, its rows are read from the store on their own,
+    /// once the page is cut, for the sessions left on it.
+    ///
+    /// The run store has no status for a run that is stopping. Only the
+    /// runtime knows that a run the runtime holds is stopping. A query for
+    /// `Stopping` is answered from the sessions the runtime holds, not from
+    /// the store. Those sessions are paged in session-id order with `after`,
+    /// `limit` and `next` as any other page is. A query for any other state
+    /// leaves out a session whose newest run is stopping, even when the
+    /// store's row for that session matches.
+    ///
+    /// A page holds no session past the last one the store returned, when it
+    /// returned more than the page holds, since the store has not been read
+    /// past it. The page's `next` is the id of the last session on the page
+    /// when more matched, and otherwise that of the last session the store
+    /// returned, even when that session was left off the page. A session
+    /// whose newest run changes while the page is read, to one the query
+    /// does not select, is left off it the same way, so a page can come back
+    /// short, and `next` still moves past every session it passed over.
+    pub async fn sessions(&self, query: &SessionQuery) -> Result<SessionPage, SessionStoreError> {
+        let (statuses, pending_approval) = match query.state {
+            Some(AgentStateKind::Stopping) => return self.stopping_sessions(query).await,
+            None => (None, None),
+            Some(AgentStateKind::Preparing) => {
+                (Some(RunStatuses::just(RunStatus::Preparing)), None)
+            }
+            Some(AgentStateKind::Running) => {
+                (Some(RunStatuses::just(RunStatus::Running)), Some(false))
+            }
+            Some(AgentStateKind::Blocked) => {
+                (Some(RunStatuses::just(RunStatus::Running)), Some(true))
+            }
+            Some(AgentStateKind::Parked) => (Some(RunStatuses::just(RunStatus::Parked)), None),
+            Some(AgentStateKind::Done) => (
+                Some(
+                    RunStatuses::just(RunStatus::Finished)
+                        .and(RunStatus::Failed)
+                        .and(RunStatus::Cancelled),
+                ),
+                None,
+            ),
+        };
+        let filter = SessionFilter {
+            session: None,
+            chat: query.chat.clone(),
+            agent: query.agent.clone(),
+            statuses,
+            pending_approval,
+            limit: query.limit.get() + 1,
+            after: query.after.clone(),
+        };
+        let stored = self.shared.run_store.newest_per_session(&filter).await?;
+        let bounds = PageBounds::new(filter.after.clone(), &stored, query.limit, |row| {
+            row.newest().session_id()
+        });
+        let mut stored: BTreeMap<SessionId, SessionRuns> = stored
+            .into_iter()
+            .map(|runs| (runs.newest().session_id(), runs))
+            .collect();
+        let mut page: BTreeMap<SessionId, PageSession> = BTreeMap::new();
+        let open_sessions: Vec<Arc<SessionRecord>> =
+            self.shared.lock_sessions().values().cloned().collect();
+        for open_session in open_sessions {
+            let id = &open_session.id;
+            if !bounds.contains(id) {
+                continue;
+            }
+            let Some(newest_run) = self.newest_run(&open_session) else {
+                continue;
+            };
+            // With no row on the store's page, the session's newest run did
+            // not match there, or the store has no run of it.
+            let candidate = match stored.remove(id) {
+                Some(runs) => {
+                    PageSession::Runs(session_runs_with_newest_run(Some(runs), newest_run))
+                }
+                None => PageSession::NewestRun(newest_run),
+            };
+            if filter.matches_newest_run(candidate.newest_run()) {
+                page.insert(id.clone(), candidate);
+            }
+        }
+        page.extend(
+            stored
+                .into_iter()
+                .map(|(id, runs)| (id, PageSession::Runs(runs))),
+        );
+        let mut page: Vec<PageSession> = page.into_values().collect();
+        let next = bounds.cut(&mut page, query.limit, |candidate| {
+            candidate.newest_run().session_id()
+        });
+        let mut sessions = Vec::with_capacity(page.len());
+        for candidate in page {
+            let row = match candidate {
+                PageSession::Runs(runs) => runs,
+                PageSession::NewestRun(newest_run) => {
+                    let stored = self
+                        .session_runs_from_store(&newest_run.session_id())
+                        .await?;
+                    let runs = session_runs_with_newest_run(stored, newest_run);
+                    // A newer run of the session can reach the store after
+                    // the page's first read, and it may not match.
+                    if !filter.matches(&runs) {
+                        continue;
+                    }
+                    runs
+                }
+            };
+            let snapshot = self.session_snapshot(row).await?;
+            if query
+                .state
+                .is_none_or(|kind| snapshot.state().kind() == kind)
+            {
+                sessions.push(snapshot);
+            }
+        }
+        Ok(SessionPage::new(sessions, next))
+    }
+
+    /// The page of a `Stopping` query: the sessions this process holds whose
+    /// live run was stopped and matches the query's agent and chat.
+    async fn stopping_sessions(
+        &self,
+        query: &SessionQuery,
+    ) -> Result<SessionPage, SessionStoreError> {
+        let open_sessions: Vec<Arc<SessionRecord>> =
+            self.shared.lock_sessions().values().cloned().collect();
+        let mut ids: Vec<SessionId> = open_sessions
+            .iter()
+            .filter(|session| query.after.as_ref().is_none_or(|after| session.id > *after))
+            .filter(|session| {
+                let state = session.lock();
+                state.live.as_ref().is_some_and(|live| {
+                    let facts = live.facts();
+                    live.stopped().is_some()
+                        && query
+                            .agent
+                            .as_ref()
+                            .is_none_or(|agent| *agent == facts.run.agent)
+                        && query.chat.as_ref().is_none_or(|chat| {
+                            facts
+                                .lane()
+                                .is_some_and(|lane| lane.conversation().chat() == chat)
+                        })
+                })
+            })
+            .map(|session| session.id.clone())
+            .collect();
+        ids.sort();
+        let next = cut_to_page(&mut ids, query.limit, SessionId::clone);
+        let mut sessions = Vec::with_capacity(ids.len());
+        for id in &ids {
+            if let Some(snapshot) = self.session(id).await?
+                && snapshot.state().kind() == AgentStateKind::Stopping
+            {
+                sessions.push(snapshot);
+            }
+        }
+        Ok(SessionPage::new(sessions, next))
+    }
+
+    /// The session `id`, or `None` for a session this process does not hold
+    /// and the run store has no run of.
+    ///
+    /// For a session the runtime holds, its newest run is the runtime's:
+    /// the live run, or else the last run that ended while the runtime
+    /// still keeps it. The run store's rows supply the runs before it, and
+    /// past its bound the store can have let some or all of them go. For a
+    /// session the runtime does not hold, everything comes from the store's
+    /// rows. The runtime adds what only it knows about a session it holds:
+    /// the newest run's current facts and whether it was stopped, the last
+    /// run that ended, the observer counts, and the journal's newest number.
+    /// For a session it does not hold, the newest number is read from the
+    /// journal store.
+    pub async fn session(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<SessionSnapshot>, SessionStoreError> {
+        let stored = self.session_runs_from_store(id).await?;
+        let open_session = self.shared.lock_sessions().get(id).cloned();
+        let newest_run = open_session.and_then(|session| self.newest_run(&session));
+        let row = match (stored, newest_run) {
+            (stored, Some(newest_run)) => session_runs_with_newest_run(stored, newest_run),
+            (Some(row), None) => row,
+            (None, None) => return Ok(None),
+        };
+        Ok(Some(self.session_snapshot(row).await?))
+    }
+
+    /// The runs of the session `id` as the run store describes them, or
+    /// `None` when it has none.
+    async fn session_runs_from_store(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<SessionRuns>, SessionStoreError> {
+        let filter = SessionFilter {
+            session: Some(id.clone()),
+            limit: 1,
+            ..SessionFilter::default()
+        };
+        Ok(self
+            .shared
+            .run_store
+            .newest_per_session(&filter)
+            .await?
+            .pop())
+    }
+
+    /// The facts of the newest run the runtime holds of `session`: its live
+    /// run, or else the last run that ended, while the runtime still keeps
+    /// it.
+    fn newest_run(&self, session: &SessionRecord) -> Option<RunFacts> {
+        let last_ended = {
+            let state = session.lock();
+            if let Some(live) = &state.live {
+                return Some(live.facts());
+            }
+            state.last_run.map(|(run, _)| run)
+        };
+        self.shared.run(&last_ended?).map(|record| record.facts())
+    }
+
+    /// The newest number on the session's stream, or `None` for a session
+    /// neither this process nor the journal store knows. It comes from the
+    /// journal the runtime holds, and from the journal store for a session
+    /// it does not hold. The run store plays no part.
+    pub async fn latest_event(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<SequenceNumber>, SessionStoreError> {
+        let open_session = self.shared.lock_sessions().get(id).cloned();
+        match open_session {
+            Some(session) => Ok(session.journal.latest()),
+            None => self.shared.journal_store.latest(id).await,
+        }
+    }
+
+    /// The entry numbered `seq` on the session's stream, or `None` when the
+    /// journal store holds none: the stream has not reached `seq`, the store
+    /// let the entry go, or it forgot the session. It is read from the
+    /// journal store, which keeps a session's entries whether this process
+    /// holds the session or not. The run store plays no part, so a session
+    /// whose runs the run store has dropped still has its entries.
+    pub async fn journal_entry(
+        &self,
+        id: &SessionId,
+        seq: SequenceNumber,
+    ) -> Result<Option<JournalEntry>, SessionStoreError> {
+        let entries = self.shared.journal_store.read(id, seq, seq, 1).await?;
+        Ok(entries.into_iter().find(|entry| entry.seq() == seq))
+    }
+
+    /// The snapshot of the session `row` describes, with what the runtime
+    /// holds for the session in place of the store's view where it has it.
+    async fn session_snapshot(
+        &self,
+        row: SessionRuns,
+    ) -> Result<SessionSnapshot, SessionStoreError> {
+        let (newest, stored_previous) = row.into_parts();
+        let record = self.shared.run(&newest.run.run_id);
+        let stopped = record
+            .as_ref()
+            .is_some_and(|record| record.stopped().is_some());
+        let newest = record.map_or(newest, |record| record.facts());
+        let id = newest.session_id();
+        let open_session = self.shared.lock_sessions().get(&id).cloned();
+        let (latest_event, observers, last_ended_run) = match open_session {
+            Some(session) => {
+                let state = session.lock();
+                (
+                    session.journal.latest(),
+                    state.observers.counts(),
+                    state.last_run.map(|(run, _)| run),
+                )
+            }
+            None => (
+                self.shared.journal_store.latest(&id).await?,
+                ObserverCounts::default(),
+                None,
+            ),
+        };
+        // The session's own last run, unless that is the newest run itself.
+        let previous_ended = last_ended_run
+            .filter(|last| *last != newest.run.run_id)
+            .or(stored_previous);
+        Ok(SessionSnapshot::of(
+            newest,
+            stopped,
+            previous_ended,
+            latest_event,
+            observers,
+        ))
+    }
+
+    /// One page of the runs `query` selects, in run-id order: those the run
+    /// store lists, and those the runtime holds. A run the runtime holds is
+    /// matched and shown by its record's facts in place of the store's row,
+    /// so a live run's usage and newest number are current, and the page has
+    /// the run whatever the store kept of it. The page ends, and its `next`
+    /// is worked out, as on [`sessions`](Self::sessions).
+    pub async fn runs(&self, query: &RunQuery) -> Result<RunPage, SessionStoreError> {
+        let filter = RunFilter {
+            session: query.session.clone(),
+            conversation: None,
+            chat: query.chat.clone(),
+            status: query.status,
+            pending_approval: query.pending_approval,
+            limit: query.limit.get() + 1,
+            after: query.after,
+        };
+        let stored = self.shared.run_store.list(&filter).await?;
+        let bounds = PageBounds::new(filter.after, &stored, query.limit, |facts| facts.run.run_id);
+        let mut runs: BTreeMap<RunId, RunSnapshot> = stored
+            .into_iter()
+            .map(|facts| (facts.run.run_id, self.snapshot_from_store(facts)))
+            .collect();
+        for record in self.shared.run_records() {
+            if !bounds.contains(&record.id) {
+                continue;
+            }
+            let snapshot = self.snapshot_from_record(&record);
+            if filter.matches(snapshot.facts()) {
+                runs.insert(record.id, snapshot);
+            } else {
+                runs.remove(&record.id);
+            }
+        }
+        let mut runs: Vec<RunSnapshot> = runs.into_values().collect();
+        let next = bounds.cut(&mut runs, query.limit, |run| run.facts().run.run_id);
+        Ok(RunPage::new(runs, next))
+    }
+
+    /// The run, from its record while the runtime holds it and from the run
+    /// store after that. `None` for a run neither has. A read can wait, as
+    /// `ending_written` says.
+    pub async fn run(&self, run: &RunId) -> Result<Option<RunSnapshot>, SessionStoreError> {
+        if let Some(record) = self.shared.run(run) {
+            self.ending_written(&record).await;
+            return Ok(Some(self.snapshot_from_record(&record)));
+        }
+        let facts = self.shared.run_store.get(run).await?;
+        Ok(facts.map(|facts| self.snapshot_from_store(facts)))
+    }
+
+    /// Whether the run's facts show its ending, once any ending already
+    /// being written is written. A run's ending goes on the session's stream
+    /// before its facts, so a reader can see the run's terminal event while
+    /// the facts still say it is live. Once the run's stream has ended, this
+    /// waits for the facts, or for a drain, which can let the run go without
+    /// an ending; a run whose stream is still going is not waited for.
+    async fn ending_written(&self, record: &RunRecord) -> bool {
+        if !record.stoppable() {
+            tokio::select! {
+                biased;
+                () = record.ended() => {}
+                () = self.shared.shut_down.cancelled() => {}
+            }
+        }
+        record.facts().run.status.is_terminal()
+    }
+
+    /// The snapshot of a run the runtime holds, with its session's observers.
+    fn snapshot_from_record(&self, record: &RunRecord) -> RunSnapshot {
+        let observers = self
+            .observer_counts(&record.facts().session_id())
+            .unwrap_or_default();
+        RunSnapshot::from_record(record, observers)
+    }
+
+    /// The snapshot of a run read from the run store, with its session's
+    /// observers.
+    fn snapshot_from_store(&self, facts: RunFacts) -> RunSnapshot {
+        let observers = self
+            .observer_counts(&facts.session_id())
+            .unwrap_or_default();
+        RunSnapshot::from_store(facts, observers)
+    }
+
+    /// Stops the run as [`cancel`](Self::cancel) does, and says what came of
+    /// it:
+    ///
+    /// - [`StopOutcome::Stopping`] when the run was stopped by this call or
+    ///   an earlier one and has not ended. The first cause given is the one
+    ///   the run ends with. The snapshot is taken before the stop, so it
+    ///   never shows the run as ended.
+    /// - [`StopOutcome::AlreadyEnded`] when the run's stream had already
+    ///   ended, or the run store holds the run as ended. The run keeps the
+    ///   ending it has. A run whose ending is still being written is waited
+    ///   for, so the snapshot shows how it ended.
+    /// - [`StopOutcome::NotHere`] when the runtime does not hold the run, or
+    ///   a drain lets the run go before its ending is written, and the run
+    ///   store has no ended run with this id.
+    pub async fn stop(
+        &self,
+        run: &RunId,
+        cause: CancelCause,
+        reason: Option<String>,
+    ) -> Result<StopOutcome, SessionStoreError> {
+        if let Some(record) = self.shared.run(run) {
+            let before = self.snapshot_from_record(&record);
+            if record.stop(cause, reason) {
+                return Ok(StopOutcome::Stopping(before));
+            }
+            // A refused stop means the stream has ended. A drain can let the
+            // run go without its ending, and then the run is read from the
+            // store.
+            if self.ending_written(&record).await {
+                return Ok(StopOutcome::AlreadyEnded(
+                    self.snapshot_from_record(&record),
+                ));
+            }
+        }
+        Ok(match self.shared.run_store.get(run).await? {
+            Some(facts) if facts.run.status.is_terminal() => {
+                StopOutcome::AlreadyEnded(self.snapshot_from_store(facts))
+            }
+            Some(_) | None => StopOutcome::NotHere,
+        })
+    }
+}
+
+/// Cuts `rows` down to `limit`, and returns the key the next page starts
+/// after: that of the last row kept, when there were more rows than that.
+fn cut_to_page<T, K>(rows: &mut Vec<T>, limit: PageLimit, key: impl FnOnce(&T) -> K) -> Option<K> {
+    if rows.len() <= limit.get() {
+        return None;
+    }
+    rows.truncate(limit.get());
+    rows.last().map(key)
+}
+
+/// The keys a page read from the store, with what the runtime holds added,
+/// can hold. They come after `after`, the last key of the previous page.
+/// When the store returned more rows than the page holds, they go no
+/// further than `stored_end`, the key of the last row it returned: the
+/// store was not read past it, so a row the runtime adds past it could come
+/// after rows the store has not returned yet.
+struct PageBounds<K> {
+    after: Option<K>,
+    stored_end: Option<K>,
+}
+
+impl<K: Ord> PageBounds<K> {
+    fn new<T>(after: Option<K>, stored: &[T], limit: PageLimit, key: impl FnOnce(&T) -> K) -> Self {
+        let stored_end = if stored.len() > limit.get() {
+            stored.last().map(key)
+        } else {
+            None
+        };
+        Self { after, stored_end }
+    }
+
+    fn contains(&self, key: &K) -> bool {
+        self.after.as_ref().is_none_or(|after| key > after)
+            && self.stored_end.as_ref().is_none_or(|end| key <= end)
+    }
+
+    /// Cuts `rows`, in key order, down to `limit`, and returns the page's
+    /// `next`: the key of the last row kept when there were more, or else
+    /// `stored_end`, since the store may have more rows past it.
+    fn cut<T>(self, rows: &mut Vec<T>, limit: PageLimit, key: impl FnOnce(&T) -> K) -> Option<K> {
+        cut_to_page(rows, limit, key).or(self.stored_end)
+    }
+}
+
+/// A session on a page of [`AgentRuntime::sessions`] before the page is cut.
+enum PageSession {
+    /// The session's runs.
+    Runs(SessionRuns),
+    /// The newest run of a session the runtime holds, without the store's
+    /// rows for the session.
+    NewestRun(RunFacts),
+}
+
+impl PageSession {
+    fn newest_run(&self) -> &RunFacts {
+        match self {
+            Self::Runs(runs) => runs.newest(),
+            Self::NewestRun(newest_run) => newest_run,
+        }
+    }
+}
+
+/// The runs of a session the runtime holds: `stored`, the run store's view
+/// of them if it has one, with `newest_run`, the runtime's newest run of the
+/// session, as the newest. `push` takes only a later run, so the store's
+/// newest run stands when it is the later one: when the store's rows were
+/// read after `newest_run`, or another process writes to the same store.
+fn session_runs_with_newest_run(stored: Option<SessionRuns>, newest_run: RunFacts) -> SessionRuns {
+    let Some(mut runs) = stored else {
+        return SessionRuns::new(newest_run);
+    };
+    if newest_run.run.run_id >= runs.newest().run.run_id {
+        runs.push(newest_run);
+    }
+    runs
 }
 
 impl Shared {
@@ -566,6 +1088,16 @@ impl Shared {
             .unwrap_or_else(PoisonError::into_inner)
             .get(run)
             .cloned()
+    }
+
+    /// The records of every run the runtime holds.
+    fn run_records(&self) -> Vec<Arc<RunRecord>> {
+        self.runs
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Waits out the retention window, then lets the ended run go, and the
