@@ -1295,7 +1295,6 @@ mod tests {
     }
 
     mod webhook_signing {
-        use std::collections::HashMap;
         use std::time::Duration;
 
         use bytes::Bytes;
@@ -1670,8 +1669,8 @@ mod tests {
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: aura_config::WebhookUrl::new(url).unwrap(),
                     timeout_secs: 300,
-                    headers: HashMap::new(),
-                    headers_from_request: HashMap::new(),
+                    headers: aura_config::HeaderMap::new(),
+                    headers_from_request: aura_config::HeaderMap::new(),
                     tool_headers_from_response,
                 },
             }
@@ -2315,10 +2314,14 @@ mod tests {
             .collect()
     }
 
+    fn make_header_map(pairs: &[(&str, &str)]) -> aura_config::HeaderMap {
+        aura_config::HeaderMap::try_from(make_req_headers(pairs)).expect("test headers are valid")
+    }
+
     #[test]
     fn webhook_headers_static_only() {
-        let static_headers = make_req_headers(&[("x-tenant", "sre-prod")]);
-        let headers_from_request = std::collections::HashMap::new();
+        let static_headers = make_header_map(&[("x-tenant", "sre-prod")]);
+        let headers_from_request = aura_config::HeaderMap::new();
         let header_map =
             crate::webhook_utils::resolve_headers(&static_headers, &headers_from_request, None);
         assert_eq!(header_map.get("x-tenant").unwrap(), "sre-prod");
@@ -2327,8 +2330,8 @@ mod tests {
 
     #[test]
     fn webhook_headers_mapped_only() {
-        let static_headers = std::collections::HashMap::new();
-        let headers_from_request = make_req_headers(&[("x-tenant", "x-incoming-tenant")]);
+        let static_headers = aura_config::HeaderMap::new();
+        let headers_from_request = make_header_map(&[("x-tenant", "x-incoming-tenant")]);
         let req_headers = make_req_headers(&[("x-incoming-tenant", "forwarded-value")]);
 
         let header_map = crate::webhook_utils::resolve_headers(
@@ -2343,8 +2346,8 @@ mod tests {
     #[test]
     fn webhook_headers_fallback_precedence() {
         // When the mapped request header IS present, it overrides the static value.
-        let static_headers = make_req_headers(&[("authorization", "static-token")]);
-        let headers_from_request = make_req_headers(&[("authorization", "x-incoming-auth")]);
+        let static_headers = make_header_map(&[("authorization", "static-token")]);
+        let headers_from_request = make_header_map(&[("authorization", "x-incoming-auth")]);
         let req_headers = make_req_headers(&[("x-incoming-auth", "dynamic-token")]);
 
         let header_map = crate::webhook_utils::resolve_headers(
@@ -2376,8 +2379,8 @@ mod tests {
     fn webhook_headers_case_insensitive_lookup() {
         // TOML config uses "Authorization" (capitalized) but the inbound
         // request header arrives lowercased. The lookup must be case-insensitive.
-        let static_headers = std::collections::HashMap::new();
-        let headers_from_request = make_req_headers(&[("Authorization", "Authorization")]);
+        let static_headers = aura_config::HeaderMap::new();
+        let headers_from_request = make_header_map(&[("Authorization", "Authorization")]);
         let req_headers = make_req_headers(&[("authorization", "Token my-token")]);
 
         let header_map = crate::webhook_utils::resolve_headers(
@@ -2399,8 +2402,8 @@ mod tests {
         // Both refer to the same HTTP header; the dynamic value must override
         // the static fallback deterministically, not non-deterministically
         // based on HashMap iteration order.
-        let static_headers = make_req_headers(&[("Authorization", "static-token")]);
-        let headers_from_request = make_req_headers(&[("authorization", "x-incoming-auth")]);
+        let static_headers = make_header_map(&[("Authorization", "static-token")]);
+        let headers_from_request = make_header_map(&[("authorization", "x-incoming-auth")]);
         let req_headers = make_req_headers(&[("x-incoming-auth", "dynamic-token")]);
 
         let header_map = crate::webhook_utils::resolve_headers(
@@ -2412,23 +2415,6 @@ mod tests {
             header_map.get("authorization").unwrap(),
             "dynamic-token",
             "dynamic header must override static fallback regardless of key casing"
-        );
-    }
-
-    #[test]
-    fn webhook_headers_invalid_skipped() {
-        // Header name with a space is invalid per RFC 7230; the entry must
-        // be skipped with a warning, not panic.
-        let static_headers = make_req_headers(&[("invalid header!", "value"), ("x-valid", "ok")]);
-        let headers_from_request = std::collections::HashMap::new();
-
-        let header_map =
-            crate::webhook_utils::resolve_headers(&static_headers, &headers_from_request, None);
-        assert_eq!(header_map.get("x-valid").unwrap(), "ok");
-        assert_eq!(
-            header_map.len(),
-            1,
-            "invalid header must be skipped, valid one must remain"
         );
     }
 
@@ -2512,8 +2498,8 @@ mod tests {
         // survive. HashMap iteration order is nondeterministic, but the invalid
         // entry warns exactly once regardless of order.
         let static_headers =
-            make_req_headers(&[("x-bad", "unique-secret\r\ninvalid"), ("x-valid", "ok")]);
-        let headers_from_request = std::collections::HashMap::new();
+            make_header_map(&[("x-bad", "unique-secret\r\ninvalid"), ("x-valid", "ok")]);
+        let headers_from_request = aura_config::HeaderMap::new();
 
         let (header_map, log) = capture_thread_warn_log(|| {
             // Another thread with no subscriber reaches the same warning
@@ -2568,8 +2554,8 @@ mod tests {
         // Empty config (no static, no from_request, no req_headers) must
         // produce an empty HeaderMap, so the header loop in request_approval
         // adds nothing to the POST.
-        let static_headers = std::collections::HashMap::new();
-        let headers_from_request = std::collections::HashMap::new();
+        let static_headers = aura_config::HeaderMap::new();
+        let headers_from_request = aura_config::HeaderMap::new();
 
         let header_map =
             crate::webhook_utils::resolve_headers(&static_headers, &headers_from_request, None);

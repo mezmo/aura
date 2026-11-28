@@ -244,9 +244,9 @@ mod tests {
             .collect();
         McpServerConfig::HttpStreamable {
             url: "http://test".to_string(),
-            headers: HashMap::new(),
+            headers: aura_config::HeaderMap::new(),
             description: None,
-            headers_from_request: HashMap::new(),
+            headers_from_request: aura_config::HeaderMap::new(),
             scratchpad,
             user_agent: None,
         }

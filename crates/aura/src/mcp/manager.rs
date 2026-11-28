@@ -1305,9 +1305,9 @@ mod tests {
         let plain = RecordingMcpServer::start().await;
         let http = |url: &str, user_agent: Option<&str>| McpServerConfig::HttpStreamable {
             url: url.to_owned(),
-            headers: HashMap::new(),
+            headers: aura_config::HeaderMap::new(),
             description: None,
-            headers_from_request: HashMap::new(),
+            headers_from_request: aura_config::HeaderMap::new(),
             scratchpad: aura_config::ScratchpadRules::default(),
             user_agent: user_agent.map(|token| McpUserAgent::new(token).unwrap()),
         };
@@ -1355,9 +1355,9 @@ mod tests {
                 // Port 1 on loopback refuses connections immediately, so this
                 // exercises the transport/connection-error path deterministically.
                 url: "http://127.0.0.1:1/mcp".to_string(),
-                headers: HashMap::new(),
+                headers: aura_config::HeaderMap::new(),
                 description: None,
-                headers_from_request: HashMap::new(),
+                headers_from_request: aura_config::HeaderMap::new(),
                 scratchpad: aura_config::ScratchpadRules::default(),
                 user_agent: None,
             },
@@ -1430,9 +1430,9 @@ mod tests {
             "ghost".to_string(),
             McpServerConfig::HttpStreamable {
                 url: format!("http://{addr}/mcp"),
-                headers: HashMap::new(),
+                headers: aura_config::HeaderMap::new(),
                 description: None,
-                headers_from_request: HashMap::new(),
+                headers_from_request: aura_config::HeaderMap::new(),
                 scratchpad: aura_config::ScratchpadRules::default(),
                 user_agent: None,
             },
@@ -1512,9 +1512,9 @@ mod tests {
             "hung".to_string(),
             McpServerConfig::HttpStreamable {
                 url: format!("http://{addr}"),
-                headers: HashMap::new(),
+                headers: aura_config::HeaderMap::new(),
                 description: None,
-                headers_from_request: HashMap::new(),
+                headers_from_request: aura_config::HeaderMap::new(),
                 scratchpad: aura_config::ScratchpadRules::default(),
                 user_agent: None,
             },

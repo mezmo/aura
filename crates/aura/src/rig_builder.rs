@@ -17,7 +17,7 @@ use crate::error::BuilderError;
 use crate::forwarded_headers::ForwardedHeaders;
 use crate::hitl::PendingApprovals;
 use crate::streaming::StreamingAgent;
-use aura_config::{AgentSettings, Config, McpConfig, McpServerConfig};
+use aura_config::{AgentSettings, Config, HeaderMap, McpConfig, McpServerConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -257,19 +257,18 @@ impl RigBuilder {
 /// already present in `headers` serve as fallback when the mapped request
 /// header is absent.
 pub(crate) fn apply_request_header_mappings(
-    headers: &mut HashMap<String, String>,
-    headers_from_request: &HashMap<String, String>,
+    headers: &mut HeaderMap,
+    headers_from_request: &HeaderMap,
     req_headers: &HashMap<String, String>,
 ) -> usize {
     let mut resolved = 0;
-    for (header_key, req_header_name) in headers_from_request.iter() {
-        let req_header_lower = req_header_name.to_lowercase();
+    for (header_name, req_header_name) in headers_from_request.header_names() {
         if let Some(value) = req_headers
             .iter()
-            .find(|(k, _)| k.to_lowercase() == req_header_lower)
+            .find(|(k, _)| k.eq_ignore_ascii_case(req_header_name))
             .map(|(_, v)| v)
         {
-            headers.insert(header_key.to_lowercase(), value.clone());
+            headers.insert(header_name, value.clone());
             resolved += 1;
         }
     }
@@ -323,15 +322,6 @@ pub fn resolve_mcp_headers_in(
             }
         };
 
-        // Lowercase static header keys so mapped overrides (inserted under
-        // lowercased keys by `apply_request_header_mappings`) replace the
-        // static fallback rather than coexisting as a case-distinct entry.
-        let normalized: HashMap<String, String> = server_headers
-            .iter()
-            .map(|(k, v)| (k.to_lowercase(), v.clone()))
-            .collect();
-        *server_headers = normalized;
-
         // Resolve headers_from_request mappings using the incoming request
         // headers. Static TOML headers are already in server_headers; this
         // only overrides when the mapped request header is found. Count
@@ -355,6 +345,10 @@ mod tests {
     use aura_config::{McpConfig, load_config_from_str};
 
     /// Build a minimal AgentBuildContext with one HttpStreamable MCP server.
+    fn header_map(raw: HashMap<String, String>) -> HeaderMap {
+        HeaderMap::try_from(raw).expect("test headers are valid")
+    }
+
     fn make_build_context(
         static_headers: HashMap<String, String>,
         headers_from_request: HashMap<String, String>,
@@ -364,9 +358,9 @@ mod tests {
             "test_server".to_string(),
             McpServerConfig::HttpStreamable {
                 url: "https://example.com/mcp".to_string(),
-                headers: static_headers,
+                headers: header_map(static_headers),
                 description: None,
-                headers_from_request,
+                headers_from_request: header_map(headers_from_request),
                 scratchpad: aura_config::ScratchpadRules::default(),
                 user_agent: None,
             },
@@ -381,7 +375,7 @@ mod tests {
         }
     }
 
-    fn get_server_headers(build_context: &AgentBuildContext) -> &HashMap<String, String> {
+    fn get_server_headers(build_context: &AgentBuildContext) -> &HeaderMap {
         let mcp = build_context.mcp.as_ref().unwrap();
         match mcp.servers.get("test_server").unwrap() {
             McpServerConfig::HttpStreamable { headers, .. } => headers,
@@ -535,10 +529,14 @@ mod tests {
         // already present as a static fallback) leaves length unchanged but
         // still counts as a resolution; a mapping whose request header is
         // absent resolves zero.
-        let mut headers = HashMap::new();
-        headers.insert("authorization".to_string(), "static".to_string());
-        let mut headers_from_request = HashMap::new();
-        headers_from_request.insert("authorization".to_string(), "x-incoming-auth".to_string());
+        let mut headers = header_map(HashMap::from([(
+            "authorization".to_string(),
+            "static".to_string(),
+        )]));
+        let headers_from_request = header_map(HashMap::from([(
+            "authorization".to_string(),
+            "x-incoming-auth".to_string(),
+        )]));
         let mut req_headers = HashMap::new();
         req_headers.insert("x-incoming-auth".to_string(), "dynamic".to_string());
 
@@ -554,8 +552,10 @@ mod tests {
         assert_eq!(headers.get("authorization").unwrap(), "dynamic");
 
         // A mapping whose request header is absent resolves nothing.
-        let mut miss_mappings = HashMap::new();
-        miss_mappings.insert("x-tenant".to_string(), "x-incoming-tenant".to_string());
+        let miss_mappings = header_map(HashMap::from([(
+            "x-tenant".to_string(),
+            "x-incoming-tenant".to_string(),
+        )]));
         let resolved_none =
             apply_request_header_mappings(&mut headers, &miss_mappings, &HashMap::new());
         assert_eq!(resolved_none, 0, "absent request header must not count");

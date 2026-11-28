@@ -2,6 +2,7 @@ pub mod config;
 pub mod env;
 pub mod error;
 pub mod globpattern;
+pub mod header_map;
 pub mod lenient_bool;
 pub mod lenient_int;
 pub mod loader;
@@ -21,6 +22,7 @@ pub use config::*;
 pub use env::resolve_env_vars;
 pub use error::ConfigError;
 pub use globpattern::*;
+pub use header_map::{HeaderMap, HeaderMapError};
 pub use loader::ConfigLoader;
 pub use orchestration::{
     ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,
